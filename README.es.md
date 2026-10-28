@@ -6,7 +6,7 @@ Excalibur será un agente de inteligencia artificial personal capaz de conversar
 
 ## Estado
 
-El repositorio contiene únicamente una estructura y documentación iniciales. El agente, la CLI, la interfaz web, la tienda y las demás funcionalidades aún no están implementados.
+El repositorio contiene una estructura y documentación iniciales y una biblioteca Rust parcial de proveedores. El agente, la CLI, la interfaz web y la tienda aún no están implementados. Consulta la [cobertura y los límites de proveedores](docs/architecture/provider-implementation.es.md).
 
 ## Organización prevista
 

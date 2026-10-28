@@ -5,3 +5,5 @@
 - Respect the scope of the task and preserve unrelated work. Do not invent credentials, contact information, licensing decisions or test results.
 - Add implementation and verification commands here when the corresponding components exist.
 - Write commit messages in natural, human language that clearly describes the change.
+- Keep agent and provider logic in the shared core, not duplicated in the CLI or HTTP API. See [the architecture overview](docs/architecture/overview.md).
+- Rust provider library checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`. Tests must use mocks and must not call paid APIs.
