@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS file_version_metadata(version_id TEXT PRIMARY KEY REFERENCES file_versions(id) ON DELETE CASCADE,pre_kind TEXT CHECK(pre_kind IN('file','symlink')),pre_executable INTEGER CHECK(pre_executable IN(0,1)),post_kind TEXT CHECK(post_kind IN('file','symlink')),post_executable INTEGER CHECK(post_executable IN(0,1)));

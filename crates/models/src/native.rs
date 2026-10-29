@@ -166,6 +166,19 @@ fn anthropic_request(
         body["tools"]=json!(tools.iter().map(|t|json!({"name":t["function"]["name"],"description":t["function"]["description"],"input_schema":t["function"]["parameters"]})).collect::<Vec<_>>());
         body["tool_choice"] = json!({"type":if request.tools_enabled{"auto"}else{"none"}});
     }
+    if !request.deferred_tools.is_empty() {
+        let mut tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        tools.push(json!({"type":"tool_search_tool_bm25_20251119","name":"tool_search_tool_bm25"}));
+        let mut definitions = request.deferred_tools.clone();
+        definitions.sort_by(|a, b| a.name.cmp(&b.name));
+        tools.extend(definitions.into_iter().map(|tool|json!({"name":tool.name,"description":tool.description,"input_schema":tool.input_schema,"defer_loading":true})));
+        body["tools"] = json!(tools);
+        body["tool_choice"] = json!({"type":if request.tools_enabled{"auto"}else{"none"}});
+    }
     if config.native_tools
         && let Some(schema) = &request.output_schema
     {
@@ -249,6 +262,26 @@ fn anthropic_system_model(model: &str) -> bool {
                     suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_digit())
                 })
     })
+}
+pub(crate) fn anthropic_search_model(model: &str) -> bool {
+    anthropic_system_model(model)
+        || [
+            "claude-sonnet-5",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-5",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+        ]
+        .into_iter()
+        .any(|known| {
+            model == known
+                || model
+                    .strip_prefix(known)
+                    .and_then(|s| s.strip_prefix('-'))
+                    .is_some_and(|s| s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()))
+        })
 }
 fn gemini_request(
     config: &GatewayConfig,
@@ -513,6 +546,7 @@ pub(crate) async fn stream(
     let mut saw_start = false;
     let mut gemini_response_parts = Vec::new();
     let mut anthropic_blocks: BTreeMap<usize, Value> = BTreeMap::new();
+    let mut server_arguments: BTreeMap<usize, String> = BTreeMap::new();
     while let Some(event) = stream
         .next_event()
         .await
@@ -532,7 +566,14 @@ pub(crate) async fn stream(
                         .ok_or(ModelError::Truncated)? as usize;
                     let block = &data["content_block"];
                     anthropic_blocks.insert(index, block.clone());
-                    if block["type"] == "tool_use" {
+                    if block["type"] == "server_tool_use" {
+                        if block["name"] != "tool_search_tool_bm25" {
+                            return Err(ModelError::Configuration(
+                                "unsupported provider-side tool operation".into(),
+                            ));
+                        }
+                        server_arguments.insert(index, String::new());
+                    } else if block["type"] == "tool_use" {
                         let call = json!({"id":block["id"],"name":block["name"],"arguments":""});
                         emit(
                             sink,
@@ -599,6 +640,19 @@ pub(crate) async fn stream(
                         let part = delta["partial_json"]
                             .as_str()
                             .ok_or(ModelError::Truncated)?;
+                        if let Some(arguments) = server_arguments.get_mut(&index) {
+                            arguments.push_str(part);
+                            if server_arguments.values().map(String::len).sum::<usize>()
+                                + anthropic_blocks
+                                    .values()
+                                    .map(|v| v.to_string().len())
+                                    .sum::<usize>()
+                                > 8 * 1024 * 1024
+                            {
+                                return Err(ModelError::Truncated);
+                            }
+                            continue;
+                        }
                         let call = calls.get_mut(&index).ok_or(ModelError::Truncated)?;
                         let mut args = call["arguments"].as_str().unwrap().to_owned();
                         args.push_str(part);
@@ -680,6 +734,7 @@ pub(crate) async fn stream(
         }
         if content.len()
             + calls.values().map(|v| v.to_string().len()).sum::<usize>()
+            + server_arguments.values().map(String::len).sum::<usize>()
             + anthropic_blocks
                 .values()
                 .map(|v| v.to_string().len())
@@ -697,6 +752,15 @@ pub(crate) async fn stream(
         return Err(ModelError::Truncated);
     }
     let raw = if provider == Provider::Anthropic {
+        for (index, arguments) in &server_arguments {
+            if !arguments.is_empty() {
+                let input: Value = serde_json::from_str(arguments)
+                    .map_err(|_| validation("invalid provider search JSON"))?;
+                anthropic_blocks
+                    .get_mut(index)
+                    .ok_or(ModelError::Truncated)?["input"] = input;
+            }
+        }
         for (index, call) in &calls {
             let args = call["arguments"].as_str().unwrap();
             let input: Value = if args.is_empty() {
@@ -715,4 +779,66 @@ pub(crate) async fn stream(
         json!({"candidates":[{"content":{"parts":gemini_response_parts},"finishReason":finish}],"usageMetadata":usage})
     };
     response(provider, raw)
+}
+
+pub(crate) fn validate_deferred_response(
+    raw: &Value,
+    request: &ModelRequest,
+) -> Result<(), ModelError> {
+    let Some(blocks) = raw
+        .pointer("/choices/0/message/provider_state/blocks")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for block in blocks {
+        if block["type"] == "server_tool_use"
+            && (request.deferred_tools.is_empty() || block["name"] != "tool_search_tool_bm25")
+        {
+            return Err(ModelError::Configuration(
+                "unregistered provider-side tool operation".into(),
+            ));
+        }
+        if block["type"] == "tool_search_tool_result" {
+            if request.deferred_tools.is_empty() {
+                return Err(ModelError::Configuration(
+                    "unexpected deferred search result".into(),
+                ));
+            }
+            fn refs(value: &Value, request: &ModelRequest) -> Result<(), ModelError> {
+                match value {
+                    Value::Object(map) => {
+                        if map.get("type").and_then(Value::as_str) == Some("tool_reference") {
+                            let name = map
+                                .get("tool_name")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| validation("missing deferred reference name"))?;
+                            if !request
+                                .tools
+                                .iter()
+                                .chain(&request.deferred_tools)
+                                .any(|t| t.name == name)
+                            {
+                                return Err(validation(
+                                    "provider returned an unregistered deferred reference",
+                                ));
+                            }
+                        }
+                        for v in map.values() {
+                            refs(v, request)?;
+                        }
+                    }
+                    Value::Array(values) => {
+                        for v in values {
+                            refs(v, request)?;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            refs(block, request)?;
+        }
+    }
+    Ok(())
 }

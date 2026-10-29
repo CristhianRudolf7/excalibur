@@ -64,6 +64,12 @@ pub type StreamSink = Arc<dyn Fn(StreamDelta) + Send + Sync>;
 /// Stream deltas are provisional UI data. Only the returned complete response may
 /// enter the durable execution protocol; callbacks must never execute tool fragments.
 pub trait ModelGateway: Send + Sync {
+    fn native_deferred_tools(&self) -> bool {
+        false
+    }
+    fn deferred_catalog_override(&self) -> Option<Vec<excalibur_types::runtime::ToolDefinition>> {
+        None
+    }
     fn cache_settings(&self) -> CacheSettings {
         CacheSettings::default()
     }
@@ -205,6 +211,9 @@ pub struct GatewayConfig {
     /// system role. None uses the adapter's conservative documented model list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_system_updates: Option<bool>,
+    /// Host override for verified native deferred-tool search support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_deferred_tools: Option<bool>,
     pub max_output_tokens: u32,
 }
 impl GatewayConfig {
@@ -217,6 +226,7 @@ impl GatewayConfig {
             temperature: None,
             native_tools: true,
             native_system_updates: None,
+            native_deferred_tools: None,
             max_output_tokens: 4096,
         }
     }
@@ -280,6 +290,11 @@ impl OpenAiGateway {
                 ModelError::Configuration("invalid or externally-referencing output schema".into())
             })?;
         }
+        if !request.deferred_tools.is_empty() && !self.native_deferred_tools() {
+            return Err(ModelError::Configuration(
+                "native deferred tools are unavailable for this provider adapter".into(),
+            ));
+        }
         let mut definitions = request.tools.clone();
         definitions.sort_by(|a, b| a.name.cmp(&b.name));
         if definitions.iter().any(|t| t.name.is_empty())
@@ -289,7 +304,21 @@ impl OpenAiGateway {
                 "duplicate or empty tool name".into(),
             ));
         }
-        for tool in &definitions {
+        let mut all_definitions = definitions
+            .iter()
+            .chain(&request.deferred_tools)
+            .collect::<Vec<_>>();
+        all_definitions.sort_by(|a, b| a.name.cmp(&b.name));
+        if all_definitions.iter().any(|d| {
+            d.name.is_empty()
+                || (!request.deferred_tools.is_empty() && d.name == "tool_search_tool_bm25")
+        }) || all_definitions.windows(2).any(|v| v[0].name == v[1].name)
+        {
+            return Err(ModelError::Configuration(
+                "duplicate, empty or reserved deferred tool name".into(),
+            ));
+        }
+        for tool in all_definitions {
             jsonschema::validator_for(&tool.input_schema).map_err(|_| {
                 ModelError::Configuration(format!("invalid schema for tool {}", tool.name))
             })?;
@@ -557,6 +586,7 @@ impl OpenAiGateway {
         })
     }
     fn normalize(&self, raw: &Value, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+        native::validate_deferred_response(raw, request)?;
         let reason = raw
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str);
@@ -736,6 +766,14 @@ impl OpenAiGateway {
     }
 }
 impl ModelGateway for OpenAiGateway {
+    fn native_deferred_tools(&self) -> bool {
+        self.config.native_tools
+            && self.client.provider() == excalibur_providers::Provider::Anthropic
+            && self
+                .config
+                .native_deferred_tools
+                .unwrap_or_else(|| native::anthropic_search_model(&self.config.model))
+    }
     fn cache_settings(&self) -> CacheSettings {
         CacheSettings::provider(self.client.provider())
     }
@@ -928,6 +966,7 @@ fn validate_calls(message: &mut Message, request: &ModelRequest) -> Result<(), M
         let tool = request
             .tools
             .iter()
+            .chain(&request.deferred_tools)
             .find(|t| t.name == call.name)
             .ok_or_else(|| validation("unknown tool name"))?;
         let arguments = parse_json_minor(&call.arguments)?;

@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS workspace_schema(version INTEGER PRIMARY KEY,checksum TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS workspace_lease_activity(path TEXT PRIMARY KEY REFERENCES leases(path) ON DELETE CASCADE,activity TEXT NOT NULL,root TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS workspace_snapshots(id TEXT PRIMARY KEY,root TEXT NOT NULL,run_id TEXT NOT NULL REFERENCES runs(id),step INTEGER NOT NULL,phase TEXT NOT NULL,tree TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(root,run_id,step,phase));
+CREATE TABLE IF NOT EXISTS workspace_tasks(id TEXT PRIMARY KEY,root TEXT NOT NULL,integration_branch TEXT NOT NULL,integration_path TEXT NOT NULL,base_oid TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'active');
+CREATE TABLE IF NOT EXISTS workspace_children(task_id TEXT NOT NULL REFERENCES workspace_tasks(id),owner TEXT NOT NULL,branch TEXT NOT NULL UNIQUE,path TEXT NOT NULL UNIQUE,state TEXT NOT NULL DEFAULT 'active',PRIMARY KEY(task_id,owner));
+CREATE TABLE IF NOT EXISTS workspace_integrations(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES workspace_tasks(id),child TEXT NOT NULL,source_oid TEXT NOT NULL,intent TEXT NOT NULL,state TEXT NOT NULL,report TEXT NOT NULL DEFAULT '{}',target_before TEXT,rebased_oid TEXT,created_at INTEGER NOT NULL,UNIQUE(task_id,child,source_oid));

@@ -119,23 +119,57 @@ impl StorageConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// Declared server command. Hosts approve and confine it before activation; loading never executes it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LanguageServerConfig {
+    pub command: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub initialization_options: std::collections::BTreeMap<String, toml::Value>,
+}
+fn enabled_by_default() -> bool {
+    true
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Installation root supplied explicitly by the embedding host.
     pub data_dir: PathBuf,
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub language_servers: std::collections::BTreeMap<String, LanguageServerConfig>,
 }
 impl Config {
     pub fn defaults(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
             storage: StorageConfig::default(),
+            language_servers: Default::default(),
         }
     }
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !self.data_dir.is_absolute() {
             return Err(ConfigError::Invalid("data directory must be absolute"));
+        }
+        for (language, server) in &self.language_servers {
+            if language.is_empty()
+                || language.len() > 64
+                || !language
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+                || !server.command.is_absolute()
+                || server.args.len() > 256
+                || server
+                    .args
+                    .iter()
+                    .any(|arg| arg.len() > 16384 || arg.contains('\0'))
+            {
+                return Err(ConfigError::Invalid("invalid language server declaration"));
+            }
         }
         self.storage.validate()
     }
@@ -216,6 +250,24 @@ impl ConfigLayers {
                 )?;
                 *data_dir = toml::Value::try_from(resolved)?;
             }
+            if let Some(servers) = value
+                .get_mut("language_servers")
+                .and_then(toml::Value::as_table_mut)
+            {
+                for (_, server) in servers.iter_mut() {
+                    if let Some(command) = server.get_mut("command") {
+                        let raw = command.as_str().ok_or(ConfigError::Invalid(
+                            "language server command must be a path string",
+                        ))?;
+                        let resolved = resolve_from(
+                            Path::new(raw),
+                            path.parent()
+                                .ok_or(ConfigError::Invalid("configuration file parent missing"))?,
+                        )?;
+                        *command = toml::Value::try_from(resolved)?;
+                    }
+                }
+            }
             merge(&mut merged, value);
             sources.push(Source { layer, path });
         }
@@ -248,8 +300,8 @@ impl ConfigLayers {
     }
 }
 
-/// All current settings are installation-global. Lower-trust project/scope files
-/// intentionally have an empty key allowlist until genuinely local settings exist.
+/// Storage remains installation-global. Project files may only declare language
+/// servers, which still require host-approved confined activation. Scope files have no keys.
 fn validate_layer_keys(layer: Layer, path: &Path, value: &toml::Value) -> Result<(), ConfigError> {
     if matches!(layer, Layer::System | Layer::User) {
         return Ok(());
@@ -257,7 +309,10 @@ fn validate_layer_keys(layer: Layer, path: &Path, value: &toml::Value) -> Result
     let Some(table) = value.as_table() else {
         return Err(ConfigError::Invalid("configuration root must be a table"));
     };
-    if let Some((key, value)) = table.iter().next() {
+    if let Some((key, value)) = table
+        .iter()
+        .find(|(key, _)| !(layer == Layer::Project && key.as_str() == "language_servers"))
+    {
         // Report a concrete leaf when available, including wrong-typed values.
         let mut key = key.clone();
         let mut value = value;
@@ -632,5 +687,57 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.config.data_dir, base.join("persist/state"));
         assert_eq!(loaded.sources[0].path, base.join("settings/user.toml"));
+    }
+}
+
+#[cfg(test)]
+mod language_server_layers {
+    use super::*;
+    #[test]
+    fn project_server_overrides_only_declarations_and_resolves_against_its_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join("user.toml");
+        let project = temp.path().join("project.toml");
+        std::fs::write(
+            &user,
+            "[language_servers.rust]\ncommand='bin/global-server'\nargs=['--stdio']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            "[language_servers.rust]\ncommand='bin/project-server'\n",
+        )
+        .unwrap();
+        let layers = ConfigLayers {
+            user: Some(user),
+            project: Some(project.clone()),
+            ..Default::default()
+        };
+        let loaded = layers
+            .load(Config::defaults(temp.path().join("data")))
+            .unwrap();
+        assert_eq!(
+            loaded.config.language_servers["rust"].command,
+            temp.path().join("bin/project-server")
+        );
+        assert_eq!(loaded.config.language_servers["rust"].args, vec!["--stdio"]);
+        std::fs::write(
+            &project,
+            "data_dir='redirected'\n[language_servers.rust]\ncommand='bin/server'\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            layers.load(Config::defaults(temp.path().join("data"))),
+            Err(ConfigError::ForbiddenLayerKey { .. })
+        ));
+        let scope = ConfigLayers {
+            scope: Some(project.clone()),
+            ..Default::default()
+        };
+        std::fs::write(&project, "[language_servers.rust]\ncommand='bin/server'\n").unwrap();
+        assert!(matches!(
+            scope.load(Config::defaults(temp.path().join("data"))),
+            Err(ConfigError::ForbiddenLayerKey { .. })
+        ));
     }
 }

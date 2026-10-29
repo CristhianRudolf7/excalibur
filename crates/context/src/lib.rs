@@ -186,6 +186,7 @@ pub fn compile(input: &ContextInput) -> Result<CompiledContext, ContextError> {
         reasoning_effort: input.reasoning_effort.clone(),
         output_schema: input.output_schema.clone(),
         cache: None,
+        deferred_tools: Vec::new(),
     };
     let bytes = serde_json::to_vec(&request)?;
     Ok(CompiledContext {

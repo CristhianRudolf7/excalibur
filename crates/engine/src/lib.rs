@@ -196,6 +196,8 @@ pub struct Snapshot {
     #[serde(default)]
     pub context_instruction_digest: Option<String>,
     #[serde(default)]
+    pub native_deferred_catalog: Option<Vec<ToolDefinition>>,
+    #[serde(default)]
     pub context_summaries: BTreeMap<String, excalibur_context::SummaryOutcome>,
     #[serde(default)]
     pub pending_context_summary: Option<Value>,
@@ -250,6 +252,7 @@ impl Snapshot {
                 .transpose()?,
             context_history_cursor: 0,
             context_instruction_digest: None,
+            native_deferred_catalog: None,
             context_summaries: BTreeMap::new(),
             pending_context_summary: None,
         })
@@ -261,6 +264,15 @@ impl Snapshot {
             "model_request" => {
                 self.confirmed_model_failure = None;
                 self.request = Some(serde_json::from_value(p["request"].clone())?);
+                if self.native_deferred_catalog.is_none()
+                    && self
+                        .request
+                        .as_ref()
+                        .is_some_and(|r| !r.deferred_tools.is_empty())
+                {
+                    self.native_deferred_catalog =
+                        self.request.as_ref().map(|r| r.deferred_tools.clone());
+                }
                 self.request_revision = p["revision"].as_u64().unwrap_or(self.revision);
             }
             "model_response" => {
@@ -512,6 +524,10 @@ impl Snapshot {
             }
             "model_failure" => self.confirmed_model_failure = Some(p.clone()),
             "context_prepared" => {
+                if self.native_deferred_catalog.is_none() && p.get("deferred_tools").is_some() {
+                    self.native_deferred_catalog =
+                        Some(serde_json::from_value(p["deferred_tools"].clone())?);
+                }
                 self.context_session = Some(serde_json::from_value(p["session"].clone())?);
                 self.context_instruction_digest =
                     p["instruction_digest"].as_str().map(str::to_owned);
@@ -970,6 +986,12 @@ impl Engine {
         };
         self.flush_events(run).await?;
         *state = self.load(run).await?;
+        if applied {
+            self.tools
+                .execution_state(run, state.status.label(), state.reason.as_deref())
+                .await
+                .map_err(|_| Error::Invalid("tool lifecycle update failed"))?;
+        }
         if applied
             && matches!(
                 state.status,
@@ -1496,6 +1518,14 @@ impl Engine {
             if self.resource_limit_reached(run, &mut s).await? {
                 return Ok(s);
             }
+            self.tools
+                .execution_state(run, s.status.label(), s.reason.as_deref())
+                .await
+                .map_err(|_| Error::Invalid("tool lifecycle update failed"))?;
+            self.tools
+                .begin_step(run, s.step)
+                .await
+                .map_err(|_| Error::Invalid("step snapshot preparation failed"))?;
             let capability_tool_budget = self
                 .tools
                 .execution_tool_budget(run)
@@ -1902,6 +1932,10 @@ impl Engine {
             }
             let response = s.response.clone().unwrap();
             if response.message.tool_calls.is_empty() {
+                self.tools
+                    .end_step(run, s.step)
+                    .await
+                    .map_err(|_| Error::Invalid("step snapshot finalization failed"))?;
                 self.transition(run, &mut s, Status::Verifying, None)
                     .await?;
                 if s.status != Status::Verifying {
@@ -2057,6 +2091,10 @@ impl Engine {
                     return Ok(s);
                 }
                 let key = format!("step:{}:completed", s.step);
+                self.tools
+                    .end_step(run, s.step)
+                    .await
+                    .map_err(|_| Error::Invalid("step snapshot finalization failed"))?;
                 self.event(run, &mut s, "step_completed", key, json!({}))
                     .await?;
                 self.checkpoint(run, &mut s).await?;
@@ -2206,6 +2244,10 @@ impl Engine {
                 .collect::<Vec<_>>();
             let detection = self.observe_loops(run, &mut s, &loop_calls).await?;
             let key = format!("step:{}:completed", s.step);
+            self.tools
+                .end_step(run, s.step)
+                .await
+                .map_err(|_| Error::Invalid("step snapshot finalization failed"))?;
             self.event(run, &mut s, "step_completed", key, json!({}))
                 .await?;
             self.checkpoint(run, &mut s).await?;

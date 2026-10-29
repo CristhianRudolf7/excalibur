@@ -391,6 +391,7 @@ impl GatewayVerifier {
                 reasoning_effort: None,
                 output_schema: None,
                 cache: None,
+                deferred_tools: Vec::new(),
             };
             preflight(self.model.as_ref(), &request, &usage, &input.budget)?;
             ensure_active(&journal, &input.root_run_id, verifier_run).await?;

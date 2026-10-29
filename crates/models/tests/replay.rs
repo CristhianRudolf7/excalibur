@@ -363,3 +363,190 @@ async fn cached_http_engine_tape_replays_namespace_boundaries_and_calibration_wi
     }
     db.shutdown().await.unwrap();
 }
+struct NativeDeferredFixtureTools(Arc<AtomicUsize>);
+impl ToolRuntime for NativeDeferredFixtureTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![]
+    }
+    fn deferred_definitions<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ToolDefinition>, String>> {
+        Box::pin(async move {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(FixtureTools.definitions())
+        })
+    }
+    fn prepare<'a>(
+        &'a self,
+        run: &'a str,
+        call: ToolCall,
+    ) -> BoxFuture<'a, Result<PreparedTool, String>> {
+        FixtureTools.prepare(run, call)
+    }
+    fn execute<'a>(
+        &'a self,
+        run: &'a str,
+        key: &'a str,
+        tool: &'a PreparedTool,
+    ) -> BoxFuture<'a, ToolResult> {
+        FixtureTools.execute(run, key, tool)
+    }
+    fn reconcile<'a>(
+        &'a self,
+        run: &'a str,
+        key: &'a str,
+        tool: &'a PreparedTool,
+    ) -> BoxFuture<'a, Reconcile> {
+        FixtureTools.reconcile(run, key, tool)
+    }
+}
+#[tokio::test]
+async fn native_deferred_engine_pins_catalog_and_replays_references_without_rediscovery() {
+    use excalibur_providers::{Provider, ProviderClient, Secret};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let http_calls = Arc::new(AtomicUsize::new(0));
+    let observed = http_calls.clone();
+    let server = tokio::spawn(async move {
+        let replies = [
+            json!({"content":[{"type":"server_tool_use","id":"srvtoolu_native","name":"tool_search_tool_bm25","input":{"query":"synthetic result","limit":5}},{"type":"tool_search_tool_result","tool_use_id":"srvtoolu_native","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"fixture"}]}},{"type":"tool_use","id":"native-call","name":"fixture","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":5}}),
+            json!({"content":[{"type":"text","text":"Synthetic done"}],"stop_reason":"end_turn","usage":{"input_tokens":30,"cache_read_input_tokens":80,"cache_creation_input_tokens":0,"output_tokens":3}}),
+        ];
+        let mut requests = vec![];
+        for reply in replies {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            loop {
+                let mut bytes = [0; 4096];
+                let n = socket.read(&mut bytes).await.unwrap();
+                assert!(n > 0);
+                buffer.extend_from_slice(&bytes[..n]);
+                if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buffer[..end]);
+                    let length: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if buffer.len() >= end + 4 + length {
+                        requests.push(
+                            serde_json::from_slice::<Value>(&buffer[end + 4..end + 4 + length])
+                                .unwrap(),
+                        );
+                        break;
+                    }
+                }
+            }
+            observed.fetch_add(1, Ordering::SeqCst);
+            let body = reply.to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        }
+        requests
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(
+        temp.path().join("main.db"),
+        DatabaseKind::Main,
+        StorageConfig::default(),
+    )
+    .unwrap();
+    let journal = Journal::new(db.clone()).await.unwrap();
+    let discoveries = Arc::new(AtomicUsize::new(0));
+    let tools = Arc::new(NativeDeferredFixtureTools(discoveries.clone()));
+    let gateway = Arc::new(
+        OpenAiGateway::new(
+            ProviderClient::with_base_url(
+                Provider::Anthropic,
+                Secret::new("synthetic").unwrap(),
+                &format!("http://{address}/v1/"),
+            )
+            .unwrap(),
+            GatewayConfig::new("claude-sonnet-4-6", ModelRole::Worker),
+        )
+        .unwrap(),
+    );
+    let engine = Engine::new(journal.clone(), gateway, tools.clone());
+    let spec = RunSpec {
+        context: ContextInput::new("Synthetic core", "Compute synthetic result", "fixed"),
+        budget: Budget::default(),
+        criteria: vec![Criterion::ToolSuccess {
+            name: "fixture".into(),
+        }],
+    };
+    let run = engine
+        .create("native-deferred-record", spec.clone())
+        .await
+        .unwrap();
+    assert_eq!(engine.run(&run).await.unwrap().status, Status::Completed);
+    assert_eq!(discoveries.load(Ordering::SeqCst), 1);
+    let sent = server.await.unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(!sent[0]["messages"].as_array().unwrap().is_empty());
+    assert!(
+        sent[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "fixture" && t["defer_loading"] == true)
+    );
+    let tape = ReplayTape::from_journal(&journal, &run).await.unwrap();
+    assert!(
+        tape.entries[0]
+            .request
+            .tools
+            .iter()
+            .all(|t| t.name != "fixture")
+    );
+    assert_eq!(
+        tape.entries[0].request.deferred_tools,
+        FixtureTools.definitions()
+    );
+    assert_eq!(
+        tape.entries[0].request.deferred_tools,
+        tape.entries[1].request.deferred_tools
+    );
+    let expected = tape
+        .entries
+        .iter()
+        .map(|e| e.request.clone())
+        .collect::<Vec<_>>();
+    let replay = Arc::new(ReplayGateway::new(tape).unwrap());
+    assert!(replay.native_deferred_tools());
+    assert_eq!(
+        replay.deferred_catalog_override(),
+        Some(FixtureTools.definitions())
+    );
+    let engine = Engine::new(journal.clone(), replay.clone(), tools);
+    let replay_run = engine.create("native-deferred-replay", spec).await.unwrap();
+    assert_eq!(
+        engine.run(&replay_run).await.unwrap().status,
+        Status::Completed,
+        "{:?}",
+        replay.divergence()
+    );
+    assert!(replay.divergence().is_none());
+    assert_eq!(discoveries.load(Ordering::SeqCst), 1);
+    assert_eq!(http_calls.load(Ordering::SeqCst), 2);
+    let events = journal.replay(&replay_run, 0).await.unwrap();
+    let requests = events
+        .iter()
+        .filter(|e| e.kind == "model_request")
+        .map(|e| serde_json::from_value::<ModelRequest>(e.payload["request"].clone()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(requests, expected);
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.kind == "model_response")
+            .all(|e| e.payload["metrics"]["provider_calls"] == 0)
+    );
+    db.shutdown().await.unwrap();
+}

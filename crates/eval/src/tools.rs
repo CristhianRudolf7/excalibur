@@ -30,6 +30,40 @@ impl ExecutionTools {
     }
 }
 impl ToolRuntime for ExecutionTools {
+    fn deferred_definitions<'a>(
+        &'a self,
+        run: &'a str,
+    ) -> excalibur_types::runtime::BoxFuture<
+        'a,
+        std::result::Result<Vec<excalibur_types::runtime::ToolDefinition>, String>,
+    > {
+        self.delegate.deferred_definitions(run)
+    }
+    fn live_status(&self, run: &str) -> Vec<serde_json::Value> {
+        self.delegate.live_status(run)
+    }
+    fn execution_state<'a>(
+        &'a self,
+        run: &'a str,
+        state: &'a str,
+        reason: Option<&'a str>,
+    ) -> excalibur_types::runtime::BoxFuture<'a, Result<(), String>> {
+        self.delegate.execution_state(run, state, reason)
+    }
+    fn begin_step<'a>(
+        &'a self,
+        run: &'a str,
+        step: u64,
+    ) -> excalibur_types::runtime::BoxFuture<'a, Result<(), String>> {
+        self.delegate.begin_step(run, step)
+    }
+    fn end_step<'a>(
+        &'a self,
+        run: &'a str,
+        step: u64,
+    ) -> excalibur_types::runtime::BoxFuture<'a, Result<(), String>> {
+        self.delegate.end_step(run, step)
+    }
     fn interrupt_execution<'a>(
         &'a self,
         run: &'a str,

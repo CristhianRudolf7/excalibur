@@ -1,8 +1,13 @@
 //! Reusable local tools. Hosts supply policy and optional formatting/diagnostic integrations.
+pub mod deferred;
+pub mod entries;
 pub mod evaluation;
 mod file_authority;
 mod files;
+pub mod intelligence;
+pub mod monitor;
 mod patch;
+pub mod project;
 mod redaction;
 pub mod terminal;
 use excalibur_store::{Database, Priority};
@@ -77,12 +82,18 @@ pub struct LocalTools {
     directory: Arc<cap_std::fs::Dir>,
     policy: ToolPolicy,
     terminal: Arc<terminal::TerminalManager>,
+    workspace: excalibur_workspace::Workspace,
+    active_runs: Arc<Mutex<HashSet<String>>>,
+    steps: Arc<Mutex<HashMap<String, u64>>>,
+    parents: Arc<Mutex<HashMap<String, project::ParentAuthority>>>,
+    child_authorities: Arc<Mutex<HashMap<String, project::ChildAuthority>>>,
+    intelligence: Option<Arc<intelligence::ProjectIntelligence>>,
 }
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS tool_readset(run_id TEXT NOT NULL,path TEXT NOT NULL,fp TEXT NOT NULL,blob TEXT NOT NULL REFERENCES blobs(hash),mismatches INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(run_id,path)); CREATE TABLE IF NOT EXISTS tool_changed_files(path TEXT NOT NULL,run_id TEXT NOT NULL,call_id TEXT NOT NULL,created_at INTEGER NOT NULL DEFAULT(unixepoch()),PRIMARY KEY(path,run_id,call_id));";
 // Additive upgrade: absence conflicts need counters even without a prior readset row.
 const SCHEMA_2: &str = "CREATE TABLE IF NOT EXISTS tool_conflicts(run_id TEXT NOT NULL,path TEXT NOT NULL,mismatches INTEGER NOT NULL DEFAULT 0 CHECK(mismatches>=0),PRIMARY KEY(run_id,path)); INSERT OR IGNORE INTO tool_conflicts(run_id,path,mismatches) SELECT run_id,path,mismatches FROM tool_readset WHERE mismatches>0;";
 impl LocalTools {
-    pub async fn new(db: Database, root: PathBuf, policy: ToolPolicy) -> Result<Self, String> {
+    pub async fn new(db: Database, root: PathBuf, mut policy: ToolPolicy) -> Result<Self, String> {
         if policy.output_budget_bytes < 256 || policy.output_budget_bytes > 1024 * 1024 {
             return Err("output budget must be 256..=1048576 bytes".into());
         }
@@ -94,6 +105,29 @@ impl LocalTools {
             return Err("protected paths must be canonical absolute paths".into());
         }
         let (root, directory) = files::open_root(root)?;
+        let data_parent = db.path().parent().ok_or("database parent missing")?;
+        if data_parent.starts_with(&root) && data_parent != root {
+            policy.protected_paths.push(data_parent.to_path_buf());
+        } else {
+            policy.protected_paths.extend([
+                db.path().to_path_buf(),
+                db.path().with_file_name(format!(
+                    "{}-wal",
+                    db.path().file_name().unwrap().to_string_lossy()
+                )),
+                db.path().with_file_name(format!(
+                    "{}-shm",
+                    db.path().file_name().unwrap().to_string_lossy()
+                )),
+                data_parent.join("blobs"),
+                data_parent.join("backups"),
+                data_parent.join("tool-spool"),
+                data_parent.join("workspaces"),
+            ]);
+        }
+        policy.protected_paths.push(db.blobs().root().to_path_buf());
+        policy.protected_paths.sort();
+        policy.protected_paths.dedup();
         let checksum = hash(SCHEMA.as_bytes());
         db.write(Priority::Normal,move|conn|{
             use excalibur_store::rusqlite::OptionalExtension;
@@ -152,7 +186,26 @@ impl LocalTools {
             sandbox: Some(sandbox),
             redactor: policy.redactor.clone(),
         })?;
+        Self::project_receipt_schema(&db).await?;
+        let workspace = excalibur_workspace::Workspace::open(
+            db.clone(),
+            root.clone(),
+            db.path()
+                .parent()
+                .ok_or("database parent missing")?
+                .join("workspaces")
+                .join(hash(root.to_string_lossy().as_bytes())),
+            policy.redactor.clone(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(Self {
+            workspace,
+            parents: Arc::new(Mutex::new(HashMap::new())),
+            child_authorities: Arc::new(Mutex::new(HashMap::new())),
+            intelligence: None,
+            active_runs: Arc::new(Mutex::new(HashSet::new())),
+            steps: Arc::new(Mutex::new(HashMap::new())),
             db,
             root,
             directory: Arc::new(directory),
@@ -162,7 +215,7 @@ impl LocalTools {
     }
     /// Complete in-memory metadata; resources themselves are resolved by prepare.
     pub fn catalog(&self) -> Vec<Value> {
-        self.definitions().into_iter().map(|definition| {
+        let mut catalog: Vec<Value> = self.definitions().into_iter().map(|definition| {
             let write=matches!(definition.name.as_str(),"write_file"|"edit_file"|"apply_patch");
             let exec=matches!(definition.name.as_str(),"exec"|"exec_io");
             json!({"name":definition.name,"description":definition.description,"input_schema":definition.input_schema,
@@ -176,7 +229,9 @@ impl LocalTools {
                 "inverse":null,"probe":if write{Some("fingerprint_pre_post")}else{None},
                 "dry_run":"prepare performs validation and durable preimages without requested external effects",
                 "fast":false,"cancel":if exec{"graceful"}else if write{"after_completion"}else{"immediate"}})
-        }).collect()
+        }).collect();
+        catalog.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        catalog
     }
     /// Inject an explicitly configured terminal adapter, including redaction and shell policy.
     pub fn with_terminal(mut self, manager: Arc<terminal::TerminalManager>) -> Self {
@@ -200,6 +255,9 @@ impl LocalTools {
         }
     }
     fn schema(name: &str) -> Option<Value> {
+        if let Some(definition) = project::definitions().into_iter().find(|d| d.name == name) {
+            return Some(definition.input_schema);
+        }
         if matches!(name, "exec" | "exec_io") {
             let mut schema = terminal::TerminalManager::definitions()
                 .into_iter()
@@ -333,6 +391,9 @@ impl LocalTools {
     }
     async fn prepare_call(&self, run: &str, mut call: ToolCall) -> Result<PreparedTool, String> {
         let mut args = Self::arguments(&call)?;
+        if project::DOMAIN_TOOLS.contains(&call.name.as_str()) {
+            return self.prepare_domain(run, call, args).await;
+        }
         let mut edits = Vec::new();
         let mut resources = Vec::new();
         let effect = match call.name.as_str() {
@@ -505,7 +566,7 @@ impl LocalTools {
             call,
             effect,
             resources,
-            data: json!({"args":args,"edits":edits,"root":self.root,"version":1}),
+            data: json!({"args":args,"diagnostics_before":self.diagnostics_before(&edits).await?,"edits":edits,"root":self.root,"version":1}),
         })
     }
     async fn execute_call(
@@ -515,6 +576,15 @@ impl LocalTools {
         tool: &PreparedTool,
     ) -> Result<Value, String> {
         let args = &tool.data["args"];
+        if project::DOMAIN_TOOLS.contains(&tool.call.name.as_str()) {
+            return if matches!(tool.call.name.as_str(), "worktree" | "integration_queue")
+                && tool.effect != Effect::Pure
+            {
+                self.execute_project_operation(run, key, tool).await
+            } else {
+                self.execute_domain(run, key, tool).await
+            };
+        }
         match tool.call.name.as_str() {
             "read_file" => {
                 self.check_permission(Permission::Read)?;
@@ -638,35 +708,30 @@ impl LocalTools {
             .iter()
             .map(|e| self.root.join(&e.path).to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        let lease_paths = paths.clone();
-        let holder = run.to_owned();
-        self.db.write(Priority::Interactive,move|conn|{
-            use excalibur_store::rusqlite::OptionalExtension;
-            let now=excalibur_store::unix_seconds();
-            for path in lease_paths {
-                let owner=conn.query_row("SELECT holder_id FROM leases WHERE path=?1 AND expires_at>?2",excalibur_store::rusqlite::params![path,now],|r|r.get::<_,String>(0)).optional()?;
-                if owner.is_some_and(|owner|owner!=holder){return Err(excalibur_store::Error::Invalid("file lease held by another run"));}
-                conn.execute("INSERT INTO leases(path,holder_id,expires_at) VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET holder_id=excluded.holder_id,expires_at=excluded.expires_at",excalibur_store::rusqlite::params![path,holder,now+300])?;
-            }Ok(())
-        }).await.map_err(|e|e.to_string())?;
+        let paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+        let wait = tool.data["_resource_wait_remaining_ms"]
+            .as_u64()
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_secs(30));
+        let _guard = self
+            .workspace
+            .leases()
+            .acquire_many_with_wait(run, &paths, &tool.call.name, wait)
+            .await
+            .map_err(|e| e.to_string())?;
         let result = self.perform_edits_inner(run, key, tool).await;
-        let holder = run.to_owned();
-        let release = self
-            .db
-            .write(Priority::Interactive, move |conn| {
-                for path in paths {
-                    conn.execute(
-                        "DELETE FROM leases WHERE path=?1 AND holder_id=?2",
-                        excalibur_store::rusqlite::params![path, holder],
-                    )?;
-                }
-                Ok(())
-            })
-            .await;
-        if let Err(error) = release {
-            return Err(format!(
-                "lease release failed after file operation: {error}"
-            ));
+        // Standalone hosts without lifecycle notifications own leases for this call only.
+        let active = self
+            .active_runs
+            .lock()
+            .map_err(|_| "run state lock poisoned")?
+            .contains(run);
+        if !active {
+            self.workspace
+                .leases()
+                .release_run(run)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         result
     }
@@ -679,29 +744,28 @@ impl LocalTools {
         self.check_permission(Permission::Write)?;
         let edits: Vec<FileEdit> =
             serde_json::from_value(tool.data["edits"].clone()).map_err(|e| e.to_string())?;
-        // Check every precondition before the first requested file effect.
+        // Validate all entries before the first effect, preserving recorded metadata.
         for edit in &edits {
-            let path = self.resolve(&edit.path)?;
+            let path = if edit.metadata_guard {
+                self.resolve_entry(&edit.path)?
+            } else {
+                self.resolve(&edit.path)?
+            };
             self.check_write_path(&path)?;
-            let current = self.content(&path)?;
-            let fingerprint = current.as_deref().map(hash);
-            if fingerprint != edit.pre && fingerprint != edit.post {
-                return Err(self
-                    .conflict_report(
-                        run,
-                        &edit.path,
-                        edit.pre.as_deref(),
-                        edit.pre.as_deref(),
-                        current.as_deref(),
-                        None,
-                    )
-                    .await?);
+            if path != edit.path {
+                return Err("entry parent changed after preparation".into());
+            }
+            let current = self.current_entry(&path)?;
+            if !entries::entry_matches(edit, &current, false)
+                && !entries::entry_matches(edit, &current, true)
+            {
+                return Err(self.entry_conflict(run, edit, &current).await?);
             }
         }
         let mut reports = Vec::new();
         for edit in &edits {
-            let current = self.content(&edit.path)?.map(|v| hash(&v));
-            if current != edit.post {
+            let current = self.current_entry(&edit.path)?;
+            if !entries::entry_matches(edit, &current, true) {
                 let bytes = match &edit.post {
                     Some(hash) => Some(
                         self.db
@@ -715,23 +779,15 @@ impl LocalTools {
                     ),
                     None => None,
                 };
-                // Blob loading may yield. Check again immediately before the atomic effect.
-                let observed = self.content(&edit.path)?;
-                let fingerprint = observed.as_deref().map(hash);
-                if fingerprint != edit.pre && fingerprint != edit.post {
-                    return Err(self
-                        .conflict_report(
-                            run,
-                            &edit.path,
-                            edit.pre.as_deref(),
-                            edit.pre.as_deref(),
-                            observed.as_deref(),
-                            None,
-                        )
-                        .await?);
+                // Blob loading may yield: repeat both content and metadata checks.
+                let observed = self.current_entry(&edit.path)?;
+                if !entries::entry_matches(edit, &observed, false)
+                    && !entries::entry_matches(edit, &observed, true)
+                {
+                    return Err(self.entry_conflict(run, edit, &observed).await?);
                 }
-                if fingerprint != edit.post {
-                    self.atomic_write(&edit.path, bytes.as_deref())?;
+                if !entries::entry_matches(edit, &observed, true) {
+                    self.atomic_entry(edit, bytes.as_deref())?;
                 }
             }
             self.record_edit(run, key, &tool.call.id, edit).await?;
@@ -759,6 +815,11 @@ impl LocalTools {
             );
             self.db.write(Priority::Normal,move|conn|{conn.execute("INSERT OR IGNORE INTO tool_changed_files(path,run_id,call_id) VALUES(?1,?2,?3)",[path,run,call])?;Ok(())}).await.map_err(|e|e.to_string())?;
             let postprocessing = match &self.policy.hooks {
+                _ if edit.metadata_guard
+                    && edit.kind == excalibur_workspace::EntryKind::Symlink =>
+                {
+                    json!({"formatter":"not_applicable_symbolic_link","diagnostics":"not_applicable_symbolic_link","change_recorded":true})
+                }
                 Some(hooks) => match hooks.after_edit(&self.root.join(&edit.path)).await {
                     Ok(report) => report,
                     Err(error) => json!({"hook_error":error}),
@@ -769,7 +830,22 @@ impl LocalTools {
             };
             report["path"] = json!(edit.path);
             report["fp"] = json!(edit.post);
+            report["kind"] = json!(edit.kind);
+            report["executable"] = json!(edit.executable);
             report["postprocessing"] = postprocessing;
+            report["intelligence"] = if edit.metadata_guard
+                && edit.kind == excalibur_workspace::EntryKind::Symlink
+            {
+                json!({"status":"not_applicable_symbolic_link"})
+            } else {
+                match self
+                    .intelligence_after(&edit.path, &tool.data["diagnostics_before"][&edit.path])
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => json!({"hook_error":error}),
+                }
+            };
             reports.push(report);
         }
         Ok(json!({"files":reports}))
@@ -893,16 +969,50 @@ impl LocalTools {
             .collect::<Vec<_>>();
         keys.sort();
         keys.dedup();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let locks = keys.iter().map(|k| resource_lock(k)).collect::<Vec<_>>();
         let mut guards = Vec::new();
-        for lock in &locks {
-            guards.push(lock.lock().await);
+        let mut activity = entries::ResourceActivity::new();
+        for (resource, lock) in keys.iter().zip(&locks) {
+            match tokio::time::timeout_at(deadline, lock.lock()).await {
+                Ok(guard) => {
+                    guards.push(guard);
+                    activity.acquired(resource, run, &tool.call.name);
+                }
+                Err(_) => {
+                    let holder = entries::ResourceActivity::owner(resource);
+                    let leases = self
+                        .workspace
+                        .leases()
+                        .owners()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|owner| resource.contains(owner.path.to_string_lossy().as_ref()))
+                        .collect::<Vec<_>>();
+                    return ToolResult::error(format!(
+                        "resource busy after 30-second admission deadline: {}",
+                        json!({"resource":resource,"owner":holder,"leases":leases})
+                    ));
+                }
+            }
         }
+        let mut bounded = tool.clone();
+        bounded.data["_resource_wait_remaining_ms"] = json!(
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis()
+                .min(30_000) as u64
+        );
+        let tool = &bounded;
         let result = match tool.call.name.as_str() {
             "exec" | "exec_io" => {
                 if let Err(e) = self.check_permission(Permission::Exec) {
                     ToolResult::error(e)
                 } else if tool.call.name == "exec" {
+                    if let Err(error) = self.start_shadow_command(run).await {
+                        return ToolResult::error(error);
+                    }
                     self.terminal.exec(run, tool.data["args"].clone()).await
                 } else {
                     self.terminal.io(run, tool.data["args"].clone()).await
@@ -968,6 +1078,48 @@ pub fn head_tail(text: &str, budget: usize) -> String {
     format!("{}{}{}", &text[..end], marker, &text[start..])
 }
 impl ToolRuntime for LocalTools {
+    fn live_status(&self, run: &str) -> Vec<Value> {
+        self.terminal.live_status(run)
+    }
+    fn execution_state<'a>(
+        &'a self,
+        run: &'a str,
+        state: &'a str,
+        reason: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let active = matches!(state, "running" | "verifying")
+                || state == "waiting" && matches!(reason, Some("tool" | "subagents"));
+            {
+                let mut runs = self
+                    .active_runs
+                    .lock()
+                    .map_err(|_| "run state lock poisoned")?;
+                if active {
+                    runs.insert(run.into());
+                } else {
+                    runs.remove(run);
+                }
+            }
+            self.workspace
+                .leases()
+                .heartbeat(run, state, reason)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+    fn begin_step<'a>(&'a self, run: &'a str, step: u64) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.steps
+                .lock()
+                .map_err(|_| "step state lock poisoned")?
+                .insert(run.into(), step);
+            Ok(())
+        })
+    }
+    fn end_step<'a>(&'a self, run: &'a str, step: u64) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.finish_shadow_step(run, step).await })
+    }
     fn interrupt_execution<'a>(
         &'a self,
         run: &'a str,
@@ -1080,7 +1232,7 @@ impl ToolRuntime for LocalTools {
         })
     }
     fn definitions(&self) -> Vec<ToolDefinition> {
-        ["apply_patch","edit_file","exec","exec_io","glob","grep","read_file","write_file"].into_iter().map(|name|ToolDefinition{name:name.into(),description:match name{"read_file"=>"Read a file with numbered lines and a fingerprint, default 200 lines.","write_file"=>"Create or rewrite a file after checking the run's read fingerprint.","edit_file"=>"Replace unique text using exact, typography-normalized or trailing-space matching.","apply_patch"=>"Apply Codex block patches adding, deleting or updating multiple files.","grep"=>"Search regex in files respecting gitignore; return bounded per-file summaries.","glob"=>"Find paths matching a glob while respecting gitignore.","exec"=>"Run a command in a persistent pipe or PTY session under host execution policy.",_=>"Read, write, wait for, signal or close owned terminal sessions."}.into(),input_schema:Self::schema(name).unwrap()}).collect()
+        ["apply_patch","edit_file","exec","exec_io","glob","grep","read_file","write_file"].into_iter().map(|name|ToolDefinition{name:name.into(),description:match name{"read_file"=>"Read a file with numbered lines and a fingerprint, default 200 lines.","write_file"=>"Create or rewrite a file after checking the run's read fingerprint.","edit_file"=>"Replace unique text using exact, typography-normalized or trailing-space matching.","apply_patch"=>"Apply Codex block patches adding, deleting or updating multiple files.","grep"=>"Search regex in files respecting gitignore; return bounded per-file summaries.","glob"=>"Find paths matching a glob while respecting gitignore.","exec"=>"Run a command in a persistent pipe or PTY session under host execution policy.",_=>"Read, write, wait for, signal or close owned terminal sessions."}.into(),input_schema:Self::schema(name).unwrap()}).chain(project::definitions()).collect()
     }
     fn scheduling<'a>(
         &'a self,
@@ -1117,8 +1269,16 @@ impl ToolRuntime for LocalTools {
             }
             if matches!(
                 tool.call.name.as_str(),
-                "write_file" | "edit_file" | "apply_patch"
-            ) {
+                "write_file"
+                    | "edit_file"
+                    | "apply_patch"
+                    | "revert_edit"
+                    | "workspace_snapshot"
+                    | "lsp"
+                    | "worktree"
+                    | "integration_queue"
+            ) && tool.effect != Effect::Pure
+            {
                 let (tools, run, key, tool) =
                     (self.clone(), run.to_owned(), key.to_owned(), tool.clone());
                 // Once admitted, atomic filesystem writes and their durable history complete
@@ -1173,6 +1333,9 @@ impl ToolRuntime for LocalTools {
                     "repeatable command approval is no longer present".into(),
                 );
             }
+            if matches!(tool.call.name.as_str(), "worktree" | "integration_queue") {
+                return self.reconcile_project_operation(run, key, tool).await;
+            }
             if matches!(tool.call.name.as_str(), "exec" | "exec_io") {
                 return Reconcile::Uncertain(
                     "terminal effect may have run; inspect the retained session before retrying"
@@ -1190,22 +1353,48 @@ impl ToolRuntime for LocalTools {
                 .collect::<Vec<_>>();
             keys.sort();
             keys.dedup();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             let locks = keys.iter().map(|k| resource_lock(k)).collect::<Vec<_>>();
             let mut guards = Vec::new();
-            for lock in &locks {
-                guards.push(lock.lock().await);
+            let mut activity = entries::ResourceActivity::new();
+            for (resource, lock) in keys.iter().zip(&locks) {
+                match tokio::time::timeout_at(deadline, lock.lock()).await {
+                    Ok(guard) => {
+                        guards.push(guard);
+                        activity.acquired(resource, run, &tool.call.name);
+                    }
+                    Err(_) => {
+                        return Reconcile::Uncertain(format!(
+                            "resource busy after 30-second recovery admission deadline: {}",
+                            json!({"resource":resource,"owner":entries::ResourceActivity::owner(resource)})
+                        ));
+                    }
+                }
             }
+            let mut bounded = tool.clone();
+            bounded.data["_resource_wait_remaining_ms"] = json!(
+                deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis()
+                    .min(30_000) as u64
+            );
+            let tool = &bounded;
             for edit in &edits {
-                let state = match self
-                    .resolve(&edit.path)
-                    .and_then(|path| self.content(&path))
+                let state = match (if edit.metadata_guard {
+                    self.resolve_entry(&edit.path)
+                } else {
+                    self.resolve(&edit.path)
+                })
+                .and_then(|path| self.current_entry(&path))
                 {
-                    Ok(v) => v.map(|b| hash(&b)),
+                    Ok(v) => v,
                     Err(e) => return Reconcile::Uncertain(e),
                 };
-                if state != edit.pre && state != edit.post {
+                if !entries::entry_matches(edit, &state, false)
+                    && !entries::entry_matches(edit, &state, true)
+                {
                     return Reconcile::Uncertain(format!(
-                        "external change prevents recovery of {}",
+                        "external content, kind or mode change prevents recovery of {}",
                         edit.path
                     ));
                 }

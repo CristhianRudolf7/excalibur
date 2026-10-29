@@ -1,6 +1,6 @@
 # Agent instructions
 
-- This repository contains provider, storage, minimum durable engine, durable task/planning and evidence, context/cache, security, vault, sandbox, telemetry and evaluation libraries, plus the noninteractive exec command. Do not describe planned application or interface capabilities as implemented.
+- This repository contains provider, storage, minimum durable engine, durable task/planning and evidence, context/cache, project tools, code intelligence, editing isolation, security, vault, sandbox, telemetry and evaluation libraries, plus the noninteractive exec command. Do not describe planned application or interface capabilities as implemented.
 - Keep directory names in English. Maintain English and Spanish documentation as paired files using the `.es.md` suffix, and update both when their shared content changes. This AGENTS.md is maintained in English only.
 - Respect the scope of the task and preserve unrelated work. Do not invent credentials, contact information, licensing decisions or test results.
 - Add implementation and verification commands here when the corresponding components exist.
@@ -21,3 +21,5 @@
 - Verifiable-work checks: `cargo test -p excalibur-tasks`, `cargo test -p excalibur-engine --test verifiable_work` and `cargo test -p excalibur-eval --test verifiable` cover atomic planning, evidence freshness, completion, loops, child budgets and scoped integration. See [Verifiable work](docs/development/verifiable-work.md). All model verification fixtures are deterministic and local.
 
 - Context/cache checks: `cargo test -p excalibur-context`, `cargo test -p excalibur-models --test cache`, `cargo test -p excalibur-journal --test context_instructions`, `cargo test -p excalibur-engine --test context_compaction --test context_session_races` and `cargo test -p excalibur-telemetry --test context_summary` verify literal instructions, scoped history, cache controls, calibration and real interruption during context preparation. See [Context and cache](docs/development/context-cache.md).
+
+- Project-tool verification: `cargo test -p excalibur-workspace -p excalibur-code-intelligence`, `cargo test -p excalibur-tools --test tool_retrieval --test terminal_vs_tools --test project_tools --test project_monitor` and `cargo test -p excalibur-models --test deferred --test replay` cover retrieval, native deferred calls, confined LSP, incremental graphs, OS/durable leases, isolated integration and reversible snapshots. See [Project tools and editing concurrency](docs/development/project-tools.md).

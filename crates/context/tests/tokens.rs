@@ -106,3 +106,21 @@ fn managed_layer_limits_use_local_bpe_without_a_character_estimate_gate() {
         format!("[L0]\n{}", input.layers[0])
     );
 }
+
+#[test]
+fn native_catalog_wire_schemas_only_count_after_their_reference_is_loaded() {
+    use excalibur_types::runtime::ToolDefinition;
+    let mut request = compile(&ContextInput::new("core", "task", "fixed"))
+        .unwrap()
+        .request;
+    request.deferred_tools = vec![ToolDefinition {
+        name: "long_domain".into(),
+        description: "domain metadata ".repeat(4096),
+        input_schema: serde_json::json!({"type":"object"}),
+    }];
+    let counter = TokenCounter::for_model("unknown-native-model");
+    let before = counter.count_request(&request);
+    assert!(before < counter.count_text(&serde_json::to_string(&request).unwrap()) / 10);
+    request.messages.push(excalibur_types::runtime::Message{provider_state:Some(serde_json::json!({"provider":"anthropic","blocks":[{"type":"tool_search_tool_result","content":[{"type":"tool_reference","tool_name":"long_domain"}]}]})),..excalibur_types::runtime::Message::text("assistant","")});
+    assert!(counter.count_request(&request) > before * 10);
+}

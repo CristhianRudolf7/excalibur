@@ -1,0 +1,29 @@
+# Deferred tool retrieval
+
+`excalibur_tools::deferred` keeps host-registered domain definitions in RAM. A `CatalogTool` declares input/output JSON Schema 2020-12, tags, effect, idempotency, resource-resolution description, risk, timeout, output budget, platforms, inverse/probe availability, dry-run behavior, master eligibility and cancellation class. These are adapter contracts: registering metadata does not implement a domain or grant permission. `ToolCatalog` accepts only valid, unique ASCII snake_case names of at most 64 bytes and schemas without external references. Registration is bounded to 8,192 tools, 64 MiB total and 256 KiB per schema.
+
+`mcp_name(server, tool)` creates `mcp__server__tool` identifiers. Long or lossy/ambiguous source names receive a stable SHA-256 suffix. Duplicate final names are rejected. `resolve_skill_tools` and typed MCP references resolve real registered definitions before a skill is loaded; unavailable references fail explicitly.
+
+`DeferredTools` wraps an already secured runtime. The application composition used by the noninteractive host places this wrapper outside the execution/episode/security adapters. A `call_tool` resolves its actual name and arguments before calling that runtime's `prepare`, `execute` and `reconcile`. Canonical resources, exclusivity and effect come from the underlying preparation. The wrapper validates schemas, run ownership, preparation integrity and the current definition hash. Catalog changes can revoke preparations; recovery reports uncertainty rather than guessing whether an old effect happened. Calls through `args` and the compatibility alias `arguments` receive the same checks. Core-tool aliases remain supported.
+
+The eager definitions remain a frozen, sorted core plus `search_tools` and `call_tool`. Domain definitions do not join that prefix. Retrieval ranks names, descriptions and tags using BM25, optionally fuses host-provided vectors with reciprocal rank fusion, and returns at most five complete metadata records with scores and catalog revision/hash. Vector profiles and dimensions must match. Embeddings are never discovered or invoked automatically: a host must configure `ToolEmbedder`. Its default deadline is two seconds, configurable from 1 to 30,000 ms. Failure, timeout or invalid vectors produce an explicit lexical fallback status. No vector values are returned to the model.
+
+Master callers can search, resolve and invoke only domain entries marked `fast`. This restriction also applies to direct SDK calls. Search metadata passes the same durable redactor and builtin audit boundary. Immediate/graceful domain deadlines interrupt through the underlying runtime; after-completion operations retain their adapter's atomic completion contract. Output schemas are checked after successful execution, with an explicit indication when an effect may already have completed. Lifecycle, approval, resource limits, process/network boundaries and live-status hooks are forwarded.
+
+For native requests the first catalog is pinned per run. The engine confirms that catalog with context preparation, restores it after interruption and uses recorded catalogs during replay. Execution still checks the current registry, so retaining historical definitions does not restore a revoked operation.
+
+## Provider adaptation
+
+The Anthropic adapter uses the documented BM25 server tool and `defer_loading` on deferred definitions for supported model families, with an explicit host override for other verified deployments. It sends the full catalog over HTTP while the provider excludes deferred definitions from the initial model prefix. Server search calls/results and references remain opaque durable history; only ordinary client `tool_use` blocks enter tool execution. Streaming assembles server query fragments separately and never executes `srvtoolu` search records. Disabling tool use retains the catalog with `tool_choice: none`. [Anthropic contract](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool).
+
+The current OpenAI gateway uses Chat Completions. Its official native search contract belongs to Responses/Agents APIs, so this adapter uses the harness search/call mechanism and sends no unsupported Chat parameter. [OpenAI contract](https://developers.openai.com/api/docs/guides/tools-tool-search).
+
+Native token estimates exclude unloaded schemas, count referenced definitions when available and calibrate from actual reported usage. Wire size is distinct from model input. Provider search may load definitions during generation; estimates are not exact, and conservative call bounds can require a larger host budget for a large catalog. There are no production accuracy, savings or latency claims.
+
+## Backend verification
+
+- `cargo test -p excalibur-tools --test tool_retrieval` covers synthetic BM25 top-1 precision of 8/8, top-five bounds, host vectors/fallback, schema validation, fast roles, resource/permission delegation, live redaction, catalog updates, skill references and native pins.
+- `cargo test -p excalibur-models --test deferred --test replay` covers actual local HTTP/SSE requests, opaque references, catalog pinning and exact provider-free replay.
+- `cargo test -p excalibur-tools --test terminal --test terminal_vs_tools` covers real pipe/PTY interaction, keys, regex waits, signals, process groups, shared 16/64 ceilings, owner notices, redacted live status and bounded complete spooling. It also compares a synthetic file task through specific tools and terminal commands, preserving equal final data. Reported output bytes are a context-volume proxy, not token counts or an inference benchmark.
+
+Tests use synthetic data and local fixtures. They do not call paid APIs, embedding services or external models. Runtime terminal verification is Linux evidence; other deployment checks remain separately identified in the security documentation.

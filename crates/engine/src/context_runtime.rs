@@ -224,6 +224,7 @@ impl Engine {
             reasoning_effort: None,
             output_schema: None,
             cache: None,
+            deferred_tools: Vec::new(),
         };
         let Some(bound) = extractor.call_bound(&model_request) else {
             return Ok(SummaryOutcome::Unavailable {
@@ -478,6 +479,19 @@ impl Engine {
             .map_err(|_| Error::Invalid("context preparation exceeds policy or invalid state"))?;
         let mut compiled = prepared.compiled;
         compiled.request.tools_enabled = input.tools_enabled;
+        if self.model.native_deferred_tools() {
+            compiled.request.deferred_tools = if let Some(catalog) = &s.native_deferred_catalog {
+                catalog.clone()
+            } else if let Some(catalog) = self.model.deferred_catalog_override() {
+                catalog
+            } else {
+                self.tools
+                    .deferred_definitions(run)
+                    .await
+                    .map_err(|_| Error::Invalid("deferred catalog unavailable"))?
+            };
+        }
+
         if self.model.cache_settings().strategy != excalibur_models::CacheStrategy::Unknown {
             let run_owned = run.to_owned();
             let (principal,scope)=self.journal.database().read(ReadLane::Interactive,move|c|Ok(c.query_row("SELECT COALESCE(principal_id,'local'),COALESCE(scope_id,'general') FROM runs WHERE id=?1",[run_owned],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?)).await.map_err(excalibur_journal::Error::from)?;
@@ -506,12 +520,27 @@ impl Engine {
         if let Some(cache) = self.model.request_cache_override(s.step) {
             compiled.request.cache = Some(cache);
         }
+        if !compiled.request.deferred_tools.is_empty()
+            && excalibur_context::TokenCounter::with_margin(
+                session.policy.counter.count_request(&compiled.request),
+            ) > session
+                .policy
+                .model_window
+                .saturating_sub(session.policy.output_reserve)
+        {
+            return Err(Error::Invalid(
+                "native deferred catalog exceeds context window",
+            ));
+        }
         let plain = serde_json::to_value(&compiled.request)?;
         if self.sanitize(&plain)? != plain {
             return Err(Error::Invalid("secret literal in compiled context"));
         }
         compiled.bytes = serde_json::to_vec(&compiled.request)?;
-        let payload = json!({"session":session,"history_cursor":s.history.len(),"receipt":prepared.receipt,"instruction_digest":instruction_digest});
+        let mut payload = json!({"session":session,"history_cursor":s.history.len(),"receipt":prepared.receipt,"instruction_digest":instruction_digest});
+        if self.model.native_deferred_tools() {
+            payload["deferred_tools"] = json!(compiled.request.deferred_tools);
+        }
         let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?));
         self.event(
             run,

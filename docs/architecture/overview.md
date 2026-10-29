@@ -23,3 +23,5 @@ See [Minimum durable engine](../development/durable-engine.md) for the current c
 The shared task/planning and evidence contracts are described in [Verifiable work](../development/verifiable-work.md).
 
 Context compilation, durable sessions and provider caches are described in [Context and cache](../development/context-cache.md).
+
+Project-domain tools and editing isolation are implemented in the shared libraries; see [Project tools and editing concurrency](../development/project-tools.md).

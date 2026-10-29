@@ -437,6 +437,14 @@ async fn additive_conflict_migration_preserves_legacy_schema_and_counts() {
         )
         .await
         .unwrap();
+    let versions_before = db
+        .read(ReadLane::Interactive, |conn| {
+            Ok(conn.query_row("SELECT count(*) FROM tool_schema", [], |r| {
+                r.get::<_, i64>(0)
+            })?)
+        })
+        .await
+        .unwrap();
     let original=db.write(Priority::Normal,|conn|{let checksum=conn.query_row("SELECT checksum FROM tool_schema WHERE version=1",[],|r|r.get::<_,String>(0))?;conn.execute_batch("DROP TABLE tool_conflicts; DELETE FROM tool_schema WHERE version=2; UPDATE tool_readset SET mismatches=2;")?;Ok(checksum)}).await.unwrap();
     let upgraded = LocalTools::new(
         db.clone(),
@@ -469,7 +477,7 @@ async fn additive_conflict_migration_preserves_legacy_schema_and_counts() {
         .await
         .unwrap();
     assert_eq!(checksum, original);
-    assert_eq!(versions, 2);
+    assert_eq!(versions, versions_before);
     db.shutdown().await.unwrap();
 }
 

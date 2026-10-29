@@ -31,3 +31,5 @@ La ejecución no interactiva `excalibur exec`, el perfil de evaluación, las mé
 Consulta [Trabajo verificable](docs/development/verifiable-work.es.md) para tareas y planes durables, evidencia vigente, puerta de cierre y verificación independiente.
 
 Consulta [Contexto y caché](docs/development/context-cache.es.md) para las vistas durables de contexto, compactación, instrucciones literales y contratos de caché de proveedores.
+
+Consulta [Herramientas de proyecto y concurrencia de edición](docs/development/project-tools.es.md) para herramientas diferidas, servicios de lenguaje confinados, grafos de código, instantáneas reversibles de comandos e integración de worktrees de tareas.

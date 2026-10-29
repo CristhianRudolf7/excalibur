@@ -69,6 +69,7 @@ fn request() -> ModelRequest {
         reasoning_effort: None,
         output_schema: None,
         cache: None,
+        deferred_tools: Vec::new(),
     }
 }
 fn gateway(url: &str, native_tools: bool, role: ModelRole) -> OpenAiGateway {

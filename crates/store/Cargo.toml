@@ -21,3 +21,6 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

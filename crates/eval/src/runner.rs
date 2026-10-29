@@ -40,6 +40,8 @@ pub struct ExecOptions {
     pub budget: Budget,
     /// Host-configured model window and context lifecycle policy.
     pub context_policy: excalibur_context::SessionPolicy,
+    /// Trusted, explicitly approved server configurations; empty means no language servers.
+    pub language_servers: BTreeMap<String, excalibur_code_intelligence::ServerConfig>,
     pub output_schema: Option<Value>,
     pub criteria: Vec<Criterion>,
     pub metadata: RunMetadata,
@@ -73,6 +75,7 @@ impl ExecOptions {
             autonomy: Autonomy::Supervised,
             budget: Budget::default(),
             context_policy: excalibur_context::SessionPolicy::default(),
+            language_servers: BTreeMap::new(),
             output_schema: None,
             criteria: vec![],
             metadata: RunMetadata::default(),
@@ -152,6 +155,9 @@ pub struct Execution {
     pub telemetry: Arc<Telemetry>,
     pub tasks: excalibur_tasks::TaskStore,
     local: Arc<LocalTools>,
+    project_monitor: excalibur_tools::monitor::ProjectMonitor,
+    graph_db: Database,
+    lsp: Arc<excalibur_code_intelligence::LspManager>,
     db: Database,
     logs: PathBuf,
     blocked: Option<String>,
@@ -358,6 +364,44 @@ impl Execution {
             excalibur_sandbox::prepare_project_boundary(&root).map_err(config_error)?;
         }
         let verifier_sandbox = sandbox.clone();
+        let graph_db = Database::open(
+            data.join("codegraph.db"),
+            DatabaseKind::CodeGraph,
+            StorageConfig::default(),
+        )
+        .map_err(config_error)?;
+        let project_id = hash(&root);
+        let graph = excalibur_code_intelligence::CodeGraph::open(graph_db.clone(), &project_id)
+            .await
+            .map_err(config_error)?
+            .with_redactor(redactor.clone());
+        let lsp = Arc::new(excalibur_code_intelligence::LspManager::with_options(
+            Arc::new(excalibur_code_intelligence::ReadOnlySpawner::default()),
+            redactor.clone(),
+            std::time::Duration::from_secs(600),
+        ));
+        for (language, mut server) in options.language_servers.clone() {
+            if server.root.canonicalize().map_err(config_error)? != root {
+                return Err(config_error(
+                    "language server project root differs from execution workspace",
+                ));
+            }
+            server.hidden_paths.extend(protected.clone());
+            server.hidden_paths.push(data.clone());
+            lsp.register(&project_id, &language, server)
+                .await
+                .map_err(config_error)?;
+        }
+        let intelligence = Arc::new(
+            excalibur_tools::intelligence::ProjectIntelligence::new(
+                graph,
+                project_id,
+                root.clone(),
+            )
+            .map_err(config_error)?
+            .with_lsp(lsp.clone()),
+        );
+
         let local = Arc::new(
             LocalTools::new(
                 db.clone(),
@@ -372,6 +416,8 @@ impl Execution {
                 },
             )
             .await
+            .map_err(config_error)?
+            .with_intelligence(intelligence)
             .map_err(config_error)?,
         );
         let token = CapabilityToken {
@@ -426,6 +472,20 @@ impl Execution {
                 })
                 .map_err(config_error)?;
         let task_store = episode.task_store();
+        let observer = local
+            .project_intelligence()
+            .map(|services| services as Arc<dyn excalibur_tools::monitor::ChangeObserver>);
+        let project_monitor = excalibur_tools::monitor::ProjectMonitor::start(
+            (*local).clone(),
+            observer,
+            vec![excalibur_tools::monitor::EvidenceTarget {
+                tasks: task_store.clone(),
+                scope: "episode".into(),
+            }],
+        )
+        .await
+        .map_err(config_error)?;
+
         let skill_mount = options
             .profile_override
             .as_ref()
@@ -439,6 +499,25 @@ impl Execution {
                 options.task_network_allowed,
             )
             .with_skills(skills.clone()),
+        );
+        let available = tools
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let domains = excalibur_tools::project::deferred_catalog()
+            .into_iter()
+            .filter(|d| available.contains(&d.name))
+            .collect();
+        let domain_catalog =
+            Arc::new(excalibur_tools::deferred::ToolCatalog::new(domains).map_err(config_error)?);
+        let tools: Arc<dyn ToolRuntime> = Arc::new(
+            excalibur_tools::deferred::DeferredTools::new(
+                tools,
+                domain_catalog,
+                excalibur_tools::deferred::CallerRole::Worker,
+            )
+            .map_err(config_error)?,
         );
         let mut catalog = tools.definitions();
         catalog.extend(excalibur_engine::builtin_tool_definitions());
@@ -620,6 +699,9 @@ impl Execution {
             telemetry,
             tasks: task_store,
             local,
+            project_monitor,
+            graph_db,
+            lsp,
             db,
             logs,
             blocked,
@@ -648,6 +730,12 @@ impl Execution {
                 .await
                 .map_err(|_| ExecError::Backend)?;
         }
+        self.project_monitor
+            .scan_now()
+            .await
+            .map_err(config_error)?;
+        self.project_monitor.stop().await;
+        self.lsp.shutdown_all().await;
         self.local.terminals().shutdown().await;
         sampler.stop().await.map_err(|_| ExecError::Backend)?;
         self.engine
@@ -721,6 +809,10 @@ impl Execution {
             )
             .map_err(|_| ExecError::Backend)?,
         }
+        self.graph_db
+            .shutdown()
+            .await
+            .map_err(|_| ExecError::Backend)?;
         self.db.shutdown().await.map_err(|_| ExecError::Backend)?;
         Ok(outcome)
     }

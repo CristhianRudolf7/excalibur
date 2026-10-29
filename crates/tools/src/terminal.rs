@@ -151,21 +151,23 @@ impl Output {
                 .read_to_end(&mut bytes)?;
             return Ok((String::from_utf8_lossy(&bytes).into_owned(), false));
         }
-        let half = max / 2;
+        let marker = b"\n[... output omitted; full output is retained ...]\n";
+        let content = max.saturating_sub(marker.len());
+        let half = content / 2;
         Read::by_ref(&mut self.file)
             .take(half as u64)
             .read_to_end(&mut bytes)?;
-        bytes.extend_from_slice(b"\n[... output omitted; full output is retained ...]\n");
+        bytes.extend_from_slice(marker);
         self.file
-            .seek(SeekFrom::Start(self.total - (max - half) as u64))?;
+            .seek(SeekFrom::Start(self.total - (content - half) as u64))?;
         Read::by_ref(&mut self.file)
-            .take((max - half) as u64)
+            .take((content - half) as u64)
             .read_to_end(&mut bytes)?;
         Ok((String::from_utf8_lossy(&bytes).into_owned(), true))
     }
-    fn live_tail(&self) -> String {
+    fn live_tail(&self, redactor: &Redactor, secrets: &[String]) -> String {
         let bytes = self.tail.iter().copied().collect::<Vec<_>>();
-        let text = String::from_utf8_lossy(&bytes);
+        let text = redactor.redact_text(&redact_text(&String::from_utf8_lossy(&bytes), secrets));
         let lines = text.lines().collect::<Vec<_>>();
         let text = lines[lines.len().saturating_sub(20)..].join("\n");
         let mut start = text.len().saturating_sub(2048);
@@ -555,11 +557,13 @@ impl TerminalManager {
         Ok(())
     }
     pub fn execution_resources(&self, run: &str) -> excalibur_types::runtime::ExecutionResources {
-        let state = self.inner.state.lock().unwrap();
-        let sessions = state
-            .sessions
-            .values()
-            .filter(|session| session.owner == run);
+        let sessions = session_registry()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|session| session.owner == run)
+            .collect::<Vec<_>>();
         let mut resources = excalibur_types::runtime::ExecutionResources::default();
         for session in sessions {
             resources.terminal_sessions += 1;
@@ -572,7 +576,7 @@ impl TerminalManager {
     pub fn live_status(&self, run: &str) -> Vec<Value> {
         self.inner.state.lock().unwrap().sessions.values().filter(|s|s.owner==run).map(|s|{
             let output=s.output.lock().unwrap();
-            json!({"session_id":s.id,"command":self.inner.config.redactor.redact_text(&redact_text(&s.command,&self.inner.config.redacted_secrets)),"tail":output.live_tail(),"exited":output.exited,"exit_code":output.exit_code,"cursor":output.total})
+            json!({"session_id":s.id,"command":self.inner.config.redactor.redact_text(&redact_text(&s.command,&self.inner.config.redacted_secrets)),"tail":output.live_tail(&self.inner.config.redactor,&self.inner.config.redacted_secrets),"exited":output.exited,"exit_code":output.exit_code,"cursor":output.total})
         }).collect()
     }
     pub fn take_notices(&self, run: &str) -> Vec<Value> {
@@ -818,6 +822,13 @@ impl TerminalManager {
             Ok(v) => v,
             Err(e) => return ToolResult::error(e.to_string()),
         };
+        let text = self
+            .inner
+            .config
+            .redactor
+            .redact_text(&redact_text(&text, &self.inner.config.redacted_secrets));
+        let truncated = truncated || text.len() > max;
+        let text = crate::head_tail(&text, max);
         ToolResult {
             success: true,
             full_output_blob: output.persisted_blob.clone(),

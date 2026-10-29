@@ -9,7 +9,7 @@ pub struct ReadAuthority {
     #[cfg(unix)]
     inventory: Option<unix::Inventory>,
 }
-/// Credential-name exclusion is opt-in for trusted metadata snapshots; ordinary
+/// Credential and harness-metadata exclusion is opt-in for trusted snapshots; ordinary
 /// file tools continue to use the explicit host path policy.
 pub fn credential_path(path: &Path) -> bool {
     path.components().any(|component| {
@@ -18,7 +18,11 @@ pub fn credential_path(path: &Path) -> bool {
             || name.starts_with(".env.")
             || matches!(
                 name.as_ref(),
-                ".ssh"
+                ".git"
+                    | ".excalibur"
+                    | ".agents"
+                    | ".codex"
+                    | ".ssh"
                     | ".aws"
                     | ".azure"
                     | ".gnupg"
@@ -220,6 +224,32 @@ mod unix {
 #[cfg(all(test, unix))]
 mod tests {
     use super::ReadAuthority;
+    #[test]
+    fn trusted_snapshots_reject_hardlink_aliases_to_harness_and_git_metadata() {
+        for name in [".git", ".excalibur", ".agents", ".codex"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("project");
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(
+                root.join(name).join("config"),
+                b"synthetic private metadata",
+            )
+            .unwrap();
+            std::fs::hard_link(root.join(name).join("config"), root.join("alias")).unwrap();
+            let directory =
+                cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+            let file = directory.open("alias").unwrap();
+            assert!(
+                ReadAuthority::excluding_credential_names()
+                    .check(&directory, &root, &[], &file)
+                    .unwrap_err()
+                    .contains("hardlink")
+            );
+            assert!(super::credential_path(
+                std::path::Path::new(name).join("config").as_path()
+            ));
+        }
+    }
     #[test]
     fn cached_inventory_rechecks_the_open_descriptor_link_count() {
         let temp = tempfile::tempdir().unwrap();

@@ -1,0 +1,63 @@
+# Project tools and editing concurrency
+
+The shared Rust libraries provide project-domain tools through a deferred catalogue. The embedding host owns project paths, approved language-server commands, task identities, permissions and lifecycle. The noninteractive backend wires the project graph, change monitor and catalogue into its existing execution path; it adds no frontend server.
+
+## Catalogue and permissions
+
+`LocalTools` is the physical runtime. `project::deferred_catalog()` describes `file_history`, `revert_edit`, `workspace_snapshot`, `worktree`, `integration_queue`, `code_graph` and `lsp`. `DeferredTools` exposes their schemas through `search_tools` and executes `call_tool` through the same secured delegate as a direct call. Their schemas are absent from the eager model prefix. See [tool retrieval](tool-retrieval.md) for BM25/vector ranking, role filtering, native provider support and schema validation.
+
+A host can compose `DeferredTools(ExecutionTools(EpisodeTools(SecuredTools(LocalTools))))`. The deferred wrapper resolves the actual name before it enters authorization. Entry history/restoration requires authority over the canonical parent directory, so replacing a symlink never follows its current target for authorization. Restoration targets are explicit; rename results outside the authorized path set are rejected. A model cannot choose the Git identity, task authority or integration test executor. `LocalTools::authorize_parent` installs those trusted capabilities. Project branches are never pushed or merged into the user's branch by these tools.
+
+## Durable edits, history and command snapshots
+
+Every content restoration reuses preparation, durable preimages, fingerprint checks, write leases, atomic publication and `file_versions`. `file_history` lists a file's recorded versions. `revert_edit` plans a three-way reversal against the current file: unrelated later changes survive; conflicts return a report without overwriting. Reopening and reconciliation reuse the same prepared edit and version identity.
+
+Command steps take a before/after shadow snapshot in a private Git object store using a private index. This does not stage files or create commits in the user's repository. `workspace_snapshot` lists the current run's snapshots, shows a diff or restores explicitly selected files. Snapshot identifiers from other runs are rejected. A running command can span several steps; each step records the observed filesystem state rather than claiming the command has finished.
+
+Snapshot inputs pass descriptor-bound root and private-hardlink checks. Credential names, sensitive metadata, protected host paths, `.git`, `target`, `node_modules` and ignore rules are excluded. The graph consumes authorized regular UTF-8 files; snapshot entry handling also retains executable and link metadata where the host filesystem supports them. Restoration never follows an external link to read or overwrite its target. Unsupported or conflicting entry changes are reported explicitly.
+
+## Language services and source graph
+
+`excalibur-code-intelligence` indexes Rust, Python, JavaScript, TypeScript/TSX, JSON and Markdown through real tree-sitter grammars. File hashes prevent redundant parses; cached trees support incremental edits. Persisted nodes/edges cover symbols, imports, calls/references, tests, document sections and citations. Query results distinguish syntactic name resolution from LSP enrichment. Explicit requirement links retain their host evidence reference. `impacted_tests` follows the indexed dependency graph; incomplete or dynamic relationships are not inferred as proven facts.
+
+`ProjectIntelligence` connects this graph to the file tools and monitor. An edit returns newly introduced syntax errors and current-version LSP errors, without repeating pre-existing diagnostics. The parser also checks missing punctuation. Binary, protected or oversized source files are reported as unindexed and stale graph entries are removed. The source indexing limit is 8 MiB per file; ordinary file tooling and snapshot byte limits remain separately enforced.
+
+`LspManager` registers servers without starting them, shares one session per project/language, and reaps sessions after ten idle minutes. Its operations include definition, references, document/workspace symbols, diagnostics and rename. The concrete Linux spawner uses a read-only sandbox, a private home, closed networking and explicit host environment. Server `workspace/applyEdit` requests are rejected. Renames are proposals until the ordinary file pipeline validates document hashes, versions, Unicode UTF-16 ranges, overlap and authorized targets. Server resource-operation edits that were not negotiated are rejected.
+
+General/user and project TOML may declare `language_servers.<language>` with `command`, `args`, `enabled` and `initialization_options`. Commands resolve against the owning configuration file, independently of cwd. Scope files cannot override them; project files cannot redirect storage or reduce durability. Loading configuration never launches a server: the host must approve the declaration and create a confined `ServerConfig`. Trusted `ExecOptions.language_servers` supplies approved servers to noninteractive execution; an empty map starts none.
+
+A matching diagnostic version does not prove that the server has finished all background analysis. A server may first publish an empty list and later publish errors for the same version. Fresh checks and syntax diagnostics remain distinct from a successful build/test result.
+
+## Leases, partitions and integration
+
+`excalibur-workspace` combines durable canonical-path leases with an in-memory map and operating-system locks for cooperating processes. Leases expire after ten minutes without heartbeat; active runs renew them during long tools. Human waits, pause, blockage and terminal states release them. A conflict waits up to thirty seconds and reports the holder and activity. An admitted noninterruptible effect retains its OS guard until it finishes even if the run releases its durable lease. Read fingerprints still detect user changes, which do not participate in leasing.
+
+Hosts forward `ToolRuntime::execution_state`, `begin_step` and `end_step` through decorators. Standalone tools without motor lifecycle notifications release their leases after each call. Engine-managed runs retain them until the appropriate state transition. Durable state is checked when renewing or admitting a lease; stale notifications do not revive a terminal run.
+
+The parent can assign file sets with direct graph dependencies; overlaps are persisted and reported to the parent. Large dependency queries report their bound rather than silently producing a complete-looking partition. Without a graph, the low-level workspace API can record an explicit host-provided set.
+
+Worktrees and integration branches live in the host data directory outside the project root. Projects without Git or with submodules use shared-tree mode. Only a parent with explicit task authority can create/checkpoint/remove child worktrees and process the integration queue. Checkpoints stage authorized captured entries through a private index, with repeated content/metadata verification and a ref CAS; unselected files retain their prior staged content. Dirty child worktrees cannot enter the queue.
+
+Integration is serialized and durable: rebase onto the task integration branch, preserve both diffs and intent on conflict, run the host's impacted checks, and fast-forward only the integration branch when checks pass. Failed checks or conflicts return the branch for resolution. No successful check is invented for an absent test executor. Project Git hooks, includes and custom execution drivers cannot run through these operations; unsupported custom-driver configuration fails closed. Shared mode does not create commits on the active user branch.
+
+## External changes and lifecycle
+
+`ProjectMonitor` owns a native filesystem watcher and a durable change queue. File notifications hash only affected eligible files; directory/ignore changes and overflow trigger a rescan. Pending observer work is retried without periodically rereading the whole tree. Changes invalidate scoped task evidence, refresh/remove graph entries and notify a lease holder through a durable directive. Old read snapshots are retained so fingerprint conflicts can show the actual diff.
+
+The host retains one monitor handle while a project is active, inspects `last_error` and calls `stop` when closing it. Queued work remains durable if interrupted. The noninteractive backend performs a final scan, stops the monitor, closes language sessions and shuts down its graph/database resources.
+
+## Verification
+
+```sh
+cargo test -p excalibur-workspace
+cargo test -p excalibur-code-intelligence
+cargo test -p excalibur-tools --test tool_retrieval --test terminal_vs_tools
+cargo test -p excalibur-tools --test project_tools --test project_monitor
+cargo test -p excalibur-models --test deferred --test replay
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace
+```
+
+Backend tests use synthetic repositories, local protocol fixtures, real confined processes, SQLite, OS locks and process interruption. Source graph and language-server tests include real parsers and a separately identified rust-analyzer runtime check on Linux. These checks establish no execution result for Windows or macOS. Tool-retrieval accuracy and terminal comparisons describe their synthetic fixtures, not paid model benchmarks or general performance guarantees. External providers, MCP clients and package installation/creation remain separate capabilities; a host may only register an actually implemented runtime.

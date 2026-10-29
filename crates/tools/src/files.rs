@@ -14,11 +14,21 @@ pub(crate) const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct FileEdit {
     pub path: String,
     pub pre: Option<String>,
     pub post: Option<String>,
+    #[serde(default)]
+    pub kind: excalibur_workspace::EntryKind,
+    #[serde(default)]
+    pub executable: bool,
+    #[serde(default)]
+    pub pre_kind: Option<excalibur_workspace::EntryKind>,
+    #[serde(default)]
+    pub pre_executable: Option<bool>,
+    #[serde(default)]
+    pub metadata_guard: bool,
 }
 impl LocalTools {
     pub(crate) async fn edit_diff(
@@ -364,7 +374,8 @@ impl LocalTools {
         self.check_permission(Permission::Write)?;
         let path = self.resolve(path)?;
         self.check_write_path(&path)?;
-        let current = self.content(&path)?;
+        let entry = self.current_entry(&path)?;
+        let current = entry.as_ref().map(|e| e.content.clone());
         if let Some(content) = current.as_deref() {
             self.ensure_read(run, &path, content, fp).await?;
         } else if let Some((expected, blob, _)) = self.read_snapshot(run, &path).await? {
@@ -409,7 +420,16 @@ impl LocalTools {
             }
             None => None,
         };
-        Ok(FileEdit { path, pre, post })
+        Ok(FileEdit {
+            path,
+            pre,
+            post,
+            kind: excalibur_workspace::EntryKind::File,
+            executable: entry.as_ref().is_some_and(|e| e.executable),
+            pre_kind: entry.as_ref().map(|e| e.kind),
+            pre_executable: entry.as_ref().map(|e| e.executable),
+            metadata_guard: true,
+        })
     }
     pub(crate) fn check_write_path(&self, path: &str) -> Result<(), String> {
         let components = std::path::Path::new(path)
@@ -505,7 +525,20 @@ impl LocalTools {
             run.to_owned(),
             call_id.to_owned(),
         );
-        self.db.write(Priority::Normal,move|conn|{conn.execute("INSERT INTO file_versions(id,path,preimage_blob,postimage_blob,run_id,tool_call_id) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO NOTHING",excalibur_store::rusqlite::params![id,path,pre,post,run,call])?;Ok(())}).await.map_err(|e|e.to_string())
+        let metadata = edit.metadata_guard.then(|| {
+            (
+                edit.pre_kind,
+                edit.pre_executable,
+                edit.post.as_ref().map(|_| edit.kind),
+                edit.post.as_ref().map(|_| edit.executable),
+            )
+        });
+        self.db.write(Priority::Normal,move|conn|{
+            conn.execute("INSERT INTO file_versions(id,path,preimage_blob,postimage_blob,run_id,tool_call_id) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO NOTHING",excalibur_store::rusqlite::params![id,path,pre,post,run,call])?;
+            if let Some((pre_kind,pre_executable,post_kind,post_executable))=metadata{
+                let name=|kind:excalibur_workspace::EntryKind|match kind{excalibur_workspace::EntryKind::File=>"file",excalibur_workspace::EntryKind::Symlink=>"symlink"};
+                conn.execute("INSERT OR IGNORE INTO file_version_metadata(version_id,pre_kind,pre_executable,post_kind,post_executable) VALUES(?1,?2,?3,?4,?5)",excalibur_store::rusqlite::params![id,pre_kind.map(name),pre_executable,post_kind.map(name),post_executable])?;
+            }Ok(())}).await.map_err(|e|e.to_string())
     }
 }
 pub(crate) fn open_root(root: PathBuf) -> Result<(PathBuf, Dir), String> {

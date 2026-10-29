@@ -150,6 +150,13 @@ impl Drop for Inner {
         {
             let _ = join.join();
         }
+        // CLOEXEC does not close inherited descriptors until exec. The final
+        // Rust owner releases advisory ownership explicitly, so a concurrently
+        // forked non-owner cannot keep the file description locked in that gap.
+        let _ = fs2::FileExt::unlock(&self._lock);
+        if let Some(lock) = &self._blob_lock {
+            let _ = fs2::FileExt::unlock(lock);
+        }
     }
 }
 #[derive(Clone)]

@@ -77,7 +77,49 @@ impl TokenCounter {
             .sum()
     }
     pub fn base_request_tokens(&self, request: &ModelRequest) -> usize {
-        self.count_text(&serde_json::to_string(request).expect("serializable model request"))
+        if request.deferred_tools.is_empty() {
+            return self
+                .count_text(&serde_json::to_string(request).expect("serializable model request"));
+        }
+        // Native search transports the catalog to the provider, but only retrieved
+        // definitions enter model context. This remains an estimate calibrated by usage.
+        let mut value = serde_json::to_value(request).expect("serializable model request");
+        value.as_object_mut().unwrap().remove("deferred_tools");
+        value["deferred_search_descriptor"] = serde_json::json!({"type":"tool_search_tool_bm25_20251119","name":"tool_search_tool_bm25"});
+        fn references(value: &serde_json::Value, names: &mut std::collections::BTreeSet<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if value["type"] == "tool_reference"
+                        && let Some(name) = value["tool_name"].as_str()
+                    {
+                        names.insert(name.into());
+                    }
+                    for child in map.values() {
+                        references(child, names)
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for child in values {
+                        references(child, names)
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for message in &request.messages {
+            if let Some(state) = &message.provider_state {
+                references(state, &mut names)
+            }
+        }
+        value["retrieved_deferred_definitions"] = serde_json::json!(
+            request
+                .deferred_tools
+                .iter()
+                .filter(|tool| names.contains(&tool.name))
+                .collect::<Vec<_>>()
+        );
+        self.count_text(&serde_json::to_string(&value).expect("serializable request estimate"))
     }
     pub fn count_request(&self, request: &ModelRequest) -> usize {
         scaled(self.base_request_tokens(request), self.request_ratio_ppm)

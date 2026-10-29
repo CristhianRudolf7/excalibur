@@ -53,6 +53,18 @@ impl SecuredTools {
                 config.workspace.join(value)
             })
         };
+        // Entry restoration publishes/replaces a directory entry, including a
+        // symlink itself. Authorize the canonical parent rather than following
+        // its current leaf to a different capability root.
+        let entry_parent = |value: &str| -> std::result::Result<PathBuf, String> {
+            let full = if Path::new(value).is_absolute() {
+                PathBuf::from(value)
+            } else {
+                config.workspace.join(value)
+            };
+            let parent = full.parent().ok_or("entry parent missing")?;
+            canonical_target(parent)
+        };
         let required = |key: &str| -> std::result::Result<&str, String> {
             args.get(key)
                 .and_then(Value::as_str)
@@ -103,6 +115,50 @@ impl SecuredTools {
                     path: config.workspace,
                 }]
             }
+            "file_history" => vec![Action::Read {
+                path: entry_parent(required("path")?)?,
+            }],
+            "revert_edit" => vec![Action::WriteExact {
+                path: entry_parent(required("path")?)?,
+                change: call.arguments.clone(),
+            }],
+            "workspace_snapshot" if args["action"] == "restore" => {
+                let targets = args["paths"]
+                    .as_array()
+                    .ok_or("snapshot restoration requires explicit target paths")?;
+                if targets.is_empty() {
+                    return Err("snapshot restoration requires target paths".into());
+                }
+                targets
+                    .iter()
+                    .map(|target| {
+                        Ok(Action::WriteExact {
+                            path: entry_parent(target.as_str().ok_or("invalid snapshot target")?)?,
+                            change: call.arguments.clone(),
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, String>>()?
+            }
+            "lsp" if args["action"] == "rename" => {
+                let mut targets = std::collections::BTreeSet::from([required("path")?.to_owned()]);
+                if let Some(paths) = args["paths"].as_array() {
+                    for target in paths {
+                        targets.insert(target.as_str().ok_or("invalid rename target")?.into());
+                    }
+                }
+                targets
+                    .into_iter()
+                    .map(|target| {
+                        Ok(Action::WriteExact {
+                            path: path(&target)?,
+                            change: call.arguments.clone(),
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, String>>()?
+            }
+            "code_graph" | "lsp" | "workspace_snapshot" => vec![Action::Read {
+                path: config.workspace,
+            }],
             "exec" => {
                 if let Some(cwd) = args.get("cwd").and_then(Value::as_str)
                     && path(cwd)? != config.workspace
@@ -239,6 +295,40 @@ impl SecuredTools {
     }
 }
 impl ToolRuntime for SecuredTools {
+    fn deferred_definitions<'a>(
+        &'a self,
+        run: &'a str,
+    ) -> excalibur_types::runtime::BoxFuture<
+        'a,
+        std::result::Result<Vec<excalibur_types::runtime::ToolDefinition>, String>,
+    > {
+        self.delegate.deferred_definitions(run)
+    }
+    fn live_status(&self, run: &str) -> Vec<serde_json::Value> {
+        self.delegate.live_status(run)
+    }
+    fn execution_state<'a>(
+        &'a self,
+        run: &'a str,
+        state: &'a str,
+        reason: Option<&'a str>,
+    ) -> excalibur_types::runtime::BoxFuture<'a, std::result::Result<(), String>> {
+        self.delegate.execution_state(run, state, reason)
+    }
+    fn begin_step<'a>(
+        &'a self,
+        run: &'a str,
+        step: u64,
+    ) -> excalibur_types::runtime::BoxFuture<'a, std::result::Result<(), String>> {
+        self.delegate.begin_step(run, step)
+    }
+    fn end_step<'a>(
+        &'a self,
+        run: &'a str,
+        step: u64,
+    ) -> excalibur_types::runtime::BoxFuture<'a, std::result::Result<(), String>> {
+        self.delegate.end_step(run, step)
+    }
     fn interrupt_execution<'a>(
         &'a self,
         run: &'a str,

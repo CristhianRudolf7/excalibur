@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+excalibur-workspace = { path = "../workspace" }
+excalibur-code-intelligence = { path = "../code-intelligence" }
+notify = "=8.2.0"
+url = "2"
+excalibur-journal = { path = "../journal" }
 excalibur-tasks = { path = "../tasks" }
 excalibur-sandbox = { path = "../sandbox" }
 excalibur-vault = { path = "../vault" }
@@ -27,7 +32,7 @@ tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 [dev-dependencies]
-excalibur-journal = { path = "../journal" }
+tokio = {version="1",features=["test-util"]}
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]

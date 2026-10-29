@@ -47,6 +47,9 @@ pub struct ModelRequest {
     pub output_schema: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<PromptCache>,
+    /// Provider-native deferred catalog; excluded from the eager core prefix.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_tools: Vec<ToolDefinition>,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -237,6 +240,22 @@ impl FinalizationGuard for ReadyFinalizationGuard {
 /// Preparation may persist preimages, but must not perform the requested external effect.
 /// Execution is called only after a confirmed durable intention; recovery never guesses.
 pub trait ToolRuntime: Send + Sync {
+    /// Authoritative lifecycle update. Adapters release leases on human waits and terminal states.
+    fn execution_state<'a>(
+        &'a self,
+        _run: &'a str,
+        _state: &'a str,
+        _reason: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Durable, idempotent step boundaries for command shadow snapshots.
+    fn begin_step<'a>(&'a self, _run: &'a str, _step: u64) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn end_step<'a>(&'a self, _run: &'a str, _step: u64) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
     /// Interrupt managed run processes after an authoritative pause/cancel.
     /// Effect reconciliation still decides whether an interrupted operation may retry.
     fn interrupt_execution<'a>(
@@ -330,6 +349,16 @@ pub trait ToolRuntime: Send + Sync {
         _run: &'a str,
     ) -> BoxFuture<'a, Result<Box<dyn FinalizationGuard>, String>> {
         Box::pin(async { Ok(Box::new(ReadyFinalizationGuard) as Box<dyn FinalizationGuard>) })
+    }
+    /// Domain schemas kept outside the compiled core prefix for native deferred adapters.
+    fn deferred_definitions<'a>(
+        &'a self,
+        _run: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ToolDefinition>, String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn live_status(&self, _run: &str) -> Vec<serde_json::Value> {
+        Vec::new()
     }
     fn definitions(&self) -> Vec<ToolDefinition>;
     /// Return canonical resource keys without preparing content-dependent work.

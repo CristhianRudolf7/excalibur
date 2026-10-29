@@ -153,7 +153,7 @@ async fn output_spooling_is_complete_while_results_and_live_status_are_bounded_a
     assert_eq!(result.output["exited"], true);
     assert_eq!(result.output["truncated"], true);
     let text = result.output["output"].as_str().unwrap();
-    assert!(text.len() < 4300);
+    assert!(text.len() <= 4096);
     assert!(text.contains("[REDACTED]"));
     assert!(text.contains("FINISHED"));
     assert!(!text.contains("synthetic-secret"));
@@ -613,5 +613,138 @@ async fn execution_limits_are_admitted_atomically_and_can_be_expanded() {
     assert_eq!(manager.execution_resources("other").processes, 0);
     manager.cancel_run("limited").await;
     assert_eq!(manager.execution_resources("limited").processes, 0);
+    manager.shutdown().await;
+}
+#[tokio::test]
+async fn live_status_and_reads_recheck_secrets_registered_after_capture() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    prepare_project_boundary(&root).unwrap();
+    let redactor = excalibur_vault::Redactor::default();
+    let manager = TerminalManager::new(TerminalConfig {
+        spool_dir: temp.path().join("spool"),
+        sandbox: Some(SandboxConfig::project(&root)),
+        redactor: redactor.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+    let secret = format!("SYNTHETIC_BEGIN_{}_END_SYNTHETIC_SECRET", "x".repeat(5000));
+    let cmd = format!(
+        "i=0; while [ $i -lt 25 ]; do printf 'line-%s\\n' \"$i\"; i=$((i+1)); done; printf '%s\\n' '{secret}'"
+    );
+    let result = manager
+        .exec("late-redaction", json!({"cmd":cmd,"yield_ms":30000}))
+        .await;
+    let id = session(&result);
+    assert_eq!(result.output["exited"], true);
+    redactor
+        .register_secret(&excalibur_vault::SecretValue::new(secret.as_bytes().to_vec()).unwrap());
+    let status = manager.live_status("late-redaction");
+    let tail = status[0]["tail"].as_str().unwrap();
+    assert!(tail.contains("[REDACTED]"));
+    assert!(!tail.contains("END_SYNTHETIC_SECRET"));
+    assert!(tail.len() <= 2048);
+    assert!(tail.lines().count() <= 20);
+    let read = manager
+        .io("late-redaction", json!({"action":"read","session_id":id}))
+        .await;
+    assert!(!read.output["output"].as_str().unwrap().contains(&secret));
+    assert!(
+        read.output["output"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED]")
+    );
+    manager.shutdown().await;
+}
+#[tokio::test]
+async fn run_resource_budgets_count_commands_in_other_manager_instances() {
+    use excalibur_types::runtime::ExecutionLimits;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let first = manager_with_spool(&root, &temp.path().join("spool-a"));
+    let second = manager_with_spool(&root, &temp.path().join("spool-b"));
+    let run = format!("global-resource-budget-{}", temp.path().display());
+    let limits = ExecutionLimits {
+        max_processes: Some(1),
+        max_terminal_sessions: None,
+    };
+    first.set_execution_limits(&run, limits.clone()).unwrap();
+    second.set_execution_limits(&run, limits).unwrap();
+    let started = first
+        .exec(
+            &run,
+            json!({"cmd":"printf 'READY\\n'; sleep 30","yield_ms":250}),
+        )
+        .await;
+    session(&started);
+    assert_eq!(second.execution_resources(&run).processes, 1);
+    let denied = second
+        .exec(&run, json!({"cmd":"touch must-not-start","yield_ms":250}))
+        .await;
+    assert!(!denied.success);
+    assert!(!root.join("must-not-start").exists());
+    first.shutdown().await;
+    second.shutdown().await;
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dropping_the_last_host_manager_terminates_its_owned_process_group() {
+    struct Cleanup(i32);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-self.0, libc::SIGKILL);
+            }
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let manager = manager(temp.path());
+    let peer = manager.clone();
+    let first = manager
+        .exec(
+            "drop-owner",
+            json!({"cmd":"printf 'READY\\n'; sleep 60","yield_ms":250}),
+        )
+        .await;
+    session(&first);
+    let pid = first.output["pid"].as_u64().unwrap() as i32;
+    let _cleanup = Cleanup(pid);
+    drop(manager);
+    assert_eq!(peer.live_status("drop-owner")[0]["exited"], false);
+    drop(peer);
+    let dead = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let live = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .is_some_and(|s| s.split(") ").nth(1).is_some_and(|s| !s.starts_with('Z')));
+            if !live {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        dead.is_ok(),
+        "owned command group survived dropping all host handles"
+    );
+}
+#[tokio::test]
+async fn output_budget_includes_marker_and_lossy_utf8_while_full_bytes_remain_spooled() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = manager(temp.path());
+    let result=manager.exec("binary-budget",json!({"cmd":"printf HEAD; head -c 16384 /dev/zero | tr '\\0' '\\377'; printf TAIL","yield_ms":30000,"output_bytes":256})).await;
+    session(&result);
+    let output = result.output["output"].as_str().unwrap();
+    assert!(output.len() <= 256);
+    assert!(output.starts_with("HEAD"));
+    assert!(output.ends_with("TAIL"));
+    assert_eq!(result.output["truncated"], true);
+    let raw = std::fs::read(result.output["spool_path"].as_str().unwrap()).unwrap();
+    assert_eq!(raw.len(), 16392);
+    assert_eq!(&raw[..4], b"HEAD");
+    assert_eq!(&raw[raw.len() - 4..], b"TAIL");
     manager.shutdown().await;
 }

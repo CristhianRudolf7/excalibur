@@ -14,6 +14,13 @@ const LOCAL: &[&str] = &[
     "grep",
     "read_file",
     "write_file",
+    "file_history",
+    "revert_edit",
+    "workspace_snapshot",
+    "worktree",
+    "integration_queue",
+    "code_graph",
+    "lsp",
 ];
 #[derive(Clone)]
 pub struct EpisodeTools {
@@ -82,11 +89,20 @@ impl EpisodeTools {
     async fn planning_admission(&self, run: &str, call: &ToolCall) -> Result<(), String> {
         let mutates = matches!(
             call.name.as_str(),
-            "write_file" | "edit_file" | "apply_patch" | "exec"
-        ) || call.name == "exec_io"
-            && self.args(call)?["action"]
-                .as_str()
-                .is_some_and(|a| matches!(a, "write" | "keys"));
+            "write_file"
+                | "edit_file"
+                | "apply_patch"
+                | "exec"
+                | "revert_edit"
+                | "worktree"
+                | "integration_queue"
+        ) || call.name == "workspace_snapshot"
+            && self.args(call)?["action"] == "restore"
+            || call.name == "lsp" && self.args(call)?["action"] == "rename"
+            || call.name == "exec_io"
+                && self.args(call)?["action"]
+                    .as_str()
+                    .is_some_and(|a| matches!(a, "write" | "keys"));
         if mutates {
             self.tasks
                 .effect_admission(run)
@@ -218,10 +234,11 @@ impl EpisodeTools {
                         json!({"task_state":"blocked","reason":args["reason"],"scope":self.scope}),
                     );
                 }
+                let live = self.delegate.live_status(run);
                 let (scope, run) = (self.scope.clone(), run.to_owned());
                 self.db.read(ReadLane::Interactive,move|c| {
                     let state=c.query_row("SELECT state FROM runs WHERE id=?1",[&run],|row|row.get::<_,String>(0)).optional()?;
-                    Ok(json!({"scope":scope,"run_id":run,"run_state":state,"planning_available":true}))
+                    Ok(json!({"scope":scope,"run_id":run,"run_state":state,"planning_available":true,"live_tools":live}))
                 }).await.map_err(|e|e.to_string())
             }
             "search_tools" => {
@@ -247,6 +264,40 @@ impl EpisodeTools {
     }
 }
 impl ToolRuntime for EpisodeTools {
+    fn deferred_definitions<'a>(
+        &'a self,
+        run: &'a str,
+    ) -> excalibur_types::runtime::BoxFuture<
+        'a,
+        std::result::Result<Vec<excalibur_types::runtime::ToolDefinition>, String>,
+    > {
+        self.delegate.deferred_definitions(run)
+    }
+    fn live_status(&self, run: &str) -> Vec<serde_json::Value> {
+        self.delegate.live_status(run)
+    }
+    fn execution_state<'a>(
+        &'a self,
+        run: &'a str,
+        state: &'a str,
+        reason: Option<&'a str>,
+    ) -> excalibur_types::runtime::BoxFuture<'a, Result<(), String>> {
+        self.delegate.execution_state(run, state, reason)
+    }
+    fn begin_step<'a>(
+        &'a self,
+        run: &'a str,
+        step: u64,
+    ) -> excalibur_types::runtime::BoxFuture<'a, Result<(), String>> {
+        self.delegate.begin_step(run, step)
+    }
+    fn end_step<'a>(
+        &'a self,
+        run: &'a str,
+        step: u64,
+    ) -> excalibur_types::runtime::BoxFuture<'a, Result<(), String>> {
+        self.delegate.end_step(run, step)
+    }
     fn interrupt_execution<'a>(
         &'a self,
         run: &'a str,

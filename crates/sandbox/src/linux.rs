@@ -291,7 +291,27 @@ impl PreparedSandbox {
         hidden.dedup();
         let mut nonwritable = hidden.clone();
         nonwritable.extend(protected);
+        // Existing read-only metadata may be a file (for example a worktree's
+        // .git entry), so skipping traversal of reserved directories is not
+        // enough to exclude every protected inode from ordinary accounting.
+        for root in &read {
+            if root.is_dir() {
+                nonwritable.extend(protected_paths(root, false, &hidden)?);
+            }
+        }
+        // Preserve the stricter write boundary: an alias in writable project
+        // space must not make a read-only SDK inode writable through that name.
         hidden.extend(cross_boundary_hardlink_aliases(&write, &nonwritable)?);
+        // Read-only mounts also need inode accounting: a public name can be a
+        // hardlink to hidden material even when the process cannot write it.
+        let mut visible_roots = vec![workspace.clone()];
+        visible_roots.extend(read.iter().chain(write.iter()).cloned());
+        visible_roots.sort();
+        visible_roots.dedup();
+        hidden.extend(cross_boundary_hardlink_aliases(
+            &visible_roots,
+            &nonwritable,
+        )?);
         hidden.sort();
         hidden.dedup();
         for path in hidden {
@@ -414,13 +434,13 @@ fn runtime_tempdir(writable: &[PathBuf]) -> Result<tempfile::TempDir, String> {
     }
     Err("no trusted sandbox runtime directory exists outside writable roots".into())
 }
-/// A writable alias must account for every link to its inode inside the same
-/// writable authority. Otherwise another link may belong to protected metadata,
-/// a hidden vault, a read-only SDK or another host directory. Hide the writable
-/// aliases without inspecting any private tree or reading file content. Ordinary
-/// Cargo hardlinks wholly inside writable roots remain available.
+/// A visible alias must account for every link to its inode inside the same
+/// visible authority. Otherwise another link may belong to protected metadata,
+/// a hidden vault or another host directory. Hide aliases without inspecting
+/// private trees or reading file content. Ordinary hardlinks wholly inside the
+/// permitted union of read and write roots remain available.
 pub(crate) fn cross_boundary_hardlink_aliases(
-    writable: &[PathBuf],
+    visible: &[PathBuf],
     hidden: &[PathBuf],
 ) -> Result<Vec<PathBuf>, String> {
     let mut paths = BTreeSet::new();
@@ -430,7 +450,7 @@ pub(crate) fn cross_boundary_hardlink_aliases(
         paths: Vec<PathBuf>,
     }
     let mut inodes: BTreeMap<(u64, u64), Inode> = BTreeMap::new();
-    let mut roots = writable.iter().collect::<Vec<_>>();
+    let mut roots = visible.iter().collect::<Vec<_>>();
     roots.sort();
     let mut covered: Vec<&PathBuf> = Vec::new();
     for root in roots {
@@ -441,20 +461,36 @@ pub(crate) fn cross_boundary_hardlink_aliases(
             continue;
         }
         covered.push(root);
-        for directory in ordinary_directories(root, hidden)? {
+        let single_file = root.is_file();
+        let directories = if single_file {
+            vec![
+                root.parent()
+                    .ok_or("read root has no parent")?
+                    .to_path_buf(),
+            ]
+        } else {
+            ordinary_directories(root, hidden)?
+        };
+        for directory in directories {
             let parent = std::fs::metadata(&directory).map_err(|e| e.to_string())?;
-            for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
-                let entry = entry.map_err(|e| e.to_string())?;
-                let path = entry.path();
+            // A file read root grants only that entry, never a scan of siblings.
+            let entries = if single_file {
+                vec![root.to_path_buf()]
+            } else {
+                std::fs::read_dir(directory)
+                    .map_err(|e| e.to_string())?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?
+            };
+            for path in entries {
                 if hidden.iter().any(|excluded| path.starts_with(excluded))
                     || !paths.insert(path.clone())
                 {
                     continue;
                 }
                 if paths.len() > super::MAX_ENTRIES {
-                    return Err(
-                        "sandbox writable hardlink inventory exceeds its entry limit".into(),
-                    );
+                    return Err("sandbox visible hardlink inventory exceeds its entry limit".into());
                 }
                 let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
                 if !metadata.is_file() || metadata.nlink() <= 1 {
@@ -469,14 +505,18 @@ pub(crate) fn cross_boundary_hardlink_aliases(
                     });
                 if inode.links != metadata.nlink() {
                     return Err(
-                        "sandbox writable hardlink inventory changed during preparation".into(),
+                        "sandbox visible hardlink inventory changed during preparation".into(),
                     );
                 }
                 // Bind aliases expose the same directory entry under different
                 // absolute paths without increasing the inode's link count.
-                inode
-                    .names
-                    .insert((parent.dev(), parent.ino(), entry.file_name()));
+                inode.names.insert((
+                    parent.dev(),
+                    parent.ino(),
+                    path.file_name()
+                        .ok_or("read root has no filename")?
+                        .to_os_string(),
+                ));
                 inode.paths.push(path);
             }
         }
@@ -487,9 +527,7 @@ pub(crate) fn cross_boundary_hardlink_aliases(
             let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
             if metadata.dev() != device || metadata.ino() != inode || metadata.nlink() != info.links
             {
-                return Err(
-                    "sandbox writable hardlink inventory changed during preparation".into(),
-                );
+                return Err("sandbox visible hardlink inventory changed during preparation".into());
             }
         }
         if info.links < info.names.len() as u64 {

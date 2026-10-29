@@ -64,6 +64,7 @@ fn request() -> ModelRequest {
         reasoning_effort: None,
         output_schema: None,
         cache: None,
+        deferred_tools: Vec::new(),
     }
 }
 async fn server(status: u16, body: String) -> (String, tokio::task::JoinHandle<()>) {

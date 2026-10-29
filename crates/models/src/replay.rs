@@ -479,6 +479,19 @@ impl ReplayGateway {
     }
 }
 impl ModelGateway for ReplayGateway {
+    fn native_deferred_tools(&self) -> bool {
+        self.tape
+            .entries
+            .iter()
+            .any(|e| !e.request.deferred_tools.is_empty())
+    }
+    fn deferred_catalog_override(&self) -> Option<Vec<excalibur_types::runtime::ToolDefinition>> {
+        self.tape
+            .entries
+            .iter()
+            .find(|e| !e.request.deferred_tools.is_empty())
+            .map(|e| e.request.deferred_tools.clone())
+    }
     fn context_policy_override(&self) -> Option<Value> {
         self.tape
             .seed

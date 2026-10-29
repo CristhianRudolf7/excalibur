@@ -31,3 +31,5 @@ The `excalibur exec` command, evaluation profile, metrics/ATIF and replay are do
 See [Verifiable work](docs/development/verifiable-work.md) for durable tasks, plans, fresh evidence, the completion gate and independent verification.
 
 See [Context and cache](docs/development/context-cache.md) for durable context views, compaction, literal instructions and provider cache contracts.
+
+See [Project tools and editing concurrency](docs/development/project-tools.md) for deferred tools, confined language services, source graphs, reversible command snapshots and task worktree integration.
