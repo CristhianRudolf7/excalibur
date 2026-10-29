@@ -348,6 +348,12 @@ struct HeldModel {
     calls: AtomicUsize,
 }
 impl ModelGateway for HeldModel {
+    fn call_bound(&self, _: &ModelRequest) -> Option<excalibur_models::ModelCallBound> {
+        Some(excalibur_models::ModelCallBound {
+            max_tokens: 100,
+            max_cost_microusd: 0,
+        })
+    }
     fn identity(&self) -> String {
         "held-model-profile".into()
     }
@@ -372,7 +378,7 @@ impl ModelGateway for HeldModel {
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pause_while_model_is_held_confirms_response_without_effect_then_resume_reuses_it() {
+async fn pause_cancels_unconfirmed_inference_without_effects_and_resume_reissues_only_inference() {
     let _serial = TEST_SERIAL.lock().await;
     let (_root, db, journal) = database().await;
     let model = Arc::new(HeldModel {
@@ -390,22 +396,32 @@ async fn pause_while_model_is_held_confirms_response_without_effect_then_resume_
     });
     model.entered.notified().await;
     engine.pause(&run).await.unwrap();
-    model.release.notify_one();
-    let paused = driver.await.unwrap();
+    let paused = tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(paused.status, Status::Paused);
-    assert!(paused.response.is_some());
+    assert!(paused.response.is_none());
+    assert!(paused.usage.estimated);
+    assert_eq!(
+        paused
+            .usage
+            .input_tokens
+            .saturating_add(paused.usage.output_tokens),
+        100
+    );
     assert_eq!(tools.effects.load(Ordering::SeqCst), 0);
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
     // Reconstruct the engine boundary from durable events before resuming.
     let restarted = Engine::new(engine.journal().clone(), model.clone(), tools.clone());
-    assert!(restarted.load(&run).await.unwrap().response.is_some());
+    assert!(restarted.load(&run).await.unwrap().response.is_none());
     restarted.resume(&run).await.unwrap();
     assert_eq!(restarted.run(&run).await.unwrap().status, Status::Completed);
     assert_eq!(tools.effects.load(Ordering::SeqCst), 1);
     assert_eq!(
         model.calls.load(Ordering::SeqCst),
-        2,
-        "only the final post-tool model call is new"
+        3,
+        "unconfirmed inference is reissued once, then the final post-tool call"
     );
     let events = restarted.journal().replay(&run, 0).await.unwrap();
     assert_eq!(
@@ -413,7 +429,7 @@ async fn pause_while_model_is_held_confirms_response_without_effect_then_resume_
             .iter()
             .filter(|e| e.kind == "model_response" && e.key == "model:0:response")
             .count(),
-        1
+        0
     );
     db.shutdown().await.unwrap();
 }
@@ -478,8 +494,8 @@ async fn received_only_directive_is_applied_once_before_model_and_changed_gatewa
     assert_eq!(changed.count.load(Ordering::SeqCst), 0);
     assert_eq!(
         journal.replay(&pending, 0).await.unwrap().len(),
-        1,
-        "pending run retains only its original seed"
+        2,
+        "pending run retains its original seed and ready admission"
     );
     assert_eq!(
         journal.replay(&run, 0).await.unwrap().len(),

@@ -4,6 +4,7 @@ pub mod profile;
 mod runner;
 pub mod skills;
 mod tools;
+pub mod verifier;
 pub use runner::*;
 pub use tools::ExecutionTools;
 

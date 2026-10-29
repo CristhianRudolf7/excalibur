@@ -88,6 +88,7 @@ struct Inner {
     state: Mutex<State>,
     stopped: AtomicBool,
     run_sandboxes: Mutex<BTreeMap<String, SandboxConfig>>,
+    run_limits: Mutex<BTreeMap<String, excalibur_types::runtime::ExecutionLimits>>,
 }
 #[derive(Default)]
 struct State {
@@ -277,6 +278,7 @@ impl TerminalManager {
                 state: Mutex::new(State::default()),
                 stopped: AtomicBool::new(false),
                 run_sandboxes: Mutex::new(BTreeMap::new()),
+                run_limits: Mutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -538,6 +540,34 @@ impl TerminalManager {
             _ => return ToolResult::error("unsupported exec_io action"),
         }
         self.snapshot(&session, cursor, output_limit(&args))
+    }
+    pub fn set_execution_limits(
+        &self,
+        run: &str,
+        limits: excalibur_types::runtime::ExecutionLimits,
+    ) -> Result<(), String> {
+        let _serial = SPAWN_SERIAL.lock().unwrap();
+        self.inner
+            .run_limits
+            .lock()
+            .unwrap()
+            .insert(run.into(), limits);
+        Ok(())
+    }
+    pub fn execution_resources(&self, run: &str) -> excalibur_types::runtime::ExecutionResources {
+        let state = self.inner.state.lock().unwrap();
+        let sessions = state
+            .sessions
+            .values()
+            .filter(|session| session.owner == run);
+        let mut resources = excalibur_types::runtime::ExecutionResources::default();
+        for session in sessions {
+            resources.terminal_sessions += 1;
+            if !session.output.lock().unwrap().exited {
+                resources.processes += 1;
+            }
+        }
+        resources
     }
     pub fn live_status(&self, run: &str) -> Vec<Value> {
         self.inner.state.lock().unwrap().sessions.values().filter(|s|s.owner==run).map(|s|{
@@ -808,6 +838,19 @@ impl TerminalManager {
         let _serial = SPAWN_SERIAL.lock().unwrap();
         if self.inner.stopped.load(Ordering::Acquire) {
             return Err("terminal manager is shut down".into());
+        }
+        let limits = self.inner.run_limits.lock().unwrap().get(run).cloned();
+        if let Some(limits) = limits {
+            let resources = self.execution_resources(run);
+            if limits
+                .max_processes
+                .is_some_and(|limit| resources.processes >= limit)
+                || limits
+                    .max_terminal_sessions
+                    .is_some_and(|limit| resources.terminal_sessions >= limit)
+            {
+                return Err("budget: execution process or terminal-session limit reached".into());
+            }
         }
         self.make_room(run)?;
         make_global_room(run)?;

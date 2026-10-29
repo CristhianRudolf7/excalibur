@@ -1,9 +1,6 @@
-//! Episode-scoped tools backed by the shared writer. This is a small durable
-//! task scratchpad, not the full project/planning subsystem.
-use excalibur_store::{
-    Database, Error, Priority, ReadLane,
-    rusqlite::{self, OptionalExtension},
-};
+//! Scoped planning tools backed by the shared task store and writer.
+use excalibur_store::{Database, ReadLane, rusqlite::OptionalExtension};
+use excalibur_tasks::{TaskPolicy, TaskStore};
 use excalibur_types::runtime::*;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -18,25 +15,14 @@ const LOCAL: &[&str] = &[
     "read_file",
     "write_file",
 ];
-const ENTITIES: &[&str] = &[
-    "task",
-    "plan",
-    "requirement",
-    "criterion",
-    "check",
-    "evidence",
-    "assumption",
-    "decision",
-    "note",
-];
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS eval_tools_schema(version INTEGER PRIMARY KEY,checksum TEXT NOT NULL);CREATE TABLE IF NOT EXISTS eval_episode_records(scope TEXT NOT NULL,id TEXT NOT NULL,entity TEXT NOT NULL,version INTEGER NOT NULL CHECK(version>0),data TEXT NOT NULL CHECK(json_valid(data)),PRIMARY KEY(scope,id));CREATE TABLE IF NOT EXISTS eval_task_receipts(scope TEXT NOT NULL,operation_key TEXT NOT NULL,request_hash TEXT NOT NULL,result TEXT NOT NULL CHECK(json_valid(result)),PRIMARY KEY(scope,operation_key));";
-
 #[derive(Clone)]
 pub struct EpisodeTools {
     delegate: Arc<dyn ToolRuntime>,
     db: Database,
+    tasks: TaskStore,
     scope: String,
     catalog: Vec<ToolDefinition>,
+    workspace: Option<std::path::PathBuf>,
 }
 impl EpisodeTools {
     pub async fn new(
@@ -48,31 +34,10 @@ impl EpisodeTools {
         if scope.is_empty() || scope.len() > 128 || scope.chars().any(char::is_control) {
             return Err("episode scope must contain 1..128 printable bytes".into());
         }
-        let checksum = crate::files::hash(SCHEMA.as_bytes());
-        db.write(Priority::Normal, move |connection| {
-            connection.execute_batch(SCHEMA)?;
-            let old = connection
-                .query_row(
-                    "SELECT checksum FROM eval_tools_schema WHERE version=1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            match old {
-                Some(old) if old != checksum => {
-                    return Err(Error::Configuration(
-                        "episode tools schema checksum mismatch".into(),
-                    ));
-                }
-                None => {
-                    connection.execute("INSERT INTO eval_tools_schema VALUES(1,?1)", [checksum])?;
-                }
-                _ => {}
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|error| error.to_string())?;
+        let tasks = TaskStore::open(db.clone())
+            .await
+            .map_err(|e| e.to_string())?
+            .with_policy(TaskPolicy::episode(&scope));
         let mut catalog = delegate
             .definitions()
             .into_iter()
@@ -83,12 +48,52 @@ impl EpisodeTools {
         Ok(Self {
             delegate,
             db,
+            tasks,
             scope,
             catalog,
+            workspace: None,
         })
+    }
+    pub fn task_store(&self) -> TaskStore {
+        self.tasks.clone()
+    }
+    pub fn with_redactor(mut self, redactor: excalibur_vault::Redactor) -> Self {
+        self.tasks = self.tasks.with_redactor(redactor);
+        self
+    }
+    /// Enable executable checks in the host-authorized workspace.
+    pub fn with_workspace(mut self, workspace: std::path::PathBuf) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
+    pub fn with_planning_autonomy(mut self, autonomy: u8) -> Result<Self, String> {
+        if autonomy > 3 {
+            return Err("planning autonomy must be 0..3".into());
+        }
+        let mut policy = TaskPolicy::episode(self.scope.clone());
+        policy.autonomy = autonomy;
+        self.tasks = self.tasks.with_policy(policy);
+        Ok(self)
     }
     pub fn scope(&self) -> &str {
         &self.scope
+    }
+    async fn planning_admission(&self, run: &str, call: &ToolCall) -> Result<(), String> {
+        let mutates = matches!(
+            call.name.as_str(),
+            "write_file" | "edit_file" | "apply_patch" | "exec"
+        ) || call.name == "exec_io"
+            && self.args(call)?["action"]
+                .as_str()
+                .is_some_and(|a| matches!(a, "write" | "keys"));
+        if mutates {
+            self.tasks
+                .effect_admission(run)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
     fn args(&self, call: &ToolCall) -> Result<Value, String> {
         let args: Value = serde_json::from_str(&call.arguments)
@@ -157,26 +162,19 @@ impl EpisodeTools {
         }
         Ok(args)
     }
-    async fn receipt(&self, key: &str, request_hash: &str) -> Result<Option<Value>, String> {
-        let (scope, key, hash) = (self.scope.clone(), key.to_owned(), request_hash.to_owned());
-        self.db.read(ReadLane::Interactive,move|c| {
-            let found=c.query_row("SELECT request_hash,result FROM eval_task_receipts WHERE scope=?1 AND operation_key=?2",[scope,key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
-            match found {Some((stored,_))if stored!=hash=>Err(Error::Configuration("episode operation key reused with different arguments".into())),Some((_,result))=>serde_json::from_str(&result).map(Some).map_err(|e|Error::Configuration(e.to_string())),None=>Ok(None)}
-        }).await.map_err(|e|e.to_string())
+    async fn receipt(&self, key: &str, args: &Value) -> Result<Option<Value>, String> {
+        self.tasks
+            .receipt(&self.scope, key, args)
+            .await
+            .map(|value| value.map(episode_view))
+            .map_err(|e| e.to_string())
     }
     async fn task_db(&self, key: &str, args: Value) -> Result<Value, String> {
-        let scope = self.scope.clone();
-        let key = key.to_owned();
-        let request_hash = crate::files::hash(args.to_string().as_bytes());
-        let sanitizer = self.delegate.clone();
-        self.db.write(Priority::Normal,move|connection| {
-            let old=connection.query_row("SELECT request_hash,result FROM eval_task_receipts WHERE scope=?1 AND operation_key=?2",[&scope,&key],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).optional()?;
-            if let Some((hash,result))=old {if hash!=request_hash{return Err(Error::Configuration("episode operation key reused with different arguments".into()));}return serde_json::from_str(&result).map_err(|e|Error::Configuration(e.to_string()));}
-            let value=apply_batch(connection,&scope,&args).map_err(Error::Configuration)?;
-            let value=sanitizer.sanitize_durable(&value).map_err(Error::Configuration)?;
-            connection.execute("INSERT INTO eval_task_receipts VALUES(?1,?2,?3,?4)",rusqlite::params![scope,key,request_hash,value.to_string()])?;
-            Ok(value)
-        }).await.map_err(|e|e.to_string())
+        self.tasks
+            .batch(&self.scope, key, args)
+            .await
+            .map(episode_view)
+            .map_err(|e| e.to_string())
     }
     async fn own_execute(
         &self,
@@ -186,7 +184,33 @@ impl EpisodeTools {
     ) -> Result<Value, String> {
         let args = self.own_args(tool)?;
         match tool.call.name.as_str() {
-            "task_db" => self.task_db(key, args).await,
+            "task_db" => {
+                if let Some(check) = check_request(&args)? {
+                    self.tasks
+                        .effect_admission(run)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let task = self
+                        .tasks
+                        .task_for_run(run)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or("check execution requires a bound task")?;
+                    let root = self
+                        .workspace
+                        .clone()
+                        .ok_or("check execution requires a host workspace")?;
+                    let evidence = excalibur_tasks::verification::CheckRunner::new(
+                        self.delegate.clone(),
+                        root,
+                    )
+                    .run_keyed(&self.tasks, &task.id, check, run, key)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    return Ok(json!({"evidence":evidence}));
+                }
+                self.task_db(key, args).await
+            }
             "clock" => Ok(json!({"unix_seconds":excalibur_store::unix_seconds(),"timezone":"UTC"})),
             "status" => {
                 if args["action"] == "block" {
@@ -197,8 +221,7 @@ impl EpisodeTools {
                 let (scope, run) = (self.scope.clone(), run.to_owned());
                 self.db.read(ReadLane::Interactive,move|c| {
                     let state=c.query_row("SELECT state FROM runs WHERE id=?1",[&run],|row|row.get::<_,String>(0)).optional()?;
-                    let count=c.query_row("SELECT count(*) FROM eval_episode_records WHERE scope=?1",[&scope],|row|row.get::<_,u64>(0))?;
-                    Ok(json!({"scope":scope,"run_id":run,"run_state":state,"task_records":count}))
+                    Ok(json!({"scope":scope,"run_id":run,"run_state":state,"planning_available":true}))
                 }).await.map_err(|e|e.to_string())
             }
             "search_tools" => {
@@ -224,6 +247,55 @@ impl EpisodeTools {
     }
 }
 impl ToolRuntime for EpisodeTools {
+    fn interrupt_execution<'a>(
+        &'a self,
+        run: &'a str,
+        cancelled: bool,
+        tool: Option<&'a PreparedTool>,
+    ) -> BoxFuture<'a, Result<bool, String>> {
+        Box::pin(async move {
+            let inner = tool
+                .filter(|t| LOCAL.contains(&t.call.name.as_str()) || t.call.name == "call_tool")
+                .map(|tool| self.inner(tool))
+                .transpose()?;
+            if let Some(inner) = &inner {
+                self.delegate
+                    .interrupt_execution(run, cancelled, Some(inner))
+                    .await
+            } else if tool.is_none()
+                || tool.is_some_and(|t| {
+                    t.call.name == "task_db"
+                        && check_request(&self.args(&t.call).unwrap_or(Value::Null))
+                            .ok()
+                            .flatten()
+                            .is_some()
+                })
+            {
+                self.delegate
+                    .interrupt_execution(run, cancelled, None)
+                    .await
+            } else {
+                Ok(false)
+            }
+        })
+    }
+    fn configure_execution_limits<'a>(
+        &'a self,
+        run: &'a str,
+        limits: excalibur_types::runtime::ExecutionLimits,
+    ) -> excalibur_types::runtime::BoxFuture<'a, std::result::Result<(), String>> {
+        self.delegate.configure_execution_limits(run, limits)
+    }
+    fn execution_resources<'a>(
+        &'a self,
+        run: &'a str,
+    ) -> excalibur_types::runtime::BoxFuture<
+        'a,
+        std::result::Result<Option<excalibur_types::runtime::ExecutionResources>, String>,
+    > {
+        self.delegate.execution_resources(run)
+    }
+
     fn sanitize_durable(&self, value: &Value) -> Result<Value, String> {
         self.delegate.sanitize_durable(value)
     }
@@ -285,7 +357,7 @@ impl ToolRuntime for EpisodeTools {
         for (name, description, schema) in [
             (
                 "task_db",
-                "Atomic episode-local create_task/update_task/create_record/update_record/query. Updates require expected_version; queries return at most 20 rows and 8000 bytes with a cursor. No projects or full planner.",
+                "Atomic scoped tasks, plans, requirements, criteria, checks and dependencies. Mutable records require expected_version; queries are bounded. Evidence and completion are host-derived, never writable success claims. Submit {ops:[{op:run_check,check:ID}]} alone to execute a declared check through the sandbox.",
                 task_schema(),
             ),
             (
@@ -354,16 +426,39 @@ impl ToolRuntime for EpisodeTools {
                 {
                     return Err("tool is absent from the frozen episode catalog".into());
                 }
+                self.planning_admission(run, &call).await?;
                 let inner = self.delegate.prepare(run, call.clone()).await?;
                 return Ok(self.wrap(call, inner));
             }
             if call.name == "call_tool" {
-                let inner = self.delegate.prepare(run, self.dynamic(&call)?).await?;
+                let dynamic = self.dynamic(&call)?;
+                self.planning_admission(run, &dynamic).await?;
+                let inner = self.delegate.prepare(run, dynamic).await?;
                 return Ok(self.wrap(call, inner));
             }
             let args = self.args(&call)?;
             match call.name.as_str() {
-                "task_db" => validate_batch(&self.scope, &args)?,
+                "task_db" => {
+                    if check_request(&args)?.is_some() {
+                        if self.workspace.is_none()
+                            || self
+                                .tasks
+                                .task_for_run(run)
+                                .await
+                                .map_err(|e| e.to_string())?
+                                .is_none()
+                        {
+                            return Err(
+                                "run_check requires a bound task and a host-authorized workspace"
+                                    .into(),
+                            );
+                        }
+                    } else {
+                        self.tasks
+                            .validate_batch(&self.scope, &args)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
                 "clock" => keys(&args, &[])?,
                 "status" => {
                     keys(&args, &["action", "reason"])?;
@@ -398,9 +493,16 @@ impl ToolRuntime for EpisodeTools {
                 _ => return Err("tool is disabled or unavailable in the evaluation episode".into()),
             }
             let keyed = call.name == "task_db";
+            let non_idempotent_check = keyed && check_request(&args)?.is_some();
             Ok(PreparedTool {
                 call,
-                effect: if keyed { Effect::Keyed } else { Effect::Pure },
+                effect: if non_idempotent_check {
+                    Effect::NonIdempotent
+                } else if keyed {
+                    Effect::Keyed
+                } else {
+                    Effect::Pure
+                },
                 resources: vec![Resource {
                     key: format!("episode:{}", self.scope),
                     write: keyed,
@@ -419,7 +521,37 @@ impl ToolRuntime for EpisodeTools {
         Box::pin(async move {
             if LOCAL.contains(&tool.call.name.as_str()) || tool.call.name == "call_tool" {
                 return match self.inner(tool) {
-                    Ok(inner) => self.delegate.execute(run, key, &inner).await,
+                    Ok(inner) => {
+                        if let Err(error) = self.planning_admission(run, &inner.call).await {
+                            return ToolResult::error(error);
+                        }
+                        let _guard = if matches!(
+                            inner.call.name.as_str(),
+                            "write_file" | "edit_file" | "apply_patch"
+                        ) {
+                            Some(self.tasks.begin_mutation().await)
+                        } else {
+                            None
+                        };
+                        let result = self.delegate.execute(run, key, &inner).await;
+                        let paths = result.output["files"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|file| file["path"].as_str().map(str::to_owned))
+                            .collect::<Vec<_>>();
+                        if !paths.is_empty()
+                            && let Err(error) = self
+                                .tasks
+                                .invalidate_paths_locked(&self.scope, &paths)
+                                .await
+                        {
+                            return ToolResult::error(format!(
+                                "file effect confirmed; evidence invalidation requires recovery: {error}"
+                            ));
+                        }
+                        result
+                    }
                     Err(error) => ToolResult::error(error),
                 };
             }
@@ -471,8 +603,29 @@ impl ToolRuntime for EpisodeTools {
             if tool.call.name != "task_db" {
                 return Reconcile::Retry;
             }
-            let hash = crate::files::hash(args.to_string().as_bytes());
-            match self.receipt(key, &hash).await {
+            if check_request(&args).ok().flatten().is_some() {
+                let operation = format!("{run}:{key}");
+                let id = self
+                    .db
+                    .read(ReadLane::Interactive, move |c| {
+                        Ok(c.query_row(
+                            "SELECT evidence_id FROM task_check_attempts WHERE operation_key=?1",
+                            [operation],
+                            |r| r.get::<_, Option<String>>(0),
+                        )
+                        .optional()?
+                        .flatten())
+                    })
+                    .await;
+                return match id {
+                    Ok(Some(id)) => match self.tasks.evidence(&id).await {
+                        Ok(Some(evidence)) => Reconcile::Done(ToolResult::ok(json!({"evidence":evidence}))),
+                        _ => Reconcile::Uncertain("check receipt references unavailable evidence".into()),
+                    },
+                    _ => Reconcile::Uncertain("check interrupted before its evidence receipt; effects will not be repeated automatically".into()),
+                };
+            }
+            match self.receipt(key, &args).await {
                 Ok(Some(result)) => match self.delegate.sanitize_durable(&result) {
                     Ok(result) => Reconcile::Done(ToolResult::ok(result)),
                     Err(error) => Reconcile::Uncertain(error),
@@ -484,16 +637,7 @@ impl ToolRuntime for EpisodeTools {
     }
 }
 fn task_schema() -> Value {
-    let id = json!({"type":"string","minLength":1,"maxLength":128,"description":"At most 128 UTF-8 bytes, without control characters."});
-    let data = json!({"type":"object","description":"Record fields, at most 4096 serialized UTF-8 bytes. Updates merge these fields; null can clear a value."});
-    let entity = json!({"enum":ENTITIES});
-    json!({"type":"object","required":["ops"],"properties":{"ops":{"type":"array","minItems":1,"maxItems":64,"items":{"oneOf":[
-        {"type":"object","required":["op","id","title"],"properties":{"op":{"const":"create_task"},"id":id,"title":id,"scope":{"type":"string"},"data":data},"additionalProperties":false},
-        {"type":"object","required":["op","id","entity"],"properties":{"op":{"const":"create_record"},"id":id,"entity":entity,"scope":{"type":"string"},"data":data},"additionalProperties":false},
-        {"type":"object","required":["op","id","expected_version"],"properties":{"op":{"const":"update_task"},"id":id,"title":id,"scope":{"type":"string"},"data":data,"expected_version":{"type":"integer","minimum":1}},"additionalProperties":false},
-        {"type":"object","required":["op","id","expected_version"],"properties":{"op":{"const":"update_record"},"id":id,"entity":entity,"scope":{"type":"string"},"data":data,"expected_version":{"type":"integer","minimum":1}},"additionalProperties":false},
-        {"type":"object","required":["op"],"properties":{"op":{"const":"query"},"entity":entity,"scope":{"type":"string"},"after":{"type":"string","maxLength":128},"limit":{"type":"integer","minimum":1,"maximum":20,"default":20}},"additionalProperties":false}
-    ]}}},"additionalProperties":false})
+    excalibur_tasks::task_schema()
 }
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value
@@ -514,192 +658,37 @@ fn keys(value: &Value, allowed: &[&str]) -> Result<(), String> {
         Ok(())
     }
 }
-fn validate_batch(scope: &str, args: &Value) -> Result<(), String> {
+
+fn check_request(args: &Value) -> Result<Option<&str>, String> {
+    let Some(ops) = args.get("ops").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    if !ops.iter().any(|op| op["op"] == "run_check") {
+        return Ok(None);
+    }
     keys(args, &["ops"])?;
-    let ops = args["ops"].as_array().ok_or("ops must be an array")?;
-    if ops.is_empty() || ops.len() > 64 {
-        return Err("ops must contain 1..64 operations".into());
+    if ops.len() != 1 {
+        return Err("run_check is an executable operation and must be submitted alone".into());
     }
-    for op in ops {
-        if op.get("scope").is_some_and(|s| s != scope) {
-            return Err("operation targets another episode scope".into());
-        }
-        let name = text(op, "op")?;
-        match name {
-            "create_task" | "update_task" => {
-                keys(
-                    op,
-                    &["op", "scope", "id", "title", "data", "expected_version"],
-                )?;
-                text(op, "id")?;
-                if name == "create_task" {
-                    text(op, "title")?;
-                }
-                if op.get("title").is_some() {
-                    text(op, "title")?;
-                }
-            }
-            "create_record" | "update_record" => {
-                keys(
-                    op,
-                    &["op", "scope", "id", "entity", "data", "expected_version"],
-                )?;
-                text(op, "id")?;
-                if name == "create_record" && !ENTITIES.contains(&text(op, "entity")?) {
-                    return Err("entity is disabled in the evaluation episode".into());
-                }
-                if op.get("entity").is_some() && !ENTITIES.contains(&text(op, "entity")?) {
-                    return Err("entity is disabled in the evaluation episode".into());
-                }
-            }
-            "query" => {
-                keys(op, &["op", "scope", "entity", "limit", "after"])?;
-                if op
-                    .get("entity")
-                    .is_some_and(|v| !ENTITIES.contains(&v.as_str().unwrap_or("")))
-                {
-                    return Err("query entity is unavailable".into());
-                }
-                if op.get("after").is_some_and(|value| {
-                    value
-                        .as_str()
-                        .is_none_or(|s| s.len() > 128 || s.chars().any(char::is_control))
-                }) {
-                    return Err("query cursor must be a string up to 128 bytes".into());
-                }
-                if op
-                    .get("limit")
-                    .is_some_and(|v| v.as_u64().is_none_or(|n| n == 0 || n > 20))
-                {
-                    return Err("queries allow 1..20 rows".into());
-                }
-            }
-            _ => return Err("project, personal and cross-scope operations are disabled".into()),
-        }
-        if name.starts_with("update_")
-            && op
-                .get("expected_version")
-                .and_then(Value::as_u64)
-                .is_none_or(|n| n == 0 || n > i64::MAX as u64)
-        {
-            return Err("updates require a positive expected_version".into());
-        }
-        if op
-            .get("data")
-            .is_some_and(|data| !data.is_object() || data.to_string().len() > 4096)
-        {
-            return Err("record data must be an object up to 4096 bytes".into());
-        }
-    }
-    Ok(())
+    keys(&ops[0], &["op", "check"])?;
+    Ok(Some(text(&ops[0], "check")?))
 }
-fn apply_batch(
-    connection: &rusqlite::Connection,
-    scope: &str,
-    args: &Value,
-) -> Result<Value, String> {
-    validate_batch(scope, args)?;
-    let mut results = Vec::new();
-    for op in args["ops"].as_array().unwrap() {
-        let name = text(op, "op")?;
-        if name == "query" {
-            let entity = op.get("entity").and_then(Value::as_str);
-            let after = op.get("after").and_then(Value::as_str).unwrap_or("");
-            let limit = op.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
-            let mut statement=connection.prepare("SELECT id,entity,version,data FROM eval_episode_records WHERE scope=?1 AND (?2 IS NULL OR entity=?2) AND id>?3 ORDER BY id LIMIT 21").map_err(|e|e.to_string())?;
-            let rows = statement
-                .query_map(rusqlite::params![scope, entity, after], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, u64>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-            let mut output = Vec::new();
-            let mut bytes = 0;
-            let mut more = false;
-            for (id, entity, version, data) in rows {
-                let value = json!({"id":id,"entity":entity,"version":version,"data":serde_json::from_str::<Value>(&data).map_err(|e|e.to_string())?});
-                let size = value.to_string().len();
-                if output.len() >= limit || bytes + size > 8000 {
-                    more = true;
-                    break;
+
+// Preserve the episode DTO for opaque task fields; canonical fields remain
+// available at the row's top level. The same view is used for durable receipts.
+fn episode_view(mut value: Value) -> Value {
+    for result in value["results"].as_array_mut().into_iter().flatten() {
+        for row in result["rows"].as_array_mut().into_iter().flatten() {
+            if row["entity"] == "task" && row["data"].is_object() && row["metadata"].is_object() {
+                let mut data = row["metadata"].as_object().cloned().unwrap_or_default();
+                for field in ["title", "detail"] {
+                    if let Some(value) = row.get(field) {
+                        data.insert(field.into(), value.clone());
+                    }
                 }
-                bytes += size;
-                output.push(value);
+                row["data"] = Value::Object(data);
             }
-            let cursor = output.last().map(|value| value["id"].clone());
-            results.push(json!({"rows":output,"more":more,"next":cursor}));
-            continue;
-        }
-        let id = text(op, "id")?;
-        let mut data = op.get("data").cloned().unwrap_or(json!({}));
-        if let Some(title) = op.get("title") {
-            data["title"] = title.clone();
-        }
-        if name.starts_with("create_") {
-            if data.to_string().len() > 4096 {
-                return Err("record exceeds the 4096-byte data limit".into());
-            }
-            let entity = if name == "create_task" {
-                "task"
-            } else {
-                text(op, "entity")?
-            };
-            connection
-                .execute(
-                    "INSERT INTO eval_episode_records VALUES(?1,?2,?3,1,?4)",
-                    rusqlite::params![scope, id, entity, data.to_string()],
-                )
-                .map_err(|e| format!("record creation failed: {e}"))?;
-            results.push(json!({"id":id,"entity":entity,"version":1}));
-        } else {
-            let expected = op["expected_version"].as_u64().unwrap();
-            let old = connection
-                .query_row(
-                    "SELECT entity,version,data FROM eval_episode_records WHERE scope=?1 AND id=?2",
-                    [scope, id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, u64>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|e| e.to_string())?
-                .ok_or("record does not exist in this episode")?;
-            if old.1 != expected {
-                return Err(format!("version conflict: current_version={}", old.1));
-            }
-            if name == "update_task" && old.0 != "task" {
-                return Err("update_task requires a task record".into());
-            }
-            if op
-                .get("entity")
-                .is_some_and(|entity| entity.as_str() != Some(old.0.as_str()))
-            {
-                return Err("record entity cannot change during update".into());
-            }
-            let patch = data;
-            data = serde_json::from_str(&old.2).map_err(|_| "stored episode record is invalid")?;
-            let object = data
-                .as_object_mut()
-                .ok_or("stored episode record must be an object")?;
-            for (key, value) in patch.as_object().unwrap() {
-                object.insert(key.clone(), value.clone());
-            }
-            if data.to_string().len() > 4096 {
-                return Err("updated record exceeds the 4096-byte data limit".into());
-            }
-            connection.execute("UPDATE eval_episode_records SET version=version+1,data=?3 WHERE scope=?1 AND id=?2",rusqlite::params![scope,id,data.to_string()]).map_err(|e|e.to_string())?;
-            results.push(json!({"id":id,"entity":old.0,"version":expected+1}));
         }
     }
-    Ok(json!({"scope":scope,"results":results}))
+    value
 }

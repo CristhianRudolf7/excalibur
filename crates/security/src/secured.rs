@@ -239,6 +239,31 @@ impl SecuredTools {
     }
 }
 impl ToolRuntime for SecuredTools {
+    fn interrupt_execution<'a>(
+        &'a self,
+        run: &'a str,
+        cancelled: bool,
+        tool: Option<&'a excalibur_types::runtime::PreparedTool>,
+    ) -> excalibur_types::runtime::BoxFuture<'a, std::result::Result<bool, String>> {
+        self.delegate.interrupt_execution(run, cancelled, tool)
+    }
+    fn configure_execution_limits<'a>(
+        &'a self,
+        run: &'a str,
+        limits: excalibur_types::runtime::ExecutionLimits,
+    ) -> excalibur_types::runtime::BoxFuture<'a, std::result::Result<(), String>> {
+        self.delegate.configure_execution_limits(run, limits)
+    }
+    fn execution_resources<'a>(
+        &'a self,
+        run: &'a str,
+    ) -> excalibur_types::runtime::BoxFuture<
+        'a,
+        std::result::Result<Option<excalibur_types::runtime::ExecutionResources>, String>,
+    > {
+        self.delegate.execution_resources(run)
+    }
+
     fn observe_untrusted<'a>(
         &'a self,
         run: &'a str,

@@ -19,3 +19,5 @@ Inicialmente, el desarrollo y las pruebas se realizarán mediante la CLI y el n�
 Consulta el [soporte previsto de proveedores](providers.es.md) para las integraciones y otras modalidades.
 
 Consulta [Motor durable mínimo](../development/durable-engine.es.md) para el contrato actual y sus pruebas backend.
+
+Los contratos compartidos de tareas, planificación y evidencia se describen en [Trabajo verificable](../development/verifiable-work.es.md).

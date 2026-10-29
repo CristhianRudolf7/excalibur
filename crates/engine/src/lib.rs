@@ -1,11 +1,20 @@
 //! A durable single-run step engine. Applications embed it; no CLI or HTTP server.
+mod allocations;
+mod completion;
 mod episode_utilities;
+mod loops;
+pub use allocations::{
+    AllocatedUsage, ChildBudgetAllocation, remaining_budget, remaining_budget_for,
+    reserve_child_budget, settle_child_budget,
+};
+pub use completion::*;
 use excalibur_context::{ContextInput, compile};
 use excalibur_journal::{Event, Journal};
 use excalibur_models::ModelGateway;
 use excalibur_store::unix_seconds;
 use excalibur_types::runtime::*;
 use futures::{FutureExt, future::join_all};
+pub use loops::{LoopDetection, LoopRule, LoopState};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -35,6 +44,10 @@ pub struct Budget {
     pub max_wall_seconds: u64,
     pub max_tool_calls: u64,
     pub tool_timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_processes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_terminal_sessions: Option<u64>,
 }
 impl Default for Budget {
     fn default() -> Self {
@@ -45,7 +58,27 @@ impl Default for Budget {
             max_wall_seconds: 3600,
             max_tool_calls: 1000,
             tool_timeout_seconds: 300,
+            max_processes: None,
+            max_terminal_sessions: None,
         }
+    }
+}
+impl Budget {
+    pub fn fits_within(&self, cap: &Self) -> bool {
+        self.max_steps <= cap.max_steps
+            && self.max_tokens <= cap.max_tokens
+            && self.max_wall_seconds <= cap.max_wall_seconds
+            && self.max_tool_calls <= cap.max_tool_calls
+            && self.tool_timeout_seconds <= cap.tool_timeout_seconds
+            && cap
+                .max_cost_microusd
+                .is_none_or(|max| self.max_cost_microusd.is_some_and(|cost| cost <= max))
+            && cap
+                .max_processes
+                .is_none_or(|max| self.max_processes.is_some_and(|count| count <= max))
+            && cap
+                .max_terminal_sessions
+                .is_none_or(|max| self.max_terminal_sessions.is_some_and(|count| count <= max))
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -75,7 +108,12 @@ pub struct RunSpec {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
+    Created,
+    Ready,
     Running,
+    Waiting,
+    Verifying,
+    Recovering,
     Paused,
     Blocked,
     Completed,
@@ -86,7 +124,12 @@ pub enum Status {
 impl Status {
     fn label(&self) -> &'static str {
         match self {
+            Self::Created => "created",
+            Self::Ready => "ready",
             Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Verifying => "verifying",
+            Self::Recovering => "recovering",
             Self::Paused => "paused",
             Self::Blocked => "blocked",
             Self::Completed => "completed",
@@ -125,12 +168,34 @@ pub struct Snapshot {
     pub pending_directives: BTreeMap<String, String>,
     pub last_sequence: u64,
     pub gateway_identity: String,
+    #[serde(default)]
+    pub gate_assessment: GateAssessment,
+    #[serde(default)]
+    pub delivery_report: Option<DeliveryReport>,
+    #[serde(default)]
+    pub model_calls: u64,
+    #[serde(default)]
+    pub last_gate_step: Option<u64>,
+    #[serde(default)]
+    pub loops: LoopState,
+    #[serde(default)]
+    pub child_allocations: BTreeMap<String, ChildBudgetAllocation>,
+    #[serde(default)]
+    pub last_loop_step: Option<u64>,
+    #[serde(default)]
+    pub confirmed_model_failure: Option<Value>,
+    #[serde(default)]
+    pub request_revision: u64,
 }
 impl Snapshot {
     fn started(seed: &Value) -> Result<Self> {
         Ok(Self {
             spec: serde_json::from_value(seed["spec"].clone())?,
-            status: Status::Running,
+            status: if seed["initial_state"] == "created" {
+                Status::Created
+            } else {
+                Status::Running
+            },
             reason: None,
             step: 0,
             started_at: seed["started_at"]
@@ -155,6 +220,15 @@ impl Snapshot {
                 .as_str()
                 .ok_or(Error::Invalid("gateway identity missing"))?
                 .into(),
+            gate_assessment: GateAssessment::default(),
+            delivery_report: None,
+            model_calls: 0,
+            last_gate_step: None,
+            loops: LoopState::default(),
+            child_allocations: BTreeMap::new(),
+            last_loop_step: None,
+            confirmed_model_failure: None,
+            request_revision: 0,
         })
     }
     fn apply(&mut self, event: &Event) -> Result<()> {
@@ -162,7 +236,9 @@ impl Snapshot {
         match event.kind.as_str() {
             "run_started" => {}
             "model_request" => {
+                self.confirmed_model_failure = None;
                 self.request = Some(serde_json::from_value(p["request"].clone())?);
+                self.request_revision = p["revision"].as_u64().unwrap_or(self.revision);
             }
             "model_response" => {
                 let response: ModelResponse = serde_json::from_value(p["response"].clone())?;
@@ -198,6 +274,8 @@ impl Snapshot {
                     .is_some_and(|p| p.effect != Effect::Pure)
                 {
                     self.host_checks.clear();
+                    self.gate_assessment.evidence.clear();
+                    self.gate_report.clear();
                 }
             }
             "tool_result" => {
@@ -266,9 +344,57 @@ impl Snapshot {
                 self.step += 1;
             }
             "gate_report" => {
-                self.gate_attempts += 1;
                 self.gate_report = serde_json::from_value(p["pending"].clone())?;
+                if self.last_gate_step != Some(self.step) && !self.gate_report.is_empty() {
+                    self.gate_attempts += 1;
+                }
+                self.last_gate_step = Some(self.step);
                 self.final_text = p["final_text"].as_str().map(str::to_owned);
+                if let Some(assessment) = p.get("assessment") {
+                    self.gate_assessment = serde_json::from_value(assessment.clone())?;
+                }
+            }
+            "delivery_report" => {
+                let report: DeliveryReport = serde_json::from_value(p.clone())?;
+                if report.status == self.status && report.reason == self.reason {
+                    self.delivery_report = Some(report);
+                }
+            }
+            "loop_observation" => {
+                self.loops = serde_json::from_value(p["state"].clone())?;
+                self.last_loop_step = p["step"].as_u64();
+            }
+            "loop_detection" => {}
+            "child_budget_reserved" => {
+                let id = p["allocation_id"]
+                    .as_str()
+                    .ok_or(Error::Invalid("allocation ID missing"))?;
+                self.child_allocations
+                    .insert(id.into(), serde_json::from_value(p["allocation"].clone())?);
+            }
+            "child_budget_settled" => {
+                let id = p["allocation_id"]
+                    .as_str()
+                    .ok_or(Error::Invalid("allocation ID missing"))?;
+                self.child_allocations
+                    .get_mut(id)
+                    .ok_or(Error::Invalid("settled allocation missing"))?
+                    .settled = Some(serde_json::from_value(p["usage"].clone())?);
+            }
+            "model_interrupted" => {
+                self.confirmed_model_failure = None;
+                let usage: Usage = serde_json::from_value(p["estimated_usage"].clone())?;
+                self.usage.input_tokens =
+                    self.usage.input_tokens.saturating_add(usage.input_tokens);
+                self.usage.output_tokens =
+                    self.usage.output_tokens.saturating_add(usage.output_tokens);
+                self.usage.cost_microusd =
+                    self.usage.cost_microusd.saturating_add(usage.cost_microusd);
+                self.usage.estimated |= usage.estimated;
+                self.request = None;
+                self.response = None;
+                self.calls.clear();
+                self.step += 1;
             }
             "state_change" => {
                 self.status = serde_json::from_value(p["state"].clone())?;
@@ -291,11 +417,16 @@ impl Snapshot {
                     .remove(p["id"].as_str().ok_or(Error::Invalid("directive ID"))?);
                 let text = p["text"].as_str().ok_or(Error::Invalid("directive text"))?;
                 self.revision += 1;
+                self.gate_attempts = 0;
+                self.loops = LoopState::default();
+                self.last_loop_step = None;
                 self.history.push(Message::text(
                     "system",
                     format!("Context update v{}: {text}", self.revision),
                 ));
                 self.host_checks.clear();
+                self.gate_assessment.evidence.clear();
+                self.gate_report.clear();
             }
             "host_check" => {
                 let id = p["id"].as_str().ok_or(Error::Invalid("host check ID"))?;
@@ -307,14 +438,62 @@ impl Snapshot {
             "budget_updated" => {
                 self.spec.budget = serde_json::from_value(p["budget"].clone())?;
             }
-            "checkpoint" | "model_failure" | "model_dispatch" => {}
+            "model_dispatch" => self.model_calls += 1,
+            "verifier_model_request" => self.request = Some(serde_json::from_value(p.clone())?),
+            "verifier_model_response" => {
+                let response: ModelResponse = serde_json::from_value(p.clone())?;
+                self.final_text = Some(response.message.content);
+                self.request = None;
+            }
+            "verifier_tool_result" => {}
+            "verifier_model_failure" => {
+                if p["receipt_confirmed"] == true
+                    || (p["dispatch_absent"] == true
+                        && p.pointer("/metrics/provider_calls_known") == Some(&Value::Bool(true))
+                        && p.pointer("/metrics/provider_calls").and_then(Value::as_u64) == Some(0))
+                {
+                    self.request = None;
+                }
+            }
+            "verification_interruption_failed" => {
+                self.gate_assessment.open_questions.push("A verifier interruption could not be confirmed; inspect child state before resuming".into());
+                self.gate_report
+                    .push("Verifier interruption requires host reconciliation".into());
+            }
+            "verification_usage" => {
+                if p["receipt_confirmed"] == true {
+                    self.request = None;
+                }
+                let usage: Usage = serde_json::from_value(p["usage"].clone())?;
+                self.usage.input_tokens =
+                    self.usage.input_tokens.saturating_add(usage.input_tokens);
+                self.usage.output_tokens =
+                    self.usage.output_tokens.saturating_add(usage.output_tokens);
+                self.usage.cost_microusd =
+                    self.usage.cost_microusd.saturating_add(usage.cost_microusd);
+                self.usage.estimated |= usage.estimated;
+                self.model_calls = self
+                    .model_calls
+                    .saturating_add(p["model_calls"].as_u64().unwrap_or(0));
+                self.tool_calls = self
+                    .tool_calls
+                    .saturating_add(p["tool_calls"].as_u64().unwrap_or(0));
+                self.step = self.step.saturating_add(
+                    p["step_count"]
+                        .as_u64()
+                        .unwrap_or_else(|| p["model_calls"].as_u64().unwrap_or(0)),
+                );
+            }
+            "model_failure" => self.confirmed_model_failure = Some(p.clone()),
+            "checkpoint" | "wake_event" => {}
             _ => return Err(Error::Invalid("unknown durable event")),
         }
         self.last_sequence = event.sequence;
         Ok(())
     }
     pub fn pending_criteria(&self) -> Vec<String> {
-        self.spec
+        let mut pending: Vec<String> = self
+            .spec
             .criteria
             .iter()
             .filter_map(|criterion| {
@@ -351,7 +530,11 @@ impl Snapshot {
                 };
                 (!ok).then(|| format!("Unverified criterion: {criterion:?}"))
             })
-            .collect()
+            .collect();
+        if self.response.is_some() && self.request_revision != self.revision {
+            pending.push("Final response precedes the latest instruction revision".into());
+        }
+        pending
     }
     fn latest_tool(&self, name: &str) -> Option<ToolResult> {
         // The append-only history pairs assistant calls with results, in original call order.
@@ -417,6 +600,7 @@ pub struct Engine {
     observer: Option<Arc<dyn Observer>>,
     projection: Option<Projection>,
     stream_sink: Option<excalibur_models::StreamSink>,
+    completion_gate: Option<Arc<dyn CompletionGate>>,
 }
 impl Engine {
     pub fn new(
@@ -431,7 +615,12 @@ impl Engine {
             observer: None,
             projection: None,
             stream_sink: None,
+            completion_gate: None,
         }
+    }
+    pub fn with_completion_gate(mut self, gate: Arc<dyn CompletionGate>) -> Self {
+        self.completion_gate = Some(gate);
+        self
     }
     pub fn with_durable_sink(mut self, sink: Arc<dyn DurableSink>) -> Self {
         self.projection = Some(Projection {
@@ -544,11 +733,14 @@ impl Engine {
             self.flush_events(&run).await?;
             return Ok(run);
         }
-        let seed = json!({"spec":spec,"started_at":unix_seconds(),"gateway_identity":self.model.identity(),"model_dispatch_protocol":1});
+        let seed = json!({"spec":spec,"started_at":unix_seconds(),"gateway_identity":self.model.identity(),"model_dispatch_protocol":1,"initial_state":"created"});
         if self.sanitize(&seed)? != seed {
             return Err(Error::Invalid("secret literal in durable run identity"));
         }
         let run = self.journal.create_run(operation, seed).await?;
+        let mut state = self.load(&run).await?;
+        self.transition_from(&run, &mut state, &["created"], Status::Ready, None)
+            .await?;
         self.flush_events(&run).await?;
         Ok(run)
     }
@@ -621,7 +813,7 @@ impl Engine {
         status: Status,
         reason: Option<String>,
     ) -> Result<()> {
-        self.transition_from(run, state, &["running"], status, reason)
+        self.transition_from(run, state, &["running", "verifying"], status, reason)
             .await?;
         Ok(())
     }
@@ -664,6 +856,11 @@ impl Engine {
         if !expected.contains(&state.status.label()) {
             return Ok(false);
         }
+        if matches!(status, Status::Completed | Status::CompletedWithPending)
+            && (!state.pending_directives.is_empty() || state.request_revision != state.revision)
+        {
+            return Ok(false);
+        }
         let key = format!(
             "state:{}:{}:{}",
             state.step,
@@ -674,22 +871,64 @@ impl Engine {
             .map(|text| self.sanitize(&json!(text)))
             .transpose()?
             .and_then(|value| value.as_str().map(str::to_owned));
-        let applied = self
-            .journal
-            .set_state_if(run, expected, status.label(), reason, &key)
-            .await?;
+        let applied = if matches!(status, Status::Completed | Status::CompletedWithPending) {
+            self.journal
+                .set_state_if_revision(
+                    run,
+                    expected,
+                    state.last_sequence,
+                    status.label(),
+                    reason,
+                    &key,
+                )
+                .await?
+        } else {
+            self.journal
+                .set_state_if(run, expected, status.label(), reason, &key)
+                .await?
+        };
         self.flush_events(run).await?;
         *state = self.load(run).await?;
+        if applied
+            && matches!(
+                state.status,
+                Status::Paused
+                    | Status::Blocked
+                    | Status::Waiting
+                    | Status::Completed
+                    | Status::CompletedWithPending
+                    | Status::Cancelled
+                    | Status::Failed
+            )
+        {
+            self.emit_delivery_report(run, state).await?;
+        }
         Ok(applied)
+    }
+    async fn emit_delivery_report(&self, run: &str, state: &mut Snapshot) -> Result<()> {
+        let report = completion::build_report(&self.journal, run, state).await?;
+        let key = format!("delivery:{}", state.last_sequence);
+        self.event(
+            run,
+            state,
+            "delivery_report",
+            key,
+            serde_json::to_value(report)?,
+        )
+        .await
     }
     /// Host finalization of an unrecoverable execution error; never overwrites
     /// user controls or an already completed run.
     pub async fn fail(&self, run: &str, reason: &str) -> Result<()> {
         let mut state = self.load(run).await?;
+        if state.status == Status::Ready {
+            self.transition_from(run, &mut state, &["ready"], Status::Running, None)
+                .await?;
+        }
         self.transition_from(
             run,
             &mut state,
-            &["running"],
+            &["ready", "running", "waiting", "verifying", "recovering"],
             Status::Failed,
             Some(reason.into()),
         )
@@ -698,6 +937,10 @@ impl Engine {
     }
     pub async fn block(&self, run: &str, reason: &str) -> Result<()> {
         let mut state = self.load(run).await?;
+        if state.status == Status::Ready {
+            self.transition_from(run, &mut state, &["ready"], Status::Running, None)
+                .await?;
+        }
         self.transition(run, &mut state, Status::Blocked, Some(reason.into()))
             .await
     }
@@ -711,7 +954,15 @@ impl Engine {
             .transition_from(
                 run,
                 &mut s,
-                &["running", "paused", "blocked"],
+                &[
+                    "ready",
+                    "running",
+                    "waiting",
+                    "verifying",
+                    "recovering",
+                    "paused",
+                    "blocked",
+                ],
                 Status::Paused,
                 Some("user".into()),
             )
@@ -730,7 +981,16 @@ impl Engine {
             .transition_from(
                 run,
                 &mut s,
-                &["running", "paused", "blocked"],
+                &[
+                    "created",
+                    "ready",
+                    "running",
+                    "waiting",
+                    "verifying",
+                    "recovering",
+                    "paused",
+                    "blocked",
+                ],
                 Status::Cancelled,
                 Some("user".into()),
             )
@@ -744,10 +1004,48 @@ impl Engine {
         let _guard = self.journal.lock_run(run).await;
         let mut s = self.load(run).await?;
         if !self
-            .transition_from(run, &mut s, &["paused"], Status::Running, None)
+            .transition_from(run, &mut s, &["paused"], Status::Ready, None)
             .await?
         {
             return Err(Error::Invalid("only paused runs can resume"));
+        }
+        Ok(())
+    }
+    /// Host-declared wait. Calling run again does not wake it or spend model tokens.
+    pub async fn wait(&self, run: &str, reason: WaitReason) -> Result<()> {
+        let mut state = self.load(run).await?;
+        let reason = serde_json::to_value(reason)?.as_str().unwrap().to_owned();
+        if !self
+            .transition_from(run, &mut state, &["running"], Status::Waiting, Some(reason))
+            .await?
+        {
+            return Err(Error::Invalid("only a running execution can wait"));
+        }
+        Ok(())
+    }
+    /// A durable external event resumes a wait, without reopening user-paused runs.
+    pub async fn wake(&self, run: &str, event: WakeEvent, evidence: &str) -> Result<()> {
+        if evidence.trim().is_empty() {
+            return Err(Error::Invalid("wake evidence required"));
+        }
+        let mut state = self.load(run).await?;
+        if state.status != Status::Waiting {
+            return Err(Error::Invalid("only waiting executions can wake"));
+        }
+        let key = format!("wake:{}", state.last_sequence);
+        self.event(
+            run,
+            &mut state,
+            "wake_event",
+            key,
+            json!({"event":event,"evidence":evidence}),
+        )
+        .await?;
+        if !self
+            .transition_from(run, &mut state, &["waiting"], Status::Running, None)
+            .await?
+        {
+            return Err(Error::Invalid("control state prevented waking"));
         }
         Ok(())
     }
@@ -767,6 +1065,16 @@ impl Engine {
         }
         if budget.max_cost_microusd.is_some() && !self.model.cost_is_known() {
             return Err(Error::Invalid("cost budget requires priced usage"));
+        }
+        let cap=self.journal.database().read(excalibur_store::ReadLane::Interactive,{
+            let run=run.to_owned();move|c|{use excalibur_store::rusqlite::OptionalExtension;Ok(c.query_row("SELECT json_extract(payload,'$.allocation.budget') FROM journal WHERE kind='child_budget_reserved' AND json_extract(payload,'$.allocation.child_run')=?1 LIMIT 1",[run],|r|r.get::<_,String>(0)).optional()?)}
+        }).await.map_err(excalibur_journal::Error::from)?;
+        if cap.as_ref().is_some_and(|json| {
+            !serde_json::from_str::<Budget>(json).is_ok_and(|cap| budget.fits_within(&cap))
+        }) {
+            return Err(Error::Invalid(
+                "child budget cannot exceed its parent allocation",
+            ));
         }
         let key = format!("budget:{}", state.last_sequence);
         self.event(
@@ -797,6 +1105,13 @@ impl Engine {
             json!({"id":id,"text":text}),
         )
         .await?;
+        let mut state = self.load(run).await?;
+        if state.status == Status::Waiting {
+            self.wake(run, WakeEvent::Directive, id).await?;
+        } else if state.status == Status::Blocked {
+            self.transition_from(run, &mut state, &["blocked"], Status::Ready, None)
+                .await?;
+        }
         Ok(())
     }
     pub async fn record_check(
@@ -849,13 +1164,48 @@ impl Engine {
         let key = tool_key(run, s.step, index);
         self.event(run,&mut s,"tool_result",format!("{key}:result"),json!({"index":index,"name":call.name,"result":result,"reconciliation_evidence":evidence})).await?;
         if !self
-            .transition_from(run, &mut s, &["blocked"], Status::Running, None)
+            .transition_from(run, &mut s, &["blocked"], Status::Ready, None)
             .await?
         {
             return Err(Error::Invalid(
                 "reconciled outcome recorded but control state prevents resuming",
             ));
         }
+        Ok(())
+    }
+    /// Explicit host recovery of a confirmed model failure whose stop transition
+    /// was interrupted. Account from a receipt or a conservative reservation;
+    /// unknown charge is never silently converted into a measured zero.
+    pub async fn resolve_model_failure(
+        &self,
+        run: &str,
+        accounted_usage: Usage,
+        evidence: &str,
+    ) -> Result<()> {
+        let _guard = self.journal.lock_run(run).await;
+        let mut state = self.load(run).await?;
+        if !matches!(state.status, Status::Paused | Status::Blocked)
+            || state.confirmed_model_failure.is_none()
+            || state.request.is_none()
+            || state.response.is_some()
+            || !state.calls.is_empty()
+            || evidence.trim().is_empty()
+        {
+            return Err(Error::Invalid(
+                "explicit evidence and a paused confirmed model failure required",
+            ));
+        }
+        let key = format!("model:{}:interrupted", state.step);
+        self.event(
+            run,
+            &mut state,
+            "model_interrupted",
+            key,
+            json!({"estimated_usage":accounted_usage,"reconciliation_evidence":evidence}),
+        )
+        .await?;
+        self.transition_from(run, &mut state, &["paused", "blocked"], Status::Ready, None)
+            .await?;
         Ok(())
     }
     async fn honor_approval_wait(&self, run: &str, state: &mut Snapshot) -> Result<bool> {
@@ -871,12 +1221,165 @@ impl Engine {
         }
         Ok(false)
     }
+    async fn honor_admission(&self, run: &str, state: &mut Snapshot) -> Result<bool> {
+        let Some(gate) = &self.completion_gate else {
+            return Ok(false);
+        };
+        let admission = gate.admission(run).await.unwrap_or_else(|_| {
+            AdmissionState::Blocked("execution admission authority unavailable".into())
+        });
+        let (status, reason) = match admission {
+            AdmissionState::Ready => return Ok(false),
+            AdmissionState::Paused(reason) => (Status::Paused, reason),
+            AdmissionState::Blocked(reason) => (Status::Blocked, reason),
+            AdmissionState::Cancelled(reason) => (Status::Cancelled, reason),
+        };
+        if state.status == Status::Ready && status == Status::Blocked {
+            self.transition_from(run, state, &["ready"], Status::Running, None)
+                .await?;
+        }
+        self.transition_from(
+            run,
+            state,
+            &["ready", "running", "verifying", "recovering"],
+            status,
+            Some(reason),
+        )
+        .await?;
+        Ok(true)
+    }
     pub async fn run(&self, run: &str) -> Result<Snapshot> {
+        match self.drive(run).await {
+            Ok(mut state) => {
+                if matches!(
+                    state.status,
+                    Status::Paused
+                        | Status::Blocked
+                        | Status::Waiting
+                        | Status::Completed
+                        | Status::CompletedWithPending
+                        | Status::Failed
+                        | Status::Cancelled
+                ) && state.delivery_report.as_ref().is_none_or(|report| {
+                    report.source_sequence.saturating_add(1) < state.last_sequence
+                        || report.status != state.status
+                        || report.reason != state.reason
+                        || report.metrics.usage != state.usage
+                        || report.metrics.tool_calls != state.tool_calls
+                        || report.metrics.model_calls != state.model_calls
+                }) {
+                    self.emit_delivery_report(run, &mut state).await?;
+                }
+                Ok(state)
+            }
+            Err(error) => {
+                if matches!(error, Error::Model(_)) {
+                    self.fail(
+                        run,
+                        "model execution failed; inspect the classified model_failure event",
+                    )
+                    .await?;
+                }
+                Err(error)
+            }
+        }
+    }
+    async fn drive(&self, run: &str) -> Result<Snapshot> {
         let _guard = self.journal.lock_run(run).await;
         // Only intentions already present at admission need reconciliation.
-        let initial = self.load(run).await?;
+        let mut initial = self.load(run).await?;
         if initial.gateway_identity != self.model.identity() {
             return Err(Error::Invalid("gateway profile differs from durable run"));
+        }
+        if initial.status == Status::Created {
+            self.transition_from(run, &mut initial, &["created"], Status::Ready, None)
+                .await?;
+        }
+        if self.completion_gate.is_none()
+            && matches!(
+                initial.status,
+                Status::Ready | Status::Running | Status::Verifying | Status::Recovering
+            )
+        {
+            let bound=self.journal.database().read(excalibur_store::ReadLane::Interactive,{
+                let run=run.to_owned();move|c|{
+                    let exists:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_run_links')",[],|r|r.get(0))?;
+                    if !exists{return Ok(false);}
+                    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM task_run_links WHERE run_id=?1)",[run],|r|r.get::<_,bool>(0))?)
+                }
+            }).await.map_err(excalibur_journal::Error::from)?;
+            if bound {
+                if initial.status == Status::Ready {
+                    self.transition_from(run, &mut initial, &["ready"], Status::Running, None)
+                        .await?;
+                }
+                self.transition_from(
+                    run,
+                    &mut initial,
+                    &["running", "verifying", "recovering"],
+                    Status::Blocked,
+                    Some(
+                        "durable task completion adapter is required for this bound execution"
+                            .into(),
+                    ),
+                )
+                .await?;
+                return Ok(initial);
+            }
+        }
+        if matches!(
+            initial.status,
+            Status::Ready | Status::Running | Status::Verifying | Status::Recovering
+        ) && self.honor_admission(run, &mut initial).await?
+        {
+            return Ok(initial);
+        }
+        if matches!(initial.status, Status::Running | Status::Verifying) {
+            self.transition_from(
+                run,
+                &mut initial,
+                &["running", "verifying"],
+                Status::Recovering,
+                Some("restart reconciliation".into()),
+            )
+            .await?;
+        }
+        if initial.status == Status::Recovering {
+            self.transition_from(run, &mut initial, &["recovering"], Status::Ready, None)
+                .await?;
+        }
+        if initial.status == Status::Ready {
+            self.transition_from(run, &mut initial, &["ready"], Status::Running, None)
+                .await?;
+        }
+        if initial.status == Status::Running {
+            if initial.confirmed_model_failure.is_some()
+                && initial.request.is_some()
+                && initial.response.is_none()
+            {
+                self.transition(run,&mut initial,Status::Paused,Some("recovery: a model failure was already confirmed; provider calls will not repeat without an explicit host resolution".into())).await?;
+                return Ok(initial);
+            }
+            let available = remaining_budget(&initial);
+            let limits = ExecutionLimits {
+                max_processes: available.max_processes,
+                max_terminal_sessions: available.max_terminal_sessions,
+            };
+            if self
+                .tools
+                .configure_execution_limits(run, limits)
+                .await
+                .is_err()
+            {
+                self.transition(
+                    run,
+                    &mut initial,
+                    Status::Paused,
+                    Some("budget resource limits cannot be enforced by this adapter".into()),
+                )
+                .await?;
+                return Ok(initial);
+            }
         }
         if initial.status == Status::Running {
             for input in &initial.spec.context.untrusted {
@@ -903,6 +1406,12 @@ impl Engine {
             if self.honor_approval_wait(run, &mut s).await? {
                 return Ok(s);
             }
+            if self.honor_admission(run, &mut s).await? {
+                return Ok(s);
+            }
+            if self.resource_limit_reached(run, &mut s).await? {
+                return Ok(s);
+            }
             let capability_tool_budget = self
                 .tools
                 .execution_tool_budget(run)
@@ -918,6 +1427,43 @@ impl Engine {
                 )
                 .await?;
             }
+            // A durable projection may enqueue another directive while the
+            // previous application is being projected. Observe that fact before
+            // compiling or reusing an earlier response.
+            s = self.load(run).await?;
+            if s.status != Status::Running {
+                return Ok(s);
+            }
+            if !s.pending_directives.is_empty() {
+                continue;
+            }
+            if s.request_revision != s.revision
+                && s.response.as_ref().is_some_and(|response| {
+                    response
+                        .message
+                        .tool_calls
+                        .iter()
+                        .enumerate()
+                        .all(|(index, _)| {
+                            s.calls
+                                .get(&index)
+                                .is_some_and(|call| call.result.is_some())
+                        })
+                })
+            {
+                let key = format!("step:{}:completed", s.step);
+                let revision = s.revision;
+                self.event(
+                    run,
+                    &mut s,
+                    "step_completed",
+                    key,
+                    json!({"superseded_by_instruction_revision":revision}),
+                )
+                .await?;
+                self.checkpoint(run, &mut s).await?;
+                continue;
+            }
             if remaining_time(&s) == 0 {
                 self.transition(run, &mut s, Status::Paused, Some("wall time budget".into()))
                     .await?;
@@ -930,12 +1476,21 @@ impl Engine {
                     return Ok(s);
                 }
                 let mut input = s.spec.context.clone();
+                if let Some(gate) = &self.completion_gate {
+                    input.volatile.current_plan = gate
+                        .context(run)
+                        .await
+                        .map_err(|_| Error::Invalid("current task plan is unavailable"))?;
+                }
                 input.activity.extend(s.history.clone());
                 input.volatile.now_utc = self
                     .model
                     .request_time_override(s.step)
                     .unwrap_or_else(|| unix_seconds().to_string());
                 input.volatile.continuation = s.continuation.clone();
+                if !s.loops.note.is_empty() {
+                    input.volatile.recovery_notices.push(s.loops.note.clone());
+                }
                 for pin in s.pinned_observations.values() {
                     input.volatile.recovery_notices.push(format!(
                         "Pinned observation (untrusted data): {}",
@@ -945,6 +1500,13 @@ impl Engine {
                 input.volatile.budget_status = serde_json::to_string(
                     &json!({"step":s.step,"budget":s.spec.budget,"usage":s.usage,"tool_calls":s.tool_calls}),
                 )?;
+                if !s.child_allocations.is_empty() {
+                    let mut budget_status: Value =
+                        serde_json::from_str(&input.volatile.budget_status)?;
+                    budget_status["child_allocations"] =
+                        serde_json::to_value(&s.child_allocations)?;
+                    input.volatile.budget_status = serde_json::to_string(&budget_status)?;
+                }
                 input.volatile.finalization_report = s.gate_report.join("\n");
                 input.tools_enabled = !closing(&s)
                     && capability_tool_budget.is_none_or(|budget| s.tool_calls < budget);
@@ -963,19 +1525,18 @@ impl Engine {
                 };
                 self.point(Boundary::BeforeModelRequest, run, s.step, None);
                 let key = format!("model:{}:request", s.step);
-                self.event(run,&mut s,"model_request",key,json!({"request":compiled.request,"hash":format!("{:x}",Sha256::digest(&compiled.bytes)),"layer_hashes":compiled.layer_hashes})).await?;
+                let revision = s.revision;
+                self.event(run,&mut s,"model_request",key,json!({"request":compiled.request,"hash":format!("{:x}",Sha256::digest(&compiled.bytes)),"layer_hashes":compiled.layer_hashes,"revision":revision})).await?;
                 self.point(Boundary::ModelRequestConfirmed, run, s.step, None);
             }
             if s.response.is_none() {
                 let request = s.request.clone().unwrap();
+                let available = remaining_budget(&s);
                 if let Some(bound) = self.model.call_bound(&request)
-                    && (bound.max_tokens
-                        > s.spec.budget.max_tokens.saturating_sub(
-                            s.usage.input_tokens.saturating_add(s.usage.output_tokens),
-                        )
-                        || s.spec.budget.max_cost_microusd.is_some_and(|cap| {
-                            bound.max_cost_microusd > cap.saturating_sub(s.usage.cost_microusd)
-                        }))
+                    && (bound.max_tokens > available.max_tokens
+                        || available
+                            .max_cost_microusd
+                            .is_some_and(|cap| bound.max_cost_microusd > cap))
                 {
                     self.transition(
                         run,
@@ -987,29 +1548,145 @@ impl Engine {
                     return Ok(s);
                 }
                 let key = format!("model:{}:dispatch", s.step);
-                self.event(
-                    run,
-                    &mut s,
-                    "model_dispatch",
-                    key,
-                    json!({"metadata":self.model.metadata()}),
-                )
-                .await?;
+                let payload = self.sanitize(&json!({"metadata":self.model.metadata()}))?;
+                let Some(sequence) = self
+                    .journal
+                    .append_when_running(run, "model_dispatch", &key, payload.clone())
+                    .await?
+                else {
+                    return self.load(run).await;
+                };
+                self.flush_events(run).await?;
+                if sequence > s.last_sequence {
+                    s.apply(&Event {
+                        sequence,
+                        kind: "model_dispatch".into(),
+                        key,
+                        payload,
+                    })?;
+                }
                 let remaining = remaining_time(&s).max(1);
+                let stream_repeats = Arc::new(Mutex::new(loops::StreamRepeats::default()));
+                let repeated = Arc::new(tokio::sync::Notify::new());
+                let tracked_sink = self.stream_sink.as_ref().map(|sink| {
+                    let sink = sink.clone();
+                    let tracker = stream_repeats.clone();
+                    let repeated = repeated.clone();
+                    Arc::new(move |delta: excalibur_models::StreamDelta| {
+                        if let excalibur_models::StreamDelta::Text { delta: text, .. } = &delta
+                            && tracker.lock().unwrap().push(text)
+                        {
+                            repeated.notify_one();
+                            return;
+                        }
+                        sink(delta);
+                    }) as excalibur_models::StreamSink
+                });
+                let mut interruption_metrics =
+                    excalibur_models::ModelCallMetrics::request(&request, self.model.metadata());
+                interruption_metrics.usage.estimated = true;
+                let control_metrics = interruption_metrics.clone();
+                let control_interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let interrupted_flag = control_interrupted.clone();
+                let interruption_bound = self.model.call_bound(&request);
+                let reserved_tokens = interruption_bound
+                    .as_ref()
+                    .map(|bound| bound.max_tokens)
+                    .unwrap_or(available.max_tokens);
+                let reserved_cost = interruption_bound
+                    .as_ref()
+                    .map(|bound| bound.max_cost_microusd)
+                    .unwrap_or(available.max_cost_microusd.unwrap_or(0));
+                let estimated_input = serde_json::to_vec(&request)?.len() as u64 + 100;
                 let response = tokio::time::timeout(
                     Duration::from_secs(remaining),
                     AssertUnwindSafe(async {
-                        if let Some(sink) = &self.stream_sink {
-                            self.model
-                                .complete_stream_observed(request, sink.clone())
-                                .await
+                        let call=async{if let Some(sink) = tracked_sink {
+                            tokio::select!{
+                                biased;
+                                _=repeated.notified()=>Err(excalibur_models::ModelCallError::new(excalibur_models::ModelError::Consumer,interruption_metrics)),
+                                outcome=self.model.complete_stream_observed(request,sink)=>outcome,
+                            }
                         } else {
                             self.model.complete_observed(request).await
+                        }};
+                        tokio::select!{
+                            outcome=call=>outcome,
+                            _=self.wait_for_control(run,None)=>{
+                                interrupted_flag.store(true,std::sync::atomic::Ordering::SeqCst);
+                                Err(excalibur_models::ModelCallError::new(excalibur_models::ModelError::Consumer,control_metrics))
+                            },
                         }
                     })
                     .catch_unwind(),
                 )
                 .await;
+                if control_interrupted.load(std::sync::atomic::Ordering::SeqCst) {
+                    let key = format!("model:{}:failure", s.step);
+                    self.event(run,&mut s,"model_failure",key,json!({"failure_class":"consumer","error":"local model request cancelled by durable control; provider receipt and charge are unknown"})).await?;
+                    let key = format!("model:{}:interrupted", s.step);
+                    self.event(run,&mut s,"model_interrupted",key,json!({"accounting_kind":"conservative_reservation","estimated_usage":Usage{input_tokens:estimated_input.min(reserved_tokens),output_tokens:reserved_tokens.saturating_sub(estimated_input),cost_microusd:reserved_cost,estimated:true}})).await?;
+                    return self.load(run).await;
+                }
+                if stream_repeats.lock().unwrap().detected {
+                    let (metrics, usage, cost_known) = match &response {
+                        Ok(Ok(Ok(observed))) => (
+                            Some(observed.metrics.clone()),
+                            observed.response.usage.clone(),
+                            observed.metrics.cost_microusd.is_some(),
+                        ),
+                        Ok(Ok(Err(failure))) => (
+                            Some(*failure.metrics.clone()),
+                            Usage {
+                                input_tokens: estimated_input.min(reserved_tokens),
+                                output_tokens: reserved_tokens.saturating_sub(estimated_input),
+                                cost_microusd: reserved_cost,
+                                estimated: true,
+                            },
+                            false,
+                        ),
+                        _ => (
+                            None,
+                            Usage {
+                                input_tokens: estimated_input.min(reserved_tokens),
+                                output_tokens: reserved_tokens.saturating_sub(estimated_input),
+                                cost_microusd: reserved_cost,
+                                estimated: true,
+                            },
+                            false,
+                        ),
+                    };
+                    let key = format!("model:{}:failure", s.step);
+                    self.event(run,&mut s,"model_failure",key,json!({"failure_class":"validation","metrics":metrics,"error":"stream repetition R5 stopped; absent provider counters and charge remain unknown"})).await?;
+                    let detection = s.loops.detect(LoopRule::R5);
+                    self.record_loop_detection(run, &mut s, Some(detection.clone()))
+                        .await?;
+                    let key = format!("model:{}:interrupted", s.step);
+                    self.event(
+                        run,
+                        &mut s,
+                        "model_interrupted",
+                        key,
+                        json!({"estimated_usage":usage}),
+                    )
+                    .await?;
+                    if detection.level >= 3 {
+                        self.transition(run, &mut s, Status::Blocked, Some(detection.note))
+                            .await?;
+                        return Ok(s);
+                    }
+                    if s.spec.budget.max_cost_microusd.is_some() && !cost_known {
+                        self.transition(
+                            run,
+                            &mut s,
+                            Status::Paused,
+                            Some("budget: interrupted model charge is unknown".into()),
+                        )
+                        .await?;
+                        return Ok(s);
+                    }
+                    continue;
+                }
                 let observed = match response {
                     Ok(Ok(Ok(observed))) => observed,
                     Ok(Ok(Err(error))) => {
@@ -1115,26 +1792,143 @@ impl Engine {
             }
             let response = s.response.clone().unwrap();
             if response.message.tool_calls.is_empty() {
-                let pending = s.pending_criteria();
-                let key = format!("gate:{}", s.step);
+                self.transition(run, &mut s, Status::Verifying, None)
+                    .await?;
+                if s.status != Status::Verifying {
+                    return Ok(s);
+                }
+                let input = GateInput {
+                    step: s.step,
+                    instruction_revision: s.revision,
+                    final_text: response.message.content.clone(),
+                    local_pending: s.pending_criteria(),
+                    budget_remaining: remaining_budget(&s),
+                };
+                let external_guard = if let Some(gate) = &self.completion_gate {
+                    let (inspected, timed_out) = tokio::select! {
+                        outcome=gate.inspect(run,&input)=>(Some(outcome),false),
+                        _=self.wait_for_phase_control(run,None,"verifying")=>(None,false),
+                        _=tokio::time::sleep(Duration::from_secs(remaining_time(&s)))=>(None,true),
+                    };
+                    if timed_out {
+                        self.transition(
+                            run,
+                            &mut s,
+                            Status::Paused,
+                            Some("wall time budget exhausted during verification".into()),
+                        )
+                        .await?;
+                    }
+                    let Some(inspected) = inspected else {
+                        let cancelled = self.journal.state(run).await?.0 == "cancelled";
+                        if gate.interrupt(run, cancelled).await.is_err() {
+                            let key =
+                                format!("verification-interrupt:{}:{}", s.step, s.last_sequence);
+                            self.event(
+                                run,
+                                &mut s,
+                                "verification_interruption_failed",
+                                key,
+                                json!({"warning":"verifier child interruption was not confirmed"}),
+                            )
+                            .await?;
+                        }
+                        return self.load(run).await;
+                    };
+                    match inspected {
+                        Ok(guard) => Some(guard),
+                        Err(_) => {
+                            self.transition(
+                                run,
+                                &mut s,
+                                Status::Blocked,
+                                Some(
+                                    "completion gate unavailable; verification cannot be claimed"
+                                        .into(),
+                                ),
+                            )
+                            .await?;
+                            return Ok(s);
+                        }
+                    }
+                } else {
+                    None
+                };
+                s = self.load(run).await?;
+                if s.status != Status::Verifying {
+                    return Ok(s);
+                }
+                let assessment = external_guard
+                    .as_ref()
+                    .map(|guard| guard.report())
+                    .unwrap_or_default();
+                let mut pending = input.local_pending;
+                pending.extend(
+                    assessment
+                        .issues
+                        .iter()
+                        .map(|issue| format!("{}: {}", issue.id, issue.detail)),
+                );
+                let confirmations_only = !assessment.issues.is_empty()
+                    && assessment
+                        .issues
+                        .iter()
+                        .all(|issue| issue.kind == GateIssueKind::UserConfirmation)
+                    && pending.len() == assessment.issues.len();
+                let blocked = assessment.issues.iter().any(|issue| issue.blocked);
+                let key = format!("gate:{}:{}", s.step, s.last_sequence);
                 self.event(
                     run,
                     &mut s,
                     "gate_report",
                     key,
-                    json!({"pending":pending,"final_text":response.message.content}),
+                    json!({"pending":pending,"final_text":response.message.content,"assessment":assessment}),
                 )
                 .await?;
                 self.point(Boundary::GateReportConfirmed, run, s.step, None);
                 if s.gate_report.is_empty() {
                     self.transition(run, &mut s, Status::Completed, None)
                         .await?;
+                    if s.status == Status::Verifying {
+                        drop(external_guard);
+                        self.transition_from(run, &mut s, &["verifying"], Status::Running, None)
+                            .await?;
+                        continue;
+                    }
                     return Ok(s);
                 }
-                if s.gate_attempts > 2 || closing(&s) {
-                    let reason = s.gate_report.join("; ");
-                    self.transition(run, &mut s, Status::CompletedWithPending, Some(reason))
-                        .await?;
+                if s.gate_attempts >= 2 || closing(&s) || confirmations_only {
+                    let reason = if confirmations_only {
+                        format!("pending your confirmation: {}", s.gate_report.join("; "))
+                    } else {
+                        s.gate_report.join("; ")
+                    };
+                    self.transition(
+                        run,
+                        &mut s,
+                        if blocked {
+                            Status::Blocked
+                        } else {
+                            Status::CompletedWithPending
+                        },
+                        Some(reason),
+                    )
+                    .await?;
+                    if s.status == Status::Verifying {
+                        drop(external_guard);
+                        self.transition_from(run, &mut s, &["verifying"], Status::Running, None)
+                            .await?;
+                        continue;
+                    }
+                    return Ok(s);
+                }
+                drop(external_guard);
+                self.transition_from(run, &mut s, &["verifying"], Status::Running, None)
+                    .await?;
+                if s.status != Status::Running {
+                    return Ok(s);
+                }
+                if self.honor_admission(run, &mut s).await? {
                     return Ok(s);
                 }
                 let key = format!("step:{}:completed", s.step);
@@ -1176,12 +1970,14 @@ impl Engine {
                 if s.status != Status::Running {
                     return Ok(s);
                 }
-                let mut slots = s
-                    .spec
-                    .budget
-                    .max_tool_calls
-                    .min(capability_tool_budget.unwrap_or(u64::MAX))
-                    .saturating_sub(s.tool_calls);
+                if self.honor_admission(run, &mut s).await? {
+                    return Ok(s);
+                }
+                let mut slots = remaining_budget(&s).max_tool_calls.min(
+                    capability_tool_budget
+                        .unwrap_or(u64::MAX)
+                        .saturating_sub(s.tool_calls),
+                );
                 let mut tool_limit = false;
                 let mut actions = Vec::new();
                 for (index, plan) in batch {
@@ -1266,15 +2062,164 @@ impl Engine {
             if s.status != Status::Running {
                 return Ok(s);
             }
+            let loop_calls = response
+                .message
+                .tool_calls
+                .iter()
+                .enumerate()
+                .filter_map(|(index, call)| {
+                    s.calls
+                        .get(&index)
+                        .and_then(|c| c.result.clone())
+                        .map(|result| (call.clone(), result))
+                })
+                .collect::<Vec<_>>();
+            let detection = self.observe_loops(run, &mut s, &loop_calls).await?;
             let key = format!("step:{}:completed", s.step);
             self.event(run, &mut s, "step_completed", key, json!({}))
                 .await?;
             self.checkpoint(run, &mut s).await?;
-            if let Some(reason) = loop_reason(&s.history) {
-                self.transition(run, &mut s, Status::Paused, Some(reason))
+            if let Some(detection) = detection.filter(|d| d.level >= 3) {
+                self.transition(run, &mut s, Status::Blocked, Some(detection.note))
                     .await?;
                 return Ok(s);
             }
+        }
+    }
+    async fn observe_loops(
+        &self,
+        run: &str,
+        state: &mut Snapshot,
+        calls: &[(ToolCall, ToolResult)],
+    ) -> Result<Option<LoopDetection>> {
+        if state.last_loop_step == Some(state.step) {
+            return Ok(state.loops.last_detection.clone());
+        }
+        let versions=self.journal.database().read(excalibur_store::ReadLane::Interactive,{
+            let run=run.to_owned();move|c|{let mut stmt=c.prepare("SELECT DISTINCT path,postimage_blob FROM file_versions WHERE run_id=?1 ORDER BY path,postimage_blob")?;Ok(stmt.query_map([run],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?)}
+        }).await.map_err(excalibur_journal::Error::from)?;
+        let plan = if let Some(gate) = &self.completion_gate {
+            gate.context(run)
+                .await
+                .map_err(|_| Error::Invalid("task progress unavailable"))?
+        } else {
+            String::new()
+        };
+        let progress = json!({"files":versions,"revision":state.revision,"evidence":state.host_checks,"plan":plan});
+        let detection = state.loops.observe(calls, &progress);
+        self.record_loop_detection(run, state, detection.clone())
+            .await?;
+        Ok(detection)
+    }
+    async fn wait_for_control(&self, run: &str, tool: Option<&PreparedTool>) -> bool {
+        self.wait_for_phase_control(run, tool, "running").await
+    }
+    async fn wait_for_phase_control(
+        &self,
+        run: &str,
+        tool: Option<&PreparedTool>,
+        phase: &str,
+    ) -> bool {
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            match self.journal.state(run).await {
+                Ok((state, _)) if state == phase => {}
+                Ok((state, _)) => {
+                    return self
+                        .tools
+                        .interrupt_execution(run, state == "cancelled", tool)
+                        .await
+                        .unwrap_or(false);
+                }
+                Err(_) => {
+                    return self
+                        .tools
+                        .interrupt_execution(run, false, tool)
+                        .await
+                        .unwrap_or(false);
+                }
+            }
+        }
+    }
+    async fn record_loop_detection(
+        &self,
+        run: &str,
+        state: &mut Snapshot,
+        detection: Option<LoopDetection>,
+    ) -> Result<()> {
+        let key = format!("loops:{}:{}", state.step, state.last_sequence);
+        self.event(
+            run,
+            state,
+            "loop_observation",
+            key,
+            json!({"state":state.loops,"step":state.step}),
+        )
+        .await?;
+        if let Some(detection) = detection {
+            let key = format!("loop:{}:{}", state.step, state.last_sequence);
+            self.event(
+                run,
+                state,
+                "loop_detection",
+                key,
+                serde_json::to_value(detection)?,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    async fn resource_limit_reached(&self, run: &str, state: &mut Snapshot) -> Result<bool> {
+        let limits = remaining_budget(state);
+        if limits.max_processes.is_none() && limits.max_terminal_sessions.is_none() {
+            return Ok(false);
+        }
+        if self
+            .tools
+            .configure_execution_limits(
+                run,
+                ExecutionLimits {
+                    max_processes: limits.max_processes,
+                    max_terminal_sessions: limits.max_terminal_sessions,
+                },
+            )
+            .await
+            .is_err()
+        {
+            self.transition(
+                run,
+                state,
+                Status::Paused,
+                Some("budget resource limit cannot be enforced".into()),
+            )
+            .await?;
+            return Ok(true);
+        }
+        let resources = self
+            .tools
+            .execution_resources(run)
+            .await
+            .map_err(|_| Error::Invalid("execution resource counts unavailable"))?;
+        let reason = match resources {
+            None => Some("budget resource counts cannot be verified"),
+            Some(r) if limits.max_processes.is_some_and(|max| r.processes >= max) => {
+                Some("budget: managed process limit")
+            }
+            Some(r)
+                if limits
+                    .max_terminal_sessions
+                    .is_some_and(|max| r.terminal_sessions >= max) =>
+            {
+                Some("budget: terminal session limit")
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            self.transition(run, state, Status::Paused, Some(reason.into()))
+                .await?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
     async fn execute_tool(&self, run: &str, job: ToolJob) -> Option<AttemptFailure> {
@@ -1391,11 +2336,22 @@ impl Engine {
             }
             Reconcile::Retry => match tokio::time::timeout(
                 Duration::from_secs(timeout),
-                AssertUnwindSafe(self.execute(run, &key, &prepared)).catch_unwind(),
+                AssertUnwindSafe(async {
+                    let execution=self.execute(run,&key,&prepared);
+                    tokio::pin!(execution);
+                    tokio::select! {
+                        result=&mut execution=>Some(result),
+                        interrupted=self.wait_for_control(run,Some(&prepared))=>{
+                            if !interrupted&&prepared.effect!=Effect::Pure{Some(execution.await)}else{None}
+                        },
+                    }
+                })
+                .catch_unwind(),
             )
             .await
             {
-                Ok(Ok(result)) => result,
+                Ok(Ok(Some(result))) => result,
+                Ok(Ok(None)) => return None,
                 _ if prepared.effect == Effect::Pure => {
                     ToolResult::error("read-only tool interrupted or timed out")
                 }
@@ -1620,82 +2576,30 @@ struct AttemptFailure {
 fn tool_key(run: &str, step: u64, index: usize) -> String {
     format!("{run}:step:{step}:tool:{index}")
 }
-fn loop_reason(history: &[Message]) -> Option<String> {
-    let mut signature = None;
-    let mut failed_steps = 0;
-    let mut failed_results = Vec::new();
-    for message in history.iter().rev() {
-        if message.role == "system" {
-            break;
-        }
-        if message.role == "tool" {
-            let result: ToolResult = serde_json::from_str(&message.content).ok()?;
-            let detail = result
-                .output
-                .get("error")
-                .and_then(Value::as_str)
-                .and_then(|text| serde_json::from_str::<Value>(text).ok());
-            if failed_steps == 0
-                && (result.output["escalate_to_parent"] == true
-                    || detail
-                        .as_ref()
-                        .is_some_and(|v| v["escalate_to_parent"] == true))
-            {
-                return Some(
-                    "file fingerprint conflicts require parent or host intervention".into(),
-                );
-            }
-            failed_results.push(!result.success);
-        } else if message.role == "assistant" && !message.tool_calls.is_empty() {
-            if failed_results.len() != message.tool_calls.len() || failed_results.iter().any(|v| !v)
-            {
-                return None;
-            }
-            let current: Vec<_> = message
-                .tool_calls
-                .iter()
-                .map(|call| (&call.name, &call.arguments))
-                .collect();
-            let current = serde_json::to_string(&current).ok()?;
-            if signature.as_ref().is_some_and(|s| s != &current) {
-                return None;
-            }
-            signature = Some(current);
-            failed_results.clear();
-            failed_steps += 1;
-            if failed_steps >= 3 {
-                return Some(
-                    "three identical unsuccessful tool steps require host intervention".into(),
-                );
-            }
-        }
-    }
-    None
-}
 fn remaining_time(s: &Snapshot) -> u64 {
-    s.spec
-        .budget
-        .max_wall_seconds
-        .saturating_sub(unix_seconds().saturating_sub(s.started_at).max(0) as u64)
+    remaining_budget(s).max_wall_seconds
 }
 fn budget_exhausted(s: &Snapshot) -> bool {
-    s.step >= s.spec.budget.max_steps
-        || s.usage.input_tokens.saturating_add(s.usage.output_tokens) >= s.spec.budget.max_tokens
-        || s.spec
-            .budget
-            .max_cost_microusd
-            .is_some_and(|max| s.usage.cost_microusd >= max)
-        || remaining_time(s) == 0
+    let remaining = remaining_budget(s);
+    remaining.max_steps == 0
+        || remaining.max_tokens == 0
+        || remaining.max_cost_microusd == Some(0)
+        || remaining.max_wall_seconds == 0
 }
 fn closing(s: &Snapshot) -> bool {
     let b = &s.spec.budget;
-    let used = s.usage.input_tokens.saturating_add(s.usage.output_tokens);
-    s.tool_calls >= b.max_tool_calls
-        || b.max_steps.saturating_sub(s.step) <= 1
-        || b.max_steps.saturating_sub(s.step).saturating_mul(10) < b.max_steps
-        || b.max_tokens.saturating_sub(used).saturating_mul(10) < b.max_tokens
-        || b.max_cost_microusd
-            .is_some_and(|max| max.saturating_sub(s.usage.cost_microusd).saturating_mul(10) < max)
+    let remaining = remaining_budget(s);
+    let steps_with_current = remaining
+        .max_steps
+        .saturating_add(u64::from(s.request.is_some()));
+    remaining.max_tool_calls == 0
+        || steps_with_current <= 1
+        || steps_with_current.saturating_mul(10) < b.max_steps
+        || remaining.max_tokens.saturating_mul(10) < b.max_tokens
+        || remaining
+            .max_cost_microusd
+            .zip(b.max_cost_microusd)
+            .is_some_and(|(left, total)| left.saturating_mul(10) < total)
         || remaining_time(s).saturating_mul(10) < b.max_wall_seconds
 }
 fn covers(plan: &ToolScheduling, tool: &PreparedTool) -> bool {

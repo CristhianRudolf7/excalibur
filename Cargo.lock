@@ -872,6 +872,7 @@ dependencies = [
  "excalibur-sandbox",
  "excalibur-security",
  "excalibur-store",
+ "excalibur-tasks",
  "excalibur-telemetry",
  "excalibur-tools",
  "excalibur-types",
@@ -935,6 +936,7 @@ dependencies = [
 name = "excalibur-sandbox"
 version = "0.1.0"
 dependencies = [
+ "cap-std",
  "excalibur-types",
  "httparse",
  "libc",
@@ -944,6 +946,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -992,6 +995,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "excalibur-tasks"
+version = "0.1.0"
+dependencies = [
+ "cap-std",
+ "excalibur-engine",
+ "excalibur-journal",
+ "excalibur-sandbox",
+ "excalibur-store",
+ "excalibur-tools",
+ "excalibur-types",
+ "excalibur-vault",
+ "globset",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
 name = "excalibur-telemetry"
 version = "0.1.0"
 dependencies = [
@@ -1016,8 +1041,10 @@ name = "excalibur-tools"
 version = "0.1.0"
 dependencies = [
  "cap-std",
+ "excalibur-journal",
  "excalibur-sandbox",
  "excalibur-store",
+ "excalibur-tasks",
  "excalibur-types",
  "excalibur-vault",
  "fs2",

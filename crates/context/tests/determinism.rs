@@ -94,3 +94,26 @@ fn determinism_across_processes_and_restart() {
     }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn current_micro_plan_changes_only_the_volatile_projection() {
+    let mut context = excalibur_context::ContextInput::new("Core", "Literal request", "UTC");
+    let before = excalibur_context::compile(&context).unwrap();
+    context.volatile.current_plan = "micro@2 S1: verify [in_progress]".into();
+    let after = excalibur_context::compile(&context).unwrap();
+    assert_eq!(&before.layer_hashes[..5], &after.layer_hashes[..5]);
+    assert_ne!(before.layer_hashes[5], after.layer_hashes[5]);
+    assert!(
+        after
+            .request
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("micro@2")
+    );
+    assert_eq!(
+        after.bytes,
+        excalibur_context::compile(&context).unwrap().bytes
+    );
+}

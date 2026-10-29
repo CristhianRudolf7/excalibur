@@ -1,5 +1,6 @@
 //! Fail-closed Linux process confinement. Configuration belongs to the trusted host.
 //! Project roots and existing sensitive subtrees are fixed by the trusted host.
+pub mod file_authority;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

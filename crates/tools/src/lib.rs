@@ -968,6 +968,35 @@ pub fn head_tail(text: &str, budget: usize) -> String {
     format!("{}{}{}", &text[..end], marker, &text[start..])
 }
 impl ToolRuntime for LocalTools {
+    fn interrupt_execution<'a>(
+        &'a self,
+        run: &'a str,
+        _cancelled: bool,
+        tool: Option<&'a PreparedTool>,
+    ) -> BoxFuture<'a, Result<bool, String>> {
+        Box::pin(async move {
+            if tool.is_some_and(|t| !matches!(t.call.name.as_str(), "exec" | "exec_io")) {
+                return Ok(false);
+            }
+            let active = self.terminal.execution_resources(run).processes > 0;
+            self.terminal.cancel_run(run).await;
+            Ok(active)
+        })
+    }
+    fn configure_execution_limits<'a>(
+        &'a self,
+        run: &'a str,
+        limits: excalibur_types::runtime::ExecutionLimits,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.terminal.set_execution_limits(run, limits) })
+    }
+    fn execution_resources<'a>(
+        &'a self,
+        run: &'a str,
+    ) -> BoxFuture<'a, Result<Option<excalibur_types::runtime::ExecutionResources>, String>> {
+        Box::pin(async move { Ok(Some(self.terminal.execution_resources(run))) })
+    }
+
     fn configure_network_authorizer<'a>(
         &'a self,
         run: &'a str,

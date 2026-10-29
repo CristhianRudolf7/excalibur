@@ -19,3 +19,5 @@ Initially, develop and test through the CLI and shared core. Whether the CLI sho
 See [planned provider support](providers.md) for the target integrations and other modalities.
 
 See [Minimum durable engine](../development/durable-engine.md) for the current contract and backend checks.
+
+The shared task/planning and evidence contracts are described in [Verifiable work](../development/verifiable-work.md).

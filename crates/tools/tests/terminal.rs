@@ -567,3 +567,51 @@ fn global_session_ceiling_helper() {
         tokio::join!(a.shutdown(), b.shutdown());
     });
 }
+
+#[tokio::test]
+async fn execution_limits_are_admitted_atomically_and_can_be_expanded() {
+    use excalibur_types::runtime::ExecutionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    manager
+        .set_execution_limits(
+            "limited",
+            ExecutionLimits {
+                max_processes: Some(1),
+                max_terminal_sessions: Some(2),
+            },
+        )
+        .unwrap();
+    let command = json!({"cmd":"IFS= read -r line", "yield_ms":250});
+    let (left, right) = tokio::join!(
+        manager.exec("limited", command.clone()),
+        manager.exec("limited", command.clone())
+    );
+    assert_eq!(usize::from(left.success) + usize::from(right.success), 1);
+    let rejected = if left.success { &right } else { &left };
+    assert!(rejected.output.to_string().contains("budget"));
+    assert_eq!(manager.execution_resources("limited").processes, 1);
+    assert_eq!(manager.execution_resources("limited").terminal_sessions, 1);
+    manager
+        .set_execution_limits(
+            "limited",
+            ExecutionLimits {
+                max_processes: Some(2),
+                max_terminal_sessions: Some(2),
+            },
+        )
+        .unwrap();
+    assert!(manager.exec("limited", command).await.success);
+    assert_eq!(manager.execution_resources("limited").processes, 2);
+    assert!(
+        !manager
+            .exec("limited", json!({"cmd":"touch forbidden"}))
+            .await
+            .success
+    );
+    assert!(!dir.path().join("forbidden").exists());
+    assert_eq!(manager.execution_resources("other").processes, 0);
+    manager.cancel_run("limited").await;
+    assert_eq!(manager.execution_resources("limited").processes, 0);
+    manager.shutdown().await;
+}

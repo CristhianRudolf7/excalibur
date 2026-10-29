@@ -193,6 +193,17 @@ pub enum FinalizationState {
 pub trait FinalizationGuard: Send {
     fn state(&self) -> FinalizationState;
 }
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionLimits {
+    pub max_processes: Option<u64>,
+    pub max_terminal_sessions: Option<u64>,
+}
+/// Managed command groups and terminal records; this is not an OS descendant count.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionResources {
+    pub processes: u64,
+    pub terminal_sessions: u64,
+}
 struct ReadyFinalizationGuard;
 impl FinalizationGuard for ReadyFinalizationGuard {
     fn state(&self) -> FinalizationState {
@@ -202,6 +213,35 @@ impl FinalizationGuard for ReadyFinalizationGuard {
 /// Preparation may persist preimages, but must not perform the requested external effect.
 /// Execution is called only after a confirmed durable intention; recovery never guesses.
 pub trait ToolRuntime: Send + Sync {
+    /// Interrupt managed run processes after an authoritative pause/cancel.
+    /// Effect reconciliation still decides whether an interrupted operation may retry.
+    fn interrupt_execution<'a>(
+        &'a self,
+        _run: &'a str,
+        _cancelled: bool,
+        _tool: Option<&'a PreparedTool>,
+    ) -> BoxFuture<'a, Result<bool, String>> {
+        Box::pin(async { Ok(false) })
+    }
+    fn configure_execution_limits<'a>(
+        &'a self,
+        _run: &'a str,
+        limits: ExecutionLimits,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            if limits.max_processes.is_some() || limits.max_terminal_sessions.is_some() {
+                Err("tool adapter cannot enforce execution resource limits".into())
+            } else {
+                Ok(())
+            }
+        })
+    }
+    fn execution_resources<'a>(
+        &'a self,
+        _run: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ExecutionResources>, String>> {
+        Box::pin(async { Ok(None) })
+    }
     /// Sanitize data before any durable model/context or execution event is recorded.
     fn sanitize_durable(&self, value: &Value) -> Result<Value, String> {
         Ok(value.clone())

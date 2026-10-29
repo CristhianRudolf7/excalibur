@@ -270,11 +270,7 @@ fn pending_backend_criterion_has_exit_2_after_bounded_completion_gate() {
     )
     .unwrap();
     let final_reply = response(json!({"role":"assistant","content":"done"}));
-    let (endpoint, _, worker) = server(vec![
-        (200, final_reply.clone()),
-        (200, final_reply.clone()),
-        (200, final_reply),
-    ]);
+    let (endpoint, calls, worker) = server(vec![(200, final_reply.clone()), (200, final_reply)]);
     let out = command(&root, &logs)
         .args([
             "--base-url",
@@ -294,6 +290,7 @@ fn pending_backend_criterion_has_exit_2_after_bounded_completion_gate() {
         String::from_utf8_lossy(&out.stderr)
     );
     worker.join().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     let result = String::from_utf8(out.stdout)
         .unwrap()
         .lines()

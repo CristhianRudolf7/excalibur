@@ -57,6 +57,7 @@ pub struct Security {
     protected: Arc<Vec<PathBuf>>,
     evaluations: Arc<Vec<PathBuf>>,
     noninteractive: bool,
+    verification_checks: Option<Arc<std::collections::BTreeSet<String>>>,
 }
 const SQL: &str = include_str!("schema.sql");
 const DISPATCH_SQL: &str = include_str!("dispatch.sql");
@@ -117,6 +118,7 @@ impl Security {
             protected: Arc::new(Vec::new()),
             evaluations: Arc::new(Vec::new()),
             noninteractive: false,
+            verification_checks: None,
         })
     }
     /// Host-owned encrypted vault and evaluation paths are never delegated to model policy.
@@ -289,6 +291,26 @@ impl Security {
         self.noninteractive = true;
         self
     }
+    /// Host-selected exact check commands, confined by a read-only, offline
+    /// capability. This does not create or impersonate a user approval.
+    pub fn with_verification_checks(
+        mut self,
+        commands: std::collections::BTreeSet<String>,
+    ) -> Result<Self> {
+        if self.ceiling.roots.iter().any(|root| root.write)
+            || self.ceiling.network != Network::None
+            || !self.ceiling.secrets.is_empty()
+            || !self.ceiling.external_actions.is_empty()
+            || !matches!(
+                self.ceiling.sandbox_profile.as_deref(),
+                Some("read-only" | "eval")
+            )
+        {
+            return Err(Error::Denied("verification checks require a read-only offline capability without secrets or external actions".into()));
+        }
+        self.verification_checks = Some(Arc::new(commands));
+        Ok(self)
+    }
     pub async fn authorize(&self, run: &str, action: &Action, now: i64) -> Result<Decision> {
         self.authorize_with_ticket(run, action, now, None).await
     }
@@ -317,6 +339,27 @@ impl Security {
         if let Some(reason) = denial {
             self.audit(json!({"kind":"authorization_denied","run":run,"action":action,"reason":reason,"at":now})).await?;
             return Ok(Decision::Deny { reason });
+        }
+        if let (Action::Exec { command }, Some(checks)) = (action, &self.verification_checks) {
+            let report = classify(action);
+            let allowed = checks.contains(command)
+                && token.roots.iter().all(|root| !root.write)
+                && token.network == Network::None
+                && token.secrets.is_empty()
+                && token.external_actions.is_empty()
+                && matches!(token.sandbox_profile.as_deref(), Some("read-only" | "eval"))
+                && !report.sensitive
+                && !report.network_command
+                && report.risk != Risk::High;
+            self.audit(json!({"kind":"verification_check_authorized","run":run,"action":action,"allowed":allowed,"at":now})).await?;
+            return Ok(if allowed {
+                Decision::Allow
+            } else {
+                Decision::Deny {
+                    reason: "command is outside the declared offline read-only verification policy"
+                        .into(),
+                }
+            });
         }
         if self
             .approved(run, &config.project, action, now, ticket)

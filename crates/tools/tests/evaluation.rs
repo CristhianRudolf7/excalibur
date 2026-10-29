@@ -303,7 +303,13 @@ async fn episode_queries_are_bounded_and_concurrent_updates_preserve_data() {
     );
     let ops=(0..25).map(|index|json!({"op":"create_task","id":format!("task-{index:02}"),"title":"Task","data":{"retained":true}})).collect::<Vec<_>>();
     assert!(invoke(&tools, "create", json!({"ops":ops})).await.success);
-    let query = invoke(&tools, "query", json!({"ops":[{"op":"query"}]})).await;
+    let query = invoke(
+        &tools,
+        "query",
+        json!({"ops":[{"op":"query","entity":"task","fields":["id","version","metadata","title"]}]}),
+    )
+    .await;
+    assert!(query.success, "{query:?}");
     assert_eq!(
         query.output["results"][0]["rows"].as_array().unwrap().len(),
         20
@@ -313,9 +319,10 @@ async fn episode_queries_are_bounded_and_concurrent_updates_preserve_data() {
     let rest = invoke(
         &tools,
         "rest",
-        json!({"ops":[{"op":"query","after":cursor}]}),
+        json!({"ops":[{"op":"query","entity":"task","after":cursor,"fields":["id","version","metadata","title"]}]}),
     )
     .await;
+    assert!(rest.success, "{rest:?}");
     assert_eq!(
         rest.output["results"][0]["rows"].as_array().unwrap().len(),
         5
@@ -495,4 +502,26 @@ async fn invalid_cgroup_delegation_prevents_user_code() {
     );
     assert!(!root.join("cgroup-effect").exists());
     terminal.shutdown().await;
+}
+
+#[tokio::test]
+async fn task_queries_preserve_opaque_episode_data_and_replay_the_same_view() {
+    let (_temp, db, local) = fixture().await;
+    let tools = EpisodeTools::new(local, db.clone(), "dto").await.unwrap();
+    assert!(invoke(&tools,"draft",json!({"ops":[{"op":"create_record","id":"draft-task","entity":"task","data":{"opaque":"retained draft"}}]})).await.success);
+    let args = json!({"ops":[{"op":"query","entity":"task"}]});
+    let prepared = tools
+        .prepare("run", call("query", "task_db", args))
+        .await
+        .unwrap();
+    let result = tools.execute("run", "query-key", &prepared).await;
+    assert!(result.success, "{result:?}");
+    assert_eq!(
+        result.output["results"][0]["rows"][0]["data"]["opaque"],
+        "retained draft"
+    );
+    assert!(
+        matches!(tools.reconcile("run","query-key",&prepared).await,Reconcile::Done(replayed)if replayed==result)
+    );
+    db.shutdown().await.unwrap();
 }

@@ -5,6 +5,9 @@ use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolatileContext {
+    /// Current database projection, refreshed by the host before each step.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub current_plan: String,
     /// Explicit host time, never obtained by the compiler.
     pub now_utc: String,
     pub continuation: String,

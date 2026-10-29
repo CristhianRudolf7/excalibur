@@ -115,10 +115,15 @@ pub fn exit_code(status: &Status) -> i32 {
         Status::Paused => 4,
         Status::Failed => 5,
         Status::Cancelled => 130,
-        Status::Running => 1,
+        Status::Created
+        | Status::Ready
+        | Status::Running
+        | Status::Waiting
+        | Status::Verifying
+        | Status::Recovering => 1,
     }
 }
-struct Projection(Arc<Telemetry>);
+struct Projection(Arc<Telemetry>, excalibur_tasks::TaskStore);
 impl DurableSink for Projection {
     fn record<'a>(
         &'a self,
@@ -126,6 +131,10 @@ impl DurableSink for Projection {
         event: &'a Event,
     ) -> BoxFuture<'a, std::result::Result<(), String>> {
         Box::pin(async move {
+            self.1
+                .observe_event(run, event)
+                .await
+                .map_err(|_| "task projection unavailable".to_string())?;
             self.0
                 .record_event(run, event)
                 .await
@@ -138,6 +147,7 @@ pub struct Execution {
     pub engine: Engine,
     pub run_id: String,
     pub telemetry: Arc<Telemetry>,
+    pub tasks: excalibur_tasks::TaskStore,
     local: Arc<LocalTools>,
     db: Database,
     logs: PathBuf,
@@ -344,6 +354,7 @@ impl Execution {
         if options.profile == ExecutionProfile::Project {
             excalibur_sandbox::prepare_project_boundary(&root).map_err(config_error)?;
         }
+        let verifier_sandbox = sandbox.clone();
         let local = Arc::new(
             LocalTools::new(
                 db.clone(),
@@ -383,7 +394,7 @@ impl Execution {
             .await
             .map_err(|_| ExecError::Backend)?
             .with_protected_paths(
-                protected,
+                protected.clone(),
                 vec![
                     PathBuf::from("/tests"),
                     PathBuf::from("/solution"),
@@ -395,9 +406,23 @@ impl Execution {
         let secured: Arc<dyn ToolRuntime> =
             Arc::new(SecuredTools::new(local.clone(), security.clone()));
         let episode =
-            excalibur_tools::evaluation::EpisodeTools::new(secured, db.clone(), "episode")
+            excalibur_tools::evaluation::EpisodeTools::new(secured.clone(), db.clone(), "episode")
                 .await
+                .map_err(config_error)?
+                .with_workspace(root.clone())
+                .with_redactor(redactor.clone())
+                .with_planning_autonomy(if options.profile == ExecutionProfile::Eval {
+                    3
+                } else {
+                    match options.autonomy {
+                        Autonomy::Consultative => 0,
+                        Autonomy::Supervised => 1,
+                        Autonomy::Autonomous => 2,
+                        Autonomy::Full => 3,
+                    }
+                })
                 .map_err(config_error)?;
+        let task_store = episode.task_store();
         let skill_mount = options
             .profile_override
             .as_ref()
@@ -433,12 +458,12 @@ impl Execution {
                 .extra
                 .insert("profile_hash".into(), json!(hash(p)));
         }
-        options.metadata.extra.insert("capability_availability".into(),json!({"tools":catalog.iter().map(|d|&d.name).collect::<Vec<_>>(),"subagent_orchestrator":false,"full_task_planner":false,"full_skill_catalog":false,"deferred_adapters":[],"rewards_source":"external_host_adapter_only"}));
+        options.metadata.extra.insert("capability_availability".into(),json!({"tools":catalog.iter().map(|d|&d.name).collect::<Vec<_>>(),"subagent_orchestrator":false,"durable_task_planning":true,"independent_task_verifier":true,"full_skill_catalog":false,"deferred_adapters":[],"rewards_source":"external_host_adapter_only"}));
         options.metadata.tool_catalog_hash = Some(tools_hash);
         options.metadata.skill_catalog_hash = Some(hash(&skills));
         options.metadata.environment = json!({"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"cpus":options.task_cpu_count,"timezone":"UTC","language":frozen.as_ref().map(|p|p.language.as_str()).unwrap_or("en")});
         let sampling = json!({"seed":options.metadata.seed,"temperature":options.metadata.temperature,"reasoning_effort":options.metadata.reasoning_effort,"requested_only":true});
-        let mut telemetry_config = TelemetryConfig::new(&data, options.metadata, redactor);
+        let mut telemetry_config = TelemetryConfig::new(&data, options.metadata, redactor.clone());
         telemetry_config.artifact_root = Some(logs.clone());
         telemetry_config.resources.cgroup = options.cgroup.clone();
         telemetry_config.resources.cgroup_scope = options.cgroup_scope;
@@ -447,8 +472,70 @@ impl Execution {
                 .await
                 .map_err(|_| ExecError::Backend)?,
         );
+        let (checklist_runtime, checklist_path): (Arc<dyn ToolRuntime>, PathBuf) =
+            if options.profile == ExecutionProfile::Eval {
+                let checklist_root = data.join("checklists");
+                std::fs::create_dir_all(&checklist_root).map_err(|_| ExecError::Backend)?;
+                let checklist = LocalTools::new(
+                    db.clone(),
+                    checklist_root,
+                    ToolPolicy {
+                        redactor: redactor.clone(),
+                        read: Access::Allow,
+                        write: Access::Allow,
+                        exec: Access::Deny,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(config_error)?;
+                (Arc::new(checklist), PathBuf::from("README.md"))
+            } else {
+                let folder = ["tests", "test", "scripts"]
+                    .into_iter()
+                    .find(|folder| root.join(folder).is_dir())
+                    .unwrap_or("tests");
+                let projection: Arc<dyn ToolRuntime> = if options.autonomy == Autonomy::Consultative
+                {
+                    Arc::new(
+                        LocalTools::new(
+                            db.clone(),
+                            root.clone(),
+                            ToolPolicy {
+                                redactor: redactor.clone(),
+                                protected_paths: protected.clone(),
+                                read: Access::Allow,
+                                write: Access::Deny,
+                                exec: Access::Deny,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map_err(config_error)?,
+                    )
+                } else {
+                    local.clone()
+                };
+                (projection, PathBuf::from(folder).join("README.md"))
+            };
+        let verifier = Arc::new(crate::verifier::GatewayVerifier {
+            store: task_store.clone(),
+            model: model.clone(),
+            workspace: root.clone(),
+            sandbox: verifier_sandbox,
+            protected: protected.clone(),
+            redactor: redactor.clone(),
+        });
+        let gate = excalibur_tasks::verification::TaskCompletionGate::new(
+            task_store.clone(),
+            excalibur_tasks::verification::CheckRunner::new(secured.clone(), root.clone())
+                .with_exclusions(protected.clone()),
+        )
+        .with_verifier(verifier)
+        .with_checklist(checklist_runtime, checklist_path);
         let engine = Engine::new(journal, model, tools)
-            .with_durable_sink(Arc::new(Projection(telemetry.clone())));
+            .with_completion_gate(Arc::new(gate))
+            .with_durable_sink(Arc::new(Projection(telemetry.clone(), task_store.clone())));
         let mut context = ContextInput::new(
             "You are Excalibur, the execution coordinator for one isolated task. Never ask questions or request permission. Use conservative assumptions. Missing mandatory data blocks the task: call status with action=block and a reason instead of asking. Rejected operations are tool results: find an authorized alternative. Never read verifier tests or benchmark solutions; never change security or use undeclared services.",
             options.request.clone(),
@@ -475,10 +562,20 @@ impl Execution {
                 &options.operation_id,
                 excalibur_engine::RunSpec {
                     context,
-                    budget: options.budget,
+                    budget: options.budget.clone(),
                     criteria,
                 },
             )
+            .await
+            .map_err(config_error)?;
+        task_store.host_batch("episode", "bootstrap-execution", json!({"ops":[
+            {"op":"create_task","id":"episode-task","title":"Execute the literal request","data":{"request_card":{"original":options.request,"interpretation":"Execute the literal request and report observable results","assumptions":[],"open_questions":[],"pinned_instructions":[]},"budget":options.budget,"metadata":{"workspace":root}}},
+            {"op":"create_requirement","id":"episode-request","data":{"text":if options.request.trim().is_empty(){"Mandatory request input is missing"}else{options.request.as_str()},"state":"accepted","kind":"functional","priority":"must"}},
+            {"op":"create_criterion","id":"episode-response","data":{"requirement_id":"episode-request","statement":"Return a final response satisfying the declared local output contract","method":"inspection","expected":"Nonempty final response validated against the host output schema, when supplied","impact_area":[],"metadata":{"implicit_final_response":true}}},
+            {"op":"link_requirement","task":"episode-task","requirement":"episode-request"}
+        ]})).await.map_err(config_error)?;
+        task_store
+            .bind_root("episode-task", &run)
             .await
             .map_err(config_error)?;
         security
@@ -517,6 +614,7 @@ impl Execution {
             engine,
             run_id: run,
             telemetry,
+            tasks: task_store,
             local,
             db,
             logs,

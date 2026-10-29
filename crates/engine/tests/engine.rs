@@ -70,7 +70,7 @@ async fn final_claim_cannot_pass_unverified_criteria_and_gate_retries_are_bounde
     let run = engine.create("gate", spec(false, 10)).await.unwrap();
     let result = engine.run(&run).await.unwrap();
     assert_eq!(result.status, Status::CompletedWithPending);
-    assert_eq!(result.gate_attempts, 3);
+    assert_eq!(result.gate_attempts, 2);
     assert_eq!(
         engine
             .journal()
@@ -80,7 +80,7 @@ async fn final_claim_cannot_pass_unverified_criteria_and_gate_retries_are_bounde
             .iter()
             .filter(|e| e.kind == "model_response")
             .count(),
-        3
+        2
     );
     db.shutdown().await.unwrap();
 }
@@ -164,7 +164,7 @@ impl ModelGateway for NoteModel {
                             .content
                             .contains("Continue from the exact durable state")
                     );
-                    ("effect", json!({}))
+                    ("effect", json!({"sample":n}))
                 };
                 message.tool_calls = vec![ToolCall {
                     id: format!("c{n}"),
@@ -179,13 +179,54 @@ impl ModelGateway for NoteModel {
         })
     }
 }
+struct ProgressObservations(Effects);
+impl ToolRuntime for ProgressObservations {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.0.definitions()
+    }
+    fn prepare<'a>(
+        &'a self,
+        run: &'a str,
+        call: ToolCall,
+    ) -> BoxFuture<'a, Result<PreparedTool, String>> {
+        self.0.prepare(run, call)
+    }
+    fn execute<'a>(
+        &'a self,
+        run: &'a str,
+        key: &'a str,
+        prepared: &'a PreparedTool,
+    ) -> BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let mut result = self.0.execute(run, key, prepared).await;
+            result.output["observed_execution_count"] =
+                json!(count(&self.0.root.join("executions")));
+            result
+        })
+    }
+    fn reconcile<'a>(
+        &'a self,
+        run: &'a str,
+        key: &'a str,
+        prepared: &'a PreparedTool,
+    ) -> BoxFuture<'a, Reconcile> {
+        self.0.reconcile(run, key, prepared)
+    }
+}
+fn progress_tools(journal: &Journal) -> Arc<dyn ToolRuntime> {
+    Arc::new(ProgressObservations(Effects {
+        root: journal.database().path().parent().unwrap().into(),
+        effect: Effect::Pure,
+        journal: journal.clone(),
+    }))
+}
 #[tokio::test]
 async fn continuation_and_checkpoint_reconstruct_exact_history_after_reopening() {
     let (dir, db, base) = fixture().await;
     let engine = Engine::new(
         base.journal().clone(),
         Arc::new(NoteModel),
-        engine_tools(base.journal()),
+        progress_tools(base.journal()),
     );
     drop(base);
     let run = engine.create("checkpoint", spec(false, 30)).await.unwrap();
@@ -212,7 +253,7 @@ async fn continuation_and_checkpoint_reconstruct_exact_history_after_reopening()
     )
     .unwrap();
     let j = Journal::new(db.clone()).await.unwrap();
-    let engine = Engine::new(j.clone(), Arc::new(NoteModel), engine_tools(&j));
+    let engine = Engine::new(j.clone(), Arc::new(NoteModel), progress_tools(&j));
     assert_eq!(
         serde_json::to_value(engine.run(&run).await.unwrap()).unwrap(),
         encoded
@@ -481,7 +522,7 @@ impl ToolRuntime for InvalidTool {
     }
 }
 #[tokio::test]
-async fn repeated_failed_steps_pause_without_effects_or_unbounded_model_calls() {
+async fn repeated_failed_steps_escalate_then_block_without_effects() {
     let (_dir, db, base) = fixture().await;
     let model = Arc::new(RepeatInvalid(AtomicUsize::new(0)));
     let engine = Engine::new(base.journal().clone(), model.clone(), Arc::new(InvalidTool));
@@ -491,11 +532,12 @@ async fn repeated_failed_steps_pause_without_effects_or_unbounded_model_calls() 
     }];
     let run = engine.create("loop", request).await.unwrap();
     let state = engine.run(&run).await.unwrap();
-    assert_eq!(state.status, Status::Paused);
-    assert_eq!(state.step, 3);
-    assert_eq!(state.tool_calls, 3);
-    assert_eq!(model.0.load(Ordering::SeqCst), 3);
-    assert!(state.reason.unwrap().contains("identical unsuccessful"));
+    assert_eq!(state.status, Status::Blocked);
+    assert_eq!(state.step, 5);
+    assert_eq!(state.tool_calls, 5);
+    assert_eq!(model.0.load(Ordering::SeqCst), 5);
+    assert_eq!(state.loops.detections, 3);
+    assert!(state.reason.unwrap().contains("host intervention"));
     assert!(
         !base
             .journal()

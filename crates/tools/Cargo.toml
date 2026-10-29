@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+excalibur-tasks = { path = "../tasks" }
 excalibur-sandbox = { path = "../sandbox" }
 excalibur-vault = { path = "../vault" }
 excalibur-types = { path = "../types" }
@@ -26,6 +27,7 @@ tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 [dev-dependencies]
+excalibur-journal = { path = "../journal" }
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]

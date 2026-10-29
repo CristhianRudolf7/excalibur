@@ -1,0 +1,54 @@
+# Verifiable work
+
+[Español](verifiable-work.es.md)
+
+`excalibur-tasks` stores scoped requests, requirements, criteria, checks, plans and evidence in the principal SQLite database. `excalibur-engine` owns execution state and the completion decision. `excalibur-eval` connects these shared libraries to noninteractive execution; the command contains no separate planning logic.
+
+## Tasks and plans
+
+`TaskStore::open(Database)` installs a checksummed additive schema while preserving the storage schema and existing rows. `TaskPolicy` limits scopes, project operations, principal and autonomy. General tasks and notebook records do not require a project. A task retains the literal request card, origin conversation when provided, notification policy, budget and root-run history. Short codes are allocated by the writer.
+
+`task_db` accepts batches of at most 64 operations. References and dependency cycles are checked inside the writer transaction. A rejected operation rolls back the whole batch, including short-code allocations. Mutable records use `expected_version`; conflicts return the current record. Queries accept requested fields, filters, a cursor and limits of up to 20 records, with a bounded response and a continuation indicator. Operation receipts make replay idempotent. Canonical query fields remain at the row top level. The episode adapter also exposes opaque task metadata and title/detail in its `data` view, including replayed receipts. Legacy generic records are drafts and cannot provide trusted evidence or change derived task state. `host_batch` is a Rust host API for authenticated source updates and reserved metadata; the model tool cannot invoke it, forge the implicit-response tag, lower a task level or replace the literal request.
+
+Canonical operations cover projects, tasks, plans, plan items, dependencies, milestones, requirements, criteria, checks, assumptions, decisions, log and notebook entries. Project registration creates a macro plan. Micro plans belong to tasks; their compact current projection is refreshed before every model step. Completed micro plans are archived. N1 tasks promote to N2 on registered-project changes or more than 15 steps; estimates beyond one day, multiple milestones or an explicit initiative request promote to N3. An explicit host-selected level can override automatic promotion.
+
+Plans are proposed as structured operations. Approval is a host action bound to the proposal hash, and is required for low autonomy and N3. Replanning computes affected dependency descendants and requirement-linked tasks, preserves unaffected completed work, retains old plan versions, validates the diff and records directives for changed active tasks. Replan requests are durable and become directives/context for structured planning. A database snapshot exposes the tree, progress, blockers and latest report without inference. No master conversation or notification transport is started by this library.
+
+Task state is derived from the authoritative root execution. A host reopening creates a new root and retains previous roots. The new execution starts its own instruction epoch, invalidates previous evidence and versioned exemptions, and preserves all historical proofs and criterion versions. Subtree pause, exact-order resume and bottom-up cancellation are durable controls; cancellation requires host confirmation below full autonomy. In-flight managed commands are interrupted; noninterruptible effects are allowed to finish before their result is reconciled. Runtime control never overwrites user cancellation or pause. A durable task-change directive wakes a waiting run and makes a blocked run ready; paused and terminal runs retain their control state. Internal replan requests retain a blocking state until new information arrives. The embedding host drives runnable executions.
+
+## Evidence and completion
+
+Criteria use `command`, `test`, `inspection`, `metric` or `user_confirmation`. Each executable check has a declared definition and environment. `CheckRunner` executes file assertions or commands through the existing authorized tool runtime, with durable admission, output blobs, fingerprints, instruction revision, code commit and dirty impact-tree hash. An interrupted command with uncertain effects is not automatically repeated. Secrets pass through the existing redaction and durable-content checks.
+
+Evidence is fresh only when impact fingerprints and the applicable instruction revision still match. Missing paths and newly added matching files affect the fingerprint. Generated checklist sections have a canonical fingerprint; surrounding user text remains significant. Writes invalidate affected evidence using the impact index. Final evaluation rechecks fingerprints, including external file edits. Snapshot work is bounded to 4096 directories, 100000 entries and 512 MiB of hashed content, with streamed reads and fixed-prefix pruning; hosts must narrow an impact area exceeding those bounds. Criterion states and missing, failed and stale queries are derived from backend evidence, not writable model assertions. A justified not-applicable decision is versioned and host-controlled.
+
+`TaskCompletionGate` checks requirements, fresh criteria, every declared executable check, instruction revision, blocking questions and nonterminal children. Judgment never replaces command/test/metric proof. N1 inspection may use judgment; higher levels require independent agreement. A final response only satisfies the explicitly tagged response criterion after matching the confirmed journal response and the local output contract; it cannot satisfy custom executable criteria. The default one-off response criterion does not certify arbitrary code changes; code acceptance requires registered executable checks.
+
+The gate creates an independent verification job for N2 tasks with at least five requirements, N3 work, explicit requests and higher-level inspection. Its input includes the literal request, criteria, evidence, deliverable diff and summary, without executor reasoning. The shared gateway driver uses a separate read-only capability, reruns declared checks, records its own observations and charges a reserved child budget. Executable verdicts must cite its own fresh passing checks. Inspection verdicts need its own recorded observations. Stage verification can close a milestone only through a versioned backend operation tied to its fresh independent verdict; a model cannot mark it done directly. Review disagreement is bounded to two rounds per criterion. Interrupted attempts retain their history and do not count as review disagreement. The reusable `excalibur_eval::verifier::GatewayVerifier` drives the registered gateway with the frozen `verifier@1` role and the shipped `task-verification` skill. The evaluation profile uses the declared single gateway; hosts may provide another authorized verifier implementation.
+
+A failed gate returns a compact report to execution. After two failed finalization attempts the run stops honestly with pending work or a blocker. Unanswered user-confirmation criteria produce pending completion without an indefinite wait. A later host confirmation records criterion evidence without rerunning checks. Terminal run history remains immutable.
+
+The root report separates local usage, settled child consumption and outstanding reservations. Reservations and uncertain consumption are labeled; they are not claimed as measured provider tokens. Every stopped run has a structured delivery report: state and reason, summary, deliverables, evidence, modified files, assumptions, questions, pending work and measured usage/time/call counters. Paused and blocked states retain durable context and can resume.
+
+## Checklist and loops
+
+The tests README is a database projection. Only the section between `<!-- excalibur:checklist -->` and `<!-- /excalibur:checklist -->` is replaced. Existing outside text is preserved; user edits inside are retained by file-version history. Writes use the same lease, fingerprint and durable pre/postimage pipeline as ordinary file edits. Evaluation checklists live under the ephemeral Excalibur data directory, outside the evaluated workspace. The source of truth remains SQLite.
+
+The deterministic loop detector covers identical results, repeated errors, cycles of two to five calls, lack of progress, repeated output text and repeated file fingerprint conflicts. It escalates from a corrective note to a strategy change and then a blocker. `exec_io wait_for` is an explicit wait, not a polling loop. Execution budgets and atomic child reservations cover steps, tokens, cost when priced, wall time and tool calls. Managed command-group and retained-session limits are enforced at terminal admission; they are not a claim to count or cap every operating-system descendant. The host's sandbox/cgroup boundary remains separate.
+
+## Verification and boundaries
+
+```sh
+cargo test -p excalibur-tasks
+cargo test -p excalibur-engine --test verifiable_work
+cargo test -p excalibur-eval --test verifiable
+cargo test -p excalibur-tools --test terminal
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace
+```
+
+Tests use synthetic data, scripted gateways, real temporary files/SQLite, mock tool responses and local sandboxed processes. They do not require model credentials, inference, GPU or paid services. Runtime evidence applies to the Linux environment actually tested; no Windows or macOS execution is implied.
+
+The future general subagent scheduler, master/channel delivery, code-graph impact expansion, user-wide billing calendars, provider quota scheduler and system resource supervision remain separate capabilities. This scope supplies task relationships, durable controls, scoped impact declarations, reservation contracts and host adapters needed to compose them; it does not present those future services as running. An N0 conversation need not create a task.

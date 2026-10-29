@@ -3,6 +3,7 @@ name = "excalibur-eval"
 version = "0.1.0"
 edition = "2024"
 [dependencies]
+excalibur-tasks = { path = "../tasks" }
 excalibur-types = { path = "../types" }
 excalibur-store = { path = "../store" }
 excalibur-journal = { path = "../journal" }

@@ -1,0 +1,54 @@
+# Trabajo verificable
+
+[English](verifiable-work.md)
+
+`excalibur-tasks` almacena solicitudes, requisitos, criterios, comprobaciones, planes y evidencias por ámbito en SQLite principal. `excalibur-engine` controla el estado de ejecución y la decisión de cierre. `excalibur-eval` conecta estas bibliotecas compartidas con la ejecución no interactiva; el comando no duplica la planificación.
+
+## Tareas y planes
+
+`TaskStore::open(Database)` instala un esquema aditivo con checksum y conserva el esquema de almacenamiento y los datos existentes. `TaskPolicy` limita ámbitos, operaciones de proyecto, principal y autonomía. Las tareas y el bloc general no requieren proyecto. La tarea conserva la ficha literal, conversación de origen cuando se proporciona, política de notificación, presupuesto e historial de ejecuciones raíz. El escritor asigna los códigos cortos.
+
+`task_db` acepta lotes de hasta 64 operaciones. Las referencias y ciclos de dependencias se comprueban dentro de la transacción del escritor. Un rechazo revierte todo el lote, incluidos los contadores. Las filas modificables usan `expected_version`; los conflictos devuelven la fila actual. Las consultas aceptan campos, filtros, cursor y hasta 20 registros, con respuesta acotada e indicador de continuación. Los recibos hacen idempotente la reproducción. Los campos canónicos de consulta están en el nivel superior de la fila. El adaptador de episodio también expone metadatos opacos y título/detalle de la tarea en su vista `data`, incluidos recibos reproducidos. Los registros genéricos heredados son borradores y no aportan evidencia confiable ni cambian el estado derivado de una tarea. `host_batch` es una API Rust del host para fuentes autenticadas y metadatos reservados; la herramienta del modelo no puede invocarla, fabricar la etiqueta de respuesta implícita, bajar el nivel de una tarea ni reemplazar la solicitud literal.
+
+Las operaciones canónicas cubren proyectos, tareas, planes, pasos, dependencias, hitos, requisitos, criterios, comprobaciones, suposiciones, decisiones, bitácora y bloc. Registrar un proyecto crea su plan macro. Los planes micro pertenecen a tareas; su proyección compacta vigente se actualiza antes de cada paso del modelo. Se archivan al completar la tarea. Una N1 asciende a N2 al cambiar un proyecto registrado o superar 15 pasos; estimar más de un día, varios hitos o una petición explícita de iniciativa lleva a N3. El nivel elegido expresamente por el host puede sustituir la promoción automática.
+
+Los planes se proponen como operaciones estructuradas. La aprobación corresponde al host y queda ligada al hash de la propuesta; es obligatoria con autonomía baja y N3. La replanificación calcula descendientes afectados y tareas ligadas a requisitos, conserva el trabajo completado no afectado y versiones anteriores, valida el diff y registra directivas para las tareas activas modificadas. Las solicitudes de replanificación son durables y se convierten en directivas/contexto para planificación estructurada. Una instantánea de BD ofrece árbol, progreso, bloqueos y último informe sin inferencia. La biblioteca no inicia una conversación maestra ni transporte de notificaciones.
+
+El estado de la tarea deriva de su ejecución raíz autoritativa. Reabrir desde el host crea otra raíz y conserva las anteriores. La nueva ejecución establece su propia época de instrucciones, invalida evidencias y exenciones previas y conserva las pruebas y versiones históricas de los criterios. Pausa de subárbol, reanudación exacta de la orden y cancelación de abajo arriba son controles durables; cancelar requiere confirmación del host por debajo de autonomía plena. Se interrumpen los comandos gestionados en curso; los efectos no interrumpibles terminan antes de reconciliar su resultado. El control de ejecución nunca sobrescribe una pausa o cancelación del usuario. Una directiva durable de cambio de tarea despierta una ejecución en espera y deja lista una bloqueada; las pausadas y terminales conservan su estado de control. Las solicitudes internas de replanificación conservan el bloqueo hasta recibir nueva información. El host ejecuta las ejecuciones admitidas.
+
+## Evidencia y cierre
+
+Los criterios usan `command`, `test`, `inspection`, `metric` o `user_confirmation`. Cada comprobación ejecutable declara su definición y entorno. `CheckRunner` ejecuta aserciones de archivo o comandos mediante las herramientas autorizadas existentes, con admisión durable, blobs de salida, huellas, revisión de instrucciones, commit y hash del árbol afectado con cambios sin confirmar. Un comando interrumpido con efectos inciertos no se repite automáticamente. Los secretos pasan por la redacción y las comprobaciones de contenido durable existentes.
+
+Una evidencia solo está vigente si coinciden las huellas del área de impacto y la revisión de instrucciones. Las rutas ausentes y nuevos archivos coincidentes afectan a la huella. La sección generada del checklist tiene huella canónica; el texto del usuario que la rodea sigue siendo significativo. Las escrituras invalidan la evidencia afectada mediante el índice de impacto. La evaluación final vuelve a comprobar huellas, incluidos cambios externos. El trabajo de instantánea se limita a 4096 directorios, 100000 entradas y 512 MiB de contenido, con lectura por bloques y poda por prefijos fijos; el host debe acotar un área que supere esos límites. Los estados y consultas de criterios ausentes, fallidos y obsoletos derivan del backend; el modelo no puede escribir un éxito. Una declaración justificada de no aplicabilidad está versionada y controlada por el host.
+
+`TaskCompletionGate` comprueba requisitos, criterios vigentes, todas las comprobaciones ejecutables, revisión de instrucciones, preguntas bloqueantes e hijos no terminales. El juicio no sustituye pruebas command/test/metric. Una inspección N1 puede usar juicio; niveles superiores necesitan acuerdo independiente. La respuesta final solo satisface el criterio de respuesta etiquetado expresamente tras cotejar el registro confirmado y el contrato local de salida; no satisface criterios ejecutables personalizados. El criterio predeterminado de respuesta de un encargo aislado no certifica cambios arbitrarios de código; aceptar código requiere comprobaciones ejecutables registradas.
+
+La puerta crea una verificación independiente en N2 con al menos cinco requisitos, N3, petición explícita e inspecciones de nivel superior. Su entrada incluye solicitud literal, criterios, evidencia, diff y resumen de entregables, sin razonamiento del ejecutor. El controlador compartido usa otra capacidad de solo lectura, repite comprobaciones, registra observaciones propias y consume una reserva del presupuesto padre. Un veredicto ejecutable debe citar sus propias comprobaciones vigentes aprobadas; una inspección requiere observaciones propias registradas. La verificación por etapa solo cierra un hito mediante una operación backend versionada ligada a su veredicto independiente vigente; el modelo no puede marcarlo terminado directamente. El desacuerdo se limita a dos rondas por criterio. Los intentos interrumpidos conservan su historial y no cuentan como desacuerdo de revisión. `excalibur_eval::verifier::GatewayVerifier` utiliza la pasarela registrada, el rol congelado `verifier@1` y la skill incluida `task-verification`. El perfil de evaluación utiliza la pasarela única declarada; el host puede proporcionar otro verificador autorizado.
+
+El cierre fallido devuelve un informe compacto al ejecutor. Tras dos intentos de finalización fallidos la ejecución termina honestamente con pendientes o bloqueo. Los criterios de confirmación del usuario pendientes no producen espera indefinida. Una confirmación posterior del host registra evidencia del criterio sin repetir comprobaciones. El historial de ejecuciones terminales permanece inmutable.
+
+El informe raíz separa uso local, consumo liquidado de hijos y reservas pendientes. Las reservas y el consumo incierto se identifican; no se presentan como tokens medidos del proveedor. Toda ejecución detenida tiene informe estructurado: estado y motivo, resumen, entregables, evidencias, archivos modificados, suposiciones, preguntas, pendientes y contadores medidos de uso, tiempo y llamadas. Pausa y bloqueo conservan contexto durable y permiten reanudar.
+
+## Checklist y bucles
+
+El README de pruebas es una proyección de la BD. Solo se reemplaza la sección entre `<!-- excalibur:checklist -->` y `<!-- /excalibur:checklist -->`. Se conserva el texto exterior; las ediciones interiores del usuario quedan en el historial de archivos. Se utiliza la misma canalización de arrendamiento, huella y pre/postimágenes durables que para otras ediciones. En evaluación vive en el directorio efímero de datos de Excalibur, fuera del árbol evaluado. SQLite sigue siendo la fuente de verdad.
+
+El detector determinista cubre resultados idénticos, errores repetidos, ciclos de dos a cinco llamadas, falta de progreso, texto repetido y conflictos reiterados de huella. Escala de nota correctiva a cambio de estrategia y después bloqueo. `exec_io wait_for` es una espera explícita, no un bucle de sondeo. Los presupuestos de ejecución y reservas atómicas de hijos cubren pasos, tokens, coste cuando hay tarifa, tiempo y llamadas. Los límites de grupos de comandos gestionados y sesiones retenidas se aplican al admitir terminales; no afirman contar ni limitar todos los descendientes del sistema operativo. El aislamiento y cgroup del host son otra frontera.
+
+## Comprobaciones y límites
+
+```sh
+cargo test -p excalibur-tasks
+cargo test -p excalibur-engine --test verifiable_work
+cargo test -p excalibur-eval --test verifiable
+cargo test -p excalibur-tools --test terminal
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace
+```
+
+Las pruebas usan datos sintéticos, pasarelas programadas, archivos temporales y SQLite reales, herramientas simuladas y procesos locales aislados. No necesitan credenciales de modelos, inferencia, GPU ni servicios pagados. La evidencia de ejecución corresponde al entorno Linux probado; no implica ejecución en Windows ni macOS.
+
+El futuro planificador general de subagentes, entrega por maestro/canales, expansión del impacto mediante grafo de código, calendarios de facturación del usuario, cupos de proveedores y supervisión de recursos del sistema son capacidades separadas. Este alcance aporta relaciones de tareas, controles durables, áreas declaradas de impacto, reservas y adaptadores de host para componerlas; no presenta esos servicios futuros como activos. Una conversación N0 no necesita crear tarea.
