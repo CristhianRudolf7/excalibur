@@ -19,6 +19,9 @@ async fn setup(policy: ToolPolicy) -> (tempfile::TempDir, Database, Arc<LocalToo
     })
     .await
     .unwrap();
+    if matches!(policy.exec, Access::Allow) {
+        excalibur_tools::terminal::prepare_project_boundary(&root).unwrap();
+    }
     let tools = Arc::new(LocalTools::new(db.clone(), root, policy).await.unwrap());
     (temp, db, tools)
 }
@@ -709,6 +712,9 @@ async fn injected_terminal_redacts_and_persists_full_output_before_spool_acknowl
         TerminalManager::new(TerminalConfig {
             spool_dir: temp.path().join("custom-spool"),
             redacted_secrets: vec!["SYNTHETIC_SECRET".into()],
+            sandbox: Some(excalibur_tools::terminal::SandboxConfig::project(
+                temp.path().join("project"),
+            )),
             ..Default::default()
         })
         .unwrap(),

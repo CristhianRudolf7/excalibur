@@ -57,6 +57,8 @@ pub enum Error {
     BlobTooLarge(String),
     #[error("blob has no registered metadata: {0}")]
     BlobMetadataMissing(String),
+    #[error("blob output denied by durable content inspection")]
+    BlobAccessDenied,
     #[error("blob belongs to another storage namespace")]
     BlobOwnerMismatch,
     #[error("operation requires the principal database")]

@@ -1,13 +1,21 @@
 #![cfg(unix)]
-use excalibur_tools::terminal::{TerminalConfig, TerminalManager};
+use excalibur_tools::terminal::{
+    SandboxConfig, TerminalConfig, TerminalManager, prepare_project_boundary,
+};
 use serde_json::json;
 use std::{path::Path, time::Duration};
-fn manager(dir: &Path) -> TerminalManager {
+fn manager_with_spool(root: &Path, spool: &Path) -> TerminalManager {
+    std::fs::create_dir_all(root).unwrap();
+    prepare_project_boundary(root).unwrap();
     TerminalManager::new(TerminalConfig {
-        spool_dir: dir.join("spool"),
+        spool_dir: spool.into(),
+        sandbox: Some(SandboxConfig::project(root)),
         ..Default::default()
     })
     .unwrap()
+}
+fn manager(dir: &Path) -> TerminalManager {
+    manager_with_spool(dir, &dir.join("spool"))
 }
 fn session(result: &excalibur_types::runtime::ToolResult) -> String {
     assert!(result.success, "{result:?}");
@@ -19,7 +27,7 @@ async fn pipe_sessions_accept_input_and_wait_for_patterns_without_polling() {
     let manager = manager(dir.path());
     let first=manager.exec("run-a",json!({"cmd":"printf 'ready\\n'; IFS= read -r line; printf 'got:%s\\n' \"$line\"","cwd":dir.path(),"yield_ms":250})).await;
     let id = session(&first);
-    assert!(!first.output["exited"].as_bool().unwrap());
+    assert!(!first.output["exited"].as_bool().unwrap(), "{first:?}");
     let ready = manager
         .io(
             "run-a",
@@ -132,8 +140,10 @@ async fn pty_supports_named_keys_and_group_signals() {
 #[tokio::test]
 async fn output_spooling_is_complete_while_results_and_live_status_are_bounded_and_redacted() {
     let dir = tempfile::tempdir().unwrap();
+    prepare_project_boundary(dir.path()).unwrap();
     let manager = TerminalManager::new(TerminalConfig {
         spool_dir: dir.path().join("spool"),
+        sandbox: Some(SandboxConfig::project(dir.path())),
         redacted_secrets: vec!["synthetic-secret".into()],
         ..Default::default()
     })
@@ -162,8 +172,10 @@ async fn output_spooling_is_complete_while_results_and_live_status_are_bounded_a
 #[tokio::test]
 async fn session_limit_evicts_oldest_unprotected_and_notifies_its_owner() {
     let dir = tempfile::tempdir().unwrap();
+    prepare_project_boundary(dir.path()).unwrap();
     let manager = TerminalManager::new(TerminalConfig {
         spool_dir: dir.path().join("spool"),
+        sandbox: Some(SandboxConfig::project(dir.path())),
         max_per_run: 3,
         max_global: 3,
         protected_recent: 2,
@@ -206,7 +218,10 @@ async fn process_deadline_escalates_and_environment_disables_pagers() {
     let env=manager.exec("env",json!({"cmd":"printf '%s,%s,%s,%s' \"$PAGER\" \"$GIT_PAGER\" \"$TERM\" \"$NO_COLOR\"","cwd":dir.path(),"yield_ms":1000})).await;
     assert_eq!(env.output["output"], "cat,cat,dumb,1");
     let result=manager.exec("timeout",json!({"cmd":"trap '' TERM; sleep 30","cwd":dir.path(),"yield_ms":250,"timeout_ms":250})).await;
-    let id = session(&result);
+    let id = result.output["session_id"]
+        .as_str()
+        .expect("an admitted timeout retains its session and real failure details")
+        .to_owned();
     let done = manager
         .io(
             "timeout",
@@ -279,7 +294,16 @@ fn daemon_process_helper() {
     runtime.block_on(async{
         let manager=manager(&root);
         let result=manager.exec("crash",json!({"cmd":"sleep 60 & child=$!; printf '%s %s' \"$$\" \"$child\" > child-pids; wait","cwd":root,"yield_ms":250})).await;
-        assert!(result.success,"{result:?}");let pids=std::fs::read(root.join("child-pids")).unwrap();std::fs::write(root.join("ready"),pids).unwrap();
+        assert!(result.success,"{result:?}");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !root.join("child-pids").is_file() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("sandbox shell must fork its child and publish the marker before daemon interruption");
+        let pid=result.output["pid"].as_u64().unwrap()as u32;let mut pids=vec![pid];let mut index=0;
+        while index<pids.len(){let process=pids[index];index+=1;if let Ok(children)=std::fs::read_to_string(format!("/proc/{process}/task/{process}/children")){pids.extend(children.split_whitespace().filter_map(|p|p.parse::<u32>().ok()));}}
+        assert!(pids.len()>=2,"sandbox must contain real child processes");
+        std::fs::write(root.join("ready"),pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")).unwrap();
         std::future::pending::<()>().await;
     });
 }
@@ -287,15 +311,16 @@ fn daemon_process_helper() {
 #[tokio::test]
 async fn run_session_ceiling_and_eviction_are_shared_across_manager_instances() {
     let dir = tempfile::tempdir().unwrap();
-    let a = manager(&dir.path().join("a"));
-    let b = manager(&dir.path().join("b"));
+    let workspace = dir.path().join("workspace");
+    let a = manager_with_spool(&workspace, &dir.path().join("a/spool"));
+    let b = manager_with_spool(&workspace, &dir.path().join("b/spool"));
     let mut first = String::new();
     for n in 0..17 {
         let mgr = if n < 8 { &a } else { &b };
         let result = mgr
             .exec(
                 "same-run-across-managers",
-                json!({"cmd":"sleep 30","cwd":dir.path(),"yield_ms":250}),
+                json!({"cmd":"sleep 30","cwd":workspace,"yield_ms":250}),
             )
             .await;
         if n == 0 {
@@ -320,10 +345,16 @@ async fn run_session_ceiling_and_eviction_are_shared_across_manager_instances() 
 async fn wait_regex_searches_the_complete_spool_across_chunks_and_resident_gap() {
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(dir.path());
-    let result=manager.exec("regex-spool",json!({"cmd":"head -c 65534 /dev/zero | tr '\\0' a; printf 'CROSS_BOUNDARY_END'; head -c 600000 /dev/zero | tr '\\0' a; printf 'HIDDEN_MAGIC'; head -c 600000 /dev/zero | tr '\\0' b; IFS= read -r line; printf DONE","cwd":dir.path(),"yield_ms":1000,"output_bytes":256})).await;
+    let result=manager.exec("regex-spool",json!({"cmd":"head -c 65534 /dev/zero | tr '\\0' a; printf 'CROSS_BOUNDARY_END'; head -c 600000 /dev/zero | tr '\\0' a; printf 'HIDDEN_MAGIC'; head -c 600000 /dev/zero | tr '\\0' b; printf '\\nREADY_FOR_INPUT\\n'; IFS= read -r line; printf DONE","cwd":dir.path(),"yield_ms":1000,"output_bytes":256})).await;
     let id = session(&result);
     assert_eq!(result.output["exited"], false);
-    assert!(result.output["cursor"].as_u64().unwrap() > 1200000);
+    let ready=manager.io("regex-spool",json!({"action":"wait_for","session_id":id,"pattern":"READY_FOR_INPUT","timeout_ms":10000,"output_bytes":256})).await;
+    assert_eq!(ready.output["matched"], true, "{ready:?}");
+    assert_eq!(ready.output["exited"], false, "{ready:?}");
+    assert!(
+        ready.output["cursor"].as_u64().unwrap() > 1200000,
+        "{ready:?}"
+    );
     for pattern in ["CROSS_BOUNDARY_END", "HIDDEN_MAGIC"] {
         let found=manager.io("regex-spool",json!({"action":"wait_for","session_id":id,"pattern":pattern,"timeout_ms":0,"output_bytes":256})).await;
         assert!(found.success, "{found:?}");
@@ -497,8 +528,9 @@ fn global_session_ceiling_helper() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let a = manager(&root.path().join("a"));
-        let b = manager(&root.path().join("b"));
+        let workspace = root.path().join("workspace");
+        let a = manager_with_spool(&workspace, &root.path().join("a/spool"));
+        let b = manager_with_spool(&workspace, &root.path().join("b/spool"));
         let mut first = String::new();
         for n in 0..65 {
             let mgr = if n % 2 == 0 { &a } else { &b };
@@ -506,7 +538,7 @@ fn global_session_ceiling_helper() {
             let result = mgr
                 .exec(
                     &run,
-                    json!({"cmd":"printf complete","cwd":root.path(),"yield_ms":250}),
+                    json!({"cmd":"printf complete","cwd":workspace,"yield_ms":250}),
                 )
                 .await;
             let id = session(&result);

@@ -130,9 +130,84 @@ impl ToolScheduling {
         }
     }
 }
+/// Inspects the full uncompressed blob during the same streaming hash verification.
+/// No byte window may be returned until finish accepts the complete content.
+pub trait DurableByteInspector: Send {
+    fn inspect(&mut self, bytes: &[u8]) -> Result<(), String>;
+    fn finish(&mut self) -> Result<(), String>;
+}
+/// Kernel/process adapter input, derived only from the host execution capability.
+/// Adapters must reject an unsupported restriction instead of broadening it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProcessNetwork {
+    None,
+    Domains(Vec<String>),
+    Full,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessBoundary {
+    pub read_roots: Vec<std::path::PathBuf>,
+    pub write_roots: Vec<std::path::PathBuf>,
+    pub network: ProcessNetwork,
+    pub profile: String,
+    pub workspace: std::path::PathBuf,
+    pub denied_paths: Vec<std::path::PathBuf>,
+}
 /// Preparation may persist preimages, but must not perform the requested external effect.
 /// Execution is called only after a confirmed durable intention; recovery never guesses.
 pub trait ToolRuntime: Send + Sync {
+    /// Sanitize data before any durable model/context or execution event is recorded.
+    fn sanitize_durable(&self, value: &Value) -> Result<Value, String> {
+        Ok(value.clone())
+    }
+    /// Approval waits do not consume a tool result or advance the model step.
+    fn pending_approval<'a>(&'a self, _run: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
+    fn approval_blocked<'a>(&'a self, _run: &'a str) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { None })
+    }
+    /// The engine forwards explicitly untrusted context before any model/tool step.
+    fn observe_untrusted<'a>(
+        &'a self,
+        _run: &'a str,
+        _source: &'a str,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Install an effective per-run process boundary; unsupported adapters fail closed.
+    fn configure_process_boundary<'a>(
+        &'a self,
+        _run: &'a str,
+        _boundary: ProcessBoundary,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Err("process adapter cannot enforce execution capabilities".into()) })
+    }
+    /// Optional host capability limit, measured in admitted tool calls per run.
+    fn execution_tool_budget<'a>(
+        &'a self,
+        _run: &'a str,
+    ) -> BoxFuture<'a, Result<Option<u64>, String>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// A trusted decorator can defer an admitted effect for a new approval.
+    /// The returned result is not final and must not be persisted as tool_result.
+    fn result_requires_approval(&self, _result: &ToolResult) -> bool {
+        false
+    }
+    /// Optional output inspector, recreated for every verified blob read.
+    fn durable_blob_inspector(&self) -> Option<Box<dyn DurableByteInspector>> {
+        None
+    }
+    /// Audit engine-owned pure utilities through the same host security boundary.
+    fn audit_builtin<'a>(
+        &'a self,
+        _run: &'a str,
+        _call: &'a ToolCall,
+        _result: Option<&'a ToolResult>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
     fn definitions(&self) -> Vec<ToolDefinition>;
     /// Return canonical resource keys without preparing content-dependent work.
     /// None conservatively schedules this call alone; errors are reported by prepare.

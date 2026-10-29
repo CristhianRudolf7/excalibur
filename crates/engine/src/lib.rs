@@ -413,6 +413,12 @@ impl Engine {
         spec.context.tools.extend(builtin_definitions());
         spec.context.tools.sort_by(|a, b| a.name.cmp(&b.name));
         compile(&spec.context).map_err(|_| Error::Invalid("invalid initial context"))?;
+        let spec_value = serde_json::to_value(&spec)?;
+        if self.sanitize(&spec_value)? != spec_value {
+            return Err(Error::Invalid(
+                "secret literal in initial run specification; use a secret reference",
+            ));
+        }
         // Creation time belongs to the durable seed, not to a stable prompt prefix.
         // Reusing an operation returns its existing run, preserving its original time.
         let existing = self
@@ -448,7 +454,14 @@ impl Engine {
             }
             return Ok(run);
         }
-        self.journal.create_run(operation,json!({"spec":spec,"started_at":unix_seconds(),"gateway_identity":self.model.identity()})).await.map_err(Into::into)
+        let seed = json!({"spec":spec,"started_at":unix_seconds(),"gateway_identity":self.model.identity()});
+        if self.sanitize(&seed)? != seed {
+            return Err(Error::Invalid("secret literal in durable run identity"));
+        }
+        self.journal
+            .create_run(operation, seed)
+            .await
+            .map_err(Into::into)
     }
     pub async fn load(&self, run: &str) -> Result<Snapshot> {
         let checkpoint = self.journal.latest_checkpoint(run).await?;
@@ -479,6 +492,17 @@ impl Engine {
         }
         Ok(state)
     }
+    fn sanitize(&self, value: &Value) -> Result<Value> {
+        self.tools
+            .sanitize_durable(value)
+            .map_err(|_| Error::Invalid("durable data sanitization failed"))
+    }
+    async fn append_safe(&self, run: &str, kind: &str, key: &str, payload: Value) -> Result<u64> {
+        Ok(self
+            .journal
+            .append(run, kind, key, self.sanitize(&payload)?)
+            .await?)
+    }
     async fn event(
         &self,
         run: &str,
@@ -487,10 +511,8 @@ impl Engine {
         key: String,
         payload: Value,
     ) -> Result<()> {
-        let sequence = self
-            .journal
-            .append(run, kind, &key, payload.clone())
-            .await?;
+        let payload = self.sanitize(&payload)?;
+        let sequence = self.append_safe(run, kind, &key, payload.clone()).await?;
         if sequence > state.last_sequence {
             state.apply(&Event {
                 sequence,
@@ -532,6 +554,10 @@ impl Engine {
             state.last_sequence,
             status.label()
         );
+        let reason = reason
+            .map(|text| self.sanitize(&json!(text)))
+            .transpose()?
+            .and_then(|value| value.as_str().map(str::to_owned));
         let applied = self
             .journal
             .set_state_if(run, expected, status.label(), reason, &key)
@@ -621,22 +647,20 @@ impl Engine {
             return Err(Error::Invalid("directive ID/text"));
         }
         // Each fact is durable; an interrupted application is resumed from the received event.
-        self.journal
-            .append(
-                run,
-                "directive_received",
-                &format!("directive:{id}:received"),
-                json!({"id":id,"text":text}),
-            )
-            .await?;
-        self.journal
-            .append(
-                run,
-                "directive_applied",
-                &format!("directive:{id}:applied"),
-                json!({"id":id,"text":text}),
-            )
-            .await?;
+        self.append_safe(
+            run,
+            "directive_received",
+            &format!("directive:{id}:received"),
+            json!({"id":id,"text":text}),
+        )
+        .await?;
+        self.append_safe(
+            run,
+            "directive_applied",
+            &format!("directive:{id}:applied"),
+            json!({"id":id,"text":text}),
+        )
+        .await?;
         Ok(())
     }
     pub async fn record_check(
@@ -650,14 +674,13 @@ impl Engine {
             return Err(Error::Invalid("host evidence required"));
         }
         let s = self.load(run).await?;
-        self.journal
-            .append(
-                run,
-                "host_check",
-                &format!("check:{id}:{}:{}", s.revision, s.last_sequence),
-                json!({"id":id,"passed":passed,"evidence":evidence,"revision":s.revision}),
-            )
-            .await?;
+        self.append_safe(
+            run,
+            "host_check",
+            &format!("check:{id}:{}:{}", s.revision, s.last_sequence),
+            json!({"id":id,"passed":passed,"evidence":evidence,"revision":s.revision}),
+        )
+        .await?;
         Ok(())
     }
     /// A trusted consumer supplies a reconciled outcome; it cannot request a blind retry.
@@ -706,6 +729,16 @@ impl Engine {
         if initial.gateway_identity != self.model.identity() {
             return Err(Error::Invalid("gateway profile differs from durable run"));
         }
+        if initial.status == Status::Running {
+            for input in &initial.spec.context.untrusted {
+                self.tools
+                    .observe_untrusted(run, &input.source)
+                    .await
+                    .map_err(|_| {
+                        Error::Invalid("untrusted context provenance could not be recorded")
+                    })?;
+            }
+        }
         let mut recovering: BTreeSet<String> = initial
             .calls
             .iter()
@@ -717,6 +750,11 @@ impl Engine {
             if s.status != Status::Running {
                 return Ok(s);
             }
+            let capability_tool_budget = self
+                .tools
+                .execution_tool_budget(run)
+                .await
+                .map_err(|_| Error::Invalid("execution capability unavailable"))?;
             for (id, text) in s.pending_directives.clone() {
                 self.event(
                     run,
@@ -746,7 +784,8 @@ impl Engine {
                     &json!({"step":s.step,"budget":s.spec.budget,"usage":s.usage,"tool_calls":s.tool_calls}),
                 )?;
                 input.volatile.finalization_report = s.gate_report.join("\n");
-                input.tools_enabled = !closing(&s);
+                input.tools_enabled = !closing(&s)
+                    && capability_tool_budget.is_none_or(|budget| s.tool_calls < budget);
                 let compiled = match compile(&input) {
                     Ok(c) => c,
                     Err(e) => {
@@ -796,6 +835,36 @@ impl Engine {
                         != response.message.tool_calls.len()
                 {
                     return Err(Error::Invalid("invalid model tool call identifiers"));
+                }
+                for call in &response.message.tool_calls {
+                    let original = json!(call.arguments);
+                    let parsed: Option<Value> = serde_json::from_str(&call.arguments)
+                        .or_else(|_| json5::from_str(&call.arguments))
+                        .ok();
+                    if self.sanitize(&original)? != original
+                        || parsed.as_ref().is_some_and(|value| {
+                            self.sanitize(value).is_ok_and(|safe| safe != *value)
+                        })
+                    {
+                        let safe_response = ModelResponse {
+                            message: Message::text(
+                                "assistant",
+                                "[tool request rejected: secret literal]",
+                            ),
+                            usage: response.usage.clone(),
+                        };
+                        let key = format!("model:{}:response", s.step);
+                        self.event(
+                            run,
+                            &mut s,
+                            "model_response",
+                            key,
+                            json!({"response":safe_response}),
+                        )
+                        .await?;
+                        self.transition(run, &mut s, Status::Blocked, Some("model requested a secret literal in tool arguments; use executor secret references".into())).await?;
+                        return Ok(s);
+                    }
                 }
                 self.point(Boundary::ModelReturned, run, s.step, None);
                 let key = format!("model:{}:response", s.step);
@@ -876,7 +945,12 @@ impl Engine {
                 if s.status != Status::Running {
                     return Ok(s);
                 }
-                let mut slots = s.spec.budget.max_tool_calls.saturating_sub(s.tool_calls);
+                let mut slots = s
+                    .spec
+                    .budget
+                    .max_tool_calls
+                    .min(capability_tool_budget.unwrap_or(u64::MAX))
+                    .saturating_sub(s.tool_calls);
                 let mut tool_limit = false;
                 let mut actions = Vec::new();
                 for (index, plan) in batch {
@@ -931,6 +1005,21 @@ impl Engine {
                                 "uncertain effect"
                             }
                         )),
+                    )
+                    .await?;
+                    return Ok(s);
+                }
+                if let Some(reason) = self.tools.approval_blocked(run).await {
+                    self.transition(run, &mut s, Status::Blocked, Some(reason))
+                        .await?;
+                    return Ok(s);
+                }
+                if self.tools.pending_approval(run).await {
+                    self.transition(
+                        run,
+                        &mut s,
+                        Status::Paused,
+                        Some("approval required".into()),
                     )
                     .await?;
                     return Ok(s);
@@ -1002,19 +1091,30 @@ impl Engine {
                     prepared
                 }
                 other => {
+                    if self.tools.pending_approval(run).await
+                        || self.tools.approval_blocked(run).await.is_some()
+                    {
+                        return None;
+                    }
                     let reason=match other{Err(error)=>error,Ok(_)=>"resource plan or call identity changed before admission; retry with current state".into()};
-                    return self.journal.append(run,"tool_result",&format!("{key}:result"),json!({"index":index,"name":call.name,"result":ToolResult::error(reason)})).await.err().map(|error|AttemptFailure{retryable:true,reason:format!("rejection could not be recorded: {error}")});
+                    return self.append_safe(run,"tool_result",&format!("{key}:result"),json!({"index":index,"name":call.name,"result":ToolResult::error(reason)})).await.err().map(|error|AttemptFailure{retryable:true,reason:format!("rejection could not be recorded: {error}")});
+                }
+            };
+            let payload = json!({"index":index,"prepared":prepared});
+            let payload = match self.sanitize(&payload) {
+                Ok(safe) if safe == payload => safe,
+                _ => {
+                    return Some(AttemptFailure {
+                        retryable: false,
+                        reason: "secret literal in prepared operation; effect was not admitted"
+                            .into(),
+                    });
                 }
             };
             self.point(Boundary::BeforeToolIntent, run, step, Some(&key));
             match self
                 .journal
-                .append_when_running(
-                    run,
-                    "tool_intent",
-                    &key,
-                    json!({"index":index,"prepared":prepared}),
-                )
+                .append_when_running(run, "tool_intent", &key, payload)
                 .await
             {
                 Ok(Some(_)) => {}
@@ -1068,10 +1168,12 @@ impl Engine {
                 }
             },
         };
+        if self.tools.result_requires_approval(&result) {
+            return None;
+        }
         self.point(Boundary::ToolEffectReturned, run, step, Some(&key));
         if let Err(error) = self
-            .journal
-            .append(
+            .append_safe(
                 run,
                 "tool_result",
                 &format!("{key}:result"),
@@ -1168,7 +1270,20 @@ impl Engine {
         }
     }
     async fn execute(&self, run: &str, key: &str, tool: &PreparedTool) -> ToolResult {
-        match tool.call.name.as_str() {
+        let builtin = matches!(
+            tool.call.name.as_str(),
+            "leave_continuation_note" | "get_tool_output"
+        );
+        if builtin
+            && self
+                .tools
+                .audit_builtin(run, &tool.call, None)
+                .await
+                .is_err()
+        {
+            return ToolResult::error("builtin audit admission failed");
+        }
+        let result = match tool.call.name.as_str() {
             "leave_continuation_note" => ToolResult::ok(json!({"note":tool.data["note"]})),
             "get_tool_output" => {
                 let hash = tool.data["hash"].as_str().unwrap().parse().unwrap();
@@ -1181,7 +1296,12 @@ impl Engine {
                 match self
                     .journal
                     .database()
-                    .read_blob_window(hash, offset, limit)
+                    .read_blob_window_inspected(
+                        hash,
+                        offset,
+                        limit,
+                        self.tools.durable_blob_inspector(),
+                    )
                     .await
                 {
                     Ok(window) => ToolResult::ok(json!({
@@ -1194,7 +1314,17 @@ impl Engine {
                 }
             }
             _ => self.tools.execute(run, key, tool).await,
+        };
+        if builtin
+            && self
+                .tools
+                .audit_builtin(run, &tool.call, Some(&result))
+                .await
+                .is_err()
+        {
+            return ToolResult::error("builtin result audit failed");
         }
+        result
     }
     async fn reconcile(&self, run: &str, key: &str, tool: &PreparedTool) -> Reconcile {
         match tool.effect {

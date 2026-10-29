@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+excalibur-sandbox = { path = "../sandbox" }
+excalibur-vault = { path = "../vault" }
 excalibur-types = { path = "../types" }
 excalibur-store = { path = "../store" }
 serde = { version = "1", features = ["derive"] }

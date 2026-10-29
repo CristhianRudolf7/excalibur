@@ -1,0 +1,13 @@
+CREATE TABLE IF NOT EXISTS security_schema(version INTEGER PRIMARY KEY,checksum TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS security_runs(run_id TEXT PRIMARY KEY REFERENCES runs(id),definition TEXT NOT NULL CHECK(json_valid(definition)));
+CREATE TRIGGER IF NOT EXISTS security_runs_immutable_update BEFORE UPDATE ON security_runs BEGIN SELECT RAISE(ABORT,'capability base is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS security_runs_immutable_delete BEFORE DELETE ON security_runs BEGIN SELECT RAISE(ABORT,'capability base is immutable'); END;
+CREATE TABLE IF NOT EXISTS security_state(run_id TEXT PRIMARY KEY REFERENCES runs(id),tainted_secret INTEGER NOT NULL,untrusted_seen INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS security_rules(id TEXT PRIMARY KEY,definition TEXT NOT NULL CHECK(json_valid(definition)));
+CREATE TABLE IF NOT EXISTS security_approvals(id TEXT PRIMARY KEY REFERENCES approvals(id),run_id TEXT NOT NULL REFERENCES runs(id),project TEXT NOT NULL,action_hash TEXT NOT NULL,request TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,status TEXT NOT NULL,scope TEXT NOT NULL,consumed INTEGER NOT NULL DEFAULT 0,consumed_by TEXT,response_id TEXT,reminded INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS security_admissions(ticket TEXT PRIMARY KEY,run_id TEXT NOT NULL,call_hash TEXT NOT NULL,expires_at INTEGER NOT NULL,actions TEXT NOT NULL,approval_ids TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS capability_grants_immutable_update BEFORE UPDATE ON capability_grants BEGIN SELECT RAISE(ABORT,'capability grants are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS capability_grants_immutable_delete BEFORE DELETE ON capability_grants BEGIN SELECT RAISE(ABORT,'capability grants are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS security_audit_immutable_update BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT,'audit is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS security_audit_immutable_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT,'audit is append-only'); END;
+CREATE TABLE IF NOT EXISTS security_domains(run_id TEXT NOT NULL,domain TEXT NOT NULL,PRIMARY KEY(run_id,domain));

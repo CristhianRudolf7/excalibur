@@ -77,6 +77,7 @@ async fn simple_task_runs_from_mock_model_through_files_terminal_and_verified_co
     )
     .unwrap();
     let journal = Journal::new(db.clone()).await.unwrap();
+    excalibur_tools::terminal::prepare_project_boundary(&workspace).unwrap();
     let tools = Arc::new(
         LocalTools::new(
             db.clone(),

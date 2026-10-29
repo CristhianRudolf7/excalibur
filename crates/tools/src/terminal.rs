@@ -1,6 +1,8 @@
 //! Local process sessions. The embedding host authorizes commands and validates cwd.
-//! This module provides process lifetime isolation, not an operating-system sandbox.
+//! Linux commands require an explicit kernel sandbox; unavailable profiles fail closed.
+pub use excalibur_sandbox::{SandboxConfig, SandboxProfile, prepare_project_boundary};
 use excalibur_types::runtime::{ToolDefinition, ToolResult};
+use excalibur_vault::Redactor;
 use portable_pty::{PtySize, native_pty_system};
 use regex_automata::{
     Input,
@@ -41,6 +43,8 @@ pub struct TerminalConfig {
     pub max_per_run: usize,
     pub max_global: usize,
     pub protected_recent: usize,
+    pub sandbox: Option<SandboxConfig>,
+    pub redactor: Redactor,
 }
 impl std::fmt::Debug for TerminalConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -54,6 +58,8 @@ impl std::fmt::Debug for TerminalConfig {
             .field("max_per_run", &self.max_per_run)
             .field("max_global", &self.max_global)
             .field("protected_recent", &self.protected_recent)
+            .field("sandbox", &self.sandbox)
+            .field("redactor", &"live redactor")
             .finish()
     }
 }
@@ -66,6 +72,8 @@ impl Default for TerminalConfig {
             max_per_run: 16,
             max_global: 64,
             protected_recent: 8,
+            sandbox: None,
+            redactor: Redactor::default(),
         }
     }
 }
@@ -79,6 +87,7 @@ struct Inner {
     environment: Value,
     state: Mutex<State>,
     stopped: AtomicBool,
+    run_sandboxes: Mutex<BTreeMap<String, SandboxConfig>>,
 }
 #[derive(Default)]
 struct State {
@@ -215,7 +224,7 @@ impl WaitPattern {
     }
 }
 impl TerminalManager {
-    pub fn new(config: TerminalConfig) -> Result<Self, String> {
+    pub fn new(mut config: TerminalConfig) -> Result<Self, String> {
         if !config.spool_dir.is_absolute()
             || config.max_per_run == 0
             || config.max_global == 0
@@ -226,6 +235,13 @@ impl TerminalManager {
             return Err("invalid terminal configuration".into());
         }
         fs::create_dir_all(&config.spool_dir).map_err(|e| e.to_string())?;
+        if let Some(sandbox) = config.sandbox.as_mut() {
+            sandbox.workspace = sandbox
+                .workspace
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            sandbox.hidden_paths.push(config.spool_dir.clone());
+        }
         let mut environment = detect_environment();
         let shell = config
             .shell
@@ -248,8 +264,25 @@ impl TerminalManager {
                 environment,
                 state: Mutex::new(State::default()),
                 stopped: AtomicBool::new(false),
+                run_sandboxes: Mutex::new(BTreeMap::new()),
             }),
         })
+    }
+    /// Trusted capability adapter narrows the base sandbox for a durable run.
+    pub fn set_run_sandbox(&self, run: &str, sandbox: SandboxConfig) -> Result<(), String> {
+        let base = self
+            .inner
+            .config
+            .sandbox
+            .as_ref()
+            .ok_or("no host sandbox is configured")?;
+        let restricted = sandbox.restricted_by(base)?;
+        self.inner
+            .run_sandboxes
+            .lock()
+            .unwrap()
+            .insert(run.into(), restricted);
+        Ok(())
     }
     pub fn spool_dir(&self) -> &Path {
         &self.inner.config.spool_dir
@@ -282,18 +315,48 @@ impl TerminalManager {
         if !(250..=30000).contains(&yield_ms) || !(250..=86400000).contains(&timeout) {
             return ToolResult::error("yield_ms must be 250..30000 and timeout_ms 250..86400000");
         }
-        let Some(cwd) = args.get("cwd").and_then(Value::as_str).map(PathBuf::from) else {
-            return ToolResult::error("explicit canonical cwd is required by terminal adapter");
+        if cfg!(not(target_os = "linux")) {
+            return ToolResult::error(
+                "mandatory native process sandbox is unavailable on this target",
+            );
+        }
+        let sandbox = self
+            .inner
+            .run_sandboxes
+            .lock()
+            .unwrap()
+            .get(run)
+            .cloned()
+            .or_else(|| self.inner.config.sandbox.clone());
+        let Some(sandbox) = sandbox else {
+            return ToolResult::error(
+                "exec requires an explicit host sandbox; command was not executed",
+            );
         };
-        if !cwd.is_absolute() || !cwd.is_dir() {
-            return ToolResult::error("cwd must be an absolute existing directory");
+        let cwd = match sandbox.workspace.canonicalize() {
+            Ok(path) => path,
+            Err(error) => return ToolResult::error(error.to_string()),
+        };
+        if let Some(supplied) = args.get("cwd").and_then(Value::as_str)
+            && Path::new(supplied).canonicalize().ok().as_ref() != Some(&cwd)
+        {
+            return ToolResult::error(
+                "cwd is fixed by the host sandbox; a model cannot redirect its authority",
+            );
         }
         let manager = self.clone();
         let run = run.to_string();
         let cmd = cmd.to_string();
         let tty = args.get("tty").and_then(Value::as_bool).unwrap_or(false);
         let session = match tokio::task::spawn_blocking(move || {
-            manager.spawn(&run, &cmd, &cwd, tty, Duration::from_millis(timeout))
+            manager.spawn(
+                &run,
+                &cmd,
+                &cwd,
+                tty,
+                Duration::from_millis(timeout),
+                sandbox,
+            )
         })
         .await
         {
@@ -304,7 +367,15 @@ impl TerminalManager {
         let _ = self
             .wait(&session, None, Duration::from_millis(yield_ms))
             .await;
-        self.snapshot(&session, 0, output_limit(&args))
+        let mut result = self.snapshot(&session, 0, output_limit(&args));
+        if result.output["exited"] == true
+            && (result.output["exit_code"] != 0
+                || result.output["timed_out"] == true
+                || !result.output["error"].is_null())
+        {
+            result.success = false;
+        }
+        result
     }
     pub async fn io(&self, run: &str, args: Value) -> ToolResult {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("");
@@ -430,7 +501,7 @@ impl TerminalManager {
     pub fn live_status(&self, run: &str) -> Vec<Value> {
         self.inner.state.lock().unwrap().sessions.values().filter(|s|s.owner==run).map(|s|{
             let output=s.output.lock().unwrap();
-            json!({"session_id":s.id,"command":redact_text(&s.command,&self.inner.config.redacted_secrets),"tail":output.live_tail(),"exited":output.exited,"exit_code":output.exit_code,"cursor":output.total})
+            json!({"session_id":s.id,"command":self.inner.config.redactor.redact_text(&redact_text(&s.command,&self.inner.config.redacted_secrets)),"tail":output.live_tail(),"exited":output.exited,"exit_code":output.exit_code,"cursor":output.total})
         }).collect()
     }
     pub fn take_notices(&self, run: &str) -> Vec<Value> {
@@ -691,6 +762,7 @@ impl TerminalManager {
         cwd: &Path,
         tty: bool,
         timeout: Duration,
+        sandbox: SandboxConfig,
     ) -> Result<Arc<Session>, String> {
         let _serial = SPAWN_SERIAL.lock().unwrap();
         if self.inner.stopped.load(Ordering::Acquire) {
@@ -723,7 +795,7 @@ impl TerminalManager {
         let monitor = std::thread::spawn(move || {
             let failed = sender.clone();
             let result = (|| -> Result<(), String> {
-                let launched = launch(&manager.inner.shell, &cmd, &cwd, tty)?;
+                let launched = launch(&manager.inner.shell, &cmd, &cwd, tty, &sandbox)?;
                 let session = Arc::new(Session {
                     id: id.clone(),
                     owner: run.clone(),
@@ -767,14 +839,16 @@ impl TerminalManager {
                 for mut reader in launched.readers {
                     let session = session.clone();
                     let secrets = manager.inner.config.redacted_secrets.clone();
+                    let redactor = manager.inner.config.redactor.clone();
                     readers.push(std::thread::spawn(move || {
                         let mut sanitizer = StreamRedactor::new(&secrets);
+                        let mut live = redactor.stream();
                         let mut buffer = [0u8; 8192];
                         loop {
                             match reader.read(&mut buffer) {
                                 Ok(0) => break,
                                 Ok(n) => {
-                                    let clean = sanitizer.push(&buffer[..n], false);
+                                    let clean = live.push(&sanitizer.push(&buffer[..n], false));
                                     let write_result = session.output.lock().unwrap().push(&clean);
                                     if let Err(e) = write_result {
                                         session.output.lock().unwrap().error = Some(e.to_string());
@@ -792,7 +866,8 @@ impl TerminalManager {
                                 }
                             }
                         }
-                        let clean = sanitizer.push(&[], true);
+                        let mut clean = live.push(&sanitizer.push(&[], true));
+                        clean.extend(live.finish());
                         let _ = session.output.lock().unwrap().push(&clean);
                         session.notify.notify_waiters();
                     }));
@@ -830,6 +905,8 @@ impl TerminalManager {
                     }
                     #[cfg(target_os = "linux")]
                     drop(launched.guardian);
+                    #[cfg(target_os = "linux")]
+                    drop(launched.sandbox);
                     let mut output = observed.output.lock().unwrap();
                     output.exited = true;
                     output.exit_code = code;
@@ -943,7 +1020,7 @@ fn evict(session: &Arc<Session>) -> Result<(), String> {
     if let Some(manager) = session.manager.upgrade() {
         let mut state = manager.state.lock().unwrap();
         state.sessions.remove(&session.id);
-        state.notices.push_back(json!({"run":session.owner,"session_id":session.id,"command":redact_text(&session.command,&manager.config.redacted_secrets),"reason":"session_limit_eviction"}));
+        state.notices.push_back(json!({"run":session.owner,"session_id":session.id,"command":manager.config.redactor.redact_text(&redact_text(&session.command,&manager.config.redacted_secrets)),"reason":"session_limit_eviction"}));
         while state.notices.len() > 256 {
             state.notices.pop_front();
         }
@@ -1109,6 +1186,8 @@ impl StreamRedactor {
     }
 }
 struct Launched {
+    #[cfg(target_os = "linux")]
+    sandbox: excalibur_sandbox::PreparedSandbox,
     pid: u32,
     input: Box<dyn Write + Send>,
     readers: Vec<Box<dyn Read + Send>>,
@@ -1177,11 +1256,27 @@ fn safe_env() -> Vec<(String, String)> {
     .collect()
 }
 #[cfg(unix)]
-fn launch(shell: &Path, cmd: &str, cwd: &Path, tty: bool) -> Result<Launched, String> {
+fn launch(
+    shell: &Path,
+    cmd: &str,
+    cwd: &Path,
+    tty: bool,
+    sandbox: &SandboxConfig,
+) -> Result<Launched, String> {
     use std::os::unix::process::CommandExt;
+    #[cfg(not(target_os = "linux"))]
+    let _ = sandbox;
+    #[cfg(target_os = "linux")]
+    let prepared = excalibur_sandbox::PreparedSandbox::new(sandbox)?;
+    #[cfg(target_os = "linux")]
+    let mut command = Command::new(&prepared.program);
+    #[cfg(not(target_os = "linux"))]
     let mut command = Command::new(shell);
+    #[cfg(target_os = "linux")]
+    prepared.configure(&mut command, shell, &shell_args(shell, cmd), tty);
+    #[cfg(not(target_os = "linux"))]
+    command.args(shell_args(shell, cmd));
     command
-        .args(shell_args(shell, cmd))
         .current_dir(cwd)
         .env_clear()
         .envs(safe_env())
@@ -1224,6 +1319,8 @@ fn launch(shell: &Path, cmd: &str, cwd: &Path, tty: bool) -> Result<Launched, St
     let mut guardian = LinuxGuardian::new().map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
     let (announce, acknowledge) = guardian.child_fds();
+    #[cfg(target_os = "linux")]
+    let filter_fd = prepared.filter_fd();
     let parent = unsafe { libc::getpid() };
     unsafe {
         command.pre_exec(move || {
@@ -1240,6 +1337,9 @@ fn launch(shell: &Path, cmd: &str, cwd: &Path, tty: bool) -> Result<Launched, St
                 }
                 if libc::getppid() != parent {
                     libc::_exit(125);
+                }
+                if libc::fcntl(filter_fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
                 }
                 // User code starts only after a live guardian knows this process group.
                 let bytes = libc::getpid().to_ne_bytes();
@@ -1291,6 +1391,8 @@ fn launch(shell: &Path, cmd: &str, cwd: &Path, tty: bool) -> Result<Launched, St
     };
     drop(pty);
     Ok(Launched {
+        #[cfg(target_os = "linux")]
+        sandbox: prepared,
         pid,
         input,
         readers,
@@ -1300,8 +1402,15 @@ fn launch(shell: &Path, cmd: &str, cwd: &Path, tty: bool) -> Result<Launched, St
     })
 }
 #[cfg(windows)]
-fn launch(shell: &Path, cmd: &str, cwd: &Path, tty: bool) -> Result<Launched, String> {
+fn launch(
+    shell: &Path,
+    cmd: &str,
+    cwd: &Path,
+    tty: bool,
+    sandbox: &SandboxConfig,
+) -> Result<Launched, String> {
     use std::os::windows::{io::AsRawHandle, process::CommandExt};
+    let _ = sandbox;
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED};
     if tty {
         let pair = native_pty_system()
@@ -1402,7 +1511,13 @@ fn launch(shell: &Path, cmd: &str, cwd: &Path, tty: bool) -> Result<Launched, St
     }
 }
 #[cfg(not(any(unix, windows)))]
-fn launch(_shell: &Path, _cmd: &str, _cwd: &Path, _tty: bool) -> Result<Launched, String> {
+fn launch(
+    _shell: &Path,
+    _cmd: &str,
+    _cwd: &Path,
+    _tty: bool,
+    _sandbox: &SandboxConfig,
+) -> Result<Launched, String> {
     Err("local process adapter is unavailable on this target".into())
 }
 

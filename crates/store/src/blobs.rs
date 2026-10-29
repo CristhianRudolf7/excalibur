@@ -180,6 +180,7 @@ impl BlobStore {
         expected_size: u64,
         offset: u64,
         max_bytes: usize,
+        mut inspector: Option<Box<dyn excalibur_types::runtime::DurableByteInspector>>,
     ) -> Result<BlobWindow> {
         if !(1..=1024 * 1024).contains(&max_bytes) {
             return Err(Error::Invalid("blob window must be 1..=1048576 bytes"));
@@ -220,6 +221,11 @@ impl BlobStore {
                 return Err(Error::BlobCorrupt(hash.0.clone()));
             }
             hasher.update(&buffer[..count]);
+            if let Some(inspector) = &mut inspector {
+                inspector
+                    .inspect(&buffer[..count])
+                    .map_err(|_| Error::BlobAccessDenied)?;
+            }
             if next > offset && total < end {
                 let from = offset.max(total) - total;
                 let until = end.min(next) - total;
@@ -229,6 +235,9 @@ impl BlobStore {
         }
         if total != expected_size || format!("{:x}", hasher.finalize()) != hash.0 {
             return Err(Error::BlobCorrupt(hash.0.clone()));
+        }
+        if let Some(inspector) = &mut inspector {
+            inspector.finish().map_err(|_| Error::BlobAccessDenied)?;
         }
         Ok(BlobWindow {
             bytes,

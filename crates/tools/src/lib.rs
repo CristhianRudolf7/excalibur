@@ -1,6 +1,7 @@
 //! Reusable local tools. Hosts supply policy and optional formatting/diagnostic integrations.
 mod files;
 mod patch;
+mod redaction;
 pub mod terminal;
 use excalibur_store::{Database, Priority};
 use excalibur_types::runtime::{
@@ -39,6 +40,9 @@ pub trait PostEditHooks: Send + Sync {
 }
 #[derive(Clone)]
 pub struct ToolPolicy {
+    pub redactor: excalibur_vault::Redactor,
+    /// Canonical host-owned vault/evaluation paths excluded from all file tools.
+    pub protected_paths: Vec<PathBuf>,
     pub read: Access,
     pub write: Access,
     pub exec: Access,
@@ -50,6 +54,8 @@ pub struct ToolPolicy {
 impl Default for ToolPolicy {
     fn default() -> Self {
         Self {
+            redactor: excalibur_vault::Redactor::default(),
+            protected_paths: Vec::new(),
             read: Access::Allow,
             write: Access::Ask,
             exec: Access::Deny,
@@ -75,6 +81,13 @@ impl LocalTools {
         if policy.output_budget_bytes < 256 || policy.output_budget_bytes > 1024 * 1024 {
             return Err("output budget must be 256..=1048576 bytes".into());
         }
+        if policy
+            .protected_paths
+            .iter()
+            .any(|p| !p.is_absolute() || p.exists() && p.canonicalize().ok().as_ref() != Some(p))
+        {
+            return Err("protected paths must be canonical absolute paths".into());
+        }
         let (root, directory) = files::open_root(root)?;
         let checksum = hash(SCHEMA.as_bytes());
         db.write(Priority::Normal,move|conn|{
@@ -89,6 +102,24 @@ impl LocalTools {
             else {conn.execute_batch(SCHEMA_2)?;conn.execute("INSERT INTO tool_schema VALUES(2,?1)",[checksum_2])?;}
             Ok(())
         }).await.map_err(|e|e.to_string())?;
+        let mut sandbox = terminal::SandboxConfig::project(root.clone());
+        sandbox.hidden_paths = policy.protected_paths.clone();
+        sandbox
+            .hidden_paths
+            .push(db.path().parent().unwrap().to_path_buf());
+        sandbox.hidden_paths.extend([
+            db.path().to_path_buf(),
+            db.path().with_file_name(format!(
+                "{}-wal",
+                db.path().file_name().unwrap().to_string_lossy()
+            )),
+            db.path().with_file_name(format!(
+                "{}-shm",
+                db.path().file_name().unwrap().to_string_lossy()
+            )),
+            db.path().parent().unwrap().join("blobs"),
+            db.path().parent().unwrap().join("backups"),
+        ]);
         let terminal = terminal::TerminalManager::new(terminal::TerminalConfig {
             spool_dir: db
                 .path()
@@ -100,6 +131,8 @@ impl LocalTools {
             max_per_run: 16,
             max_global: 64,
             protected_recent: 8,
+            sandbox: Some(sandbox),
+            redactor: policy.redactor.clone(),
         })?;
         Ok(Self {
             db,
@@ -517,7 +550,9 @@ impl LocalTools {
         } else {
             None
         };
+        let protected = self.policy.protected_paths.clone();
         let files = ignore::WalkBuilder::new(&self.root)
+            .filter_entry(move |entry| !protected.iter().any(|p| entry.path().starts_with(p)))
             .hidden(false)
             .git_ignore(true)
             .git_exclude(true)
@@ -625,6 +660,7 @@ impl LocalTools {
         // Check every precondition before the first requested file effect.
         for edit in &edits {
             let path = self.resolve(&edit.path)?;
+            self.check_write_path(&path)?;
             let current = self.content(&path)?;
             let fingerprint = current.as_deref().map(hash);
             if fingerprint != edit.pre && fingerprint != edit.post {
@@ -711,6 +747,7 @@ impl LocalTools {
         Ok(json!({"files":reports}))
     }
     async fn output(&self, run: &str, call: &str, mut result: ToolResult) -> ToolResult {
+        result.output = self.policy.redactor.redact_json(&result.output);
         if result.full_output_blob.is_none()
             && let Some(path) = result.output.get("spool_path").and_then(Value::as_str)
         {
@@ -723,9 +760,13 @@ impl LocalTools {
                     .get("cursor")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
+                let redactor = self.policy.redactor.clone();
                 let prepared = tokio::task::spawn_blocking(move || {
                     use std::io::Read;
-                    blobs.prepare_reader(std::fs::File::open(path)?.take(cursor))
+                    blobs.prepare_reader(redaction::RedactedReader::new(
+                        std::fs::File::open(path)?.take(cursor),
+                        &redactor,
+                    ))
                 })
                 .await;
                 match prepared {
@@ -899,6 +940,38 @@ pub fn head_tail(text: &str, budget: usize) -> String {
     format!("{}{}{}", &text[..end], marker, &text[start..])
 }
 impl ToolRuntime for LocalTools {
+    fn configure_process_boundary<'a>(
+        &'a self,
+        run: &'a str,
+        boundary: excalibur_types::runtime::ProcessBoundary,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            use excalibur_types::runtime::ProcessNetwork;
+            if boundary.network != ProcessNetwork::None {
+                return Err("network process authority requires an enforcing proxy; unavailable, execution denied".into());
+            }
+            let mut sandbox = terminal::SandboxConfig::project(boundary.workspace);
+            sandbox.profile =
+                match boundary.profile.as_str() {
+                    "project" | "project-restricted" => terminal::SandboxProfile::ProjectRestricted,
+                    "read-only" => terminal::SandboxProfile::ReadOnly,
+                    "file-analysis" => terminal::SandboxProfile::FileAnalysis,
+                    "tool-package" => terminal::SandboxProfile::ToolPackage,
+                    "project-net" => return Err(
+                        "project-net requires an enforcing proxy; unavailable, execution denied"
+                            .into(),
+                    ),
+                    "eval" => {
+                        return Err("eval requires a separately verified container boundary".into());
+                    }
+                    _ => return Err("unknown mandatory process sandbox profile".into()),
+                };
+            sandbox.read_roots = boundary.read_roots;
+            sandbox.write_roots = boundary.write_roots;
+            sandbox.hidden_paths = boundary.denied_paths;
+            self.terminal.set_run_sandbox(run, sandbox)
+        })
+    }
     fn definitions(&self) -> Vec<ToolDefinition> {
         ["apply_patch","edit_file","exec","exec_io","glob","grep","read_file","write_file"].into_iter().map(|name|ToolDefinition{name:name.into(),description:match name{"read_file"=>"Read a file with numbered lines and a fingerprint, default 200 lines.","write_file"=>"Create or rewrite a file after checking the run's read fingerprint.","edit_file"=>"Replace unique text using exact, typography-normalized or trailing-space matching.","apply_patch"=>"Apply Codex block patches adding, deleting or updating multiple files.","grep"=>"Search regex in files respecting gitignore; return bounded per-file summaries.","glob"=>"Find paths matching a glob while respecting gitignore.","exec"=>"Run a command in a persistent pipe or PTY session under host execution policy.",_=>"Read, write, wait for, signal or close owned terminal sessions."}.into(),input_schema:Self::schema(name).unwrap()}).collect()
     }

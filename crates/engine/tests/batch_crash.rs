@@ -116,6 +116,7 @@ async fn setup(root: &Path) -> (Database, Engine, Arc<LocalTools>) {
     )
     .unwrap();
     let journal = Journal::new(db.clone()).await.unwrap();
+    excalibur_tools::terminal::prepare_project_boundary(&workspace).unwrap();
     let tools = Arc::new(
         LocalTools::new(
             db.clone(),

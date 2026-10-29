@@ -52,6 +52,14 @@ impl LocalTools {
         for name in tail.into_iter().rev() {
             resolved.push(name);
         }
+        if self
+            .policy
+            .protected_paths
+            .iter()
+            .any(|p| resolved.starts_with(p))
+        {
+            return Err("security policy: protected host path is inaccessible".into());
+        }
         let relative = resolved
             .strip_prefix(&self.root)
             .map_err(|_| "outside root")?;
@@ -86,6 +94,11 @@ impl LocalTools {
         slot: &str,
         bytes: Vec<u8>,
     ) -> Result<String, String> {
+        if self.policy.redactor.redact_bytes(&bytes) != bytes {
+            return Err(
+                "security policy: secret content cannot be persisted in file snapshots".into(),
+            );
+        }
         let blobs = self.db.blobs();
         let prepared = tokio::task::spawn_blocking(move || blobs.prepare(&bytes))
             .await
@@ -266,6 +279,7 @@ impl LocalTools {
     ) -> Result<FileEdit, String> {
         self.check_permission(Permission::Write)?;
         let path = self.resolve(path)?;
+        self.check_write_path(&path)?;
         let current = self.content(&path)?;
         if let Some(content) = current.as_deref() {
             self.ensure_read(run, &path, content, fp).await?;
@@ -313,7 +327,36 @@ impl LocalTools {
         };
         Ok(FileEdit { path, pre, post })
     }
+    pub(crate) fn check_write_path(&self, path: &str) -> Result<(), String> {
+        let components = std::path::Path::new(path)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if components.iter().any(|c| {
+            matches!(
+                c.as_str(),
+                ".git"
+                    | ".excalibur"
+                    | ".agents"
+                    | ".codex"
+                    | ".ssh"
+                    | ".aws"
+                    | ".github"
+                    | ".gitlab"
+            )
+        }) || components
+            .windows(2)
+            .any(|c| c[0] == ".config" && c[1] == "gcloud")
+            || components
+                .iter()
+                .any(|c| matches!(c.as_str(), ".gitlab-ci.yml" | "jenkinsfile"))
+        {
+            return Err("security policy: sensitive configuration is read-only".into());
+        }
+        Ok(())
+    }
     pub(crate) fn atomic_write(&self, path: &str, bytes: Option<&[u8]>) -> Result<(), String> {
+        self.check_write_path(path)?;
         let normalized = self.resolve(path)?;
         if normalized != path {
             return Err("path changed after preparation".into());

@@ -593,6 +593,18 @@ impl Database {
         offset: u64,
         max_bytes: usize,
     ) -> Result<crate::BlobWindow> {
+        self.read_blob_window_inspected(hash, offset, max_bytes, None)
+            .await
+    }
+    /// Inspect the entire decoded content in the existing verification pass, before
+    /// returning any window. Bounded memory; no second decompression/scan is added.
+    pub async fn read_blob_window_inspected(
+        &self,
+        hash: BlobHash,
+        offset: u64,
+        max_bytes: usize,
+        inspector: Option<Box<dyn excalibur_types::runtime::DurableByteInspector>>,
+    ) -> Result<crate::BlobWindow> {
         if self.inner.kind != DatabaseKind::Main {
             return Err(Error::PrincipalOnly);
         }
@@ -619,7 +631,7 @@ impl Database {
             tokio::task::spawn_blocking(move || {
                 let _lifetime = lifetime;
                 let _activity = activity;
-                blobs.read_window(&hash, size, offset, max_bytes)
+                blobs.read_window(&hash, size, offset, max_bytes, inspector)
             })
             .await
             .map_err(|_| Error::Closed)?
@@ -1247,7 +1259,7 @@ fn blob_access_issue<T>(hash: &BlobHash, result: &Result<T>) -> Option<crate::Bl
             crate::BlobState::Ok,
             "verified on access",
         )),
-        Err(Error::BlobTooLarge(_) | Error::Invalid(_)) => None,
+        Err(Error::BlobTooLarge(_) | Error::Invalid(_) | Error::BlobAccessDenied) => None,
         Err(Error::BlobMetadataMissing(_)) => Some(crate::BlobIssue::new(
             hash.as_str().into(),
             crate::BlobState::MetadataMissing,
