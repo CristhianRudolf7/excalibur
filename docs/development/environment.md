@@ -2,7 +2,7 @@
 
 [Español](environment.es.md)
 
-Excalibur currently contains Rust provider, base/storage and minimum durable engine libraries. The complete personal agent, CLI, Axum server and frontend are planned; there is no application or development server to start yet. Do not treat the dependency checks below as implemented product features.
+Excalibur contains shared Rust provider, storage, durable engine, security, evaluation and telemetry libraries. The noninteractive command can be built with `cargo build -p excalibur-cli` and inspected with `target/debug/excalibur --help`; see [its execution contract](noninteractive.md). The complete personal agent, interactive CLI, Axum server and frontend remain planned; there is no frontend development server to start. Dependency checks are separate from implemented features.
 
 ## Environment checked on this VPS
 

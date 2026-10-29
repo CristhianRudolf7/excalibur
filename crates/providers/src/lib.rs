@@ -15,10 +15,105 @@ pub enum Error {
     Unsupported,
     #[error("provider request failed (status {0})")]
     Http(StatusCode),
+    #[error("provider request failed (status {status}, class {kind:?})")]
+    ClassifiedHttp {
+        status: StatusCode,
+        kind: KnownFailure,
+    },
     #[error("provider transport failed")]
     Transport,
     #[error("provider returned an invalid response")]
     InvalidResponse,
+}
+
+/// A closed set of provider failure categories. No response text is retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnownFailure {
+    Quota,
+    ContextWindow,
+    Overloaded,
+}
+
+#[derive(Deserialize)]
+struct OpenAiErrorEnvelope {
+    error: OpenAiErrorFields,
+}
+#[derive(Deserialize)]
+struct OpenAiErrorFields {
+    #[serde(default)]
+    code: Option<OpenAiErrorCode>,
+    #[serde(default, rename = "type")]
+    kind: Option<OpenAiErrorType>,
+}
+#[derive(Deserialize)]
+enum OpenAiErrorCode {
+    #[serde(rename = "organization_spend_limit_exceeded")]
+    OrganizationSpendLimit,
+    #[serde(rename = "project_spend_limit_exceeded")]
+    ProjectSpendLimit,
+    #[serde(rename = "organization_usage_limit_exceeded")]
+    OrganizationUsageLimit,
+    #[serde(rename = "credit_balance_exhausted")]
+    CreditBalance,
+    #[serde(rename = "insufficient_quota")]
+    InsufficientQuota,
+    #[serde(rename = "context_length_exceeded")]
+    ContextWindow,
+    #[serde(rename = "server_is_overloaded")]
+    Overloaded,
+    #[serde(other)]
+    Other,
+}
+#[derive(Deserialize)]
+enum OpenAiErrorType {
+    #[serde(rename = "insufficient_quota")]
+    InsufficientQuota,
+    #[serde(other)]
+    Other,
+}
+
+async fn openai_http_error(mut response: reqwest::Response) -> Error {
+    const MAX_ERROR_BYTES: usize = 16 * 1024;
+    let status = response.status();
+    if !matches!(status.as_u16(), 400 | 429 | 503)
+        || response
+            .content_length()
+            .is_some_and(|length| length > MAX_ERROR_BYTES as u64)
+    {
+        return Error::Http(status);
+    }
+    let mut body = Zeroizing::new(Vec::new());
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if chunk.len() <= MAX_ERROR_BYTES - body.len() => {
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            _ => return Error::Http(status),
+        }
+    }
+    let Ok(envelope) = serde_json::from_slice::<OpenAiErrorEnvelope>(&body) else {
+        return Error::Http(status);
+    };
+    let fields = envelope.error;
+    let kind = match (status.as_u16(), fields.code, fields.kind) {
+        (400, Some(OpenAiErrorCode::ContextWindow), _) => KnownFailure::ContextWindow,
+        (
+            429,
+            Some(
+                OpenAiErrorCode::OrganizationSpendLimit
+                | OpenAiErrorCode::ProjectSpendLimit
+                | OpenAiErrorCode::OrganizationUsageLimit
+                | OpenAiErrorCode::CreditBalance
+                | OpenAiErrorCode::InsufficientQuota,
+            ),
+            _,
+        )
+        | (429, _, Some(OpenAiErrorType::InsufficientQuota)) => KnownFailure::Quota,
+        (503, Some(OpenAiErrorCode::Overloaded), _) => KnownFailure::Overloaded,
+        _ => return Error::Http(status),
+    };
+    Error::ClassifiedHttp { status, kind }
 }
 
 /// Never serializable or printable; the caller owns credential acquisition and rotation.
@@ -211,6 +306,10 @@ impl fmt::Debug for ProviderClient {
 impl ProviderClient {
     /// Stable non-secret transport identity for pinning durable model requests.
     /// Endpoint construction rejects credentials, query strings and fragments.
+    /// Provider identity without credentials or endpoint details.
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
     pub fn configuration_identity(&self) -> String {
         format!("{:?}:{}", self.provider, self.base)
     }
@@ -428,6 +527,9 @@ impl ProviderClient {
         }
         let response = request.send().await.map_err(|_| Error::Transport)?;
         if !response.status().is_success() {
+            if self.provider == Provider::OpenAi {
+                return Err(openai_http_error(response).await);
+            }
             return Err(Error::Http(response.status()));
         }
         Ok(response)

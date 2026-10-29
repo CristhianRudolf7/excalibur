@@ -185,7 +185,10 @@ impl SecuredTools {
         if !token.processes {
             return Err("process capability is absent".into());
         }
-        let network_enabled = !matches!(token.network, Network::None);
+        // Eval uses the explicitly attested container network ceiling, validated
+        // by the native adapter. Project-net retains the live host broker.
+        let network_enabled = !matches!(token.network, Network::None)
+            && token.sandbox_profile.as_deref() != Some("eval");
         self.delegate
             .configure_process_boundary(
                 run,

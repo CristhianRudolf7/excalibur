@@ -21,6 +21,57 @@ pub(crate) struct FileEdit {
     pub post: Option<String>,
 }
 impl LocalTools {
+    pub(crate) async fn edit_diff(
+        &self,
+        run: &str,
+        call: &str,
+        edit: &FileEdit,
+        post: &[u8],
+    ) -> Result<Value, String> {
+        let bytes = match &edit.pre {
+            Some(hash) => self
+                .db
+                .read_blob(
+                    hash.parse()
+                        .map_err(|e: excalibur_store::Error| e.to_string())?,
+                    MAX_FILE_BYTES,
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+            None => Vec::new(),
+        };
+        let before = self.policy.redactor.redact_bytes(&bytes);
+        let after = self.policy.redactor.redact_bytes(post);
+        let before = String::from_utf8_lossy(&before);
+        let after = String::from_utf8_lossy(&after);
+        let mut config = similar::TextDiff::configure();
+        config.timeout(std::time::Duration::from_millis(250));
+        let diff = config
+            .diff_lines(before.as_ref(), after.as_ref())
+            .unified_diff()
+            .context_radius(3)
+            .header(&format!("a/{}", edit.path), &format!("b/{}", edit.path))
+            .to_string();
+        let diff = self.policy.redactor.redact_text(&diff);
+        let bytes = diff.len();
+        let truncated = bytes > 4096;
+        let blob = if truncated {
+            Some(
+                self.save_blob(
+                    run,
+                    call,
+                    &format!("edit-diff:{}", hash(edit.path.as_bytes())),
+                    diff.clone().into_bytes(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        Ok(
+            json!({"diff":crate::head_tail(&diff,4096),"diff_bytes":bytes,"diff_truncated":truncated,"diff_blob":blob}),
+        )
+    }
     pub(crate) fn resolve(&self, path: &str) -> Result<String, String> {
         let path = Path::new(path);
         if path.components().any(|p| matches!(p, Component::ParentDir)) {

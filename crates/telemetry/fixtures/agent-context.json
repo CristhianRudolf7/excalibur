@@ -1,0 +1,53 @@
+{
+  "cost_usd": 0.000125,
+  "metadata": {
+    "cache_read_known": true,
+    "complete_model_usage": true,
+    "excalibur": {
+      "agent_name": "excalibur",
+      "agent_version": "0.1.0",
+      "benchmark": null,
+      "configuration": {
+        "budget": 500
+      },
+      "configuration_hash": "e50c86a323bad6eb905ba79e71c05a037cebb4f90d75605398370801ef24b08b",
+      "environment": {},
+      "excalibur_commit": null,
+      "extra": {},
+      "harbor_version": null,
+      "instruction": "Create a synthetic file",
+      "model": "synthetic-v1",
+      "profile": "development",
+      "profile_version": null,
+      "provider": "mock",
+      "reasoning_effort": null,
+      "role": "coordinator",
+      "seed": null,
+      "skill_catalog_hash": null,
+      "task_digest": null,
+      "task_id": "synthetic-task",
+      "temperature": null,
+      "tool_catalog_hash": null,
+      "trial_id": null
+    },
+    "exit_code": 0,
+    "final_state": "completed",
+    "known_input_token_subtotal": 100,
+    "known_output_token_subtotal": 30,
+    "limitations": [],
+    "model_usage_with_unknown_cache": {},
+    "pending_model_calls": 0,
+    "usage_known": true
+  },
+  "model_usage": {
+    "synthetic-v1": {
+      "cost_usd": 0.000125,
+      "n_cache_tokens": 40,
+      "n_input_tokens": 100,
+      "n_output_tokens": 30
+    }
+  },
+  "n_cache_tokens": 40,
+  "n_input_tokens": 100,
+  "n_output_tokens": 30
+}

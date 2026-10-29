@@ -1,0 +1,98 @@
+{
+  "agent": {
+    "extra": {
+      "commit": null,
+      "configuration_hash": "e50c86a323bad6eb905ba79e71c05a037cebb4f90d75605398370801ef24b08b",
+      "profile": "development"
+    },
+    "model_name": "synthetic-v1",
+    "name": "excalibur",
+    "tool_definitions": null,
+    "version": "0.1.0"
+  },
+  "extra": {
+    "final_state": null,
+    "finalized": false,
+    "harbor_reference_commit": "509b119db0d97b141dcd9c80f4f7ab861c47c2d6",
+    "harbor_reference_version": "0.25.0",
+    "metadata": {
+      "agent_name": "excalibur",
+      "agent_version": "0.1.0",
+      "benchmark": null,
+      "configuration": {
+        "budget": 500
+      },
+      "configuration_hash": "e50c86a323bad6eb905ba79e71c05a037cebb4f90d75605398370801ef24b08b",
+      "environment": {},
+      "excalibur_commit": null,
+      "extra": {},
+      "harbor_version": null,
+      "instruction": "Create a synthetic file",
+      "model": "synthetic-v1",
+      "profile": "development",
+      "profile_version": null,
+      "provider": "mock",
+      "reasoning_effort": null,
+      "role": "coordinator",
+      "seed": null,
+      "skill_catalog_hash": null,
+      "task_digest": null,
+      "task_id": "synthetic-task",
+      "temperature": null,
+      "tool_catalog_hash": null,
+      "trial_id": null
+    },
+    "resources": {
+      "daemon_cpu_elapsed_ns": null,
+      "daemon_lifetime_peak_bytes": null,
+      "daemon_rss_delta_peak_bytes": null,
+      "daemon_rss_initial_bytes": null,
+      "daemon_rss_observed_peak_bytes": null,
+      "first_sample_unix_ms": null,
+      "group_cpu_elapsed_ns": null,
+      "group_memory_peak_bytes": null,
+      "group_oom_events_delta": null,
+      "group_oom_kills_delta": null,
+      "group_pids_observed_peak": null,
+      "group_pids_peak": null,
+      "group_process_lifetime_peak_bytes": null,
+      "group_scope": "shared",
+      "last_sample_unix_ms": null,
+      "sample_count": 0,
+      "unavailable": []
+    }
+  },
+  "final_metrics": {
+    "extra": {
+      "cache_write_tokens": null,
+      "known_input_token_subtotal": 0,
+      "known_output_token_subtotal": 0,
+      "pending_model_calls": 1,
+      "provider_calls": 0,
+      "provider_calls_known": false,
+      "reasoning_tokens": null,
+      "usage_known": false
+    },
+    "total_cached_tokens": null,
+    "total_completion_tokens": null,
+    "total_cost_usd": null,
+    "total_prompt_tokens": null,
+    "total_steps": 1
+  },
+  "schema_version": "ATIF-v1.8",
+  "session_id": "run",
+  "steps": [
+    {
+      "extra": {
+        "event_key": "seed",
+        "journal_sequence": 1,
+        "recovered": false
+      },
+      "message": "Create a synthetic file",
+      "source": "user",
+      "step_id": 1,
+      "timestamp": "2023-11-14T22:13:20.1Z"
+    }
+  ],
+  "trajectory_id": "excalibur:run"
+}

@@ -1,0 +1,24 @@
+[package]
+name = "excalibur-eval"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+excalibur-types = { path = "../types" }
+excalibur-store = { path = "../store" }
+excalibur-journal = { path = "../journal" }
+excalibur-context = { path = "../context" }
+excalibur-engine = { path = "../engine" }
+excalibur-models = { path = "../models" }
+excalibur-tools = { path = "../tools" }
+excalibur-sandbox = { path = "../sandbox" }
+excalibur-security = { path = "../security" }
+excalibur-telemetry = { path = "../telemetry" }
+excalibur-vault = { path = "../vault" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time", "signal", "macros"] }
+tempfile = "3"
+[dev-dependencies]
+excalibur-providers = { path = "../providers" }

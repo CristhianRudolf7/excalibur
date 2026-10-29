@@ -1,0 +1,202 @@
+{
+  "agent": {
+    "extra": {
+      "commit": null,
+      "configuration_hash": "e50c86a323bad6eb905ba79e71c05a037cebb4f90d75605398370801ef24b08b",
+      "profile": "development"
+    },
+    "model_name": "synthetic-v1",
+    "name": "excalibur",
+    "tool_definitions": [
+      {
+        "function": {
+          "description": "synthetic edit",
+          "name": "edit",
+          "parameters": {
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ],
+    "version": "0.1.0"
+  },
+  "extra": {
+    "final_state": "completed",
+    "finalized": true,
+    "harbor_reference_commit": "509b119db0d97b141dcd9c80f4f7ab861c47c2d6",
+    "harbor_reference_version": "0.25.0",
+    "metadata": {
+      "agent_name": "excalibur",
+      "agent_version": "0.1.0",
+      "benchmark": null,
+      "configuration": {
+        "budget": 500
+      },
+      "configuration_hash": "e50c86a323bad6eb905ba79e71c05a037cebb4f90d75605398370801ef24b08b",
+      "environment": {},
+      "excalibur_commit": null,
+      "extra": {},
+      "harbor_version": null,
+      "instruction": "Create a synthetic file",
+      "model": "synthetic-v1",
+      "profile": "development",
+      "profile_version": null,
+      "provider": "mock",
+      "reasoning_effort": null,
+      "role": "coordinator",
+      "seed": null,
+      "skill_catalog_hash": null,
+      "task_digest": null,
+      "task_id": "synthetic-task",
+      "temperature": null,
+      "tool_catalog_hash": null,
+      "trial_id": null
+    },
+    "resources": {
+      "daemon_cpu_elapsed_ns": null,
+      "daemon_lifetime_peak_bytes": null,
+      "daemon_rss_delta_peak_bytes": null,
+      "daemon_rss_initial_bytes": null,
+      "daemon_rss_observed_peak_bytes": null,
+      "first_sample_unix_ms": null,
+      "group_cpu_elapsed_ns": null,
+      "group_memory_peak_bytes": null,
+      "group_oom_events_delta": null,
+      "group_oom_kills_delta": null,
+      "group_pids_observed_peak": null,
+      "group_pids_peak": null,
+      "group_process_lifetime_peak_bytes": null,
+      "group_scope": "shared",
+      "last_sample_unix_ms": null,
+      "sample_count": 0,
+      "unavailable": []
+    }
+  },
+  "final_metrics": {
+    "extra": {
+      "cache_write_tokens": 20,
+      "known_input_token_subtotal": 100,
+      "known_output_token_subtotal": 30,
+      "pending_model_calls": 0,
+      "provider_calls": 2,
+      "provider_calls_known": true,
+      "reasoning_tokens": 10,
+      "usage_known": true
+    },
+    "total_cached_tokens": 40,
+    "total_completion_tokens": 30,
+    "total_cost_usd": 0.000125,
+    "total_prompt_tokens": 100,
+    "total_steps": 3
+  },
+  "schema_version": "ATIF-v1.8",
+  "session_id": "run",
+  "steps": [
+    {
+      "extra": {
+        "event_key": "seed",
+        "journal_sequence": 1,
+        "recovered": false
+      },
+      "message": "Create a synthetic file",
+      "source": "user",
+      "step_id": 1,
+      "timestamp": "2023-11-14T22:13:20.1Z"
+    },
+    {
+      "extra": {
+        "event_key": "model:0:response",
+        "journal_sequence": 3,
+        "model_call_metrics": {
+          "attempts": [
+            {
+              "index": 0
+            },
+            {
+              "index": 1
+            }
+          ],
+          "cost_microusd": 125,
+          "duration_ms": 60,
+          "metadata": {
+            "configuration_hash": "mock-profile",
+            "model": "synthetic-v1",
+            "price_table_hash": "abc",
+            "price_table_version": "synthetic-prices-v1",
+            "provider": "mock",
+            "role": "coordinator"
+          },
+          "provider_calls": 2,
+          "provider_calls_known": true,
+          "usage": {
+            "cache_read_tokens": 40,
+            "cache_write_by_ttl": {
+              "5m": 20
+            },
+            "cache_write_tokens": 20,
+            "estimated": false,
+            "input_tokens": 100,
+            "output_tokens": 30,
+            "reasoning_tokens": 10
+          },
+          "usage_known": true
+        },
+        "recovered": false
+      },
+      "llm_call_count": 2,
+      "message": "editing",
+      "metrics": {
+        "cached_tokens": 40,
+        "completion_tokens": 30,
+        "cost_usd": 0.000125,
+        "extra": {
+          "cache_write_by_ttl": {
+            "5m": 20
+          },
+          "cache_write_tokens": 20,
+          "estimated": false,
+          "reasoning_tokens": 10
+        },
+        "prompt_tokens": 100
+      },
+      "model_name": "synthetic-v1",
+      "observation": {
+        "results": [
+          {
+            "content": "{\"output\":{\"diff\":\"--- a/a.rs\\n+++ b/a.rs\\n+fn main() {}\\n\",\"path\":\"a.rs\"},\"success\":true}",
+            "extra": {
+              "event_key": "tool:0:0:result",
+              "journal_sequence": 5
+            },
+            "source_call_id": "call-1"
+          }
+        ]
+      },
+      "source": "agent",
+      "step_id": 2,
+      "timestamp": "2023-11-14T22:13:20.3Z",
+      "tool_calls": [
+        {
+          "arguments": {
+            "path": "a.rs"
+          },
+          "function_name": "edit",
+          "tool_call_id": "call-1"
+        }
+      ]
+    },
+    {
+      "extra": {
+        "event_key": "directive",
+        "journal_sequence": 7,
+        "recovered": false
+      },
+      "message": "continue",
+      "source": "user",
+      "step_id": 3,
+      "timestamp": "2023-11-14T22:13:20.7Z"
+    }
+  ],
+  "trajectory_id": "excalibur:run"
+}

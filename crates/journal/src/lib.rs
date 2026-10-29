@@ -219,7 +219,13 @@ impl Journal {
     ) -> Result<StateChange> {
         if !matches!(
             state,
-            "running" | "paused" | "blocked" | "completed" | "completed_with_pending" | "cancelled"
+            "running"
+                | "paused"
+                | "blocked"
+                | "completed"
+                | "completed_with_pending"
+                | "cancelled"
+                | "failed"
         ) || reason.as_ref().is_some_and(|s| s.len() > 65536)
             || key.is_empty()
             || key.len() > 1024

@@ -52,7 +52,10 @@ pub(crate) fn authoritative_run_state(
     }
 }
 pub(crate) fn terminal(state: &str) -> bool {
-    matches!(state, "completed" | "completed_with_pending" | "cancelled")
+    matches!(
+        state,
+        "completed" | "completed_with_pending" | "cancelled" | "failed"
+    )
 }
 struct HeldGuard {
     _lock: OwnedMutexGuard<()>,

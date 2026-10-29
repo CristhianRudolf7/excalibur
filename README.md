@@ -6,7 +6,7 @@ Excalibur is a planned personal AI agent that will converse with users, help pla
 
 ## Status
 
-The repository contains documentation and shared Rust provider, storage, minimum durable engine, security, vault and Linux sandbox libraries. The complete personal agent, CLI, web interface and marketplace remain planned. See [provider coverage and limits](docs/architecture/provider-implementation.md).
+The repository contains documentation and shared Rust provider, storage, minimum durable engine, security, vault and Linux sandbox libraries. The complete personal agent, interactive CLI, web interface and marketplace remain planned. See [provider coverage and limits](docs/architecture/provider-implementation.md).
 
 See [Base and storage](docs/development/storage.md) for implementation and verification evidence. See [Minimum durable engine](docs/development/durable-engine.md) for the embedded step loop, effect recovery, context, gateway and local tools.
 
@@ -25,3 +25,5 @@ See [Mandatory security](docs/development/security.md) for backend authorization
 - `scripts/`: project automation scripts.
 
 See [ROADMAP.md](ROADMAP.md), [AGENTS.md](AGENTS.md), [CHANGELOG.md](CHANGELOG.md) and [SECURITY.md](SECURITY.md). Excalibur is source-available under a license with commercial restrictions; see [LICENSE](LICENSE).
+
+The `excalibur exec` command, evaluation profile, metrics/ATIF and replay are documented in [Noninteractive execution and evaluation](docs/development/noninteractive.md). The concrete Harbor adapter is supplied by the user.

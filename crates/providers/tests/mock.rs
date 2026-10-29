@@ -1,4 +1,6 @@
-use excalibur_providers::{ChatRequest, Error, Message, Provider, ProviderClient, Role, Secret};
+use excalibur_providers::{
+    ChatRequest, Error, KnownFailure, Message, Provider, ProviderClient, Role, Secret,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -111,6 +113,117 @@ async fn failures_do_not_echo_sensitive_response() {
         .unwrap_err();
     assert!(matches!(err, Error::Http(_)));
     assert!(!format!("{err:?} {err}").contains("test-secret"));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn openai_known_http_failures_retain_only_a_closed_class_and_status() {
+    for (status, field, value, expected) in [
+        (
+            "429 Too Many Requests",
+            "code",
+            "organization_spend_limit_exceeded",
+            KnownFailure::Quota,
+        ),
+        (
+            "429 Too Many Requests",
+            "code",
+            "project_spend_limit_exceeded",
+            KnownFailure::Quota,
+        ),
+        (
+            "429 Too Many Requests",
+            "code",
+            "organization_usage_limit_exceeded",
+            KnownFailure::Quota,
+        ),
+        (
+            "429 Too Many Requests",
+            "code",
+            "credit_balance_exhausted",
+            KnownFailure::Quota,
+        ),
+        (
+            "429 Too Many Requests",
+            "code",
+            "insufficient_quota",
+            KnownFailure::Quota,
+        ),
+        (
+            "429 Too Many Requests",
+            "type",
+            "insufficient_quota",
+            KnownFailure::Quota,
+        ),
+        (
+            "400 Bad Request",
+            "code",
+            "context_length_exceeded",
+            KnownFailure::ContextWindow,
+        ),
+        (
+            "503 Service Unavailable",
+            "code",
+            "server_is_overloaded",
+            KnownFailure::Overloaded,
+        ),
+    ] {
+        let body =
+            serde_json::json!({"error":{field:value,"message":"synthetic-private-response-value"}})
+                .to_string();
+        let (url, task) = mock(status, &body).await;
+        let error = client(Provider::OpenAi, &url)
+            .chat(&chat())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::ClassifiedHttp { status: actual, kind } if actual.as_u16() == status[..3].parse::<u16>().unwrap() && kind == expected)
+        );
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains("synthetic-private"));
+        assert!(!diagnostic.contains(value));
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unknown_oversized_conflicting_and_other_provider_errors_preserve_http_fallback() {
+    let known = r#"{"error":{"code":"credit_balance_exhausted","message":"synthetic-private-response-value"}}"#;
+    for (provider, status, body) in [
+        (Provider::OpenAi, "429 Too Many Requests", r#"{"error":{"code":"synthetic-private-unknown-code","message":"credit_balance_exhausted"}}"#.to_string()),
+        (Provider::OpenAi, "429 Too Many Requests", "invalid JSON synthetic-private-response-value".to_string()),
+        (Provider::OpenAi, "401 Unauthorized", known.to_string()),
+        (Provider::OpenAi, "400 Bad Request", known.to_string()),
+        (Provider::Groq, "429 Too Many Requests", known.to_string()),
+        (Provider::OpenAi, "429 Too Many Requests", format!("{known}{}", " ".repeat(16 * 1024))),
+    ] {
+        let (url, task) = mock(status, &body).await;
+        let error = client(provider, &url).chat(&chat()).await.unwrap_err();
+        assert!(matches!(error, Error::Http(actual) if actual.as_u16() == status[..3].parse::<u16>().unwrap()));
+        assert!(!format!("{error:?} {error}").contains("synthetic-private"));
+        task.await.unwrap();
+    }
+    // Unknown-length responses must obey the same cap, rather than trusting headers.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let _ = socket.read(&mut request).await.unwrap();
+        let body = format!("{}{}", " ".repeat(16 * 1024), known);
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+    });
+    assert!(matches!(
+        client(Provider::OpenAi, &format!("http://{address}/v1/"))
+            .chat(&chat())
+            .await
+            .unwrap_err(),
+        Error::Http(_)
+    ));
     task.await.unwrap();
 }
 #[tokio::test]

@@ -56,6 +56,7 @@ pub struct Security {
     ceiling: Arc<CapabilityToken>,
     protected: Arc<Vec<PathBuf>>,
     evaluations: Arc<Vec<PathBuf>>,
+    noninteractive: bool,
 }
 const SQL: &str = include_str!("schema.sql");
 const DISPATCH_SQL: &str = include_str!("dispatch.sql");
@@ -115,6 +116,7 @@ impl Security {
             ceiling: Arc::new(ceiling),
             protected: Arc::new(Vec::new()),
             evaluations: Arc::new(Vec::new()),
+            noninteractive: false,
         })
     }
     /// Host-owned encrypted vault and evaluation paths are never delegated to model policy.
@@ -281,6 +283,12 @@ impl Security {
             _=>None,
         }
     }
+    /// Frozen host policy for unattended execution: requests needing approval
+    /// become audited denials, without creating a pending approval or waiting.
+    pub fn with_noninteractive_policy(mut self) -> Self {
+        self.noninteractive = true;
+        self
+    }
     pub async fn authorize(&self, run: &str, action: &Action, now: i64) -> Result<Decision> {
         self.authorize_with_ticket(run, action, now, None).await
     }
@@ -340,7 +348,14 @@ impl Security {
         if rule_effect == RuleEffect::Ask {
             reasons.push("ask rule matched");
         }
-        if untrusted && report.risk >= Risk::Medium {
+        // An explicitly frozen A3 container episode preauthorizes ordinary and
+        // unknown programming commands; absolute denials and host ceilings above
+        // remain effective. Interactive/project policy is unchanged.
+        let unattended_eval = self.noninteractive
+            && config.full_acknowledged
+            && autonomy == Autonomy::Full
+            && token.sandbox_profile.as_deref() == Some("eval");
+        if untrusted && report.risk >= Risk::Medium && !unattended_eval {
             reasons.push("risky action motivated only by untrusted content");
         }
         if (tainted || report.sensitive)
@@ -375,13 +390,18 @@ impl Security {
             }
             _ => {}
         }
-        if report.risk == Risk::Unknown {
+        if report.risk == Risk::Unknown && !unattended_eval {
             reasons.push("unknown or unparseable command requires approval");
         }
         if reasons.is_empty() {
             Ok(Decision::Allow)
         } else {
             let reason = reasons.join("; ");
+            if self.noninteractive {
+                let reason = format!("noninteractive policy denied approval: {reason}");
+                self.audit(json!({"kind":"authorization_denied","run":run,"action":action,"reason":reason,"at":now})).await?;
+                return Ok(Decision::Deny { reason });
+            }
             let approval_id = self
                 .request_approval(run, action, &reason, &report, now)
                 .await?;

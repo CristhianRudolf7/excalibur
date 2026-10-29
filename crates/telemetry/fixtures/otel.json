@@ -1,0 +1,195 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "excalibur"
+            }
+          },
+          {
+            "key": "service.version",
+            "value": {
+              "stringValue": "0.1.0"
+            }
+          },
+          {
+            "key": "excalibur.otel.omissions",
+            "value": {
+              "stringValue": ""
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "attributes": [
+              {
+                "key": "excalibur.gen_ai.conventions.commit",
+                "value": {
+                  "stringValue": "3fe84604a581b3d50dd5b4bd29383b462d2a5018"
+                }
+              }
+            ],
+            "name": "excalibur.telemetry",
+            "version": "0.1.0"
+          },
+          "spans": [
+            {
+              "attributes": [
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "invoke_agent"
+                  }
+                },
+                {
+                  "key": "gen_ai.agent.name",
+                  "value": {
+                    "stringValue": "excalibur"
+                  }
+                },
+                {
+                  "key": "gen_ai.conversation.id",
+                  "value": {
+                    "stringValue": "run"
+                  }
+                },
+                {
+                  "key": "excalibur.run.id",
+                  "value": {
+                    "stringValue": "run"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1700000001000000000",
+              "kind": 1,
+              "name": "invoke_agent excalibur",
+              "spanId": "4c23aed58b1631ef",
+              "startTimeUnixNano": "1700000000100000000",
+              "status": {
+                "code": 0
+              },
+              "traceId": "acba25512100f80b56fc3ccd14c65be5"
+            },
+            {
+              "attributes": [
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "mock"
+                  }
+                },
+                {
+                  "key": "gen_ai.conversation.id",
+                  "value": {
+                    "stringValue": "run"
+                  }
+                },
+                {
+                  "key": "excalibur.journal.sequence",
+                  "value": {
+                    "intValue": "3"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "synthetic-v1"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "100"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "30"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1700000000300000000",
+              "kind": 3,
+              "name": "chat synthetic-v1",
+              "parentSpanId": "4c23aed58b1631ef",
+              "spanId": "b1cf16f432ff5cfa",
+              "startTimeUnixNano": "1700000000240000000",
+              "status": {
+                "code": 0
+              },
+              "traceId": "acba25512100f80b56fc3ccd14c65be5"
+            },
+            {
+              "attributes": [
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "execute_tool"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.name",
+                  "value": {
+                    "stringValue": "edit"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.type",
+                  "value": {
+                    "stringValue": "function"
+                  }
+                },
+                {
+                  "key": "gen_ai.agent.name",
+                  "value": {
+                    "stringValue": "excalibur"
+                  }
+                },
+                {
+                  "key": "gen_ai.conversation.id",
+                  "value": {
+                    "stringValue": "run"
+                  }
+                },
+                {
+                  "key": "excalibur.journal.sequence",
+                  "value": {
+                    "intValue": "5"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.call.id",
+                  "value": {
+                    "stringValue": "call-1"
+                  }
+                }
+              ],
+              "endTimeUnixNano": "1700000000500000000",
+              "kind": 1,
+              "name": "execute_tool edit",
+              "parentSpanId": "4c23aed58b1631ef",
+              "spanId": "c47dd7bf6df49ab4",
+              "startTimeUnixNano": "1700000000465000000",
+              "status": {
+                "code": 0
+              },
+              "traceId": "acba25512100f80b56fc3ccd14c65be5"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

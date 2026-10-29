@@ -1,7 +1,11 @@
 //! Provider-neutral model boundary over the existing outbound provider transport.
 //! No model selection, credentials discovery, paid inference or agent loop occurs here.
+mod metrics;
+mod replay;
 use excalibur_providers::ProviderClient;
 use excalibur_types::runtime::{BoxFuture, Message, ModelRequest, ModelResponse, ToolCall, Usage};
+pub use metrics::*;
+pub use replay::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -22,6 +26,14 @@ pub enum ModelError {
     Truncated,
     #[error("stream consumer failed")]
     Consumer,
+    #[error("model accounting: {0}")]
+    Accounting(String),
+    #[error("provider request failed: {0:?}")]
+    ProviderFailure(ModelFailure),
+    #[error("replay request diverged: {0}")]
+    ReplayDivergence(String),
+    #[error("approved replay live budget exhausted")]
+    ReplayBudget,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum StreamDelta {
@@ -56,6 +68,75 @@ pub trait ModelGateway: Send + Sync {
     fn identity(&self) -> String {
         std::any::type_name::<Self>().into()
     }
+    fn metadata(&self) -> GatewayMetadata {
+        GatewayMetadata {
+            configuration_hash: metrics::hash(self.identity().as_bytes()),
+            ..Default::default()
+        }
+    }
+    fn request_time_override(&self, _step: u64) -> Option<String> {
+        None
+    }
+    fn call_bound(&self, _request: &ModelRequest) -> Option<ModelCallBound> {
+        None
+    }
+    fn complete_observed<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFuture<'a, Result<ObservedResponse, ModelCallError>> {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let mut metrics = Box::new(ModelCallMetrics::request(&request, self.metadata()));
+            match self.complete(request).await {
+                Ok(response) => {
+                    metrics.duration_ms =
+                        started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                    metrics.usage_known = !response.usage.estimated;
+                    metrics.usage = UsageBreakdown::from_usage(&response.usage);
+                    metrics.cost_microusd =
+                        self.cost_is_known().then_some(response.usage.cost_microusd);
+                    Ok(ObservedResponse {
+                        response,
+                        metrics: *metrics,
+                    })
+                }
+                Err(error) => {
+                    metrics.duration_ms = elapsed_ms(started);
+                    metrics.usage.estimated = true;
+                    Err(ModelCallError { error, metrics })
+                }
+            }
+        })
+    }
+    fn complete_stream_observed<'a>(
+        &'a self,
+        request: ModelRequest,
+        sink: StreamSink,
+    ) -> BoxFuture<'a, Result<ObservedResponse, ModelCallError>> {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let mut metrics = Box::new(ModelCallMetrics::request(&request, self.metadata()));
+            match self.complete_stream(request, sink).await {
+                Ok(response) => {
+                    metrics.duration_ms =
+                        started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                    metrics.usage_known = !response.usage.estimated;
+                    metrics.usage = UsageBreakdown::from_usage(&response.usage);
+                    metrics.cost_microusd =
+                        self.cost_is_known().then_some(response.usage.cost_microusd);
+                    Ok(ObservedResponse {
+                        response,
+                        metrics: *metrics,
+                    })
+                }
+                Err(error) => {
+                    metrics.duration_ms = elapsed_ms(started);
+                    metrics.usage.estimated = true;
+                    Err(ModelCallError { error, metrics })
+                }
+            }
+        })
+    }
     fn complete<'a>(
         &'a self,
         request: ModelRequest,
@@ -89,6 +170,12 @@ pub struct GatewayConfig {
     pub model: String,
     pub role: ModelRole,
     pub reasoning_effort: Option<String>,
+    /// Requested sampling seed; backend determinism is not guaranteed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// Requested sampling temperature; the selected model must support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
     pub native_tools: bool,
     pub max_output_tokens: u32,
 }
@@ -98,6 +185,8 @@ impl GatewayConfig {
             model: model.into(),
             role,
             reasoning_effort: None,
+            seed: None,
+            temperature: None,
             native_tools: true,
             max_output_tokens: 4096,
         }
@@ -106,6 +195,7 @@ impl GatewayConfig {
 pub struct OpenAiGateway {
     client: ProviderClient,
     config: GatewayConfig,
+    pricing: Option<Arc<PriceTable>>,
 }
 impl OpenAiGateway {
     pub fn new(client: ProviderClient, config: GatewayConfig) -> Result<Self, ModelError> {
@@ -114,7 +204,34 @@ impl OpenAiGateway {
                 "model and positive output budget required".into(),
             ));
         }
-        Ok(Self { client, config })
+        if config.seed.is_some_and(|seed| seed > i64::MAX as u64) {
+            return Err(ModelError::Configuration(
+                "sampling seed must fit a nonnegative signed 64-bit integer".into(),
+            ));
+        }
+        if config.temperature.is_some_and(|temperature| {
+            !temperature.is_finite() || !(0.0..=2.0).contains(&temperature)
+        }) {
+            return Err(ModelError::Configuration(
+                "sampling temperature must be finite and between 0 and 2".into(),
+            ));
+        }
+        Ok(Self {
+            client,
+            config,
+            pricing: None,
+        })
+    }
+    /// The trusted host supplies the versioned tariff; no prices are downloaded.
+    pub fn with_price_table(mut self, table: PriceTable) -> Result<Self, ModelError> {
+        table.validate()?;
+        table.price(
+            &format!("{:?}", self.client.provider()),
+            &self.config.model,
+            &UsageBreakdown::zero(),
+        )?;
+        self.pricing = Some(Arc::new(table));
+        Ok(self)
     }
     fn wire_request(&self, request: &ModelRequest) -> Result<Value, ModelError> {
         if request
@@ -182,6 +299,12 @@ impl OpenAiGateway {
         if let Some(effort) = &self.config.reasoning_effort {
             body["reasoning_effort"] = json!(effort);
         }
+        if let Some(seed) = self.config.seed {
+            body["seed"] = json!(seed);
+        }
+        if let Some(temperature) = self.config.temperature {
+            body["temperature"] = json!(temperature);
+        }
         if self.config.native_tools {
             if !definitions.is_empty() {
                 body["tools"]=json!(definitions.iter().map(|t|json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.input_schema}})).collect::<Vec<_>>());
@@ -208,9 +331,29 @@ impl OpenAiGateway {
         request: ModelRequest,
         sink: Option<StreamSink>,
     ) -> Result<ModelResponse, ModelError> {
-        let mut body = self.wire_request(&request)?;
+        self.run_observed(request, sink)
+            .await
+            .map(|observed| observed.response)
+            .map_err(|failure| failure.error)
+    }
+    async fn run_observed(
+        &self,
+        request: ModelRequest,
+        sink: Option<StreamSink>,
+    ) -> Result<ObservedResponse, ModelCallError> {
+        let started = std::time::Instant::now();
+        let mut metrics = Box::new(ModelCallMetrics::request(&request, self.metadata()));
+        metrics.provider_calls_known = true;
+        metrics.usage_known = true;
+        let mut body = match self.wire_request(&request) {
+            Ok(body) => body,
+            Err(error) => return Err(ModelCallError { error, metrics }),
+        };
         let mut total = Usage::default();
-        for attempt in 0..=1u8 {
+        metrics.usage = UsageBreakdown::zero();
+        metrics.cost_microusd = self.pricing.as_ref().map(|_| 0);
+        for attempt in 0..=1_u8 {
+            let attempt_started = std::time::Instant::now();
             let mut counted_wire = body.clone();
             counted_wire["model"] = json!(self.config.model);
             counted_wire["stream"] = json!(sink.is_some());
@@ -218,42 +361,110 @@ impl OpenAiGateway {
                 counted_wire["stream_options"] = json!({"include_usage":true});
             }
             let input_bytes = counted_wire.to_string().len() as u64;
+            metrics.provider_calls += 1;
             let raw = if let Some(sink) = &sink {
-                self.stream_once(body.clone(), sink, attempt).await?
+                self.stream_once(body.clone(), sink, attempt).await
             } else {
                 self.client
                     .native_chat(&self.config.model, body.clone())
                     .await
-                    .map_err(|_| ModelError::Provider)?
+                    .map_err(provider_error)
             };
-            let usage = usage(&raw, input_bytes);
-            total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
-            total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
-            total.estimated |= usage.estimated;
+            let raw = match raw {
+                Ok(raw) => raw,
+                Err(error) => {
+                    metrics.duration_ms = elapsed_ms(started);
+                    metrics.cost_microusd = None;
+                    metrics.usage_known = false;
+                    let unreported = UsageBreakdown {
+                        input_tokens: input_bytes.saturating_add(100),
+                        estimated: true,
+                        ..Default::default()
+                    };
+                    metrics.usage.add(&unreported);
+                    metrics.attempts.push(ModelAttemptMetrics {
+                        index: attempt,
+                        duration_ms: elapsed_ms(attempt_started),
+                        usage: unreported,
+                        cost_microusd: None,
+                        error: Some(error.classification()),
+                    });
+                    return Err(ModelCallError { error, metrics });
+                }
+            };
+            let used = usage(&raw, input_bytes);
+            let detail = usage_breakdown(&raw, &used);
+            metrics.usage_known &= !used.estimated;
+            let price = match &self.pricing {
+                Some(table) => match table.price(
+                    &format!("{:?}", self.client.provider()),
+                    &self.config.model,
+                    &detail,
+                ) {
+                    Ok(cost) => cost,
+                    Err(error) => {
+                        metrics.duration_ms = elapsed_ms(started);
+                        return Err(ModelCallError { error, metrics });
+                    }
+                },
+                None => None,
+            };
+            total.input_tokens = total.input_tokens.saturating_add(used.input_tokens);
+            total.output_tokens = total.output_tokens.saturating_add(used.output_tokens);
+            total.estimated |= used.estimated;
+            total.cost_microusd = total.cost_microusd.saturating_add(price.unwrap_or(0));
+            metrics.usage.add(&detail);
+            metrics.cost_microusd = metrics
+                .cost_microusd
+                .zip(price)
+                .map(|(a, b)| a.saturating_add(b));
             let result = self.normalize(&raw, &request);
+            metrics.attempts.push(ModelAttemptMetrics {
+                index: attempt,
+                duration_ms: elapsed_ms(attempt_started),
+                usage: detail,
+                cost_microusd: price,
+                error: result.as_ref().err().map(ModelError::classification),
+            });
+            metrics.duration_ms = elapsed_ms(started);
             match result {
                 Ok(mut response) => {
                     response.usage = total;
-                    if let Some(sink) = &sink {
-                        emit(
+                    if self.pricing.is_some() && metrics.cost_microusd.is_none() {
+                        return Err(ModelCallError {
+                            error: ModelError::Accounting(
+                                "provider usage is insufficient for the approved tariff".into(),
+                            ),
+                            metrics,
+                        });
+                    }
+                    if let Some(sink) = &sink
+                        && let Err(error) = emit(
                             sink,
                             StreamDelta::Complete {
                                 attempt,
                                 response: response.clone(),
                             },
-                        )?;
+                        )
+                    {
+                        return Err(ModelCallError { error, metrics });
                     }
-                    return Ok(response);
+                    return Ok(ObservedResponse {
+                        response,
+                        metrics: *metrics,
+                    });
                 }
                 Err(ModelError::Validation(reason)) if attempt == 0 => {
-                    if let Some(sink) = &sink {
-                        emit(
+                    if let Some(sink) = &sink
+                        && let Err(error) = emit(
                             sink,
                             StreamDelta::Retry {
                                 attempt: 1,
                                 reason: reason.clone(),
                             },
-                        )?;
+                        )
+                    {
+                        return Err(ModelCallError { error, metrics });
                     }
                     let content = raw
                         .pointer("/choices/0/message/content")
@@ -263,10 +474,13 @@ impl OpenAiGateway {
                     messages.push(json!({"role":"assistant","content":content}));
                     messages.push(json!({"role":"system","content":format!("Output validation failed: {reason}. Return one corrected output conforming to the specified schemas and tool protocol.")}));
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(ModelCallError { error, metrics }),
             }
         }
-        Err(ModelError::Validation("retry exhausted".into()))
+        Err(ModelCallError {
+            error: ModelError::Validation("retry exhausted".into()),
+            metrics,
+        })
     }
     fn normalize(&self, raw: &Value, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
         let reason = raw
@@ -341,7 +555,7 @@ impl OpenAiGateway {
             .client
             .stream_native_chat(&self.config.model, body)
             .await
-            .map_err(|_| ModelError::Provider)?;
+            .map_err(provider_error)?;
         let mut content = String::new();
         let mut calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
         let mut finish = None;
@@ -431,11 +645,89 @@ impl OpenAiGateway {
     }
 }
 impl ModelGateway for OpenAiGateway {
+    fn cost_is_known(&self) -> bool {
+        self.pricing.is_some()
+    }
+    fn metadata(&self) -> GatewayMetadata {
+        GatewayMetadata {
+            provider: Some(format!("{:?}", self.client.provider())),
+            model: Some(self.config.model.clone()),
+            role: Some(self.config.role),
+            configuration_hash: metrics::hash(self.identity().as_bytes()),
+            price_table_version: self.pricing.as_ref().map(|table| table.version.clone()),
+            price_table_hash: self
+                .pricing
+                .as_ref()
+                .and_then(|table| table.content_hash().ok()),
+        }
+    }
+    fn call_bound(&self, request: &ModelRequest) -> Option<ModelCallBound> {
+        let wire = self.wire_request(request).ok()?;
+        let input = (wire.to_string().len() as u64)
+            .saturating_add(self.config.model.len() as u64)
+            .saturating_add(1024);
+        let output = u64::from(self.config.max_output_tokens);
+        Some(ModelCallBound {
+            max_tokens: input.saturating_add(output).saturating_mul(2),
+            // A token-only bound is useful before an unpriced call. This zero
+            // is not an invoice value: cost_is_known remains false and observed
+            // cost remains None; cost budgets cannot use an unpriced gateway.
+            max_cost_microusd: self
+                .pricing
+                .as_ref()
+                .map(|table| {
+                    table
+                        .upper_bound(
+                            &format!("{:?}", self.client.provider()),
+                            &self.config.model,
+                            input.saturating_mul(3).saturating_add(output),
+                            output.saturating_mul(2),
+                        )
+                        .unwrap_or(u64::MAX)
+                })
+                .unwrap_or(0),
+        })
+    }
+    fn complete_observed<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFuture<'a, Result<ObservedResponse, ModelCallError>> {
+        Box::pin(self.run_observed(request, None))
+    }
+    fn complete_stream_observed<'a>(
+        &'a self,
+        request: ModelRequest,
+        sink: StreamSink,
+    ) -> BoxFuture<'a, Result<ObservedResponse, ModelCallError>> {
+        if self.config.role == ModelRole::Master {
+            Box::pin(self.run_observed(request, Some(sink)))
+        } else {
+            Box::pin(async move {
+                let observed = self.run_observed(request, None).await?;
+                emit(
+                    &sink,
+                    StreamDelta::Complete {
+                        attempt: 0,
+                        response: observed.response.clone(),
+                    },
+                )
+                .map_err(|error| ModelCallError {
+                    error,
+                    metrics: Box::new(observed.metrics.clone()),
+                })?;
+                Ok(observed)
+            })
+        }
+    }
+
     fn identity(&self) -> String {
         let config = serde_json::to_vec(&self.config).expect("serializable gateway configuration");
         let mut hash = Sha256::new();
         hash.update(self.client.configuration_identity());
         hash.update(config);
+        if let Some(table) = &self.pricing {
+            hash.update(table.content_hash().expect("validated price table"));
+        }
         format!("openai-compatible:{:x}", hash.finalize())
     }
     fn complete<'a>(
@@ -628,4 +920,64 @@ fn parse_json_minor(text: &str) -> Result<Value, ModelError> {
     }
     serde_json::from_str(&repaired)
         .map_err(|_| validation("invalid JSON after bounded minor repair"))
+}
+
+fn elapsed_ms(start: std::time::Instant) -> u64 {
+    start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+fn provider_error(error: excalibur_providers::Error) -> ModelError {
+    use excalibur_providers::{Error, KnownFailure};
+    ModelError::ProviderFailure(match error {
+        Error::Http(status) => ModelFailure::http(status.as_u16()),
+        Error::ClassifiedHttp { status, kind } => ModelFailure {
+            class: match kind {
+                KnownFailure::Quota => FailureClass::Quota,
+                KnownFailure::ContextWindow => FailureClass::ContextWindowExceeded,
+                KnownFailure::Overloaded => FailureClass::Overloaded,
+            },
+            http_status: Some(status.as_u16()),
+        },
+        Error::Transport => ModelFailure {
+            class: FailureClass::Transport,
+            http_status: None,
+        },
+        Error::InvalidResponse => ModelFailure {
+            class: FailureClass::InvalidResponse,
+            http_status: None,
+        },
+        Error::Configuration(_) | Error::Unsupported => ModelFailure {
+            class: FailureClass::InvalidRequest,
+            http_status: None,
+        },
+    })
+}
+impl ModelError {
+    pub fn classification(&self) -> ModelFailure {
+        ModelFailure {
+            class: match self {
+                Self::ProviderFailure(error) => return error.clone(),
+                Self::Provider => FailureClass::InvalidResponse,
+                Self::Configuration(_) => FailureClass::InvalidRequest,
+                Self::Validation(_) => FailureClass::Validation,
+                Self::Truncated => FailureClass::Truncated,
+                Self::Consumer => FailureClass::Consumer,
+                Self::Accounting(_) => FailureClass::Accounting,
+                Self::ReplayDivergence(_) => FailureClass::ReplayDivergence,
+                Self::ReplayBudget => FailureClass::Budget,
+            },
+            http_status: None,
+        }
+    }
+}
+fn usage_breakdown(raw: &Value, used: &Usage) -> UsageBreakdown {
+    let count = |path| raw.pointer(path).and_then(Value::as_u64);
+    UsageBreakdown {
+        input_tokens: used.input_tokens,
+        output_tokens: used.output_tokens,
+        estimated: used.estimated,
+        cache_read_tokens: count("/usage/prompt_tokens_details/cached_tokens"),
+        cache_write_tokens: count("/usage/prompt_tokens_details/cache_write_tokens"),
+        reasoning_tokens: count("/usage/completion_tokens_details/reasoning_tokens"),
+        cache_write_by_ttl: BTreeMap::new(),
+    }
 }

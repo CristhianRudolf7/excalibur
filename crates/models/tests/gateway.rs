@@ -356,3 +356,85 @@ async fn estimated_usage_flag_and_counts_accumulate_across_the_single_schema_ret
             .unwrap();
     assert!(!legacy.estimated);
 }
+
+#[tokio::test]
+async fn sampling_is_opt_in_and_preserves_exact_wire_values() {
+    let (url, task) = mock(vec![completion("default"), completion("sampled")]).await;
+    gateway(&url, true, ModelRole::Worker)
+        .complete(request())
+        .await
+        .unwrap();
+    let client = ProviderClient::with_base_url(
+        Provider::OpenAi,
+        Secret::new("synthetic-key").unwrap(),
+        &url,
+    )
+    .unwrap();
+    let mut config = GatewayConfig::new("synthetic-model", ModelRole::Worker);
+    config.seed = Some(i64::MAX as u64);
+    config.temperature = Some(0.0);
+    OpenAiGateway::new(client, config)
+        .unwrap()
+        .complete(request())
+        .await
+        .unwrap();
+    let sent = task.await.unwrap();
+    assert!(sent[0].get("seed").is_none());
+    assert!(sent[0].get("temperature").is_none());
+    assert_eq!(sent[1]["seed"], json!(i64::MAX));
+    assert_eq!(sent[1]["temperature"], json!(0.0));
+}
+
+#[test]
+fn sampling_validation_and_identity_preserve_legacy_default_configuration() {
+    use sha2::{Digest, Sha256};
+
+    let client = || {
+        ProviderClient::with_base_url(
+            Provider::OpenAi,
+            Secret::new("synthetic-key").unwrap(),
+            "http://127.0.0.1:1/v1/",
+        )
+        .unwrap()
+    };
+    let config = GatewayConfig::new("synthetic-model", ModelRole::Worker);
+    let legacy_json = r#"{"model":"synthetic-model","role":"Worker","reasoning_effort":null,"native_tools":true,"max_output_tokens":4096}"#;
+    assert_eq!(serde_json::to_string(&config).unwrap(), legacy_json);
+    let legacy: GatewayConfig = serde_json::from_str(legacy_json).unwrap();
+    assert!(legacy.seed.is_none() && legacy.temperature.is_none());
+    let mut hash = Sha256::new();
+    hash.update(client().configuration_identity());
+    hash.update(legacy_json.as_bytes());
+    let default_identity = OpenAiGateway::new(client(), config.clone())
+        .unwrap()
+        .identity();
+    assert_eq!(
+        default_identity,
+        format!("openai-compatible:{:x}", hash.finalize())
+    );
+    for (seed, temperature) in [(Some(0), None), (None, Some(2.0)), (Some(1), Some(0.5))] {
+        let mut opted_in = config.clone();
+        opted_in.seed = seed;
+        opted_in.temperature = temperature;
+        assert_ne!(
+            default_identity,
+            OpenAiGateway::new(client(), opted_in).unwrap().identity()
+        );
+    }
+    for seed in [i64::MAX as u64 + 1, u64::MAX] {
+        let mut invalid = config.clone();
+        invalid.seed = Some(seed);
+        assert!(matches!(
+            OpenAiGateway::new(client(), invalid),
+            Err(ModelError::Configuration(_))
+        ));
+    }
+    for temperature in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 2.1] {
+        let mut invalid = config.clone();
+        invalid.temperature = Some(temperature);
+        assert!(matches!(
+            OpenAiGateway::new(client(), invalid),
+            Err(ModelError::Configuration(_))
+        ));
+    }
+}

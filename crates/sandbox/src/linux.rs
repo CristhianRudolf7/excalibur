@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::File,
-    io::{Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     os::{
         fd::{AsRawFd, FromRawFd, RawFd},
         unix::fs::{MetadataExt, PermissionsExt},
@@ -17,9 +17,46 @@ pub struct PreparedSandbox {
     pub args: Vec<OsString>,
     filter: File,
     proxy: Option<super::network::HostProxy>,
+    eval: Option<super::evaluation::linux::PreparedEval>,
+    eval_filter: Vec<libc::sock_filter>,
     _private: tempfile::TempDir,
 }
 impl PreparedSandbox {
+    pub fn for_shell(config: &SandboxConfig, shell: &Path) -> Result<Self, String> {
+        if config.profile != SandboxProfile::Eval {
+            return Self::new(config);
+        }
+        let writable = config
+            .write_roots
+            .iter()
+            .map(|path| canonical(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let eval = super::evaluation::linux::PreparedEval::new(config)?;
+        let mut filter = filter(false, config.eval_network, config.eval_network)?;
+        let mut bytes = Vec::new();
+        filter.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        filter.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        let eval_filter = bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| libc::sock_filter {
+                code: u16::from_ne_bytes([b[0], b[1]]),
+                jt: b[2],
+                jf: b[3],
+                k: u32::from_ne_bytes([b[4], b[5], b[6], b[7]]),
+            })
+            .collect();
+        Ok(Self {
+            program: shell.canonicalize().map_err(|e| e.to_string())?,
+            args: Vec::new(),
+            filter,
+            proxy: None,
+            eval: Some(eval),
+            eval_filter,
+            _private: runtime_tempdir(&writable)?,
+        })
+    }
     pub fn new(config: &SandboxConfig) -> Result<Self, String> {
         match config.profile {
             SandboxProfile::ReadOnly
@@ -114,6 +151,7 @@ impl PreparedSandbox {
         let filter = filter(
             matches!(config.profile, SandboxProfile::ProjectRestricted),
             networked,
+            false,
         )?;
         let mut args: Vec<OsString> = [
             "--unshare-all",
@@ -312,10 +350,16 @@ impl PreparedSandbox {
             args,
             filter,
             proxy,
+            eval: None,
+            eval_filter: Vec::new(),
             _private: private,
         })
     }
     pub fn configure(&self, command: &mut Command, shell: &Path, shell_args: &[String], tty: bool) {
+        if self.eval.is_some() {
+            command.args(shell_args);
+            return;
+        }
         command
             .args(&self.args)
             .arg("--setenv")
@@ -339,6 +383,11 @@ impl PreparedSandbox {
     }
     pub fn filter_fd(&self) -> RawFd {
         self.filter.as_raw_fd()
+    }
+    pub fn evaluation_setup(&self) -> Option<super::evaluation::EvalChildSetup> {
+        self.eval
+            .as_ref()
+            .map(|eval| super::evaluation::EvalChildSetup::new(eval.fd(), &self.eval_filter))
     }
 }
 fn runtime_tempdir(writable: &[PathBuf]) -> Result<tempfile::TempDir, String> {
@@ -370,7 +419,7 @@ fn runtime_tempdir(writable: &[PathBuf]) -> Result<tempfile::TempDir, String> {
 /// a hidden vault, a read-only SDK or another host directory. Hide the writable
 /// aliases without inspecting any private tree or reading file content. Ordinary
 /// Cargo hardlinks wholly inside writable roots remain available.
-fn cross_boundary_hardlink_aliases(
+pub(crate) fn cross_boundary_hardlink_aliases(
     writable: &[PathBuf],
     hidden: &[PathBuf],
 ) -> Result<Vec<PathBuf>, String> {
@@ -527,7 +576,7 @@ fn validated_native_tool(
     }
     Ok(path)
 }
-fn filter(restricted: bool, networked: bool) -> Result<File, String> {
+fn filter(restricted: bool, networked: bool, container_network: bool) -> Result<File, String> {
     #[cfg(target_arch = "x86_64")]
     const ARCH: u32 = 0xc000003e;
     #[cfg(target_arch = "aarch64")]
@@ -655,7 +704,30 @@ fn filter(restricted: bool, networked: bool) -> Result<File, String> {
     add(RET, 0, 0, ERRNO | libc::EPERM as u32);
     add(RET, 0, 0, ALLOW);
     add(LD, 0, 0, 0);
-    if networked {
+    if container_network {
+        add(JEQ, 0, 15, libc::SYS_socket as u32);
+        add(LD, 0, 0, 16);
+        add(JEQ, 2, 0, libc::AF_INET as u32);
+        add(JEQ, 1, 0, libc::AF_INET6 as u32);
+        add(RET, 0, 0, ERRNO | libc::EPERM as u32);
+        add(LD, 0, 0, 24);
+        add(
+            0x54,
+            0,
+            0,
+            !(libc::SOCK_CLOEXEC as u32 | libc::SOCK_NONBLOCK as u32),
+        );
+        add(JEQ, 2, 0, libc::SOCK_STREAM as u32);
+        add(JEQ, 1, 0, libc::SOCK_DGRAM as u32);
+        add(RET, 0, 0, ERRNO | libc::EPERM as u32);
+        add(LD, 0, 0, 32);
+        add(JEQ, 3, 0, 0);
+        add(JEQ, 2, 0, libc::IPPROTO_TCP as u32);
+        add(JEQ, 1, 0, libc::IPPROTO_UDP as u32);
+        add(RET, 0, 0, ERRNO | libc::EPERM as u32);
+        add(RET, 0, 0, ALLOW);
+        add(LD, 0, 0, 0);
+    } else if networked {
         // The trusted bridge needs UNIX stream and loopback TCP sockets. It adds
         // an irreversible second filter denying UNIX sockets in its user child.
         // Neither process receives UDP/raw/packet sockets or an external route.

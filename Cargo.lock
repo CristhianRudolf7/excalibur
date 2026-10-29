@@ -800,6 +800,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "excalibur-cli"
+version = "0.1.0"
+dependencies = [
+ "excalibur-engine",
+ "excalibur-eval",
+ "excalibur-models",
+ "excalibur-providers",
+ "excalibur-security",
+ "excalibur-telemetry",
+ "excalibur-types",
+ "excalibur-vault",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "excalibur-config"
 version = "0.1.0"
 dependencies = [
@@ -834,6 +851,31 @@ dependencies = [
  "excalibur-types",
  "futures",
  "json5",
+ "jsonschema",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "excalibur-eval"
+version = "0.1.0"
+dependencies = [
+ "excalibur-context",
+ "excalibur-engine",
+ "excalibur-journal",
+ "excalibur-models",
+ "excalibur-providers",
+ "excalibur-sandbox",
+ "excalibur-security",
+ "excalibur-store",
+ "excalibur-telemetry",
+ "excalibur-tools",
+ "excalibur-types",
+ "excalibur-vault",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -860,12 +902,17 @@ dependencies = [
 name = "excalibur-models"
 version = "0.1.0"
 dependencies = [
+ "excalibur-context",
+ "excalibur-engine",
+ "excalibur-journal",
  "excalibur-providers",
+ "excalibur-store",
  "excalibur-types",
  "jsonschema",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -942,6 +989,26 @@ dependencies = [
  "tokio",
  "windows-sys 0.61.2",
  "zstd",
+]
+
+[[package]]
+name = "excalibur-telemetry"
+version = "0.1.0"
+dependencies = [
+ "excalibur-journal",
+ "excalibur-store",
+ "excalibur-types",
+ "excalibur-vault",
+ "jsonschema",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

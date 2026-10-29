@@ -15,6 +15,9 @@ pub enum SandboxProfile {
 }
 #[derive(Clone, Debug)]
 pub struct SandboxConfig {
+    pub eval_container: Option<evaluation::EvalContainerAttestation>,
+    pub eval_network: bool,
+    pub cgroup_directory: Option<PathBuf>,
     pub profile: SandboxProfile,
     /// The working directory is selected by the host, never inferred from a model argument.
     pub workspace: PathBuf,
@@ -31,6 +34,9 @@ impl SandboxConfig {
     pub fn project(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         Self {
+            eval_container: None,
+            eval_network: false,
+            cgroup_directory: None,
             profile: SandboxProfile::Project,
             workspace: root.clone(),
             read_roots: vec![root.clone()],
@@ -46,6 +52,15 @@ impl SandboxConfig {
         s.profile = SandboxProfile::ReadOnly;
         s.write_roots.clear();
         s
+    }
+    pub fn evaluation(
+        root: impl Into<PathBuf>,
+        attestation: evaluation::EvalContainerAttestation,
+    ) -> Self {
+        let mut config = Self::project(root);
+        config.profile = SandboxProfile::Eval;
+        config.eval_container = Some(attestation);
+        config
     }
     pub fn project_net(
         root: impl Into<PathBuf>,
@@ -70,6 +85,16 @@ impl SandboxConfig {
     }
     pub fn restricted_by(&self, base: &Self) -> Result<Self, String> {
         let mut next = self.clone();
+        if (base.profile == SandboxProfile::Eval) != (next.profile == SandboxProfile::Eval) {
+            return Err(
+                "eval container and project sandboxes cannot substitute for one another".into(),
+            );
+        }
+        if next.eval_network && !base.eval_network {
+            return Err("evaluation network authority exceeds host container policy".into());
+        }
+        next.eval_container = base.eval_container.clone();
+        next.cgroup_directory = base.cgroup_directory.clone();
         if (matches!(
             base.profile,
             SandboxProfile::ReadOnly | SandboxProfile::FileAnalysis
@@ -266,6 +291,7 @@ fn protected_paths(
 }
 #[cfg(target_os = "linux")]
 pub mod bridge;
+pub mod evaluation;
 #[cfg(target_os = "linux")]
 mod linux;
 pub mod network;

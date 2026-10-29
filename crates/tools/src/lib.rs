@@ -1,4 +1,5 @@
 //! Reusable local tools. Hosts supply policy and optional formatting/diagnostic integrations.
+pub mod evaluation;
 mod file_authority;
 mod files;
 mod patch;
@@ -734,7 +735,7 @@ impl LocalTools {
                 }
             }
             self.record_edit(run, key, &tool.call.id, edit).await?;
-            if let Some(hash) = &edit.post {
+            let mut report = if let Some(hash) = &edit.post {
                 let bytes = self
                     .db
                     .read_blob(
@@ -744,10 +745,13 @@ impl LocalTools {
                     )
                     .await
                     .map_err(|e| e.to_string())?;
+                let report = self.edit_diff(run, &tool.call.id, edit, &bytes).await?;
                 self.remember(run, &tool.call.id, &edit.path, bytes).await?;
+                report
             } else {
                 self.forget_snapshot(run, &edit.path).await?;
-            }
+                self.edit_diff(run, &tool.call.id, edit, &[]).await?
+            };
             let (path, run, call) = (
                 self.root.join(&edit.path).to_string_lossy().into_owned(),
                 run.to_owned(),
@@ -763,7 +767,10 @@ impl LocalTools {
                     json!({"formatter":"not_configured","diagnostics":"not_configured","evidence_invalidation":"pending_host","change_recorded":true})
                 }
             };
-            reports.push(json!({"path":edit.path,"fp":edit.post,"postprocessing":postprocessing}));
+            report["path"] = json!(edit.path);
+            report["fp"] = json!(edit.post);
+            report["postprocessing"] = postprocessing;
+            reports.push(report);
         }
         Ok(json!({"files":reports}))
     }
@@ -987,35 +994,44 @@ impl ToolRuntime for LocalTools {
                 "file-analysis" => terminal::SandboxProfile::FileAnalysis,
                 "tool-package" => terminal::SandboxProfile::ToolPackage,
                 "project-net" => terminal::SandboxProfile::ProjectNet,
-                "eval" => {
-                    return Err("eval requires a separately verified container boundary".into());
-                }
+                "eval" => terminal::SandboxProfile::Eval,
                 _ => return Err("unknown mandatory process sandbox profile".into()),
             };
             #[cfg(unix)]
             {
                 use excalibur_sandbox::network::NetworkPolicy;
-                sandbox.network = match boundary.network {
-                    ProcessNetwork::None => None,
-                    network => {
-                        if sandbox.profile != terminal::SandboxProfile::ProjectNet {
-                            return Err(
-                                "network authority requires the project-net process profile".into(),
-                            );
-                        }
-                        let mut proxy = sandbox
-                            .network
-                            .ok_or("no host proxy ceiling is configured")?;
-                        proxy.policy = match network {
-                            ProcessNetwork::Domains(domains) => {
-                                NetworkPolicy::Domains(domains.into_iter().collect())
+                if sandbox.profile == terminal::SandboxProfile::Eval {
+                    sandbox.eval_network=match boundary.network {
+                        ProcessNetwork::None=>false,
+                        ProcessNetwork::Full if sandbox.eval_network=>true,
+                        ProcessNetwork::Full=>return Err("evaluation networking exceeds the host container declaration".into()),
+                        ProcessNetwork::Domains(_)=>return Err("evaluation domain restrictions require an enforcing container network adapter; unavailable".into()),
+                    };
+                    sandbox.network = None;
+                } else {
+                    sandbox.network = match boundary.network {
+                        ProcessNetwork::None => None,
+                        network => {
+                            if sandbox.profile != terminal::SandboxProfile::ProjectNet {
+                                return Err(
+                                    "network authority requires the project-net process profile"
+                                        .into(),
+                                );
                             }
-                            ProcessNetwork::Full => NetworkPolicy::Full,
-                            ProcessNetwork::None => unreachable!(),
-                        };
-                        Some(proxy)
-                    }
-                };
+                            let mut proxy = sandbox
+                                .network
+                                .ok_or("no host proxy ceiling is configured")?;
+                            proxy.policy = match network {
+                                ProcessNetwork::Domains(domains) => {
+                                    NetworkPolicy::Domains(domains.into_iter().collect())
+                                }
+                                ProcessNetwork::Full => NetworkPolicy::Full,
+                                ProcessNetwork::None => unreachable!(),
+                            };
+                            Some(proxy)
+                        }
+                    };
+                }
                 if sandbox.profile == terminal::SandboxProfile::ProjectNet
                     && sandbox.network.is_none()
                 {

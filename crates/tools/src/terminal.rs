@@ -240,6 +240,18 @@ impl TerminalManager {
                 .workspace
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
+            if sandbox.profile == SandboxProfile::Eval {
+                for roots in [&mut sandbox.read_roots, &mut sandbox.write_roots] {
+                    for root in roots.iter_mut() {
+                        if !root.is_absolute() {
+                            return Err("evaluation roots must be absolute".into());
+                        }
+                        *root = root.canonicalize().map_err(|e| e.to_string())?;
+                    }
+                    roots.sort();
+                    roots.dedup();
+                }
+            }
             sandbox.hidden_paths.push(config.spool_dir.clone());
         }
         let mut environment = detect_environment();
@@ -1296,7 +1308,7 @@ fn launch(
     #[cfg(not(target_os = "linux"))]
     let _ = sandbox;
     #[cfg(target_os = "linux")]
-    let prepared = excalibur_sandbox::PreparedSandbox::new(sandbox)?;
+    let prepared = excalibur_sandbox::PreparedSandbox::for_shell(sandbox, shell)?;
     #[cfg(target_os = "linux")]
     let mut command = Command::new(&prepared.program);
     #[cfg(not(target_os = "linux"))]
@@ -1311,6 +1323,25 @@ fn launch(
         .envs(safe_env())
         .env("PAGER", "cat")
         .env("GIT_PAGER", "cat");
+    if sandbox.profile == SandboxProfile::Eval {
+        command
+            .env("HOME", cwd)
+            .env(
+                "TMPDIR",
+                sandbox.write_roots.last().unwrap_or(&sandbox.workspace),
+            )
+            .env(
+                "TMP",
+                sandbox.write_roots.last().unwrap_or(&sandbox.workspace),
+            )
+            .env(
+                "TEMP",
+                sandbox.write_roots.last().unwrap_or(&sandbox.workspace),
+            )
+            .env("TZ", "UTC")
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8");
+    }
     let mut pty = None;
     let (input, readers) = if tty {
         let pair = native_pty_system()
@@ -1350,6 +1381,12 @@ fn launch(
     let (announce, acknowledge) = guardian.child_fds();
     #[cfg(target_os = "linux")]
     let filter_fd = prepared.filter_fd();
+    #[cfg(target_os = "linux")]
+    let eval_setup = prepared.evaluation_setup();
+    #[cfg(target_os = "linux")]
+    let cgroup = prepare_cgroup(sandbox.cgroup_directory.as_deref())?;
+    #[cfg(target_os = "linux")]
+    let cgroup_fd = cgroup.as_ref().map(std::os::fd::AsRawFd::as_raw_fd);
     let parent = unsafe { libc::getpid() };
     unsafe {
         command.pre_exec(move || {
@@ -1361,6 +1398,12 @@ fn launch(
             }
             #[cfg(target_os = "linux")]
             {
+                if let Some(fd) = cgroup_fd {
+                    let bytes = b"0";
+                    if libc::write(fd, bytes.as_ptr().cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -1398,6 +1441,9 @@ fn launch(
                         return Err(std::io::Error::last_os_error());
                     }
                 }
+                if let Some(setup) = eval_setup {
+                    setup.install()?;
+                }
             }
             let _ = parent;
             Ok(())
@@ -1429,6 +1475,29 @@ fn launch(
         #[cfg(target_os = "linux")]
         guardian,
     })
+}
+#[cfg(target_os = "linux")]
+fn prepare_cgroup(directory: Option<&Path>) -> Result<Option<File>, String> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    if !directory.is_absolute() {
+        return Err("host cgroup path must be absolute".into());
+    }
+    let path = directory
+        .canonicalize()
+        .map_err(|e| format!("cgroup unavailable: {e}"))?;
+    let name = CString::new(path.as_os_str().as_bytes()).map_err(|_| "invalid cgroup path")?;
+    let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(name.as_ptr(), &mut info) } < 0 || info.f_type != 0x63677270 {
+        return Err("host process cgroup must reside on a real cgroup v2 filesystem".into());
+    }
+    OpenOptions::new()
+        .write(true)
+        .open(path.join("cgroup.procs"))
+        .map(Some)
+        .map_err(|e| format!("cgroup delegation is not writable: {e}"))
 }
 #[cfg(windows)]
 fn launch(

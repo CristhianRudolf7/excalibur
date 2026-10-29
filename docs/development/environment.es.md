@@ -2,7 +2,7 @@
 
 [English](environment.md)
 
-Excalibur contiene actualmente bibliotecas Rust de proveedores, base/almacenamiento y motor durable mínimo. El agente personal completo, la CLI, el servidor Axum y el frontend están previstos; todavía no existe una aplicación ni un servidor de desarrollo que iniciar. Las comprobaciones de dependencias de esta página no son funcionalidades implementadas del producto.
+Excalibur contiene bibliotecas Rust compartidas de proveedores, almacenamiento, motor durable, seguridad, evaluación y telemetría. El comando no interactivo se compila con `cargo build -p excalibur-cli` y se consulta con `target/debug/excalibur --help`; véase [su contrato de ejecución](noninteractive.es.md). El agente personal completo, la CLI interactiva, el servidor Axum y el frontend siguen previstos; no hay servidor de desarrollo frontend que iniciar. Las comprobaciones de dependencias son distintas de las funcionalidades implementadas.
 
 ## Entorno comprobado en esta VPS
 

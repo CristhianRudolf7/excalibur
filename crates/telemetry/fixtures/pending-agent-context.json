@@ -1,0 +1,73 @@
+{
+  "cost_usd": null,
+  "metadata": {
+    "cache_read_known": false,
+    "complete_model_usage": false,
+    "excalibur": {
+      "agent_name": "excalibur",
+      "agent_version": "0.1.0",
+      "benchmark": null,
+      "configuration": {
+        "budget": 500
+      },
+      "configuration_hash": "e50c86a323bad6eb905ba79e71c05a037cebb4f90d75605398370801ef24b08b",
+      "environment": {},
+      "excalibur_commit": null,
+      "extra": {},
+      "harbor_version": null,
+      "instruction": "Create a synthetic file",
+      "model": "synthetic-v1",
+      "profile": "development",
+      "profile_version": null,
+      "provider": "mock",
+      "reasoning_effort": null,
+      "role": "coordinator",
+      "seed": null,
+      "skill_catalog_hash": null,
+      "task_digest": null,
+      "task_id": "synthetic-task",
+      "temperature": null,
+      "tool_catalog_hash": null,
+      "trial_id": null
+    },
+    "exit_code": null,
+    "final_state": null,
+    "known_input_token_subtotal": 0,
+    "known_output_token_subtotal": 0,
+    "limitations": [
+      "pending model calls have no confirmed outcome; physical requests, usage, cost and duration remain unknown",
+      "physical provider-call count is unknown for one or more logical model calls",
+      "token totals include estimated or provider-unconfirmed usage",
+      "one or more model calls have no confirmed provider usage; token totals are known subtotals",
+      "cache read usage not reported for every model call",
+      "cost is unknown for one or more model calls",
+      "model durations are incomplete"
+    ],
+    "model_usage_with_unknown_cache": {
+      "synthetic-v1": {
+        "calls": 1,
+        "cost_microusd": null,
+        "duration_ms": null,
+        "pending_calls": 1,
+        "provider_calls": 0,
+        "provider_calls_known": false,
+        "tokens": {
+          "cache_read_tokens": null,
+          "cache_write_by_ttl": {},
+          "cache_write_tokens": null,
+          "estimated": false,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": null
+        },
+        "usage_known": false
+      }
+    },
+    "pending_model_calls": 1,
+    "usage_known": false
+  },
+  "model_usage": {},
+  "n_cache_tokens": null,
+  "n_input_tokens": null,
+  "n_output_tokens": null
+}

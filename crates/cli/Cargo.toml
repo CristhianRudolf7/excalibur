@@ -1,0 +1,20 @@
+[package]
+name = "excalibur-cli"
+version = "0.1.0"
+edition = "2024"
+[[bin]]
+name = "excalibur"
+path = "src/main.rs"
+[dependencies]
+excalibur-types = { path = "../types" }
+excalibur-eval = { path = "../eval" }
+excalibur-engine = { path = "../engine" }
+excalibur-models = { path = "../models" }
+excalibur-providers = { path = "../providers" }
+excalibur-security = { path = "../security" }
+excalibur-telemetry = { path = "../telemetry" }
+excalibur-vault = { path = "../vault" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+[dev-dependencies]
+tempfile = "3"

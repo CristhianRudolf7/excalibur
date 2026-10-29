@@ -1,4 +1,5 @@
 //! A durable single-run step engine. Applications embed it; no CLI or HTTP server.
+mod episode_utilities;
 use excalibur_context::{ContextInput, compile};
 use excalibur_journal::{Event, Journal};
 use excalibur_models::ModelGateway;
@@ -50,6 +51,9 @@ impl Default for Budget {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Criterion {
+    FinalResponse {
+        schema: Option<Value>,
+    },
     ToolSuccess {
         name: String,
     },
@@ -77,6 +81,7 @@ pub enum Status {
     Completed,
     CompletedWithPending,
     Cancelled,
+    Failed,
 }
 impl Status {
     fn label(&self) -> &'static str {
@@ -87,6 +92,7 @@ impl Status {
             Self::Completed => "completed",
             Self::CompletedWithPending => "completed_with_pending",
             Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
         }
     }
 }
@@ -111,6 +117,8 @@ pub struct Snapshot {
     pub calls: BTreeMap<usize, CallState>,
     pub history: Vec<Message>,
     pub continuation: String,
+    #[serde(default)]
+    pub pinned_observations: BTreeMap<String, Value>,
     pub gate_report: Vec<String>,
     pub host_checks: BTreeMap<String, bool>,
     pub revision: u64,
@@ -137,6 +145,7 @@ impl Snapshot {
             calls: BTreeMap::new(),
             history: Vec::new(),
             continuation: String::new(),
+            pinned_observations: BTreeMap::new(),
             gate_report: Vec::new(),
             host_checks: BTreeMap::new(),
             revision: 0,
@@ -207,6 +216,23 @@ impl Snapshot {
                 }
                 if p["name"] == "leave_continuation_note" && result.success {
                     self.continuation = result.output["note"].as_str().unwrap_or_default().into();
+                }
+                if p["name"] == "pin_observation" && result.success {
+                    let id = format!(
+                        "{:020}:{}",
+                        result.output["source_sequence"].as_u64().unwrap_or(0),
+                        result.output["id"].as_str().unwrap_or("")
+                    );
+                    if result.output["pinned"] == false {
+                        self.pinned_observations.remove(&id);
+                    } else {
+                        self.pinned_observations.insert(id, result.output.clone());
+                    }
+                    while self.pinned_observations.len() > 8
+                        || serde_json::to_vec(&self.pinned_observations)?.len() > 4096
+                    {
+                        self.pinned_observations.pop_first();
+                    }
                 }
                 self.calls
                     .entry(index)
@@ -281,7 +307,7 @@ impl Snapshot {
             "budget_updated" => {
                 self.spec.budget = serde_json::from_value(p["budget"].clone())?;
             }
-            "checkpoint" => {}
+            "checkpoint" | "model_failure" | "model_dispatch" => {}
             _ => return Err(Error::Invalid("unknown durable event")),
         }
         self.last_sequence = event.sequence;
@@ -293,6 +319,24 @@ impl Snapshot {
             .iter()
             .filter_map(|criterion| {
                 let ok = match criterion {
+                    Criterion::FinalResponse { schema } => {
+                        self.response.as_ref().is_some_and(|r| {
+                            if !r.message.tool_calls.is_empty()
+                                || r.message.content.trim().is_empty()
+                            {
+                                return false;
+                            }
+                            match schema {
+                                None => true,
+                                Some(schema) => serde_json::from_str::<Value>(&r.message.content)
+                                    .ok()
+                                    .is_some_and(|value| {
+                                        jsonschema::validator_for(schema)
+                                            .is_ok_and(|validator| validator.is_valid(&value))
+                                    }),
+                            }
+                        })
+                    }
                     Criterion::HostCheck { id } => self.host_checks.get(id) == Some(&true),
                     Criterion::ToolSuccess { name } => {
                         self.latest_tool(name).is_some_and(|r| r.success)
@@ -348,6 +392,20 @@ pub enum Boundary {
     ToolResultConfirmed,
     CheckpointConfirmed,
 }
+/// Fallible incremental durable projection. Returning an error stops before the
+/// next model/tool effect; replaying journal events must be idempotent.
+pub trait DurableSink: Send + Sync {
+    fn record<'a>(
+        &'a self,
+        run: &'a str,
+        event: &'a Event,
+    ) -> BoxFuture<'a, std::result::Result<(), String>>;
+}
+#[derive(Clone)]
+struct Projection {
+    sink: Arc<dyn DurableSink>,
+    cursors: Arc<tokio::sync::Mutex<BTreeMap<String, u64>>>,
+}
 pub trait Observer: Send + Sync {
     fn reached(&self, phase: Boundary, run: &str, step: u64, key: Option<&str>);
 }
@@ -357,6 +415,7 @@ pub struct Engine {
     model: Arc<dyn ModelGateway>,
     tools: Arc<dyn ToolRuntime>,
     observer: Option<Arc<dyn Observer>>,
+    projection: Option<Projection>,
     stream_sink: Option<excalibur_models::StreamSink>,
 }
 impl Engine {
@@ -370,8 +429,38 @@ impl Engine {
             model,
             tools,
             observer: None,
+            projection: None,
             stream_sink: None,
         }
+    }
+    pub fn with_durable_sink(mut self, sink: Arc<dyn DurableSink>) -> Self {
+        self.projection = Some(Projection {
+            sink,
+            cursors: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+        });
+        self
+    }
+    pub async fn flush_events(&self, run: &str) -> Result<()> {
+        let Some(projection) = &self.projection else {
+            return Ok(());
+        };
+        let mut cursors = projection.cursors.lock().await;
+        let cursor = cursors.entry(run.to_owned()).or_default();
+        loop {
+            let events = self.journal.entries(run, *cursor, 256).await?;
+            if events.is_empty() {
+                break;
+            }
+            for event in events {
+                projection
+                    .sink
+                    .record(run, &event)
+                    .await
+                    .map_err(|_| Error::Invalid("durable event projection failed"))?;
+                *cursor = event.sequence;
+            }
+        }
+        Ok(())
     }
     pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
         self.observer = Some(observer);
@@ -452,16 +541,16 @@ impl Engine {
                     "operation reused with different run specification",
                 ));
             }
+            self.flush_events(&run).await?;
             return Ok(run);
         }
-        let seed = json!({"spec":spec,"started_at":unix_seconds(),"gateway_identity":self.model.identity()});
+        let seed = json!({"spec":spec,"started_at":unix_seconds(),"gateway_identity":self.model.identity(),"model_dispatch_protocol":1});
         if self.sanitize(&seed)? != seed {
             return Err(Error::Invalid("secret literal in durable run identity"));
         }
-        self.journal
-            .create_run(operation, seed)
-            .await
-            .map_err(Into::into)
+        let run = self.journal.create_run(operation, seed).await?;
+        self.flush_events(&run).await?;
+        Ok(run)
     }
     pub async fn load(&self, run: &str) -> Result<Snapshot> {
         let checkpoint = self.journal.latest_checkpoint(run).await?;
@@ -498,10 +587,12 @@ impl Engine {
             .map_err(|_| Error::Invalid("durable data sanitization failed"))
     }
     async fn append_safe(&self, run: &str, kind: &str, key: &str, payload: Value) -> Result<u64> {
-        Ok(self
+        let sequence = self
             .journal
             .append(run, kind, key, self.sanitize(&payload)?)
-            .await?)
+            .await?;
+        self.flush_events(run).await?;
+        Ok(sequence)
     }
     async fn event(
         &self,
@@ -587,8 +678,28 @@ impl Engine {
             .journal
             .set_state_if(run, expected, status.label(), reason, &key)
             .await?;
+        self.flush_events(run).await?;
         *state = self.load(run).await?;
         Ok(applied)
+    }
+    /// Host finalization of an unrecoverable execution error; never overwrites
+    /// user controls or an already completed run.
+    pub async fn fail(&self, run: &str, reason: &str) -> Result<()> {
+        let mut state = self.load(run).await?;
+        self.transition_from(
+            run,
+            &mut state,
+            &["running"],
+            Status::Failed,
+            Some(reason.into()),
+        )
+        .await?;
+        Ok(())
+    }
+    pub async fn block(&self, run: &str, reason: &str) -> Result<()> {
+        let mut state = self.load(run).await?;
+        self.transition(run, &mut state, Status::Blocked, Some(reason.into()))
+            .await
     }
     /// Controls are persisted without acquiring the long-running run lock.
     pub async fn pause(&self, run: &str) -> Result<()> {
@@ -646,7 +757,7 @@ impl Engine {
         let mut state = self.load(run).await?;
         if matches!(
             state.status,
-            Status::Completed | Status::CompletedWithPending | Status::Cancelled
+            Status::Completed | Status::CompletedWithPending | Status::Cancelled | Status::Failed
         ) || budget.max_steps == 0
             || budget.max_tokens == 0
             || budget.max_wall_seconds == 0
@@ -784,6 +895,7 @@ impl Engine {
             .map(|(i, _)| tool_key(run, initial.step, *i))
             .collect();
         loop {
+            self.flush_events(run).await?;
             let mut s = self.load(run).await?;
             if s.status != Status::Running {
                 return Ok(s);
@@ -819,8 +931,17 @@ impl Engine {
                 }
                 let mut input = s.spec.context.clone();
                 input.activity.extend(s.history.clone());
-                input.volatile.now_utc = unix_seconds().to_string();
+                input.volatile.now_utc = self
+                    .model
+                    .request_time_override(s.step)
+                    .unwrap_or_else(|| unix_seconds().to_string());
                 input.volatile.continuation = s.continuation.clone();
+                for pin in s.pinned_observations.values() {
+                    input.volatile.recovery_notices.push(format!(
+                        "Pinned observation (untrusted data): {}",
+                        serde_json::to_string(pin)?
+                    ));
+                }
                 input.volatile.budget_status = serde_json::to_string(
                     &json!({"step":s.step,"budget":s.spec.budget,"usage":s.usage,"tool_calls":s.tool_calls}),
                 )?;
@@ -847,22 +968,88 @@ impl Engine {
             }
             if s.response.is_none() {
                 let request = s.request.clone().unwrap();
+                if let Some(bound) = self.model.call_bound(&request)
+                    && (bound.max_tokens
+                        > s.spec.budget.max_tokens.saturating_sub(
+                            s.usage.input_tokens.saturating_add(s.usage.output_tokens),
+                        )
+                        || s.spec.budget.max_cost_microusd.is_some_and(|cap| {
+                            bound.max_cost_microusd > cap.saturating_sub(s.usage.cost_microusd)
+                        }))
+                {
+                    self.transition(
+                        run,
+                        &mut s,
+                        Status::Paused,
+                        Some("budget cannot reserve the next model call".into()),
+                    )
+                    .await?;
+                    return Ok(s);
+                }
+                let key = format!("model:{}:dispatch", s.step);
+                self.event(
+                    run,
+                    &mut s,
+                    "model_dispatch",
+                    key,
+                    json!({"metadata":self.model.metadata()}),
+                )
+                .await?;
                 let remaining = remaining_time(&s).max(1);
                 let response = tokio::time::timeout(
                     Duration::from_secs(remaining),
                     AssertUnwindSafe(async {
                         if let Some(sink) = &self.stream_sink {
-                            self.model.complete_stream(request, sink.clone()).await
+                            self.model
+                                .complete_stream_observed(request, sink.clone())
+                                .await
                         } else {
-                            self.model.complete(request).await
+                            self.model.complete_observed(request).await
                         }
                     })
                     .catch_unwind(),
                 )
-                .await
-                .map_err(|_| Error::Model("request timed out; no response recorded".into()))?
-                .map_err(|_| Error::Model("gateway panicked; no response recorded".into()))?
-                .map_err(|e| Error::Model(e.to_string()))?;
+                .await;
+                let observed = match response {
+                    Ok(Ok(Ok(observed))) => observed,
+                    Ok(Ok(Err(error))) => {
+                        let reason = error.to_string();
+                        let failure_class =
+                            serde_json::to_value(error.error.classification().class)
+                                .unwrap_or(Value::Null);
+                        let key = format!("model:{}:failure", s.step);
+                        self.event(run,&mut s,"model_failure",key,json!({"metrics":error.metrics,"failure_class":failure_class,"error":reason})).await?;
+                        return Err(Error::Model(reason));
+                    }
+                    Err(_) => {
+                        let key = format!("model:{}:failure", s.step);
+                        self.event(run,&mut s,"model_failure",key,json!({"failure_class":"agent_timeout","error":"wall time exhausted during model request"})).await?;
+                        self.transition(
+                            run,
+                            &mut s,
+                            Status::Paused,
+                            Some("wall time budget".into()),
+                        )
+                        .await?;
+                        return Ok(s);
+                    }
+                    Ok(Err(_)) => {
+                        let key = format!("model:{}:failure", s.step);
+                        self.event(
+                            run,
+                            &mut s,
+                            "model_failure",
+                            key,
+                            json!({"failure_class":"harness_error","error":"gateway panicked"}),
+                        )
+                        .await?;
+                        return Err(Error::Model(
+                            "gateway panicked; no response recorded".into(),
+                        ));
+                    }
+                };
+                let response = observed.response;
+                let model_metrics = observed.metrics;
                 if response.message.role != "assistant"
                     || response.message.tool_calls.len() > 128
                     || response.message.tool_calls.iter().any(|c| c.id.is_empty())
@@ -900,7 +1087,7 @@ impl Engine {
                             &mut s,
                             "model_response",
                             key,
-                            json!({"response":safe_response}),
+                            json!({"response":safe_response,"metrics":model_metrics}),
                         )
                         .await?;
                         self.transition(run, &mut s, Status::Blocked, Some("model requested a secret literal in tool arguments; use executor secret references".into())).await?;
@@ -914,7 +1101,7 @@ impl Engine {
                     &mut s,
                     "model_response",
                     key,
-                    json!({"response":response}),
+                    json!({"response":response,"metrics":model_metrics}),
                 )
                 .await?;
                 self.point(Boundary::ModelResponseConfirmed, run, s.step, None);
@@ -1056,6 +1243,19 @@ impl Engine {
                 if self.honor_approval_wait(run, &mut s).await? {
                     return Ok(s);
                 }
+                s = self.load(run).await?;
+                if let Some(reason) = s.calls.values().find_map(|call| {
+                    let result = call.result.as_ref()?;
+                    (call.prepared.as_ref()?.call.name == "status"
+                        && result.success
+                        && result.output["task_state"] == "blocked")
+                        .then(|| result.output["reason"].as_str().map(str::to_owned))
+                        .flatten()
+                }) {
+                    self.transition(run, &mut s, Status::Blocked, Some(reason))
+                        .await?;
+                    return Ok(s);
+                }
                 if tool_limit {
                     self.transition(run, &mut s, Status::Paused, Some("tool budget".into()))
                         .await?;
@@ -1089,6 +1289,7 @@ impl Engine {
             timeout,
         } = job;
         let _locks = resource_locks(&plan).await;
+        let tool_started = std::time::Instant::now();
         match self.journal.is_running(run).await {
             Ok(true) => {}
             Ok(false) => return None,
@@ -1129,7 +1330,7 @@ impl Engine {
                         return None;
                     }
                     let reason=match other{Err(error)=>error,Ok(_)=>"resource plan or call identity changed before admission; retry with current state".into()};
-                    return self.append_safe(run,"tool_result",&format!("{key}:result"),json!({"index":index,"name":call.name,"result":ToolResult::error(reason)})).await.err().map(|error|AttemptFailure{retryable:true,reason:format!("rejection could not be recorded: {error}")});
+                    return self.append_safe(run,"tool_result",&format!("{key}:result"),json!({"index":index,"name":call.name,"result":ToolResult::error(reason),"duration_ms":tool_started.elapsed().as_millis().min(u64::MAX as u128) as u64})).await.err().map(|error|AttemptFailure{retryable:true,reason:format!("rejection could not be recorded: {error}")});
                 }
             };
             let payload = json!({"index":index,"prepared":prepared});
@@ -1157,6 +1358,12 @@ impl Engine {
                         reason: format!("intention could not be confirmed: {error}"),
                     });
                 }
+            }
+            if let Err(error) = self.flush_events(run).await {
+                return Some(AttemptFailure {
+                    retryable: true,
+                    reason: error.to_string(),
+                });
             }
             self.point(Boundary::ToolIntentConfirmed, run, step, Some(&key));
             prepared
@@ -1209,7 +1416,7 @@ impl Engine {
                 run,
                 "tool_result",
                 &format!("{key}:result"),
-                json!({"index":index,"name":prepared.call.name,"result":result}),
+                json!({"index":index,"name":prepared.call.name,"result":result,"duration_ms":tool_started.elapsed().as_millis().min(u64::MAX as u128) as u64}),
             )
             .await
         {
@@ -1231,10 +1438,12 @@ impl Engine {
         Ok(())
     }
     async fn scheduling(&self, run: &str, call: &ToolCall, timeout: u64) -> ToolScheduling {
-        if matches!(
-            call.name.as_str(),
-            "leave_continuation_note" | "get_tool_output"
-        ) {
+        if episode_utilities::is_builtin(&call.name)
+            || matches!(
+                call.name.as_str(),
+                "leave_continuation_note" | "get_tool_output"
+            )
+        {
             return ToolScheduling {
                 resources: Vec::new(),
                 exclusive: false,
@@ -1255,6 +1464,9 @@ impl Engine {
         run: &str,
         call: ToolCall,
     ) -> std::result::Result<PreparedTool, String> {
+        if episode_utilities::is_builtin(&call.name) {
+            return episode_utilities::prepare(call);
+        }
         if matches!(
             call.name.as_str(),
             "leave_continuation_note" | "get_tool_output"
@@ -1302,10 +1514,11 @@ impl Engine {
         }
     }
     async fn execute(&self, run: &str, key: &str, tool: &PreparedTool) -> ToolResult {
-        let builtin = matches!(
-            tool.call.name.as_str(),
-            "leave_continuation_note" | "get_tool_output"
-        );
+        let builtin = episode_utilities::is_builtin(&tool.call.name)
+            || matches!(
+                tool.call.name.as_str(),
+                "leave_continuation_note" | "get_tool_output"
+            );
         if builtin
             && self
                 .tools
@@ -1345,6 +1558,9 @@ impl Engine {
                     Err(e) => ToolResult::error(e.to_string()),
                 }
             }
+            name if episode_utilities::is_builtin(name) => {
+                episode_utilities::execute(&self.journal, self.tools.as_ref(), run, key, tool).await
+            }
             _ => self.tools.execute(run, key, tool).await,
         };
         if builtin
@@ -1367,8 +1583,12 @@ impl Engine {
         }
     }
 }
+pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
+    builtin_definitions()
+}
 fn builtin_definitions() -> Vec<ToolDefinition> {
-    vec![
+    let mut definitions = episode_utilities::definitions();
+    definitions.extend(vec![
         ToolDefinition {
             name: "leave_continuation_note".into(),
             description: "Save or clear a brief note for subsequent model calls and recovery."
@@ -1380,7 +1600,8 @@ fn builtin_definitions() -> Vec<ToolDefinition> {
             description: "Read a bounded byte window of a stored full tool output.".into(),
             input_schema: json!({"type":"object","required":["hash"],"properties":{"hash":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1048576}},"additionalProperties":false}),
         },
-    ]
+    ]);
+    definitions
 }
 struct ToolJob {
     index: usize,

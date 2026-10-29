@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/open-telemetry/semantic-conventions-genai",
+  "commit": "3fe84604a581b3d50dd5b4bd29383b462d2a5018",
+  "status": "Development",
+  "files_sha256": {
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "gen-ai-agent-spans.md": "5fab1b5d53414efd0d39821d9d146d7af25247d176896bf928c000acc97ed4a7",
+    "client-inference.md": "777fc37ef24860f1e7d0bada465bb4cfc9c983dcb43e2a3c69ae902c07236fdb",
+    "gen-ai-spans.md": "3a542c9f9a51c1417bcd57b7bbcbea06c3c9b8efaa0160621f58a31d00459674"
+  }
+}
