@@ -559,24 +559,71 @@ async fn gate_wall_deadline_drops_pending_verification_and_runs_cleanup() {
 #[tokio::test]
 async fn budget_allocation_cycles_are_rejected_by_the_same_writer_transaction() {
     let (_dir, db, engine, _, _) = fixture().await;
-    let mut s = spec();
-    s.budget = Budget {
+    let mut parent = spec();
+    parent.budget = Budget {
         max_tokens: 100,
         max_steps: 3,
-        max_wall_seconds: 10,
+        max_wall_seconds: 3600,
         max_tool_calls: 5,
         ..Default::default()
     };
-    let a = engine.create("cycle-a", s.clone()).await.unwrap();
-    let b = engine.create("cycle-b", s.clone()).await.unwrap();
-    reserve_child_budget(engine.journal(), &a, "first", &b, s.budget.clone())
+    let mut child = parent.clone();
+    child.budget.max_wall_seconds = 10;
+    let a = engine.create("cycle-a", parent.clone()).await.unwrap();
+    let b = engine.create("cycle-b", child.clone()).await.unwrap();
+    reserve_child_budget(engine.journal(), &a, "first", &b, child.budget)
         .await
         .unwrap();
-    assert!(
-        reserve_child_budget(engine.journal(), &b, "cycle", &a, s.budget)
-            .await
-            .is_err()
-    );
+    let before_a = engine.journal().replay(&a, 0).await.unwrap();
+    let before_b = engine.journal().replay(&b, 0).await.unwrap();
+    // Exercise the writer's DAG guard directly: a reverse allocation through
+    // the engine would already fail its strictly decreasing wall-time budget.
+    let error = engine
+        .journal()
+        .append_child_budget_reservation(
+            &b,
+            before_b.last().unwrap().sequence,
+            "allocation:cycle",
+            json!({
+                "allocation_id":"cycle",
+                "child_sequence":before_a.last().unwrap().sequence,
+                "allocation":ChildBudgetAllocation {
+                    child_run:a.clone(), budget:parent.budget, settled:None
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        excalibur_journal::Error::Storage(excalibur_store::Error::Invalid(
+            "child budget allocation would create a cycle"
+        ))
+    ));
+    assert_eq!(engine.journal().replay(&a, 0).await.unwrap(), before_a);
+    assert_eq!(engine.journal().replay(&b, 0).await.unwrap(), before_b);
+    db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn child_wall_budget_cannot_exceed_parent_even_before_any_elapsed_time() {
+    let (_dir, db, engine, _, _) = fixture().await;
+    let mut parent = spec();
+    parent.budget.max_wall_seconds = 10;
+    let mut child = parent.clone();
+    child.budget.max_wall_seconds = 11;
+    let a = engine.create("wall-parent", parent).await.unwrap();
+    let b = engine.create("wall-child", child.clone()).await.unwrap();
+    let before_a = engine.journal().replay(&a, 0).await.unwrap();
+    let before_b = engine.journal().replay(&b, 0).await.unwrap();
+    assert!(matches!(
+        reserve_child_budget(engine.journal(), &a, "excess-wall", &b, child.budget).await,
+        Err(Error::Invalid(
+            "child budget exceeds unallocated parent budget"
+        ))
+    ));
+    assert_eq!(engine.journal().replay(&a, 0).await.unwrap(), before_a);
+    assert_eq!(engine.journal().replay(&b, 0).await.unwrap(), before_b);
     db.shutdown().await.unwrap();
 }
 
