@@ -72,15 +72,48 @@ impl LocalTools {
             .ok_or_else(|| "path is not UTF-8".into())
     }
     pub(crate) fn content(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        self.content_guarded(path, &mut crate::file_authority::ReadAuthority::default())
+    }
+    pub(crate) fn check_content_authority(
+        &self,
+        path: &str,
+        authority: &mut crate::file_authority::ReadAuthority,
+    ) -> Result<(), String> {
+        let file = self.directory.open(path).map_err(|e| e.to_string())?;
+        authority.check(
+            &self.directory,
+            &self.root,
+            &self.policy.protected_paths,
+            &file,
+        )
+    }
+    pub(crate) fn content_guarded(
+        &self,
+        path: &str,
+        authority: &mut crate::file_authority::ReadAuthority,
+    ) -> Result<Option<Vec<u8>>, String> {
         match self.directory.open(path) {
-            Ok(file) => {
+            Ok(mut file) => {
+                authority.check(
+                    &self.directory,
+                    &self.root,
+                    &self.policy.protected_paths,
+                    &file,
+                )?;
                 let mut out = Vec::new();
-                file.take(MAX_FILE_BYTES + 1)
+                std::io::Read::by_ref(&mut file)
+                    .take(MAX_FILE_BYTES + 1)
                     .read_to_end(&mut out)
                     .map_err(|e| e.to_string())?;
                 if out.len() as u64 > MAX_FILE_BYTES {
                     return Err("file exceeds 64 MiB limit".into());
                 }
+                authority.check(
+                    &self.directory,
+                    &self.root,
+                    &self.policy.protected_paths,
+                    &file,
+                )?;
                 Ok(Some(out))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),

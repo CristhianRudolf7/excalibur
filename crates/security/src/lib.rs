@@ -1,5 +1,7 @@
 //! Deterministic authorization, durable approvals and append-only audit for host adapters.
 mod executor;
+mod finalization;
+mod network;
 mod policy;
 mod secured;
 use excalibur_store::{Database, Priority, ReadLane};
@@ -415,6 +417,7 @@ impl Security {
         risk: &RiskReport,
         now: i64,
     ) -> Result<String> {
+        let _approval_ordering = self.approval_ordering_lock(run).await?;
         let hash = action_key(action)?;
         let base_id = format!("approval_{}", digest(format!("{run}:{hash}").as_bytes()));
         let config = self.run_security(run).await?;
@@ -427,6 +430,7 @@ impl Security {
         );
         Ok(self.db.write(Priority::Journal, move |c| {
             use excalibur_store::rusqlite::OptionalExtension;
+            if finalization::terminal(&finalization::authoritative_run_state(c,&run)?) { return Err(excalibur_store::Error::Invalid("terminal execution cannot create an approval")); }
             let previous = c.query_row("SELECT id,status,consumed FROM security_approvals WHERE run_id=?1 AND action_hash=?2 ORDER BY rowid DESC LIMIT 1",excalibur_store::rusqlite::params![run,hash],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?))).optional()?;
             if let Some((id,status,consumed)) = &previous && (status != "approved" || !consumed) { return Ok(id.clone()); }
             let id = match previous { None=>base_id, Some((id,_,_))=>format!("{base_id}_{}",digest(id.as_bytes())) };
@@ -449,12 +453,25 @@ impl Security {
                 "authenticated instruction ID required".into(),
             ));
         }
+        let lookup = id.to_owned();
+        let run: String = self
+            .db
+            .read(ReadLane::Interactive, move |c| {
+                Ok(c.query_row(
+                    "SELECT run_id FROM security_approvals WHERE id=?1",
+                    [lookup],
+                    |row| row.get(0),
+                )?)
+            })
+            .await?;
+        let _approval_ordering = self.approval_ordering_lock(&run).await?;
         let (id, instruction, redactor) = (
             id.to_owned(),
             authenticated_instruction.to_owned(),
             self.redactor.clone(),
         );
         Ok(self.db.write(Priority::Journal,move|c| {
+            if finalization::terminal(&finalization::authoritative_run_state(c,&run)?) { return Err(excalibur_store::Error::Invalid("terminal execution cannot renew an approval")); }
             let changed = c.execute("UPDATE security_approvals SET status='pending',created_at=?2,expires_at=?3,response_id=NULL,reminded=0 WHERE id=?1 AND status IN('rejected','expired')",excalibur_store::rusqlite::params![id,now,now+7*86400])?;
             if changed != 0 {
                 c.execute("UPDATE approvals SET state='pending',response=NULL,deadline=?2 WHERE id=?1",excalibur_store::rusqlite::params![id,now+7*86400])?;

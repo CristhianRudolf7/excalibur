@@ -136,6 +136,35 @@ pub trait DurableByteInspector: Send {
     fn inspect(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn finish(&mut self) -> Result<(), String>;
 }
+/// Live egress gate, called by a trusted host broker before each new TCP
+/// connection. Implementations must fail closed when authorization is unavailable.
+pub trait NetworkAdmission: Send + Sync {
+    /// Recheck the same admitted attempt immediately before the pinned TCP
+    /// connect, after DNS. This must not consume a second Once approval.
+    fn revalidate(&self) -> Result<(), String>;
+}
+struct UnrestrictedNetworkAdmission;
+impl NetworkAdmission for UnrestrictedNetworkAdmission {
+    fn revalidate(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+pub trait NetworkAuthorizer: Send + Sync {
+    fn authorize(&self, domain: &str, port: u16) -> Result<(), String>;
+    fn authorize_connection(
+        &self,
+        domain: &str,
+        port: u16,
+    ) -> Result<Box<dyn NetworkAdmission>, String> {
+        self.authorize(domain, port)?;
+        Ok(Box::new(UnrestrictedNetworkAdmission))
+    }
+
+    /// Metadata-only denial audit; never receives URI paths, headers or bodies.
+    fn rejected(&self, _domain: &str, _port: u16, _reason: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
 /// Kernel/process adapter input, derived only from the host execution capability.
 /// Adapters must reject an unsupported restriction instead of broadening it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -152,6 +181,23 @@ pub struct ProcessBoundary {
     pub profile: String,
     pub workspace: std::path::PathBuf,
     pub denied_paths: Vec<std::path::PathBuf>,
+}
+/// Security facts observed while holding an approval/finalization ordering guard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FinalizationState {
+    Ready,
+    Pending,
+    Blocked(String),
+}
+/// Retain this guard until the terminal journal transition has committed.
+pub trait FinalizationGuard: Send {
+    fn state(&self) -> FinalizationState;
+}
+struct ReadyFinalizationGuard;
+impl FinalizationGuard for ReadyFinalizationGuard {
+    fn state(&self) -> FinalizationState {
+        FinalizationState::Ready
+    }
 }
 /// Preparation may persist preimages, but must not perform the requested external effect.
 /// Execution is called only after a confirmed durable intention; recovery never guesses.
@@ -207,6 +253,19 @@ pub trait ToolRuntime: Send + Sync {
         _result: Option<&'a ToolResult>,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
+    }
+    fn configure_network_authorizer<'a>(
+        &'a self,
+        _run: &'a str,
+        _authorizer: std::sync::Arc<dyn NetworkAuthorizer>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Err("process adapter cannot enforce live network authorization".into()) })
+    }
+    fn finalization_guard<'a>(
+        &'a self,
+        _run: &'a str,
+    ) -> BoxFuture<'a, Result<Box<dyn FinalizationGuard>, String>> {
+        Box::pin(async { Ok(Box::new(ReadyFinalizationGuard) as Box<dyn FinalizationGuard>) })
     }
     fn definitions(&self) -> Vec<ToolDefinition>;
     /// Return canonical resource keys without preparing content-dependent work.

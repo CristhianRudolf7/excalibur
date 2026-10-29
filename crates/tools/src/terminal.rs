@@ -269,6 +269,10 @@ impl TerminalManager {
         })
     }
     /// Trusted capability adapter narrows the base sandbox for a durable run.
+    pub fn sandbox_config(&self) -> Option<SandboxConfig> {
+        self.inner.config.sandbox.clone()
+    }
+    /// Trusted capability adapter narrows the base sandbox for a durable run.
     pub fn set_run_sandbox(&self, run: &str, sandbox: SandboxConfig) -> Result<(), String> {
         let base = self
             .inner
@@ -282,6 +286,31 @@ impl TerminalManager {
             .lock()
             .unwrap()
             .insert(run.into(), restricted);
+        Ok(())
+    }
+    /// Attach a live security decision to future connections. Already-running
+    /// proxies retain their guard, which consults current durable host policy.
+    pub fn set_network_authorizer(
+        &self,
+        run: &str,
+        authorizer: Arc<dyn excalibur_types::runtime::NetworkAuthorizer>,
+    ) -> Result<(), String> {
+        let mut runs = self.inner.run_sandboxes.lock().unwrap();
+        let sandbox = runs
+            .get_mut(run)
+            .ok_or("run process boundary has not been configured")?;
+        if let Some(network) = &mut sandbox.network {
+            let host = self
+                .inner
+                .config
+                .sandbox
+                .as_ref()
+                .and_then(|s| s.network.as_ref())
+                .ok_or("no host proxy ceiling is configured")?;
+            let mut next = network.clone();
+            next.authorizer = Some(authorizer);
+            *network = next.restricted_by(host)?;
+        }
         Ok(())
     }
     pub fn spool_dir(&self) -> &Path {

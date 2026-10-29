@@ -1,5 +1,6 @@
 use super::{SandboxConfig, SandboxProfile, canonical, ordinary_directories, protected_paths};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::File,
     io::{Seek, SeekFrom, Write},
@@ -15,20 +16,18 @@ pub struct PreparedSandbox {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     filter: File,
+    proxy: Option<super::network::HostProxy>,
     _private: tempfile::TempDir,
 }
 impl PreparedSandbox {
     pub fn new(config: &SandboxConfig) -> Result<Self, String> {
         match config.profile {
             SandboxProfile::ReadOnly
+            | SandboxProfile::Project
             | SandboxProfile::ProjectRestricted
+            | SandboxProfile::ProjectNet
             | SandboxProfile::FileAnalysis
             | SandboxProfile::ToolPackage => {}
-            SandboxProfile::ProjectNet => {
-                return Err(
-                    "project-net requires an enforcing proxy; unavailable, execution denied".into(),
-                );
-            }
             _ => {
                 return Err(
                     "requested sandbox profile has no verified Linux implementation".into(),
@@ -59,7 +58,20 @@ impl PreparedSandbox {
             .iter()
             .map(|p| canonical(p))
             .collect::<Result<Vec<_>, _>>()?;
-        for path in read.iter().chain(write.iter()) {
+        for path in &read {
+            if ["/proc", "/sys", "/dev", "/run"]
+                .iter()
+                .any(|reserved| path.starts_with(reserved))
+            {
+                return Err(
+                    "host kernel and runtime filesystems cannot be sandbox read roots".into(),
+                );
+            }
+            if !path.is_dir() && !path.is_file() {
+                return Err("read roots must be regular files or directories".into());
+            }
+        }
+        for path in &write {
             if !path.starts_with(&workspace) {
                 return Err("sandbox roots must be within the fixed project boundary".into());
             }
@@ -68,11 +80,29 @@ impl PreparedSandbox {
         read.dedup();
         write.sort();
         write.dedup();
+        let networked = config.profile == SandboxProfile::ProjectNet;
+        let bridge = if networked {
+            let path = config
+                .proxy_bridge
+                .as_deref()
+                .ok_or("project-net requires a trusted internal network bridge")?;
+            Some(validated_native_tool(path, &workspace, &write)?)
+        } else {
+            None
+        };
         let program = validated_bubblewrap(config.bubblewrap.as_deref(), &workspace, &write)?;
-        let private = tempfile::Builder::new()
-            .prefix("excalibur-sandbox-")
-            .tempdir()
-            .map_err(|e| e.to_string())?;
+        let private = runtime_tempdir(&write)?;
+        let proxy = if networked {
+            Some(super::network::HostProxy::start_in(
+                config
+                    .network
+                    .clone()
+                    .ok_or("project-net requires an enforcing host proxy configuration")?,
+                private.path(),
+            )?)
+        } else {
+            None
+        };
         let empty_dir = private.path().join("masked-directory");
         std::fs::create_dir(&empty_dir).map_err(|e| e.to_string())?;
         std::fs::set_permissions(&empty_dir, std::fs::Permissions::from_mode(0o0))
@@ -81,10 +111,10 @@ impl PreparedSandbox {
         std::fs::write(&empty_file, []).map_err(|e| e.to_string())?;
         std::fs::set_permissions(&empty_file, std::fs::Permissions::from_mode(0o0))
             .map_err(|e| e.to_string())?;
-        let filter = filter(matches!(
-            config.profile,
-            SandboxProfile::ProjectRestricted | SandboxProfile::ToolPackage
-        ))?;
+        let filter = filter(
+            matches!(config.profile, SandboxProfile::ProjectRestricted),
+            networked,
+        )?;
         let mut args: Vec<OsString> = [
             "--unshare-all",
             "--unshare-user",
@@ -117,9 +147,36 @@ impl PreparedSandbox {
             "/etc/nsswitch.conf",
             "/etc/localtime",
             "/etc/terminfo",
+            "/etc/ssl/certs",
+            "/etc/ssl/openssl.cnf",
         ] {
             if Path::new(path).exists() {
                 push(&mut args, "--ro-bind", Path::new(path), Path::new(path));
+            }
+        }
+        // Debian-style compiler/awk entry points are symlinks through this
+        // directory. Projecting only links whose final targets are already in
+        // the read-only system runtime does not expose additional host files.
+        if Path::new("/etc/alternatives").is_dir() {
+            args.extend(
+                ["--dir", "/etc/alternatives"]
+                    .into_iter()
+                    .map(OsString::from),
+            );
+            for entry in std::fs::read_dir("/etc/alternatives").map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                if !entry.file_type().map_err(|e| e.to_string())?.is_symlink() {
+                    continue;
+                }
+                if let Ok(target) = entry.path().canonicalize()
+                    && target.starts_with("/usr")
+                {
+                    args.extend([
+                        OsString::from("--symlink"),
+                        target.into_os_string(),
+                        entry.path().into_os_string(),
+                    ]);
+                }
             }
         }
         args.extend(
@@ -163,8 +220,8 @@ impl PreparedSandbox {
         }
         protected.sort();
         protected.dedup();
-        for path in protected {
-            push(&mut args, "--ro-bind", &path, &path);
+        for path in &protected {
+            push(&mut args, "--ro-bind", path, path);
         }
         // Existing credential material is hidden even when it is inside an authorized project.
         let mut hidden = config.hidden_paths.clone();
@@ -194,8 +251,18 @@ impl PreparedSandbox {
         }
         hidden.sort();
         hidden.dedup();
+        let mut nonwritable = hidden.clone();
+        nonwritable.extend(protected);
+        hidden.extend(cross_boundary_hardlink_aliases(&write, &nonwritable)?);
+        hidden.sort();
+        hidden.dedup();
         for path in hidden {
-            if !path.starts_with(&workspace) || !path.exists() {
+            if !read
+                .iter()
+                .chain(write.iter())
+                .any(|root| path.starts_with(root))
+                || !path.exists()
+            {
                 continue;
             }
             let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
@@ -213,6 +280,25 @@ impl PreparedSandbox {
                 &path,
             );
         }
+        if let (Some(proxy), Some(bridge)) = (&proxy, &bridge) {
+            args.extend(
+                ["--dir", "/run", "--dir", "/run/excalibur"]
+                    .into_iter()
+                    .map(OsString::from),
+            );
+            push(
+                &mut args,
+                "--ro-bind",
+                proxy.socket_path(),
+                Path::new("/run/excalibur/proxy.sock"),
+            );
+            push(
+                &mut args,
+                "--ro-bind",
+                bridge,
+                Path::new("/run/excalibur/network-bridge"),
+            );
+        }
         args.extend([
             OsString::from("--chdir"),
             workspace.into_os_string(),
@@ -225,6 +311,7 @@ impl PreparedSandbox {
             program,
             args,
             filter,
+            proxy,
             _private: private,
         })
     }
@@ -237,11 +324,133 @@ impl PreparedSandbox {
         if !tty {
             command.args(["--setenv", "NO_COLOR", "1", "--setenv", "CLICOLOR", "0"]);
         }
-        command.arg("--").arg(shell).args(shell_args);
+        command.arg("--");
+        if self.proxy.is_some() {
+            command.args([
+                "/run/excalibur/network-bridge",
+                "--socket",
+                "/run/excalibur/proxy.sock",
+                "--listen",
+                "127.0.0.1:3128",
+                "--",
+            ]);
+        }
+        command.arg(shell).args(shell_args);
     }
     pub fn filter_fd(&self) -> RawFd {
         self.filter.as_raw_fd()
     }
+}
+fn runtime_tempdir(writable: &[PathBuf]) -> Result<tempfile::TempDir, String> {
+    // Security resources never follow process-global TMPDIR/TMP/TEMP. Another
+    // sandbox must not be able to mutate their bind sources before namespace setup.
+    for candidate in ["/tmp", "/var/tmp"] {
+        let Ok(parent) = Path::new(candidate).canonicalize() else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::metadata(&parent) else {
+            continue;
+        };
+        if !metadata.is_dir()
+            || writable.iter().any(|root| parent.starts_with(root))
+            || ![0, unsafe { libc::geteuid() }].contains(&metadata.uid())
+            || metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0
+        {
+            continue;
+        }
+        return tempfile::Builder::new()
+            .prefix("excalibur-sandbox-")
+            .tempdir_in(parent)
+            .map_err(|_| "private sandbox runtime directory is unavailable".into());
+    }
+    Err("no trusted sandbox runtime directory exists outside writable roots".into())
+}
+/// A writable alias must account for every link to its inode inside the same
+/// writable authority. Otherwise another link may belong to protected metadata,
+/// a hidden vault, a read-only SDK or another host directory. Hide the writable
+/// aliases without inspecting any private tree or reading file content. Ordinary
+/// Cargo hardlinks wholly inside writable roots remain available.
+fn cross_boundary_hardlink_aliases(
+    writable: &[PathBuf],
+    hidden: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let mut paths = BTreeSet::new();
+    struct Inode {
+        links: u64,
+        names: BTreeSet<(u64, u64, OsString)>,
+        paths: Vec<PathBuf>,
+    }
+    let mut inodes: BTreeMap<(u64, u64), Inode> = BTreeMap::new();
+    let mut roots = writable.iter().collect::<Vec<_>>();
+    roots.sort();
+    let mut covered: Vec<&PathBuf> = Vec::new();
+    for root in roots {
+        if hidden.iter().any(|excluded| root.starts_with(excluded)) {
+            continue;
+        }
+        if covered.iter().any(|parent| root.starts_with(parent)) {
+            continue;
+        }
+        covered.push(root);
+        for directory in ordinary_directories(root, hidden)? {
+            let parent = std::fs::metadata(&directory).map_err(|e| e.to_string())?;
+            for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path();
+                if hidden.iter().any(|excluded| path.starts_with(excluded))
+                    || !paths.insert(path.clone())
+                {
+                    continue;
+                }
+                if paths.len() > super::MAX_ENTRIES {
+                    return Err(
+                        "sandbox writable hardlink inventory exceeds its entry limit".into(),
+                    );
+                }
+                let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+                if !metadata.is_file() || metadata.nlink() <= 1 {
+                    continue;
+                }
+                let inode = inodes
+                    .entry((metadata.dev(), metadata.ino()))
+                    .or_insert_with(|| Inode {
+                        links: metadata.nlink(),
+                        names: BTreeSet::new(),
+                        paths: Vec::new(),
+                    });
+                if inode.links != metadata.nlink() {
+                    return Err(
+                        "sandbox writable hardlink inventory changed during preparation".into(),
+                    );
+                }
+                // Bind aliases expose the same directory entry under different
+                // absolute paths without increasing the inode's link count.
+                inode
+                    .names
+                    .insert((parent.dev(), parent.ino(), entry.file_name()));
+                inode.paths.push(path);
+            }
+        }
+    }
+    let mut aliases = Vec::new();
+    for ((device, inode), info) in inodes {
+        for path in &info.paths {
+            let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+            if metadata.dev() != device || metadata.ino() != inode || metadata.nlink() != info.links
+            {
+                return Err(
+                    "sandbox writable hardlink inventory changed during preparation".into(),
+                );
+            }
+        }
+        if info.links < info.names.len() as u64 {
+            return Err("sandbox hardlink directory entries changed during preparation".into());
+        }
+        if info.links > info.names.len() as u64 {
+            aliases.extend(info.paths);
+        }
+    }
+    Ok(aliases)
 }
 fn push(args: &mut Vec<OsString>, option: &str, source: &Path, target: &Path) {
     args.extend([
@@ -299,7 +508,26 @@ fn validated_bubblewrap(
     }
     Ok(path)
 }
-fn filter(restricted: bool) -> Result<File, String> {
+fn validated_native_tool(
+    path: &Path,
+    workspace: &Path,
+    writable: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let path = path
+        .canonicalize()
+        .map_err(|_| "trusted network bridge is unavailable")?;
+    let meta =
+        std::fs::metadata(&path).map_err(|_| "trusted network bridge metadata unavailable")?;
+    if !meta.is_file()
+        || meta.mode() & 0o6022 != 0
+        || path.starts_with(workspace)
+        || writable.iter().any(|root| path.starts_with(root))
+    {
+        return Err("network bridge must be a trusted non-setuid, non-writable toolchain executable outside the project".into());
+    }
+    Ok(path)
+}
+fn filter(restricted: bool, networked: bool) -> Result<File, String> {
     #[cfg(target_arch = "x86_64")]
     const ARCH: u32 = 0xc000003e;
     #[cfg(target_arch = "aarch64")]
@@ -325,16 +553,6 @@ fn filter(restricted: bool) -> Result<File, String> {
         add(RET, 0, 0, KILL);
     }
     let mut denied = vec![
-        libc::SYS_socket,
-        libc::SYS_socketpair,
-        libc::SYS_connect,
-        libc::SYS_bind,
-        libc::SYS_listen,
-        libc::SYS_accept,
-        libc::SYS_accept4,
-        libc::SYS_sendto,
-        libc::SYS_sendmsg,
-        libc::SYS_sendmmsg,
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
@@ -377,6 +595,16 @@ fn filter(restricted: bool) -> Result<File, String> {
         libc::SYS_fanotify_init,
         libc::SYS_mknodat,
     ];
+    if !networked {
+        denied.extend([
+            libc::SYS_socket,
+            libc::SYS_connect,
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_accept,
+            libc::SYS_accept4,
+        ]);
+    }
     #[cfg(target_arch = "x86_64")]
     denied.push(libc::SYS_mknod);
     if restricted {
@@ -389,6 +617,61 @@ fn filter(restricted: bool) -> Result<File, String> {
     for syscall in denied {
         add(JEQ, 0, 1, syscall as u32);
         add(RET, 0, 0, ERRNO | libc::EPERM as u32);
+    }
+    if !networked {
+        // Connected anonymous IPC may use send()/sendto(NULL, 0), as Python
+        // does. No destination address can be supplied through this exception.
+        add(JEQ, 0, 13, libc::SYS_sendto as u32);
+        for offset in [48, 52, 56, 60] {
+            add(LD, 0, 0, offset);
+            add(JEQ, 1, 0, 0);
+            add(RET, 0, 0, ERRNO | libc::EPERM as u32);
+        }
+        add(RET, 0, 0, ALLOW);
+        add(LD, 0, 0, 0);
+    }
+    // sendmsg/recvmsg operate only on sockets admitted below: connected anonymous
+    // IPC, plus namespaced TCP in proxy mode. There is no datagram/name-based
+    // socket from which to acquire another peer or an external host descriptor.
+    // Anonymous stream/seqpacket IPC is required by Rust's pre-exec error
+    // channel. No pathname is involved; datagram pairs are excluded because
+    // they can disconnect and reconnect to a filesystem UNIX socket.
+    add(JEQ, 0, 12, libc::SYS_socketpair as u32);
+    add(LD, 0, 0, 16);
+    add(JEQ, 1, 0, libc::AF_UNIX as u32);
+    add(RET, 0, 0, ERRNO | libc::EPERM as u32);
+    add(LD, 0, 0, 24);
+    add(
+        0x54,
+        0,
+        0,
+        !(libc::SOCK_CLOEXEC as u32 | libc::SOCK_NONBLOCK as u32),
+    );
+    add(JEQ, 2, 0, libc::SOCK_STREAM as u32);
+    add(JEQ, 1, 0, libc::SOCK_SEQPACKET as u32);
+    add(RET, 0, 0, ERRNO | libc::EPERM as u32);
+    add(LD, 0, 0, 32);
+    add(JEQ, 1, 0, 0);
+    add(RET, 0, 0, ERRNO | libc::EPERM as u32);
+    add(RET, 0, 0, ALLOW);
+    add(LD, 0, 0, 0);
+    if networked {
+        // The trusted bridge needs UNIX stream and loopback TCP sockets. It adds
+        // an irreversible second filter denying UNIX sockets in its user child.
+        // Neither process receives UDP/raw/packet sockets or an external route.
+        add(JEQ, 0, 11, libc::SYS_socket as u32);
+        add(LD, 0, 0, 16);
+        add(JEQ, 3, 0, libc::AF_UNIX as u32);
+        add(JEQ, 2, 0, libc::AF_INET as u32);
+        add(JEQ, 1, 0, libc::AF_INET6 as u32);
+        add(RET, 0, 0, ERRNO | libc::EPERM as u32);
+        add(LD, 0, 0, 24);
+        // SOCK_CLOEXEC/NONBLOCK do not change the socket's transport type.
+        add(0x54, 0, 0, 0xf);
+        add(JEQ, 1, 0, libc::SOCK_STREAM as u32);
+        add(RET, 0, 0, ERRNO | libc::EPERM as u32);
+        add(RET, 0, 0, ALLOW);
+        add(LD, 0, 0, 0);
     }
     // clone3 carries flags behind a pointer. Returning ENOSYS selects libc's
     // ordinary clone fallback, whose namespace flags can be inspected safely.

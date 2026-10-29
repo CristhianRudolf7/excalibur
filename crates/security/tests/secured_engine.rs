@@ -804,3 +804,105 @@ async fn capability_tool_limit_preserves_final_text_and_prevents_additional_admi
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     f.db.shutdown().await.unwrap();
 }
+
+struct ReadyModel;
+impl ModelGateway for ReadyModel {
+    fn complete<'a>(
+        &'a self,
+        _: ModelRequest,
+    ) -> BoxFuture<'a, std::result::Result<ModelResponse, ModelError>> {
+        Box::pin(async {
+            Ok(ModelResponse {
+                message: Message::text("assistant", "Verified completion"),
+                usage: Usage::default(),
+            })
+        })
+    }
+}
+struct HeldFinalGate {
+    entered: tokio::sync::Notify,
+    release: (std::sync::Mutex<bool>, std::sync::Condvar),
+}
+impl excalibur_engine::Observer for HeldFinalGate {
+    fn reached(&self, phase: excalibur_engine::Boundary, _: &str, _: u64, _: Option<&str>) {
+        if phase == excalibur_engine::Boundary::GateReportConfirmed {
+            self.entered.notify_one();
+            let mut ready = self.release.0.lock().unwrap();
+            while !*ready {
+                ready = self.release.1.wait(ready).unwrap();
+            }
+        }
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_approval_at_confirmed_final_gate_cannot_be_overwritten_by_completion() {
+    let f = Fixture::new(Redactor::default()).await;
+    let gate = Arc::new(HeldFinalGate {
+        entered: tokio::sync::Notify::new(),
+        release: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+    });
+    let engine = Engine::new(
+        Journal::new(f.db.clone()).await.unwrap(),
+        Arc::new(ReadyModel),
+        f.tools.clone(),
+    )
+    .with_observer(gate.clone());
+    let run = engine
+        .create(
+            "background-at-gate",
+            RunSpec {
+                context: ContextInput::new("Core policy", "Finish verified work", "fixed"),
+                budget: Budget::default(),
+                criteria: vec![Criterion::HostCheck { id: "done".into() }],
+            },
+        )
+        .await
+        .unwrap();
+    f.register(&run, Autonomy::Consultative).await;
+    engine
+        .record_check(&run, "done", true, "Synthetic backend evidence")
+        .await
+        .unwrap();
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let run = run.clone();
+        async move { engine.run(&run).await.unwrap() }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+        .await
+        .unwrap();
+    let decision = f
+        .security
+        .authorize(
+            &run,
+            &Action::WriteExact {
+                path: f.root.join("new-action.txt"),
+                change: "synthetic background mutation".into(),
+            },
+            excalibur_store::unix_seconds(),
+        )
+        .await;
+    *gate.release.0.lock().unwrap() = true;
+    gate.release.1.notify_all();
+    assert!(matches!(decision.unwrap(), Decision::Ask { .. }));
+    let state = driver.await.unwrap();
+    assert_eq!(
+        state.status,
+        Status::Paused,
+        "a durable approval admitted before completion must win the final-state race"
+    );
+    assert_eq!(state.reason.as_deref(), Some("approval required"));
+    assert!(
+        f.security
+            .pending_approval(&run, excalibur_store::unix_seconds())
+            .await
+            .unwrap()
+    );
+    let events = engine.journal().replay(&run, 0).await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.kind == "state_change" && e.payload["state"] == "completed")
+    );
+    f.db.shutdown().await.unwrap();
+}

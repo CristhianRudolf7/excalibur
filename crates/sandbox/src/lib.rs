@@ -1,13 +1,12 @@
 //! Fail-closed Linux process confinement. Configuration belongs to the trusted host.
-//! Writable projects use a prepared hierarchy; general project/network profiles
-//! require additional policy support and are never silently substituted.
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-};
+//! Project roots and existing sensitive subtrees are fixed by the trusted host.
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxProfile {
     ReadOnly,
+    Project,
     ProjectRestricted,
     ProjectNet,
     FileAnalysis,
@@ -23,23 +22,40 @@ pub struct SandboxConfig {
     pub write_roots: Vec<PathBuf>,
     pub hidden_paths: Vec<PathBuf>,
     pub bubblewrap: Option<PathBuf>,
+    /// Host-owned proxy ceiling, resolver and private-service exceptions.
+    pub network: Option<network::ProxyConfig>,
+    /// Trusted internal native bootstrap; never selected by model arguments.
+    pub proxy_bridge: Option<PathBuf>,
 }
 impl SandboxConfig {
     pub fn project(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         Self {
-            profile: SandboxProfile::ProjectRestricted,
+            profile: SandboxProfile::Project,
             workspace: root.clone(),
             read_roots: vec![root.clone()],
             write_roots: vec![root],
             hidden_paths: Vec::new(),
             bubblewrap: None,
+            network: None,
+            proxy_bridge: None,
         }
     }
     pub fn read_only(root: impl Into<PathBuf>) -> Self {
         let mut s = Self::project(root);
         s.profile = SandboxProfile::ReadOnly;
         s.write_roots.clear();
+        s
+    }
+    pub fn project_net(
+        root: impl Into<PathBuf>,
+        network: network::ProxyConfig,
+        bridge: impl Into<PathBuf>,
+    ) -> Self {
+        let mut s = Self::project(root);
+        s.profile = SandboxProfile::ProjectNet;
+        s.network = Some(network);
+        s.proxy_bridge = Some(bridge.into());
         s
     }
     pub fn file_analysis(root: impl Into<PathBuf>) -> Self {
@@ -54,6 +70,35 @@ impl SandboxConfig {
     }
     pub fn restricted_by(&self, base: &Self) -> Result<Self, String> {
         let mut next = self.clone();
+        if (matches!(
+            base.profile,
+            SandboxProfile::ReadOnly | SandboxProfile::FileAnalysis
+        ) && !base.write_roots.is_empty())
+            || (matches!(
+                next.profile,
+                SandboxProfile::ReadOnly | SandboxProfile::FileAnalysis
+            ) && !next.write_roots.is_empty())
+        {
+            return Err("read-only process profile cannot grant writable roots".into());
+        }
+        if (base.network.is_some() && base.profile != SandboxProfile::ProjectNet)
+            || (next.network.is_some() && next.profile != SandboxProfile::ProjectNet)
+        {
+            return Err(
+                "proxy authority requires an explicit project-net profile at both boundaries"
+                    .into(),
+            );
+        }
+        if base.profile == SandboxProfile::ProjectRestricted
+            && !matches!(
+                next.profile,
+                SandboxProfile::ProjectRestricted
+                    | SandboxProfile::ReadOnly
+                    | SandboxProfile::FileAnalysis
+            )
+        {
+            return Err("process profile exceeds the host's restricted syscall policy".into());
+        }
         next.workspace = canonical(&next.workspace)?;
         if next.workspace != canonical(&base.workspace)? {
             return Err("sandbox working directory differs from host configuration".into());
@@ -85,6 +130,12 @@ impl SandboxConfig {
         next.hidden_paths.sort();
         next.hidden_paths.dedup();
         next.bubblewrap = base.bubblewrap.clone();
+        next.proxy_bridge = base.proxy_bridge.clone();
+        next.network = match (&next.network, &base.network) {
+            (Some(next), Some(base)) => Some(next.restricted_by(base)?),
+            (None, _) => None,
+            (Some(_), None) => return Err("network capability exceeds host boundary".into()),
+        };
         Ok(next)
     }
 }
@@ -172,6 +223,7 @@ pub fn prepare_project_boundary(root: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+#[cfg(target_os = "linux")]
 fn protected_paths(
     root: &Path,
     require_prepared: bool,
@@ -188,7 +240,12 @@ fn protected_paths(
                 Ok(_) => {
                     paths.insert(path);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !require_prepared => {}
+                // A general project can create ordinary directories. Their later
+                // existence must not impose a provisioning requirement on the host.
+                // Only the fixed authority root needs reserved mount points.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && (!require_prepared || dir != root) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Err(format!(
                         "project sandbox requires host-provisioned metadata boundaries: {}",
@@ -208,7 +265,10 @@ fn protected_paths(
     Ok(paths.into_iter().collect())
 }
 #[cfg(target_os = "linux")]
+pub mod bridge;
+#[cfg(target_os = "linux")]
 mod linux;
+pub mod network;
 #[cfg(target_os = "linux")]
 pub use linux::PreparedSandbox;
 #[cfg(not(target_os = "linux"))]

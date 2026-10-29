@@ -542,6 +542,31 @@ impl Engine {
         status: Status,
         reason: Option<String>,
     ) -> Result<bool> {
+        let (mut status, mut reason) = (status, reason);
+        // Hold the security runtime's barrier through the durable completion CAS.
+        // Background brokers serialize new approval requests with this same gate.
+        let _finalization_guard =
+            if matches!(status, Status::Completed | Status::CompletedWithPending) {
+                let guard = self
+                    .tools
+                    .finalization_guard(run)
+                    .await
+                    .map_err(|_| Error::Invalid("completion authority unavailable"))?;
+                match guard.state() {
+                    excalibur_types::runtime::FinalizationState::Ready => {}
+                    excalibur_types::runtime::FinalizationState::Pending => {
+                        status = Status::Paused;
+                        reason = Some("approval required".into());
+                    }
+                    excalibur_types::runtime::FinalizationState::Blocked(cause) => {
+                        status = Status::Blocked;
+                        reason = Some(cause);
+                    }
+                }
+                Some(guard)
+            } else {
+                None
+            };
         // The read gives the caller the latest facts; the writer-side guard closes
         // the race between this read and a concurrent user control transaction.
         *state = self.load(run).await?;
@@ -722,6 +747,19 @@ impl Engine {
         }
         Ok(())
     }
+    async fn honor_approval_wait(&self, run: &str, state: &mut Snapshot) -> Result<bool> {
+        if let Some(reason) = self.tools.approval_blocked(run).await {
+            self.transition(run, state, Status::Blocked, Some(reason))
+                .await?;
+            return Ok(true);
+        }
+        if self.tools.pending_approval(run).await {
+            self.transition(run, state, Status::Paused, Some("approval required".into()))
+                .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
     pub async fn run(&self, run: &str) -> Result<Snapshot> {
         let _guard = self.journal.lock_run(run).await;
         // Only intentions already present at admission need reconciliation.
@@ -748,6 +786,9 @@ impl Engine {
         loop {
             let mut s = self.load(run).await?;
             if s.status != Status::Running {
+                return Ok(s);
+            }
+            if self.honor_approval_wait(run, &mut s).await? {
                 return Ok(s);
             }
             let capability_tool_budget = self
@@ -882,6 +923,9 @@ impl Engine {
             if s.status != Status::Running {
                 return Ok(s);
             }
+            if self.honor_approval_wait(run, &mut s).await? {
+                return Ok(s);
+            }
             let response = s.response.clone().unwrap();
             if response.message.tool_calls.is_empty() {
                 let pending = s.pending_criteria();
@@ -1009,19 +1053,7 @@ impl Engine {
                     .await?;
                     return Ok(s);
                 }
-                if let Some(reason) = self.tools.approval_blocked(run).await {
-                    self.transition(run, &mut s, Status::Blocked, Some(reason))
-                        .await?;
-                    return Ok(s);
-                }
-                if self.tools.pending_approval(run).await {
-                    self.transition(
-                        run,
-                        &mut s,
-                        Status::Paused,
-                        Some("approval required".into()),
-                    )
-                    .await?;
+                if self.honor_approval_wait(run, &mut s).await? {
                     return Ok(s);
                 }
                 if tool_limit {

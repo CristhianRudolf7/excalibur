@@ -1,4 +1,5 @@
 //! Reusable local tools. Hosts supply policy and optional formatting/diagnostic integrations.
+mod file_authority;
 mod files;
 mod patch;
 mod redaction;
@@ -41,6 +42,8 @@ pub trait PostEditHooks: Send + Sync {
 #[derive(Clone)]
 pub struct ToolPolicy {
     pub redactor: excalibur_vault::Redactor,
+    /// Trusted host process boundary override. Data/vault exclusions are always added.
+    pub sandbox: Option<terminal::SandboxConfig>,
     /// Canonical host-owned vault/evaluation paths excluded from all file tools.
     pub protected_paths: Vec<PathBuf>,
     pub read: Access,
@@ -55,6 +58,7 @@ impl Default for ToolPolicy {
     fn default() -> Self {
         Self {
             redactor: excalibur_vault::Redactor::default(),
+            sandbox: None,
             protected_paths: Vec::new(),
             read: Access::Allow,
             write: Access::Ask,
@@ -102,8 +106,21 @@ impl LocalTools {
             else {conn.execute_batch(SCHEMA_2)?;conn.execute("INSERT INTO tool_schema VALUES(2,?1)",[checksum_2])?;}
             Ok(())
         }).await.map_err(|e|e.to_string())?;
-        let mut sandbox = terminal::SandboxConfig::project(root.clone());
-        sandbox.hidden_paths = policy.protected_paths.clone();
+        let mut sandbox = policy
+            .sandbox
+            .clone()
+            .unwrap_or_else(|| terminal::SandboxConfig::project(root.clone()));
+        if sandbox
+            .workspace
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            != root
+        {
+            return Err(
+                "host sandbox working directory must equal the configured project root".into(),
+            );
+        }
+        sandbox.hidden_paths.extend(policy.protected_paths.clone());
         sandbox
             .hidden_paths
             .push(db.path().parent().unwrap().to_path_buf());
@@ -564,6 +581,7 @@ impl LocalTools {
             .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
             .map(|e| e.path().to_owned());
         let mut output = Vec::new();
+        let mut authority = file_authority::ReadAuthority::default();
         let mut truncated = false;
         for file in files {
             let relative = file.strip_prefix(&self.root).map_err(|e| e.to_string())?;
@@ -572,7 +590,7 @@ impl LocalTools {
             }
             let path = self.resolve(relative.to_str().ok_or("non UTF-8 path")?)?;
             if let Some(regex) = &regex {
-                let bytes = match self.content(&path) {
+                let bytes = match self.content_guarded(&path, &mut authority) {
                     Ok(Some(v)) => v,
                     _ => continue,
                 };
@@ -595,6 +613,9 @@ impl LocalTools {
                 output
                     .push(json!({"path":path,"match_count":match_count,"first_lines":first_lines}));
             } else {
+                if self.check_content_authority(&path, &mut authority).is_err() {
+                    continue;
+                }
                 output.push(json!(path));
             }
             if output.len() >= limit {
@@ -940,6 +961,13 @@ pub fn head_tail(text: &str, budget: usize) -> String {
     format!("{}{}{}", &text[..end], marker, &text[start..])
 }
 impl ToolRuntime for LocalTools {
+    fn configure_network_authorizer<'a>(
+        &'a self,
+        run: &'a str,
+        authorizer: Arc<dyn excalibur_types::runtime::NetworkAuthorizer>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.terminal.set_network_authorizer(run, authorizer) })
+    }
     fn configure_process_boundary<'a>(
         &'a self,
         run: &'a str,
@@ -947,25 +975,59 @@ impl ToolRuntime for LocalTools {
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             use excalibur_types::runtime::ProcessNetwork;
-            if boundary.network != ProcessNetwork::None {
-                return Err("network process authority requires an enforcing proxy; unavailable, execution denied".into());
-            }
-            let mut sandbox = terminal::SandboxConfig::project(boundary.workspace);
-            sandbox.profile =
-                match boundary.profile.as_str() {
-                    "project" | "project-restricted" => terminal::SandboxProfile::ProjectRestricted,
-                    "read-only" => terminal::SandboxProfile::ReadOnly,
-                    "file-analysis" => terminal::SandboxProfile::FileAnalysis,
-                    "tool-package" => terminal::SandboxProfile::ToolPackage,
-                    "project-net" => return Err(
-                        "project-net requires an enforcing proxy; unavailable, execution denied"
-                            .into(),
-                    ),
-                    "eval" => {
-                        return Err("eval requires a separately verified container boundary".into());
+            let mut sandbox = self
+                .terminal
+                .sandbox_config()
+                .ok_or("no host sandbox is configured")?;
+            sandbox.workspace = boundary.workspace;
+            sandbox.profile = match boundary.profile.as_str() {
+                "project" => terminal::SandboxProfile::Project,
+                "project-restricted" => terminal::SandboxProfile::ProjectRestricted,
+                "read-only" => terminal::SandboxProfile::ReadOnly,
+                "file-analysis" => terminal::SandboxProfile::FileAnalysis,
+                "tool-package" => terminal::SandboxProfile::ToolPackage,
+                "project-net" => terminal::SandboxProfile::ProjectNet,
+                "eval" => {
+                    return Err("eval requires a separately verified container boundary".into());
+                }
+                _ => return Err("unknown mandatory process sandbox profile".into()),
+            };
+            #[cfg(unix)]
+            {
+                use excalibur_sandbox::network::NetworkPolicy;
+                sandbox.network = match boundary.network {
+                    ProcessNetwork::None => None,
+                    network => {
+                        if sandbox.profile != terminal::SandboxProfile::ProjectNet {
+                            return Err(
+                                "network authority requires the project-net process profile".into(),
+                            );
+                        }
+                        let mut proxy = sandbox
+                            .network
+                            .ok_or("no host proxy ceiling is configured")?;
+                        proxy.policy = match network {
+                            ProcessNetwork::Domains(domains) => {
+                                NetworkPolicy::Domains(domains.into_iter().collect())
+                            }
+                            ProcessNetwork::Full => NetworkPolicy::Full,
+                            ProcessNetwork::None => unreachable!(),
+                        };
+                        Some(proxy)
                     }
-                    _ => return Err("unknown mandatory process sandbox profile".into()),
                 };
+                if sandbox.profile == terminal::SandboxProfile::ProjectNet
+                    && sandbox.network.is_none()
+                {
+                    return Err("project-net requires effective network authority".into());
+                }
+            }
+            #[cfg(not(unix))]
+            if boundary.network != ProcessNetwork::None {
+                return Err(
+                    "native network process confinement is unavailable on this target".into(),
+                );
+            }
             sandbox.read_roots = boundary.read_roots;
             sandbox.write_roots = boundary.write_roots;
             sandbox.hidden_paths = boundary.denied_paths;

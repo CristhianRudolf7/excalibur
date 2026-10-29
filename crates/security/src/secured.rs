@@ -185,6 +185,7 @@ impl SecuredTools {
         if !token.processes {
             return Err("process capability is absent".into());
         }
+        let network_enabled = !matches!(token.network, Network::None);
         self.delegate
             .configure_process_boundary(
                 run,
@@ -216,7 +217,17 @@ impl SecuredTools {
                         .collect(),
                 },
             )
-            .await
+            .await?;
+        if network_enabled {
+            let guard = self
+                .security
+                .network_authorizer(run.to_owned())
+                .map_err(|error| error.to_string())?;
+            self.delegate
+                .configure_network_authorizer(run, guard)
+                .await?;
+        }
+        Ok(())
     }
     fn unpack(tool: &PreparedTool) -> PreparedTool {
         let mut inner = tool.clone();
@@ -274,6 +285,17 @@ impl ToolRuntime for SecuredTools {
                     .map_err(|e| e.to_string())?;
             }
             self.security.audit(json!({"kind":if result.is_some(){"tool_result"}else{"tool_call"},"run":run,"call":call,"result":result,"at":excalibur_store::unix_seconds()})).await.map_err(|e|e.to_string())
+        })
+    }
+    fn finalization_guard<'a>(
+        &'a self,
+        run: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<Box<dyn FinalizationGuard>, String>> {
+        Box::pin(async move {
+            self.security
+                .finalization_guard(run, excalibur_store::unix_seconds())
+                .await
+                .map_err(|error| error.to_string())
         })
     }
     fn definitions(&self) -> Vec<ToolDefinition> {

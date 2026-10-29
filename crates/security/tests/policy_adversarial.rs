@@ -7,6 +7,7 @@ use excalibur_store::{Database, DatabaseKind, Priority, StorageConfig};
 use excalibur_vault::SecretValue;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 struct Fixture {
     directory: tempfile::TempDir,
@@ -565,8 +566,23 @@ async fn reopened_host_ceiling_cannot_retain_historical_broader_authority() {
 }
 
 #[derive(Default)]
-struct ProbeTools(std::sync::atomic::AtomicUsize);
+struct ProbeTools(
+    std::sync::atomic::AtomicUsize,
+    std::sync::Mutex<Option<Arc<dyn excalibur_types::runtime::NetworkAuthorizer>>>,
+);
 impl excalibur_types::runtime::ToolRuntime for ProbeTools {
+    fn configure_network_authorizer<'a>(
+        &'a self,
+        _: &'a str,
+        authorizer: Arc<dyn excalibur_types::runtime::NetworkAuthorizer>,
+    ) -> excalibur_types::runtime::BoxFuture<'a, Result<(), String>> {
+        // This fixture has no sockets or subprocesses. Keep the guard to verify
+        // the authorization decorator supplies the platform-adapter contract.
+        Box::pin(async move {
+            *self.1.lock().unwrap() = Some(authorizer);
+            Ok(())
+        })
+    }
     fn definitions(&self) -> Vec<excalibur_types::runtime::ToolDefinition> {
         Vec::new()
     }
@@ -602,6 +618,10 @@ impl excalibur_types::runtime::ToolRuntime for ProbeTools {
         _: &'a excalibur_types::runtime::PreparedTool,
     ) -> excalibur_types::runtime::BoxFuture<'a, excalibur_types::runtime::ToolResult> {
         Box::pin(async move {
+            assert!(
+                self.1.lock().unwrap().is_some(),
+                "live guard must be configured before the simulated process effect"
+            );
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             excalibur_types::runtime::ToolResult::ok(json!({"synthetic":true}))
         })

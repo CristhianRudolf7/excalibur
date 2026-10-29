@@ -3,8 +3,15 @@ name = "excalibur-sandbox"
 version = "0.1.0"
 edition = "2024"
 [dependencies]
+excalibur-types = { path = "../types" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+httparse = "1"
+url = "2"
 [target.'cfg(target_os="linux")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
