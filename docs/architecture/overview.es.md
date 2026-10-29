@@ -2,7 +2,7 @@
 
 [English](overview.md)
 
-Este documento describe la arquitectura prevista. Existen una biblioteca Rust parcial de proveedores y bibliotecas de base/almacenamiento; el agente y las interfaces aún no están implementados. Consulta la [cobertura de proveedores](provider-implementation.es.md).
+Este documento describe la arquitectura prevista. Existen bibliotecas Rust de proveedores, base/almacenamiento y motor durable mínimo; la aplicación completa y las interfaces siguen previstas. Consulta la [cobertura de proveedores](provider-implementation.es.md).
 
 ## Núcleo compartido e interfaces
 
@@ -17,3 +17,5 @@ Web ── API HTTP ──────┘
 Inicialmente, el desarrollo y las pruebas se realizarán mediante la CLI y el núcleo compartido. Queda por decidir si la CLI también usará la API cuando sea necesario compartir sesiones activas entre interfaces.
 
 Consulta el [soporte previsto de proveedores](providers.es.md) para las integraciones y otras modalidades.
+
+Consulta [Motor durable mínimo](../development/durable-engine.es.md) para el contrato actual y sus pruebas backend.

@@ -2,7 +2,7 @@
 
 [Español](environment.es.md)
 
-Excalibur currently contains Rust provider and base/storage libraries. The agent, CLI, Axum server and frontend are planned; there is no application or development server to start yet. Do not treat the dependency checks below as implemented product features.
+Excalibur currently contains Rust provider, base/storage and minimum durable engine libraries. The complete personal agent, CLI, Axum server and frontend are planned; there is no application or development server to start yet. Do not treat the dependency checks below as implemented product features.
 
 ## Environment checked on this VPS
 

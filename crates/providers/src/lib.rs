@@ -209,6 +209,11 @@ impl fmt::Debug for ProviderClient {
     }
 }
 impl ProviderClient {
+    /// Stable non-secret transport identity for pinning durable model requests.
+    /// Endpoint construction rejects credentials, query strings and fragments.
+    pub fn configuration_identity(&self) -> String {
+        format!("{:?}:{}", self.provider, self.base)
+    }
     /// Call a previously deployed Modal Web Function protected by a proxy token.
     pub fn modal(base: &str, key: Secret, secret: Secret) -> Result<Self, Error> {
         let mut client = Self::with_base_url(Provider::Modal, key, base)?;

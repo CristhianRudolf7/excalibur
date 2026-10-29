@@ -56,6 +56,13 @@ pub struct BlobIoStats {
     pub decoded_bytes: u64,
     pub verified_reads: u64,
 }
+/// A verified bounded byte window. Offsets count uncompressed bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobWindow {
+    pub bytes: Vec<u8>,
+    pub offset: u64,
+    pub total_bytes: u64,
+}
 impl BlobStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
@@ -163,6 +170,71 @@ impl BlobStore {
             return Err(Error::BlobCorrupt(hash.0.clone()));
         }
         Ok(data)
+    }
+    /// Decode/hash the full registered content with a fixed 64 KiB buffer while
+    /// retaining at most a 1 MiB window. Each request is O(total uncompressed bytes),
+    /// not random access; zstd's decoder window is separately capped at 8 MiB.
+    pub(crate) fn read_window(
+        &self,
+        hash: &BlobHash,
+        expected_size: u64,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<BlobWindow> {
+        if !(1..=1024 * 1024).contains(&max_bytes) {
+            return Err(Error::Invalid("blob window must be 1..=1048576 bytes"));
+        }
+        let file = File::open(self.path(hash)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::BlobMissing(hash.0.clone())
+            } else {
+                e.into()
+            }
+        })?;
+        self.stats.verified_reads.fetch_add(1, Ordering::Relaxed);
+        let mut decoder = zstd::stream::read::Decoder::new(file)
+            .map_err(|_| Error::BlobCorrupt(hash.0.clone()))?;
+        decoder
+            .window_log_max(23)
+            .map_err(|_| Error::BlobCorrupt(hash.0.clone()))?;
+        let offset = offset.min(expected_size);
+        let end = offset.saturating_add(max_bytes as u64).min(expected_size);
+        let mut bytes = Vec::with_capacity((end - offset) as usize);
+        let mut buffer = [0u8; 65536];
+        let mut total = 0u64;
+        let mut hasher = Sha256::new();
+        loop {
+            let count = decoder
+                .read(&mut buffer)
+                .map_err(|_| Error::BlobCorrupt(hash.0.clone()))?;
+            if count == 0 {
+                break;
+            }
+            self.stats
+                .decoded_bytes
+                .fetch_add(count as u64, Ordering::Relaxed);
+            let next = total
+                .checked_add(count as u64)
+                .ok_or_else(|| Error::BlobCorrupt(hash.0.clone()))?;
+            if next > expected_size {
+                return Err(Error::BlobCorrupt(hash.0.clone()));
+            }
+            hasher.update(&buffer[..count]);
+            if next > offset && total < end {
+                let from = offset.max(total) - total;
+                let until = end.min(next) - total;
+                bytes.extend_from_slice(&buffer[from as usize..until as usize]);
+            }
+            total = next;
+        }
+        if total != expected_size || format!("{:x}", hasher.finalize()) != hash.0 {
+            return Err(Error::BlobCorrupt(hash.0.clone()));
+        }
+        Ok(BlobWindow {
+            bytes,
+            offset,
+            total_bytes: total,
+        })
     }
 }
 pub(crate) fn durable_create_dirs(path: &Path) -> Result<()> {

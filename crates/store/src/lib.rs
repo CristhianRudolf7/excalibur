@@ -13,7 +13,7 @@ pub use maintenance::{
 pub mod schema;
 mod writer;
 
-pub use blobs::{BlobHash, BlobIoStats, BlobStore, PreparedBlob};
+pub use blobs::{BlobHash, BlobIoStats, BlobStore, BlobWindow, PreparedBlob};
 pub use excalibur_config::StorageConfig;
 pub use lifecycle::{RecoveryReport, StoragePaths, restore_backup};
 pub use rusqlite;
@@ -55,6 +55,8 @@ pub enum Error {
     BlobCorrupt(String),
     #[error("blob exceeds the caller size limit: {0}")]
     BlobTooLarge(String),
+    #[error("blob has no registered metadata: {0}")]
+    BlobMetadataMissing(String),
     #[error("blob belongs to another storage namespace")]
     BlobOwnerMismatch,
     #[error("operation requires the principal database")]

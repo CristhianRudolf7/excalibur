@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/providers", "crates/types", "crates/config", "crates/store"]
+members = ["crates/providers", "crates/types", "crates/config", "crates/store", "crates/journal", "crates/engine", "crates/context", "crates/models", "crates/tools"]
 
 [profile.release]
 panic = "unwind"

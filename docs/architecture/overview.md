@@ -2,7 +2,7 @@
 
 [Español](overview.es.md)
 
-This document describes the intended architecture. A partial Rust provider library and base/storage libraries exist; the agent and interfaces are not yet implemented. See [provider coverage](provider-implementation.md).
+This document describes the intended architecture. Rust provider, base/storage and minimum durable engine libraries exist; the complete application and interfaces remain planned. See [provider coverage](provider-implementation.md).
 
 ## Shared core and interfaces
 
@@ -17,3 +17,5 @@ Web ── HTTP API ──────┘
 Initially, develop and test through the CLI and shared core. Whether the CLI should also use the API when live sessions need to be shared across interfaces remains an open decision.
 
 See [planned provider support](providers.md) for the target integrations and other modalities.
+
+See [Minimum durable engine](../development/durable-engine.md) for the current contract and backend checks.

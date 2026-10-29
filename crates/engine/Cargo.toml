@@ -1,0 +1,23 @@
+[package]
+name = "excalibur-engine"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+excalibur-types = { path = "../types" }
+excalibur-store = { path = "../store" }
+excalibur-journal = { path = "../journal" }
+excalibur-context = { path = "../context" }
+excalibur-models = { path = "../models" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+futures = "0.3"
+json5 = "0.4"
+base64 = "0.22"
+[dev-dependencies]
+excalibur-tools = { path = "../tools" }
+excalibur-providers = { path = "../providers" }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }

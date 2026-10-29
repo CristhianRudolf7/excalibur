@@ -1,0 +1,1234 @@
+//! A durable single-run step engine. Applications embed it; no CLI or HTTP server.
+use excalibur_context::{ContextInput, compile};
+use excalibur_journal::{Event, Journal};
+use excalibur_models::ModelGateway;
+use excalibur_store::unix_seconds;
+use excalibur_types::runtime::*;
+use futures::{FutureExt, future::join_all};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    panic::AssertUnwindSafe,
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
+};
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("durable journal: {0}")]
+    Journal(#[from] excalibur_journal::Error),
+    #[error("state serialization: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("invalid engine state: {0}")]
+    Invalid(&'static str),
+    #[error("model gateway: {0}")]
+    Model(String),
+}
+pub type Result<T> = std::result::Result<T, Error>;
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Budget {
+    pub max_steps: u64,
+    pub max_tokens: u64,
+    pub max_cost_microusd: Option<u64>,
+    pub max_wall_seconds: u64,
+    pub max_tool_calls: u64,
+    pub tool_timeout_seconds: u64,
+}
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            max_steps: 100,
+            max_tokens: 100_000,
+            max_cost_microusd: None,
+            max_wall_seconds: 3600,
+            max_tool_calls: 1000,
+            tool_timeout_seconds: 300,
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Criterion {
+    ToolSuccess {
+        name: String,
+    },
+    ToolOutput {
+        name: String,
+        pointer: String,
+        expected: Value,
+    },
+    HostCheck {
+        id: String,
+    },
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RunSpec {
+    pub context: ContextInput,
+    pub budget: Budget,
+    pub criteria: Vec<Criterion>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Running,
+    Paused,
+    Blocked,
+    Completed,
+    CompletedWithPending,
+    Cancelled,
+}
+impl Status {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Blocked => "blocked",
+            Self::Completed => "completed",
+            Self::CompletedWithPending => "completed_with_pending",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CallState {
+    pub prepared: Option<PreparedTool>,
+    pub result: Option<ToolResult>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub spec: RunSpec,
+    pub status: Status,
+    pub reason: Option<String>,
+    pub step: u64,
+    pub started_at: i64,
+    pub usage: Usage,
+    pub tool_calls: u64,
+    pub gate_attempts: u32,
+    pub final_text: Option<String>,
+    pub request: Option<ModelRequest>,
+    pub response: Option<ModelResponse>,
+    pub calls: BTreeMap<usize, CallState>,
+    pub history: Vec<Message>,
+    pub continuation: String,
+    pub gate_report: Vec<String>,
+    pub host_checks: BTreeMap<String, bool>,
+    pub revision: u64,
+    pub pending_directives: BTreeMap<String, String>,
+    pub last_sequence: u64,
+    pub gateway_identity: String,
+}
+impl Snapshot {
+    fn started(seed: &Value) -> Result<Self> {
+        Ok(Self {
+            spec: serde_json::from_value(seed["spec"].clone())?,
+            status: Status::Running,
+            reason: None,
+            step: 0,
+            started_at: seed["started_at"]
+                .as_i64()
+                .ok_or(Error::Invalid("missing start time"))?,
+            usage: Usage::default(),
+            tool_calls: 0,
+            gate_attempts: 0,
+            final_text: None,
+            request: None,
+            response: None,
+            calls: BTreeMap::new(),
+            history: Vec::new(),
+            continuation: String::new(),
+            gate_report: Vec::new(),
+            host_checks: BTreeMap::new(),
+            revision: 0,
+            pending_directives: BTreeMap::new(),
+            last_sequence: 1,
+            gateway_identity: seed["gateway_identity"]
+                .as_str()
+                .ok_or(Error::Invalid("gateway identity missing"))?
+                .into(),
+        })
+    }
+    fn apply(&mut self, event: &Event) -> Result<()> {
+        let p = &event.payload;
+        match event.kind.as_str() {
+            "run_started" => {}
+            "model_request" => {
+                self.request = Some(serde_json::from_value(p["request"].clone())?);
+            }
+            "model_response" => {
+                let response: ModelResponse = serde_json::from_value(p["response"].clone())?;
+                self.usage.estimated |= response.usage.estimated;
+                self.usage.input_tokens = self
+                    .usage
+                    .input_tokens
+                    .saturating_add(response.usage.input_tokens);
+                self.usage.output_tokens = self
+                    .usage
+                    .output_tokens
+                    .saturating_add(response.usage.output_tokens);
+                self.usage.cost_microusd = self
+                    .usage
+                    .cost_microusd
+                    .saturating_add(response.usage.cost_microusd);
+                self.response = Some(response);
+            }
+            "tool_intent" => {
+                let index = index(p)?;
+                let prepared = serde_json::from_value(p["prepared"].clone())?;
+                self.calls
+                    .entry(index)
+                    .or_insert(CallState {
+                        prepared: None,
+                        result: None,
+                    })
+                    .prepared = Some(prepared);
+                self.tool_calls += 1;
+                if self.calls[&index]
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|p| p.effect != Effect::Pure)
+                {
+                    self.host_checks.clear();
+                }
+            }
+            "tool_result" => {
+                let index = index(p)?;
+                if !self.calls.contains_key(&index) {
+                    self.tool_calls += 1;
+                }
+                let result: ToolResult = serde_json::from_value(p["result"].clone())?;
+                if self
+                    .calls
+                    .get(&index)
+                    .and_then(|c| c.prepared.as_ref())
+                    .is_some_and(|p| p.effect != Effect::Pure)
+                {
+                    self.host_checks.clear();
+                }
+                if p["name"] == "leave_continuation_note" && result.success {
+                    self.continuation = result.output["note"].as_str().unwrap_or_default().into();
+                }
+                self.calls
+                    .entry(index)
+                    .or_insert(CallState {
+                        prepared: None,
+                        result: None,
+                    })
+                    .result = Some(result);
+            }
+            "step_completed" => {
+                let response = self
+                    .response
+                    .take()
+                    .ok_or(Error::Invalid("completed step lacks response"))?;
+                self.history.push(response.message.clone());
+                for (index, call) in response.message.tool_calls.iter().enumerate() {
+                    let result = self
+                        .calls
+                        .get(&index)
+                        .and_then(|c| c.result.as_ref())
+                        .ok_or(Error::Invalid("completed step lacks result"))?;
+                    self.history.push(Message {
+                        role: "tool".into(),
+                        content: serde_json::to_string(result)?,
+                        tool_call_id: Some(call.id.clone()),
+                        tool_calls: Vec::new(),
+                    });
+                }
+                self.request = None;
+                self.calls.clear();
+                self.step += 1;
+            }
+            "gate_report" => {
+                self.gate_attempts += 1;
+                self.gate_report = serde_json::from_value(p["pending"].clone())?;
+                self.final_text = p["final_text"].as_str().map(str::to_owned);
+            }
+            "state_change" => {
+                self.status = serde_json::from_value(p["state"].clone())?;
+                self.reason = p["reason"].as_str().map(str::to_owned);
+            }
+            "directive_received" => {
+                self.pending_directives.insert(
+                    p["id"]
+                        .as_str()
+                        .ok_or(Error::Invalid("directive ID"))?
+                        .into(),
+                    p["text"]
+                        .as_str()
+                        .ok_or(Error::Invalid("directive text"))?
+                        .into(),
+                );
+            }
+            "directive_applied" => {
+                self.pending_directives
+                    .remove(p["id"].as_str().ok_or(Error::Invalid("directive ID"))?);
+                let text = p["text"].as_str().ok_or(Error::Invalid("directive text"))?;
+                self.revision += 1;
+                self.history.push(Message::text(
+                    "system",
+                    format!("Context update v{}: {text}", self.revision),
+                ));
+                self.host_checks.clear();
+            }
+            "host_check" => {
+                let id = p["id"].as_str().ok_or(Error::Invalid("host check ID"))?;
+                if p["revision"].as_u64() == Some(self.revision) {
+                    self.host_checks
+                        .insert(id.into(), p["passed"].as_bool().unwrap_or(false));
+                }
+            }
+            "budget_updated" => {
+                self.spec.budget = serde_json::from_value(p["budget"].clone())?;
+            }
+            "checkpoint" => {}
+            _ => return Err(Error::Invalid("unknown durable event")),
+        }
+        self.last_sequence = event.sequence;
+        Ok(())
+    }
+    pub fn pending_criteria(&self) -> Vec<String> {
+        self.spec
+            .criteria
+            .iter()
+            .filter_map(|criterion| {
+                let ok = match criterion {
+                    Criterion::HostCheck { id } => self.host_checks.get(id) == Some(&true),
+                    Criterion::ToolSuccess { name } => {
+                        self.latest_tool(name).is_some_and(|r| r.success)
+                    }
+                    Criterion::ToolOutput {
+                        name,
+                        pointer,
+                        expected,
+                    } => self
+                        .latest_tool(name)
+                        .is_some_and(|r| r.success && r.output.pointer(pointer) == Some(expected)),
+                };
+                (!ok).then(|| format!("Unverified criterion: {criterion:?}"))
+            })
+            .collect()
+    }
+    fn latest_tool(&self, name: &str) -> Option<ToolResult> {
+        // The append-only history pairs assistant calls with results, in original call order.
+        let mut latest = None;
+        let mut names = BTreeMap::new();
+        for m in &self.history {
+            for call in &m.tool_calls {
+                names.insert(call.id.clone(), call.name.clone());
+            }
+            if m.role == "tool"
+                && m.tool_call_id
+                    .as_ref()
+                    .and_then(|id| names.get(id))
+                    .is_some_and(|n| n == name)
+            {
+                latest = serde_json::from_str(&m.content).ok();
+            }
+        }
+        latest
+    }
+}
+fn index(p: &Value) -> Result<usize> {
+    p["index"]
+        .as_u64()
+        .map(|n| n as usize)
+        .ok_or(Error::Invalid("tool index missing"))
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Boundary {
+    BeforeModelRequest,
+    ModelRequestConfirmed,
+    ModelReturned,
+    ModelResponseConfirmed,
+    BeforeToolIntent,
+    ToolIntentConfirmed,
+    ToolEffectReturned,
+    ToolResultConfirmed,
+    CheckpointConfirmed,
+}
+pub trait Observer: Send + Sync {
+    fn reached(&self, phase: Boundary, run: &str, step: u64, key: Option<&str>);
+}
+#[derive(Clone)]
+pub struct Engine {
+    journal: Journal,
+    model: Arc<dyn ModelGateway>,
+    tools: Arc<dyn ToolRuntime>,
+    observer: Option<Arc<dyn Observer>>,
+    stream_sink: Option<excalibur_models::StreamSink>,
+}
+impl Engine {
+    pub fn new(
+        journal: Journal,
+        model: Arc<dyn ModelGateway>,
+        tools: Arc<dyn ToolRuntime>,
+    ) -> Self {
+        Self {
+            journal,
+            model,
+            tools,
+            observer: None,
+            stream_sink: None,
+        }
+    }
+    pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+    pub fn with_stream_sink(mut self, sink: excalibur_models::StreamSink) -> Self {
+        self.stream_sink = Some(sink);
+        self
+    }
+    pub fn journal(&self) -> &Journal {
+        &self.journal
+    }
+    fn point(&self, phase: Boundary, run: &str, step: u64, key: Option<&str>) {
+        if let Some(o) = &self.observer {
+            o.reached(phase, run, step, key);
+        }
+    }
+    pub async fn create(&self, operation: &str, mut spec: RunSpec) -> Result<String> {
+        let _creation = self
+            .journal
+            .lock_run(&format!("operation:{operation}"))
+            .await;
+        if spec.criteria.is_empty()
+            || spec.budget.max_steps == 0
+            || spec.budget.max_tokens == 0
+            || spec.budget.max_wall_seconds == 0
+            || spec.budget.tool_timeout_seconds == 0
+        {
+            return Err(Error::Invalid(
+                "nonempty criteria and positive budgets required",
+            ));
+        }
+        if spec.budget.max_cost_microusd.is_some() && !self.model.cost_is_known() {
+            return Err(Error::Invalid(
+                "cost budget requires a priced gateway; unknown cost is not zero",
+            ));
+        }
+        spec.context.tools = self.tools.definitions();
+        spec.context.tools.extend(builtin_definitions());
+        spec.context.tools.sort_by(|a, b| a.name.cmp(&b.name));
+        compile(&spec.context).map_err(|_| Error::Invalid("invalid initial context"))?;
+        // Creation time belongs to the durable seed, not to a stable prompt prefix.
+        // Reusing an operation returns its existing run, preserving its original time.
+        let existing = self
+            .journal
+            .database()
+            .read(excalibur_store::ReadLane::Interactive, {
+                let operation = operation.to_owned();
+                move |c| {
+                    use excalibur_store::rusqlite::OptionalExtension;
+                    Ok(c.query_row(
+                        "SELECT run_id FROM durable_operations WHERE operation_id=?1",
+                        [operation],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?)
+                }
+            })
+            .await
+            .map_err(excalibur_journal::Error::from)?;
+        if let Some(run) = existing {
+            let state = self.load(&run).await?;
+            let seed = self
+                .journal
+                .entries(&run, 0, 1)
+                .await?
+                .pop()
+                .ok_or(Error::Invalid("run seed missing"))?;
+            let original: RunSpec = serde_json::from_value(seed.payload["spec"].clone())?;
+            if original != spec || state.gateway_identity != self.model.identity() {
+                return Err(Error::Invalid(
+                    "operation reused with different run specification",
+                ));
+            }
+            return Ok(run);
+        }
+        self.journal.create_run(operation,json!({"spec":spec,"started_at":unix_seconds(),"gateway_identity":self.model.identity()})).await.map_err(Into::into)
+    }
+    pub async fn load(&self, run: &str) -> Result<Snapshot> {
+        let checkpoint = self.journal.latest_checkpoint(run).await?;
+        let (mut state, after) = if let Some(seq) = checkpoint {
+            let event = self
+                .journal
+                .entries(run, seq - 1, 1)
+                .await?
+                .pop()
+                .ok_or(Error::Invalid("checkpoint missing"))?;
+            let mut state: Snapshot = serde_json::from_value(event.payload)?;
+            state.last_sequence = seq;
+            (state, seq)
+        } else {
+            let event = self
+                .journal
+                .entries(run, 0, 1)
+                .await?
+                .pop()
+                .ok_or(Error::Invalid("run missing"))?;
+            if event.kind != "run_started" {
+                return Err(Error::Invalid("run seed missing"));
+            }
+            (Snapshot::started(&event.payload)?, event.sequence)
+        };
+        for event in self.journal.replay(run, after).await? {
+            state.apply(&event)?;
+        }
+        Ok(state)
+    }
+    async fn event(
+        &self,
+        run: &str,
+        state: &mut Snapshot,
+        kind: &str,
+        key: String,
+        payload: Value,
+    ) -> Result<()> {
+        let sequence = self
+            .journal
+            .append(run, kind, &key, payload.clone())
+            .await?;
+        if sequence > state.last_sequence {
+            state.apply(&Event {
+                sequence,
+                kind: kind.into(),
+                key,
+                payload,
+            })?;
+        }
+        Ok(())
+    }
+    async fn transition(
+        &self,
+        run: &str,
+        state: &mut Snapshot,
+        status: Status,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let key = format!(
+            "state:{}:{}:{}",
+            state.step,
+            state.last_sequence,
+            status.label()
+        );
+        self.journal
+            .set_state(run, status.label(), reason, &key)
+            .await?;
+        *state = self.load(run).await?;
+        Ok(())
+    }
+    /// Controls are persisted without acquiring the long-running run lock.
+    pub async fn pause(&self, run: &str) -> Result<()> {
+        let mut s = self.load(run).await?;
+        self.transition(run, &mut s, Status::Paused, Some("user".into()))
+            .await
+    }
+    pub async fn cancel(&self, run: &str) -> Result<()> {
+        let mut s = self.load(run).await?;
+        self.transition(run, &mut s, Status::Cancelled, Some("user".into()))
+            .await
+    }
+    pub async fn resume(&self, run: &str) -> Result<()> {
+        let _guard = self.journal.lock_run(run).await;
+        let mut s = self.load(run).await?;
+        if s.status != Status::Paused {
+            return Err(Error::Invalid("only paused runs can resume"));
+        }
+        self.transition(run, &mut s, Status::Running, None).await
+    }
+    /// Trusted host budget amendment; increases are explicit durable facts, never a new run.
+    pub async fn update_budget(&self, run: &str, budget: Budget) -> Result<()> {
+        let _guard = self.journal.lock_run(run).await;
+        let mut state = self.load(run).await?;
+        if matches!(
+            state.status,
+            Status::Completed | Status::CompletedWithPending | Status::Cancelled
+        ) || budget.max_steps == 0
+            || budget.max_tokens == 0
+            || budget.max_wall_seconds == 0
+            || budget.tool_timeout_seconds == 0
+        {
+            return Err(Error::Invalid("active run and positive budget required"));
+        }
+        if budget.max_cost_microusd.is_some() && !self.model.cost_is_known() {
+            return Err(Error::Invalid("cost budget requires priced usage"));
+        }
+        let key = format!("budget:{}", state.last_sequence);
+        self.event(
+            run,
+            &mut state,
+            "budget_updated",
+            key,
+            json!({"budget":budget}),
+        )
+        .await
+    }
+    pub async fn directive(&self, run: &str, id: &str, text: &str) -> Result<()> {
+        if id.is_empty() || text.len() > 64 * 1024 {
+            return Err(Error::Invalid("directive ID/text"));
+        }
+        // Each fact is durable; an interrupted application is resumed from the received event.
+        self.journal
+            .append(
+                run,
+                "directive_received",
+                &format!("directive:{id}:received"),
+                json!({"id":id,"text":text}),
+            )
+            .await?;
+        self.journal
+            .append(
+                run,
+                "directive_applied",
+                &format!("directive:{id}:applied"),
+                json!({"id":id,"text":text}),
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn record_check(
+        &self,
+        run: &str,
+        id: &str,
+        passed: bool,
+        evidence: &str,
+    ) -> Result<()> {
+        if evidence.is_empty() {
+            return Err(Error::Invalid("host evidence required"));
+        }
+        let s = self.load(run).await?;
+        self.journal
+            .append(
+                run,
+                "host_check",
+                &format!("check:{id}:{}:{}", s.revision, s.last_sequence),
+                json!({"id":id,"passed":passed,"evidence":evidence,"revision":s.revision}),
+            )
+            .await?;
+        Ok(())
+    }
+    /// A trusted consumer supplies a reconciled outcome; it cannot request a blind retry.
+    pub async fn resolve_uncertain(
+        &self,
+        run: &str,
+        index: usize,
+        result: ToolResult,
+        evidence: &str,
+    ) -> Result<()> {
+        let _guard = self.journal.lock_run(run).await;
+        let mut s = self.load(run).await?;
+        if s.status != Status::Blocked || evidence.trim().is_empty() {
+            return Err(Error::Invalid(
+                "blocked run and explicit reconciliation evidence required",
+            ));
+        }
+        let call = s
+            .response
+            .as_ref()
+            .and_then(|r| r.message.tool_calls.get(index))
+            .ok_or(Error::Invalid("pending call missing"))?
+            .clone();
+        if s.calls
+            .get(&index)
+            .is_none_or(|c| c.prepared.is_none() || c.result.is_some())
+        {
+            return Err(Error::Invalid("unresolved intention required"));
+        }
+        let key = tool_key(run, s.step, index);
+        self.event(run,&mut s,"tool_result",format!("{key}:result"),json!({"index":index,"name":call.name,"result":result,"reconciliation_evidence":evidence})).await?;
+        self.transition(run, &mut s, Status::Running, None).await
+    }
+    pub async fn run(&self, run: &str) -> Result<Snapshot> {
+        let _guard = self.journal.lock_run(run).await;
+        // Only intentions already present at admission need reconciliation.
+        let initial = self.load(run).await?;
+        if initial.gateway_identity != self.model.identity() {
+            return Err(Error::Invalid("gateway profile differs from durable run"));
+        }
+        let mut recovering: BTreeSet<String> = initial
+            .calls
+            .iter()
+            .filter(|(_, c)| c.prepared.is_some() && c.result.is_none())
+            .map(|(i, _)| tool_key(run, initial.step, *i))
+            .collect();
+        loop {
+            let mut s = self.load(run).await?;
+            if s.status != Status::Running {
+                return Ok(s);
+            }
+            for (id, text) in s.pending_directives.clone() {
+                self.event(
+                    run,
+                    &mut s,
+                    "directive_applied",
+                    format!("directive:{id}:applied"),
+                    json!({"id":id,"text":text}),
+                )
+                .await?;
+            }
+            if remaining_time(&s) == 0 {
+                self.transition(run, &mut s, Status::Paused, Some("wall time budget".into()))
+                    .await?;
+                return Ok(s);
+            }
+            if s.request.is_none() {
+                if budget_exhausted(&s) {
+                    self.transition(run, &mut s, Status::Paused, Some("budget".into()))
+                        .await?;
+                    return Ok(s);
+                }
+                let mut input = s.spec.context.clone();
+                input.activity.extend(s.history.clone());
+                input.volatile.now_utc = unix_seconds().to_string();
+                input.volatile.continuation = s.continuation.clone();
+                input.volatile.budget_status = serde_json::to_string(
+                    &json!({"step":s.step,"budget":s.spec.budget,"usage":s.usage,"tool_calls":s.tool_calls}),
+                )?;
+                input.volatile.finalization_report = s.gate_report.join("\n");
+                input.tools_enabled = !closing(&s);
+                let compiled = match compile(&input) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.transition(
+                            run,
+                            &mut s,
+                            Status::Paused,
+                            Some(format!("context budget: {e}")),
+                        )
+                        .await?;
+                        return Ok(s);
+                    }
+                };
+                self.point(Boundary::BeforeModelRequest, run, s.step, None);
+                let key = format!("model:{}:request", s.step);
+                self.event(run,&mut s,"model_request",key,json!({"request":compiled.request,"hash":format!("{:x}",Sha256::digest(&compiled.bytes)),"layer_hashes":compiled.layer_hashes})).await?;
+                self.point(Boundary::ModelRequestConfirmed, run, s.step, None);
+            }
+            if s.response.is_none() {
+                let request = s.request.clone().unwrap();
+                let remaining = remaining_time(&s).max(1);
+                let response = tokio::time::timeout(
+                    Duration::from_secs(remaining),
+                    AssertUnwindSafe(async {
+                        if let Some(sink) = &self.stream_sink {
+                            self.model.complete_stream(request, sink.clone()).await
+                        } else {
+                            self.model.complete(request).await
+                        }
+                    })
+                    .catch_unwind(),
+                )
+                .await
+                .map_err(|_| Error::Model("request timed out; no response recorded".into()))?
+                .map_err(|_| Error::Model("gateway panicked; no response recorded".into()))?
+                .map_err(|e| Error::Model(e.to_string()))?;
+                if response.message.role != "assistant"
+                    || response.message.tool_calls.len() > 128
+                    || response.message.tool_calls.iter().any(|c| c.id.is_empty())
+                    || response
+                        .message
+                        .tool_calls
+                        .iter()
+                        .map(|c| &c.id)
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        != response.message.tool_calls.len()
+                {
+                    return Err(Error::Invalid("invalid model tool call identifiers"));
+                }
+                self.point(Boundary::ModelReturned, run, s.step, None);
+                let key = format!("model:{}:response", s.step);
+                self.event(
+                    run,
+                    &mut s,
+                    "model_response",
+                    key,
+                    json!({"response":response}),
+                )
+                .await?;
+                self.point(Boundary::ModelResponseConfirmed, run, s.step, None);
+            }
+            s = self.load(run).await?;
+            if s.status != Status::Running {
+                return Ok(s);
+            }
+            let response = s.response.clone().unwrap();
+            if response.message.tool_calls.is_empty() {
+                let pending = s.pending_criteria();
+                let key = format!("gate:{}", s.step);
+                self.event(
+                    run,
+                    &mut s,
+                    "gate_report",
+                    key,
+                    json!({"pending":pending,"final_text":response.message.content}),
+                )
+                .await?;
+                if s.gate_report.is_empty() {
+                    self.transition(run, &mut s, Status::Completed, None)
+                        .await?;
+                    return Ok(s);
+                }
+                if s.gate_attempts > 2 || closing(&s) {
+                    let reason = s.gate_report.join("; ");
+                    self.transition(run, &mut s, Status::CompletedWithPending, Some(reason))
+                        .await?;
+                    return Ok(s);
+                }
+                let key = format!("step:{}:completed", s.step);
+                self.event(run, &mut s, "step_completed", key, json!({}))
+                    .await?;
+                self.checkpoint(run, &mut s).await?;
+                continue;
+            }
+            if s.request.as_ref().is_some_and(|r| !r.tools_enabled) {
+                self.transition(
+                    run,
+                    &mut s,
+                    Status::CompletedWithPending,
+                    Some("provider returned tools while tools were disabled".into()),
+                )
+                .await?;
+                return Ok(s);
+            }
+            let mut actions = Vec::new();
+            for (index, call) in response.message.tool_calls.iter().enumerate() {
+                if s.calls.get(&index).is_some_and(|c| c.result.is_some()) {
+                    continue;
+                }
+                let key = tool_key(run, s.step, index);
+                let prepared = if let Some(p) = s.calls.get(&index).and_then(|c| c.prepared.clone())
+                {
+                    p
+                } else {
+                    if s.tool_calls >= s.spec.budget.max_tool_calls {
+                        self.transition(run, &mut s, Status::Paused, Some("tool budget".into()))
+                            .await?;
+                        return Ok(s);
+                    }
+                    let preparation = tokio::time::timeout(
+                        Duration::from_secs(s.spec.budget.tool_timeout_seconds),
+                        AssertUnwindSafe(self.prepare(run, call.clone())).catch_unwind(),
+                    )
+                    .await;
+                    let preparation = match preparation {
+                        Ok(Ok(result)) => result,
+                        _ => Err("tool preparation timed out or panicked; requested effect was not admitted".into()),
+                    };
+                    let prepared = match preparation {
+                        Ok(p) => p,
+                        Err(error) => {
+                            self.event(run,&mut s,"tool_result",format!("{key}:result"),json!({"index":index,"name":call.name,"result":ToolResult::error(error)})).await?;
+                            continue;
+                        }
+                    };
+                    self.point(Boundary::BeforeToolIntent, run, s.step, Some(&key));
+                    self.event(
+                        run,
+                        &mut s,
+                        "tool_intent",
+                        key.clone(),
+                        json!({"index":index,"prepared":prepared}),
+                    )
+                    .await?;
+                    self.point(Boundary::ToolIntentConfirmed, run, s.step, Some(&key));
+                    prepared
+                };
+                actions.push((index, key, prepared));
+            }
+            for batch in batches(actions) {
+                let current = self.load(run).await?;
+                if current.status != Status::Running {
+                    return Ok(current);
+                }
+                let jobs = batch.into_iter().map(|(index, key, tool)| {
+                    let is_recovery = recovering.remove(&key);
+                    let engine = self.clone();
+                    let run = run.to_string();
+                    let step = s.step;
+                    let timeout = s.spec.budget.tool_timeout_seconds;
+                    async move {
+                        let _locks = resource_locks(&tool).await;
+                        let outcome = if is_recovery {
+                            match tokio::time::timeout(
+                                Duration::from_secs(timeout),
+                                AssertUnwindSafe(engine.reconcile(&run, &key, &tool))
+                                    .catch_unwind(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(outcome)) => outcome,
+                                _ => Reconcile::Uncertain(
+                                    "recovery probe timed out or panicked".into(),
+                                ),
+                            }
+                        } else {
+                            Reconcile::Retry
+                        };
+                        let result = match outcome {
+                            Reconcile::Done(result) => result,
+                            Reconcile::Uncertain(reason) => {
+                                return Some(AttemptFailure {
+                                    retryable: false,
+                                    reason,
+                                });
+                            }
+                            Reconcile::Retry => match tokio::time::timeout(
+                                Duration::from_secs(timeout),
+                                AssertUnwindSafe(engine.execute(&run, &key, &tool)).catch_unwind(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(result)) => result,
+                                _ if tool.effect == Effect::Pure => {
+                                    ToolResult::error("read-only tool interrupted or timed out")
+                                }
+                                _ => return Some(AttemptFailure {
+                                    retryable: tool.effect != Effect::NonIdempotent,
+                                    reason:
+                                        "tool interrupted or timed out without a confirmed result"
+                                            .into(),
+                                }),
+                            },
+                        };
+                        engine.point(Boundary::ToolEffectReturned, &run, step, Some(&key));
+                        // Each completed sibling confirms its own result before waiting for the batch.
+                        if let Err(error) = engine
+                            .journal
+                            .append(
+                                &run,
+                                "tool_result",
+                                &format!("{key}:result"),
+                                json!({"index":index,"name":tool.call.name,"result":result}),
+                            )
+                            .await
+                        {
+                            return Some(AttemptFailure {
+                                retryable: tool.effect != Effect::NonIdempotent,
+                                reason: format!("result could not be confirmed: {error}"),
+                            });
+                        }
+                        engine.point(Boundary::ToolResultConfirmed, &run, step, Some(&key));
+                        None
+                    }
+                });
+                let failures = join_all(jobs)
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                if !failures.is_empty() {
+                    s = self.load(run).await?;
+                    // Any genuinely uncertain sibling dominates retryable failures.
+                    let retryable = failures.iter().all(|failure| failure.retryable);
+                    let reason = failures
+                        .into_iter()
+                        .map(|failure| failure.reason)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    self.transition(
+                        run,
+                        &mut s,
+                        if retryable {
+                            Status::Paused
+                        } else {
+                            Status::Blocked
+                        },
+                        Some(format!(
+                            "{}: {reason}",
+                            if retryable {
+                                "retryable tool interruption"
+                            } else {
+                                "uncertain effect"
+                            }
+                        )),
+                    )
+                    .await?;
+                    return Ok(s);
+                }
+            }
+            s = self.load(run).await?;
+            if s.status != Status::Running {
+                return Ok(s);
+            }
+            let key = format!("step:{}:completed", s.step);
+            self.event(run, &mut s, "step_completed", key, json!({}))
+                .await?;
+            self.checkpoint(run, &mut s).await?;
+            if let Some(reason) = loop_reason(&s.history) {
+                self.transition(run, &mut s, Status::Paused, Some(reason))
+                    .await?;
+                return Ok(s);
+            }
+        }
+    }
+    async fn checkpoint(&self, run: &str, s: &mut Snapshot) -> Result<()> {
+        if s.step > 0 && s.step.is_multiple_of(20) {
+            let payload = serde_json::to_value(&*s)?;
+            let key = format!("checkpoint:{}", s.step);
+            self.event(run, s, "checkpoint", key, payload).await?;
+            self.point(Boundary::CheckpointConfirmed, run, s.step, None);
+        }
+        Ok(())
+    }
+    async fn prepare(
+        &self,
+        run: &str,
+        call: ToolCall,
+    ) -> std::result::Result<PreparedTool, String> {
+        if matches!(
+            call.name.as_str(),
+            "leave_continuation_note" | "get_tool_output"
+        ) {
+            let data: Value = serde_json::from_str(&call.arguments)
+                .or_else(|_| json5::from_str(&call.arguments))
+                .map_err(|e| format!("invalid tool JSON: {e}"))?;
+            let object = data.as_object().ok_or("tool arguments must be an object")?;
+            let allowed = if call.name == "leave_continuation_note" {
+                vec!["note"]
+            } else {
+                vec!["hash", "offset", "limit"]
+            };
+            if object.keys().any(|k| !allowed.contains(&k.as_str())) {
+                return Err("unknown tool argument".into());
+            }
+            if data.get("offset").is_some_and(|n| n.as_u64().is_none())
+                || data
+                    .get("limit")
+                    .is_some_and(|n| n.as_u64().is_none_or(|n| !(1..=1048576).contains(&n)))
+            {
+                return Err("offset/limit must be bounded nonnegative integers".into());
+            }
+            if call.name == "leave_continuation_note"
+                && data["note"].as_str().is_none_or(|s| s.len() > 8192)
+            {
+                return Err("note string required, max 8192 bytes".into());
+            }
+            if call.name == "get_tool_output"
+                && data["hash"]
+                    .as_str()
+                    .is_none_or(|s| s.parse::<excalibur_store::BlobHash>().is_err())
+            {
+                return Err("valid blob hash required".into());
+            }
+            Ok(PreparedTool {
+                call,
+                effect: Effect::Pure,
+                resources: Vec::new(),
+                exclusive: false,
+                data,
+            })
+        } else {
+            self.tools.prepare(run, call).await
+        }
+    }
+    async fn execute(&self, run: &str, key: &str, tool: &PreparedTool) -> ToolResult {
+        match tool.call.name.as_str() {
+            "leave_continuation_note" => ToolResult::ok(json!({"note":tool.data["note"]})),
+            "get_tool_output" => {
+                let hash = tool.data["hash"].as_str().unwrap().parse().unwrap();
+                use base64::Engine as _;
+                let offset = tool.data["offset"].as_u64().unwrap_or(0);
+                let limit = tool.data["limit"]
+                    .as_u64()
+                    .unwrap_or(8192)
+                    .clamp(1, 1024 * 1024) as usize;
+                match self
+                    .journal
+                    .database()
+                    .read_blob_window(hash, offset, limit)
+                    .await
+                {
+                    Ok(window) => ToolResult::ok(json!({
+                        "text":std::str::from_utf8(&window.bytes).ok(),
+                        "bytes_base64":base64::engine::general_purpose::STANDARD.encode(&window.bytes),
+                        "offset":window.offset,"next_offset":window.offset+window.bytes.len() as u64,
+                        "total_bytes":window.total_bytes
+                    })),
+                    Err(e) => ToolResult::error(e.to_string()),
+                }
+            }
+            _ => self.tools.execute(run, key, tool).await,
+        }
+    }
+    async fn reconcile(&self, run: &str, key: &str, tool: &PreparedTool) -> Reconcile {
+        match tool.effect {
+            Effect::Pure | Effect::Keyed => Reconcile::Retry,
+            Effect::Idempotent | Effect::NonIdempotent => {
+                self.tools.reconcile(run, key, tool).await
+            }
+        }
+    }
+}
+fn builtin_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "leave_continuation_note".into(),
+            description: "Save or clear a brief note for subsequent model calls and recovery."
+                .into(),
+            input_schema: json!({"type":"object","required":["note"],"properties":{"note":{"type":"string","maxLength":8192}},"additionalProperties":false}),
+        },
+        ToolDefinition {
+            name: "get_tool_output".into(),
+            description: "Read a bounded byte window of a stored full tool output.".into(),
+            input_schema: json!({"type":"object","required":["hash"],"properties":{"hash":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1048576}},"additionalProperties":false}),
+        },
+    ]
+}
+struct AttemptFailure {
+    retryable: bool,
+    reason: String,
+}
+fn tool_key(run: &str, step: u64, index: usize) -> String {
+    format!("{run}:step:{step}:tool:{index}")
+}
+fn loop_reason(history: &[Message]) -> Option<String> {
+    let mut signature = None;
+    let mut failed_steps = 0;
+    let mut failed_results = Vec::new();
+    for message in history.iter().rev() {
+        if message.role == "system" {
+            break;
+        }
+        if message.role == "tool" {
+            let result: ToolResult = serde_json::from_str(&message.content).ok()?;
+            let detail = result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok());
+            if failed_steps == 0
+                && (result.output["escalate_to_parent"] == true
+                    || detail
+                        .as_ref()
+                        .is_some_and(|v| v["escalate_to_parent"] == true))
+            {
+                return Some(
+                    "file fingerprint conflicts require parent or host intervention".into(),
+                );
+            }
+            failed_results.push(!result.success);
+        } else if message.role == "assistant" && !message.tool_calls.is_empty() {
+            if failed_results.len() != message.tool_calls.len() || failed_results.iter().any(|v| !v)
+            {
+                return None;
+            }
+            let current: Vec<_> = message
+                .tool_calls
+                .iter()
+                .map(|call| (&call.name, &call.arguments))
+                .collect();
+            let current = serde_json::to_string(&current).ok()?;
+            if signature.as_ref().is_some_and(|s| s != &current) {
+                return None;
+            }
+            signature = Some(current);
+            failed_results.clear();
+            failed_steps += 1;
+            if failed_steps >= 3 {
+                return Some(
+                    "three identical unsuccessful tool steps require host intervention".into(),
+                );
+            }
+        }
+    }
+    None
+}
+fn remaining_time(s: &Snapshot) -> u64 {
+    s.spec
+        .budget
+        .max_wall_seconds
+        .saturating_sub(unix_seconds().saturating_sub(s.started_at).max(0) as u64)
+}
+fn budget_exhausted(s: &Snapshot) -> bool {
+    s.step >= s.spec.budget.max_steps
+        || s.usage.input_tokens.saturating_add(s.usage.output_tokens) >= s.spec.budget.max_tokens
+        || s.spec
+            .budget
+            .max_cost_microusd
+            .is_some_and(|max| s.usage.cost_microusd >= max)
+        || remaining_time(s) == 0
+}
+fn closing(s: &Snapshot) -> bool {
+    let b = &s.spec.budget;
+    let used = s.usage.input_tokens.saturating_add(s.usage.output_tokens);
+    s.tool_calls >= b.max_tool_calls
+        || b.max_steps.saturating_sub(s.step) <= 1
+        || b.max_steps.saturating_sub(s.step).saturating_mul(10) < b.max_steps
+        || b.max_tokens.saturating_sub(used).saturating_mul(10) < b.max_tokens
+        || b.max_cost_microusd
+            .is_some_and(|max| max.saturating_sub(s.usage.cost_microusd).saturating_mul(10) < max)
+        || remaining_time(s).saturating_mul(10) < b.max_wall_seconds
+}
+fn conflict(a: &PreparedTool, b: &PreparedTool) -> bool {
+    a.exclusive
+        || b.exclusive
+        || a.resources.iter().any(|a| {
+            b.resources
+                .iter()
+                .any(|b| a.key == b.key && (a.write || b.write))
+        })
+}
+fn batches(actions: Vec<(usize, String, PreparedTool)>) -> Vec<Vec<(usize, String, PreparedTool)>> {
+    let mut result = Vec::new();
+    let mut current: Vec<(usize, String, PreparedTool)> = Vec::new();
+    for action in actions {
+        if current.iter().any(|a| conflict(&a.2, &action.2)) {
+            result.push(std::mem::take(&mut current));
+        }
+        let exclusive = action.2.exclusive;
+        current.push(action);
+        if exclusive {
+            result.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}
+type ResourceRegistry = Mutex<BTreeMap<String, Weak<tokio::sync::RwLock<()>>>>;
+static RESOURCES: OnceLock<ResourceRegistry> = OnceLock::new();
+static EXCLUSIVE: OnceLock<Arc<tokio::sync::RwLock<()>>> = OnceLock::new();
+#[allow(dead_code)]
+enum ResourceGuard {
+    Read(tokio::sync::OwnedRwLockReadGuard<()>),
+    Write(tokio::sync::OwnedRwLockWriteGuard<()>),
+}
+async fn resource_locks(tool: &PreparedTool) -> Vec<ResourceGuard> {
+    let global = EXCLUSIVE
+        .get_or_init(|| Arc::new(tokio::sync::RwLock::new(())))
+        .clone();
+    let mut held = vec![if tool.exclusive {
+        ResourceGuard::Write(global.write_owned().await)
+    } else {
+        ResourceGuard::Read(global.read_owned().await)
+    }];
+    let mut keys = BTreeMap::new();
+    for r in &tool.resources {
+        keys.entry(r.key.clone())
+            .and_modify(|write| *write |= r.write)
+            .or_insert(r.write);
+    }
+    for (key, write) in keys {
+        let lock = {
+            let mut registry = RESOURCES.get_or_init(Default::default).lock().unwrap();
+            registry.retain(|_, v| v.strong_count() > 0);
+            if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::RwLock::new(()));
+                registry.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        held.push(if write {
+            ResourceGuard::Write(lock.write_owned().await)
+        } else {
+            ResourceGuard::Read(lock.read_owned().await)
+        });
+    }
+    held
+}

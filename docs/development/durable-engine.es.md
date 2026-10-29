@@ -1,0 +1,105 @@
+# Motor durable mínimo
+
+[English](durable-engine.md)
+
+Las bibliotecas Rust compartidas implementan el camino mínimo de programación durable: registro y reconciliación de efectos (17.1–17.2), ciclo de pasos/recursos (7.3–7.4), pasarela normalizada compatible con OpenAI (19.2), compilador básico de contexto (11.1) y herramientas locales de archivos/terminal (13.2 y la canalización de 13.4–13.6). La arquitectura externa conserva el alcance técnico. No hay CLI del producto, servidor HTTP de frontend ni daemon de aplicación.
+
+## Bibliotecas e integración
+
+| Crate | Contrato |
+|---|---|
+| `excalibur-types::runtime` | Mensajes, llamadas, esquemas, consumo, efectos preparados y resultados independientes del proveedor |
+| `excalibur-journal` | Eventos SQLite confirmados de solo añadir, deduplicación de operaciones, páginas y checkpoints |
+| `excalibur-engine` | Ciclo durable, presupuestos, controles básicos de cierre/bucles, señales y planificación de recursos |
+| `excalibur-context` | Compilación determinista L0–L5 con entradas explícitas y presupuestos por capa |
+| `excalibur-models` | Chat Completions compatible con OpenAI, normalizado y completo/streaming sobre transporte de proveedores existente |
+| `excalibur-tools` | Archivos con raíz de capacidad, edición con huellas, política de ejecución, terminal e integraciones posteriores a edición |
+
+El anfitrión abre `Database` principal, inicializa `Journal::new`, aporta `ModelGateway` y `ToolRuntime` y construye `Engine::new`. `Engine::create(operation_id, RunSpec)` conserva la especificación inicial inmutable y devuelve el ID de ejecución. Repetir operación/especificación devuelve la misma ejecución; se rechaza reutilización incompatible. `Engine::run(run_id)` la ejecuta o reconstruye. Las instancias comparten bloqueos por ejecución/recurso dentro del proceso; la propiedad del archivo SQLite impide abrirlo desde otro proceso.
+
+`RunSpec` contiene `ContextInput` fijado, `Budget` y al menos un criterio de aceptación. Los criterios exigen invocación correcta, un valor JSON concreto o una comprobación del anfitrión con evidencia. Una invocación correcta no acredita cualquier significado de la tarea: deben elegirse salidas concretas o comprobaciones backend. Intenciones/resultados que modifican estado invalidan evidencia del anfitrión. Las respuestas finales pasan por una puerta básica determinista: los criterios pendientes vuelven a la siguiente llamada como máximo dos veces; después se informa `CompletedWithPending` en vez de aceptar la afirmación del modelo. Esta puerta no implementa el sistema posterior completo de planificación/verificación.
+
+Los presupuestos limitan pasos, consumo de tokens, tiempo y llamadas a herramientas; preparación/ejecución tienen timeout. Cerca del agotamiento/último paso disponible, se conservan las definiciones y se deshabilitan las herramientas. Se conserva consumo informado y se acumulan reintentos. Respuestas compatibles sin consumo reciben estimación por bytes marcada explícitamente (`Usage.estimated`), no un cero medido ficticio. Son heurísticas, no verificación de tokenizador/facturación. Se rechaza un tope económico si `ModelGateway::cost_is_known()` es falso; la pasarela incluida no calcula precios ni afirma costo medido. Un adaptador con precios puede aportarlo. `update_budget` registra un cambio explícito de confianza; `resume` continúa una ejecución pausada sin crear otra operación.
+
+`pause`/`cancel` registra controles sin esperar al bloqueo de la ejecución; un efecto atómico admitido puede terminar y se suprimen lotes posteriores. Es control entre pasos/lotes, no cancelación de todo un árbol de orquestación. Señales/cierre de terminal detienen procesos explícitamente. `directive` persiste recepción/aplicación, termina una aplicación interrumpida una sola vez y añade deltas. `record_check` adjunta evidencia backend. `load` devuelve el estado autoritativo reconstruido. `with_stream_sink` activa avisos incrementales; las herramientas esperan la respuesta completa confirmada. `Observer` expone avisos no modificadores en fronteras para verificación.
+
+## Registro y reanudación
+
+El registro usa el escritor SQLite principal y sus ajustes de durabilidad. Tablas/triggers de extensión se inicializan transaccionalmente con hash de esquema comprobado. Las ejecuciones registradas rechazan UPDATE/DELETE del diario; las claves son inmutables y retransmitir el mismo contenido devuelve su secuencia. El escritor serializa creación y asignación de secuencias. Transición de estado y proyección `runs` se confirman juntas. Eventos grandes usan blobs referenciados; se puede paginar sin exponer SQLite al contrato del motor.
+
+Eventos: `run_started`, `model_request` (solicitud normalizada completa, hash y hashes por capa), `model_response`, `tool_intent`, `tool_result`, directivas, estados y checkpoints. La respuesta completa se confirma antes de efectos. Cada intención preparada se confirma antes de ejecutar, con clave estable ejecución/paso/llamada y pre/postcondiciones de archivos. La preparación de herramientas locales conserva raíz canónica y versión; se rechaza reanudarla sobre otro workspace. Cada resultado se confirma al terminar su llamada paralela. El historial visible al modelo se añade en el orden original de llamadas, independiente de su finalización. Hay snapshots cada 20 pasos terminados; checkpoint y nota sobreviven a reapertura.
+
+| Operación incompleta | Reconciliación |
+|---|---|
+| Solicitud al modelo sin respuesta completa | Repite exactamente la solicitud registrada; puede costar otra inferencia |
+| Respuesta/resultado confirmado | Se reutiliza; no repite la operación terminada |
+| `pure` | Repite la lectura |
+| Archivo `idempotent` | Postimagen significa terminado; preimagen permite repetir; otro estado es incierto |
+| Capacidad `keyed` del anfitrión | Reenvía la misma clave; el servicio remoto debe respetar realmente ese contrato |
+| Comando arbitrario `non_idempotent` | Usa sonda fiable declarada si existe; en otro caso bloquea sin repetir |
+
+Los efectos externos con clave son un contrato de extensión probado con simulador durable; no se presenta como existente un servicio de capacidades externo. Una lectura con timeout produce resultado fallido. Una interrupción repetible pausa conservando intención; incertidumbre real bloquea. `resolve_uncertain` exige resultado observado y evidencia de reconciliación del consumidor de confianza, no una petición de repetición a ciegas. El motor no adivina que un comando sea repetible. Solo cadenas exactas de test/build/lint declaradas por proyecto/anfitrión pueden admitirse como repetibles; no se aceptan extensiones por prefijo.
+
+Tres pasos idénticos fallidos con herramientas pausan la ejecución. Tres conflictos consecutivos de huella exponen petición de escalado y pausa para padre/anfitrión. El análisis completo de progreso/bucles semánticos, jerarquía de padres y supervisión pertenecen a capacidades posteriores.
+
+## Contexto y pasarela
+
+L0 conserva instrucciones núcleo, seguridad y herramientas ordenadas por nombre; L1 identidad/catálogo; L2 ámbito fijado; L3 petición literal; L4 actividad/deltas añadidos; L5 hora explícita, presupuesto, continuación y avisos transitorios. La misma entrada produce bytes y hashes idénticos. Hora/contadores no entran en capas estables. Las actualizaciones añaden mensajes L4 en vez de editar anteriores. Hay hasta tres skills sugeridas; recuperación/selección real corresponde al anfitrión. Los presupuestos por capa rechazan entradas excesivas sin descartar silenciosamente contenido obligatorio. Recuperación de memoria, enmascarado, compactación y calibración del tokenizador quedan fuera del compilador básico.
+
+`OpenAiGateway` reutiliza `excalibur-providers::ProviderClient` para autenticación, transporte HTTPS/loopback y redacción de secretos. Traduce mensajes/resultados, llamadas nativas y alternativa textual JSON estricta. Argumentos y salida estructurada se validan con JSON Schema sin cargar referencias HTTP/archivos externos; las reparaciones menores son acotadas y un fallo de validación permite un único reintento correctivo. `GatewayConfig` fija esfuerzo por rol. La identidad conserva proveedor/endpoint/modelo/rol/esfuerzo/opciones al reanudar y excluye credenciales, por lo que rotarlas no cambia el perfil. Otros adaptadores configurables deben definir su identidad del mismo modo.
+
+El streaming del maestro emite deltas provisionales y respuesta completa; truncamiento/filtro es error y no habilita herramientas parciales. Trabajador/experto reciben respuestas completas. El adaptador normalizado incluido es Chat Completions; los otros protocolos conservan sus conexiones anteriores, sin afirmar adaptadores normalizados equivalentes para todos.
+
+## Archivos y canalización
+
+`LocalTools::new(db, absolute_root, ToolPolicy)` abre una capacidad explícita de archivos con raíz. `Access::{Allow, Ask, Deny}` se aplica antes del efecto y se vuelve a comprobar cuando corresponde. Ask devuelve aprobación requerida al anfitrión, sin concederla. Por defecto permite leer, exige aprobación para escribir y deniega comandos. Rutas canónicas, operaciones con raíz, bloqueos entre instancias y arrendamientos durables impiden recorridos externos, escapes por enlaces y escrituras conflictivas de agentes. La terminal exige autorización aparte y no queda confinada por la capacidad del lector de archivos. Aprovisionar sandbox del SO/aprobaciones corresponde al anfitrión y la capacidad posterior de seguridad; aquí no se afirma un sandbox del SO.
+
+- `read_file`: ventanas UTF-8 numeradas (200 líneas por defecto; archivos hasta 64 MiB), `fp` del contenido completo y conjunto de lectura durable por ejecución/ruta. Interpretar binarios/imágenes depende de la capacidad externa de visión.
+- `write_file`, `edit_file`: un archivo existente exige huella registrada. Preparar guarda blobs pre/post sin cambiar el destino. Renombrado atómico y sincronización del directorio preceden metadatos finales. Coincidencia exacta, normalización tipográfica y espacios finales; ambigüedad devuelve líneas. Un conflicto conserva lo escrito por el usuario, devuelve diff y escala al tercer desajuste.
+- `apply_patch`: bloques Codex añadir/borrar/actualizar/mover y hunks con contexto. Una interrupción parcial reconcilia cada pre/postimagen sin sobrescribir estados ajenos. Es aplicación multiarquivo recuperable, no una transacción atómica entre sistemas de archivos.
+- `grep`, `glob`: resúmenes acotados de regex/archivos y recorrido que respeta gitignore.
+- `leave_continuation_note`: guarda/borra una nota breve para llamadas/reinicios. `get_tool_output`: ventanas verificadas de la salida íntegra; base64 conserva límites arbitrarios de bytes y solo se incluye texto si la ventana es UTF-8 válida.
+
+Se validan argumentos antes de preparar, con reparación menor JSON. El formato posterior es transformación de bytes preparados aportada por el anfitrión; diagnósticos/invalidación son callbacks configurados, probados como integración backend. Sin ellos se informa `not_configured`/`pending_host` y se conserva cola durable de archivos cambiados. Esos hooks no constituyen LSP/indexador. Las versiones registran pre/post, llamada y ejecución; las tareas de escritura admitidas terminan publicación atómica/historial aunque se cancele al solicitante.
+
+Las salidas terminadas tienen referencia al blob completo. En una sesión activa, la referencia contiene exactamente el prefijo observado hasta `archived_through_cursor`; llamadas posteriores archivan nuevos prefijos y, al terminar, la salida íntegra. Las vistas acotadas conservan cabeza/cola, errores literales y metadatos críticos de sesión. Terminal redacta antes de guardar/archivar con valores secretos aportados por el anfitrión; nunca los descubre automáticamente. `Database::read_blob_window` reserva como máximo 1 MiB seleccionado más buffer de 64 KiB/ventana de decodificador de 8 MiB y verifica tamaño/hash completo antes de devolver. Cuesta O(contenido total) por ventana, no acceso aleatorio; trabaja fuera del escritor. Los errores mantienen incidencias tipadas. La API no impone un límite de 16 MiB al tamaño total recuperable.
+
+## Ciclo de vida de terminal
+
+`exec` admite tuberías y PTY real mediante `portable-pty`; `exec_io` incluye listado, lectura por cursor, texto/teclas, `wait_for` de patrón o salida, señales y cierre. Yield predeterminado 10 segundos, entre 250–30000 ms. El spool conserva salida completa más allá de cabeza/cola en memoria (1 MiB). El patrón incremental detecta coincidencias entre bloques y fuera de la vista residente sin cargar el spool. Las colas visibles tienen como máximo 20 líneas/2 KiB.
+
+Límites: 16 sesiones por ejecución y 64 por proceso, entre distintas instancias. Se cierra la menos usada protegiendo ocho recientes cuando es posible y se avisa al dueño. `TerminalConfig` permite límites más estrictos, intérprete y redacción; `LocalTools::with_terminal` inyecta el gestor configurado. La detección aporta SO/arquitectura, shells, gestores y comandos disponibles al ámbito estable. Tuberías usan `PAGER=cat`, `GIT_PAGER=cat`, `TERM=dumb` y supresión de color.
+
+Unix usa grupos de procesos; Linux añade señales de muerte del padre y guardián EOF para terminar el grupo propio al caer el daemon; una prueba real comprueba comando y su hijo. El hilo que lanza/vigila permanece durante la vida del proceso. Cancelar envía TERM y después KILL con margen de dos segundos. Windows tiene adaptación con Job Object/kill-on-close protegida por plataforma; su evidencia de ejecución se distingue aparte. Shutdown cierra sesiones propias, espera a los monitores terminados y libera explícitamente sus reservas de spool. Se acusa archivo del spool solo después de publicar el blob; los descriptores retenidos permiten lectura tras borrar el nombre. Los spools diagnósticos no reclamados usan reservas y limpieza explícita por edad. Sesiones de un gestor muerto se informan perdidas y no se reconstruyen/reinician comandos arbitrarios.
+
+## Verificación backend
+
+| Requisito | Evidencia ejecutable |
+|---|---|
+| Tarea completa | `engine/tests/end_to_end.rs`: HTTP compatible simulado → registro → archivos/terminal reales → salidas concretas de aceptación → cierre; retransmitir no la repite |
+| Reconciliación | `engine/tests/crash.rs`: SIGKILL real en ocho fronteras × cuatro clases, respuesta reutilizada, efecto con clave único, comando incierto bloqueado y resolución de confianza; postimagen real y edición externa protegida |
+| Checkpoints/notas/presupuestos/puerta | `engine/tests/engine.rs`: reapertura, checkpoint de 20 pasos, nota, ampliación de presupuesto, herramientas deshabilitadas, evidencia ausente/obsoleta y reintentos acotados |
+| Paralelismo/controles | `engine/tests/scheduling.rs` y engine: barreras deterministas, orden de resultados, recursos entre motores/ejecuciones, exclusividad, pausa con respuesta retenida, directiva recibida y perfil incompatible |
+| Registro | `journal/tests/journal.rs`: secuencias concurrentes/deduplicación, solo añadir, claves inmutables y reproducción desde blob grande |
+| Contexto/pasarela | Fixtures de procesos y mocks HTTP/SSE: bytes idénticos, deltas estables, validación/reparación/reintento, historial, consumo estimado y streaming completo |
+| Canalización de archivos | `tools/tests/files.rs`: permisos, raíces/enlaces, huellas/tres niveles, parches parciales/movimientos, arrendamientos, versiones, errores literales/blobs y hooks |
+| Procesos | `tools/tests/terminal.rs`: tuberías/PTY/teclas reales, señales, timeout, muerte del padre/descendientes, límites globales, spool, redacción y espera incremental |
+| Salida completa acotada en memoria | `store/tests/blob_window.rs`: flujo de 20 MiB, inicio/medio/final/EOF, corrupción fuera del tramo, incidencias tipadas y tamaños registrados |
+
+Las rutas de la tabla son relativas a `crates/`. Desde la raíz:
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace
+cargo test -p excalibur-engine --test crash -- --nocapture
+cargo test -p excalibur-engine --test end_to_end -- --nocapture
+cargo test -p excalibur-tools -- --nocapture
+```
+
+Ejecución final: 179 pruebas aprobadas, cero fallos; los helpers de subproceso ignored son invocados por sus pruebas padre activas. Datos sintéticos y simuladores de proveedores/capacidades; efectos reales de archivos/procesos dentro de directorios temporales. No requiere credenciales, inferencia, GPU, despliegue ni benchmark pagado. No se afirma calidad de un modelo real ni garantía de un servicio externo real con clave.
+
+La compilación/ejecución corresponde a esta VPS Ubuntu x86-64, Rust/Cargo 1.99.1. Matar procesos no prueba un corte eléctrico físico. Además se comprobó el módulo exacto `terminal.rs` aislado con `cargo check` para `x86_64-pc-windows-gnu` y `aarch64-apple-darwin`, mediante un manifiesto temporal fuera del producto, sin SQLite C. Esto comprueba los tipos del adaptador, no la compilación de todo el workspace ni la ejecución en Windows/macOS. Planificación completa de tareas/proyectos, memoria/skills, verificador completo, orquestador, instalación de sandbox, LSP, compactación, agenda y supervisión continua conservan sus propios alcances. El motor mínimo no los presenta como implementados.
+
+Fuentes: [historial de eventos Temporal](https://docs.temporal.io/workflow-execution/event), [arquitectura DBOS](https://docs.dbos.dev/architecture), [conceptos durables Restate](https://docs.restate.dev/foundations/key-concepts), [herramientas OpenAI](https://developers.openai.com/api/docs/guides/function-calling), [salida estructurada](https://developers.openai.com/api/docs/guides/structured-outputs), [portable-pty](https://docs.rs/portable-pty/0.9.0/portable_pty/), [muerte del padre Linux](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html), [Job Objects Windows](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects).

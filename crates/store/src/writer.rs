@@ -580,18 +580,61 @@ impl Database {
         })
         .await
         .map_err(|_| Error::Closed)?;
-        let issue = match &result {
-            Ok(_) => Some(crate::BlobIssue::new(
-                original.as_str().into(),
-                crate::BlobState::Ok,
-                "verified on access",
-            )),
-            Err(Error::BlobTooLarge(_)) => None,
-            Err(e) => Some(crate::integrity::issue_from_error(
-                original.as_str().into(),
-                e,
-            )),
+        let issue = blob_access_issue(&original, &result);
+        self.record_blob_access(generation, issue).await;
+        result
+    }
+    /// Read a verified uncompressed byte window without allocating the full blob.
+    /// The complete registered content is decoded and hashed off the writer on every
+    /// request (O(total bytes)); returned buffers are bounded to at most 1 MiB.
+    pub async fn read_blob_window(
+        &self,
+        hash: BlobHash,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<crate::BlobWindow> {
+        if self.inner.kind != DatabaseKind::Main {
+            return Err(Error::PrincipalOnly);
+        }
+        if !(1..=1024 * 1024).contains(&max_bytes) {
+            return Err(Error::Invalid("blob window must be 1..=1048576 bytes"));
+        }
+        use rusqlite::OptionalExtension;
+        let lookup = hash.as_str().to_string();
+        let metadata: Option<(u64, String)> = self
+            .read(ReadLane::Interactive, move |c| {
+                Ok(c.query_row(
+                    "SELECT size,content_generation FROM blobs WHERE hash=?1",
+                    [lookup],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?)
+            })
+            .await?;
+        let generation = metadata.as_ref().map(|(_, generation)| generation.clone());
+        let original = hash.clone();
+        let result = if let Some((size, _)) = metadata {
+            let blobs = self.blobs();
+            let (lifetime, activity) = self.activity()?;
+            tokio::task::spawn_blocking(move || {
+                let _lifetime = lifetime;
+                let _activity = activity;
+                blobs.read_window(&hash, size, offset, max_bytes)
+            })
+            .await
+            .map_err(|_| Error::Closed)?
+        } else {
+            Err(Error::BlobMetadataMissing(hash.as_str().into()))
         };
+        let issue = blob_access_issue(&original, &result);
+        self.record_blob_access(generation, issue).await;
+        result
+    }
+    async fn record_blob_access(
+        &self,
+        generation: Option<String>,
+        issue: Option<crate::BlobIssue>,
+    ) {
         if let Some(mut issue) = issue {
             issue.generation = Some(generation);
             let observed = issue.clone();
@@ -615,7 +658,6 @@ impl Database {
                     .send(StoreEvent::MaintenanceFailed(error.to_string()));
             }
         }
-        result
     }
     /// One bounded incremental integrity pass; no model or allocation proportional to blobs.
     pub async fn verify_blobs(
@@ -1196,4 +1238,24 @@ fn validate_presence(conn: &Connection, blobs: &BlobStore) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn blob_access_issue<T>(hash: &BlobHash, result: &Result<T>) -> Option<crate::BlobIssue> {
+    match result {
+        Ok(_) => Some(crate::BlobIssue::new(
+            hash.as_str().into(),
+            crate::BlobState::Ok,
+            "verified on access",
+        )),
+        Err(Error::BlobTooLarge(_) | Error::Invalid(_)) => None,
+        Err(Error::BlobMetadataMissing(_)) => Some(crate::BlobIssue::new(
+            hash.as_str().into(),
+            crate::BlobState::MetadataMissing,
+            "blob access has no registered metadata",
+        )),
+        Err(error) => Some(crate::integrity::issue_from_error(
+            hash.as_str().into(),
+            error,
+        )),
+    }
 }
