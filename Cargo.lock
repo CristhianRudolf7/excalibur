@@ -810,6 +810,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "excalibur-browser"
+version = "0.1.0"
+
+[[package]]
+name = "excalibur-cdp"
+version = "0.1.0"
+
+[[package]]
 name = "excalibur-cli"
 version = "0.1.0"
 dependencies = [
@@ -991,6 +999,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "excalibur-search"
+version = "0.1.0"
+
+[[package]]
 name = "excalibur-security"
 version = "0.1.0"
 dependencies = [
@@ -1142,6 +1154,21 @@ dependencies = [
  "windows-sys 0.61.2",
  "zbus-secret-service-keyring-store",
  "zeroize",
+]
+
+[[package]]
+name = "excalibur-web-adapter"
+version = "0.1.0"
+
+[[package]]
+name = "excalibur-webd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
