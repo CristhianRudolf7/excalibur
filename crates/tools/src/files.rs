@@ -149,7 +149,10 @@ impl LocalTools {
             self.root.join(path).to_string_lossy().into_owned(),
             fp.clone(),
         );
-        self.db.write(Priority::Normal,move|conn|{conn.execute("INSERT INTO tool_readset(run_id,path,fp,blob,mismatches) VALUES(?1,?2,?3,?4,0) ON CONFLICT(run_id,path) DO UPDATE SET fp=excluded.fp,blob=excluded.blob,mismatches=0",[run,path,copy,blob])?;Ok(())}).await.map_err(|e|e.to_string())?;
+        self.db.write(Priority::Normal,move|conn|{
+            conn.execute("INSERT INTO tool_readset(run_id,path,fp,blob,mismatches) VALUES(?1,?2,?3,?4,0) ON CONFLICT(run_id,path) DO UPDATE SET fp=excluded.fp,blob=excluded.blob,mismatches=0",[&run,&path,&copy,&blob])?;
+            conn.execute("DELETE FROM tool_conflicts WHERE run_id=?1 AND path=?2",[run,path])?;Ok(())
+        }).await.map_err(|e|e.to_string())?;
         Ok(fp)
     }
     pub(crate) async fn ensure_read(
@@ -166,28 +169,93 @@ impl LocalTools {
         if fp == actual && supplied.is_none_or(|s| s == fp) {
             return Ok(());
         }
+        Err(self
+            .conflict_report(run, path, Some(&fp), Some(&blob), Some(current), supplied)
+            .await?)
+    }
+
+    /// A single durable counter/report path for both preparation and execution.
+    /// For an admitted write, expected bytes come from its intention, not a newer readset.
+    pub(crate) async fn conflict_report(
+        &self,
+        run: &str,
+        path: &str,
+        expected: Option<&str>,
+        preimage: Option<&str>,
+        current: Option<&[u8]>,
+        supplied: Option<&str>,
+    ) -> Result<String, String> {
         let (run_copy, path_copy) = (
             run.to_owned(),
             self.root.join(path).to_string_lossy().into_owned(),
         );
-        let failures=self.db.write(Priority::Interactive,move|conn|Ok(conn.query_row("UPDATE tool_readset SET mismatches=mismatches+1 WHERE run_id=?1 AND path=?2 RETURNING mismatches",[run_copy,path_copy],|r|r.get::<_,i64>(0))?)).await.map_err(|e|e.to_string())?;
-        let prior = self
-            .db
-            .read_blob(
-                BlobHash::from_str(&blob).map_err(|e| e.to_string())?,
-                MAX_FILE_BYTES,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        let failures=self.db.write(Priority::Interactive,move|conn|{
+            let count=conn.query_row("INSERT INTO tool_conflicts(run_id,path,mismatches) VALUES(?1,?2,1) ON CONFLICT(run_id,path) DO UPDATE SET mismatches=mismatches+1 RETURNING mismatches",[&run_copy,&path_copy],|r|r.get::<_,i64>(0))?;
+            conn.execute("UPDATE tool_readset SET mismatches=?3 WHERE run_id=?1 AND path=?2",excalibur_store::rusqlite::params![run_copy,path_copy,count])?;Ok(count)
+        }).await.map_err(|e|e.to_string())?;
+        let prior = match preimage {
+            Some(blob) => self
+                .db
+                .read_blob(
+                    BlobHash::from_str(blob).map_err(|e| e.to_string())?,
+                    MAX_FILE_BYTES,
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+            None => Vec::new(),
+        };
         let prior = String::from_utf8_lossy(&prior);
-        let current = String::from_utf8_lossy(current);
-        let diff = similar::TextDiff::from_lines(prior.as_ref(), current.as_ref())
+        let current_text = String::from_utf8_lossy(current.unwrap_or_default());
+        let expected_label = if expected.is_some() {
+            "expected"
+        } else {
+            "expected (file absent)"
+        };
+        let current_label = if current.is_some() {
+            "current"
+        } else {
+            "current (file absent)"
+        };
+        let diff = similar::TextDiff::from_lines(prior.as_ref(), current_text.as_ref())
             .unified_diff()
             .context_radius(2)
-            .header("read", "current")
+            .header(expected_label, current_label)
             .to_string();
-        Err(json!({"error":"fingerprint_conflict","path":path,"expected_fp":fp,"current_fp":actual,"supplied_fp":supplied,"diff":crate::head_tail(&diff,4096),"affected_region":"see unified diff line ranges","mismatches":failures,"escalate_to_parent":failures>=3}).to_string())
+        let mut ranges = diff
+            .lines()
+            .filter(|line| line.starts_with("@@"))
+            .take(9)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let ranges_truncated = ranges.len() > 8;
+        ranges.truncate(8);
+        Ok(json!({"error":"fingerprint_conflict","path":path,"expected_fp":expected,"current_fp":current.map(hash),"supplied_fp":supplied,
+            "expected_exists":expected.is_some(),"current_exists":current.is_some(),"diff":crate::head_tail(&diff,4096),
+            "affected_region":{"line_ranges":ranges,"line_ranges_truncated":ranges_truncated,"existence_changed":expected.is_some()!=current.is_some()},
+            "mismatches":failures,"escalate_to_parent":failures>=3}).to_string())
     }
+
+    pub(crate) async fn forget_snapshot(&self, run: &str, path: &str) -> Result<(), String> {
+        let (run, path) = (
+            run.to_owned(),
+            self.root.join(path).to_string_lossy().into_owned(),
+        );
+        self.db
+            .write(Priority::Normal, move |conn| {
+                conn.execute(
+                    "DELETE FROM tool_readset WHERE run_id=?1 AND path=?2",
+                    [&run, &path],
+                )?;
+                conn.execute(
+                    "DELETE FROM tool_conflicts WHERE run_id=?1 AND path=?2",
+                    [run, path],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     pub(crate) async fn prepare_edit(
         &self,
         run: &str,
@@ -201,6 +269,10 @@ impl LocalTools {
         let current = self.content(&path)?;
         if let Some(content) = current.as_deref() {
             self.ensure_read(run, &path, content, fp).await?;
+        } else if let Some((expected, blob, _)) = self.read_snapshot(run, &path).await? {
+            return Err(self
+                .conflict_report(run, &path, Some(&expected), Some(&blob), None, fp)
+                .await?);
         } else if fp.is_some() {
             return Err("fp supplied for a nonexistent file".into());
         }

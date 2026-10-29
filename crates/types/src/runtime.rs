@@ -108,10 +108,42 @@ pub enum Reconcile {
     Retry,
     Uncertain(String),
 }
+/// Side-effect-free scheduling metadata. Resource discovery must not read file
+/// contents, create preimages or bind an operation to a mutable content snapshot.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolScheduling {
+    pub resources: Vec<Resource>,
+    pub exclusive: bool,
+}
+impl ToolScheduling {
+    /// Adapters without independent metadata are scheduled alone for safety.
+    pub fn isolated() -> Self {
+        Self {
+            resources: Vec::new(),
+            exclusive: true,
+        }
+    }
+    pub fn from_prepared(tool: &PreparedTool) -> Self {
+        Self {
+            resources: tool.resources.clone(),
+            exclusive: tool.exclusive,
+        }
+    }
+}
 /// Preparation may persist preimages, but must not perform the requested external effect.
 /// Execution is called only after a confirmed durable intention; recovery never guesses.
 pub trait ToolRuntime: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
+    /// Return canonical resource keys without preparing content-dependent work.
+    /// None conservatively schedules this call alone; errors are reported by prepare.
+    fn scheduling<'a>(
+        &'a self,
+        _run: &'a str,
+        _call: &'a ToolCall,
+    ) -> BoxFuture<'a, Option<ToolScheduling>> {
+        Box::pin(async { None })
+    }
+
     fn prepare<'a>(
         &'a self,
         run: &'a str,

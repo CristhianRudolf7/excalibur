@@ -341,6 +341,7 @@ pub enum Boundary {
     ModelRequestConfirmed,
     ModelReturned,
     ModelResponseConfirmed,
+    GateReportConfirmed,
     BeforeToolIntent,
     ToolIntentConfirmed,
     ToolEffectReturned,
@@ -507,36 +508,86 @@ impl Engine {
         status: Status,
         reason: Option<String>,
     ) -> Result<()> {
+        self.transition_from(run, state, &["running"], status, reason)
+            .await?;
+        Ok(())
+    }
+    async fn transition_from(
+        &self,
+        run: &str,
+        state: &mut Snapshot,
+        expected: &[&str],
+        status: Status,
+        reason: Option<String>,
+    ) -> Result<bool> {
+        // The read gives the caller the latest facts; the writer-side guard closes
+        // the race between this read and a concurrent user control transaction.
+        *state = self.load(run).await?;
+        if !expected.contains(&state.status.label()) {
+            return Ok(false);
+        }
         let key = format!(
             "state:{}:{}:{}",
             state.step,
             state.last_sequence,
             status.label()
         );
-        self.journal
-            .set_state(run, status.label(), reason, &key)
+        let applied = self
+            .journal
+            .set_state_if(run, expected, status.label(), reason, &key)
             .await?;
         *state = self.load(run).await?;
-        Ok(())
+        Ok(applied)
     }
     /// Controls are persisted without acquiring the long-running run lock.
     pub async fn pause(&self, run: &str) -> Result<()> {
         let mut s = self.load(run).await?;
-        self.transition(run, &mut s, Status::Paused, Some("user".into()))
-            .await
+        if s.status == Status::Paused && s.reason.as_deref() == Some("user") {
+            return Ok(());
+        }
+        if !self
+            .transition_from(
+                run,
+                &mut s,
+                &["running", "paused", "blocked"],
+                Status::Paused,
+                Some("user".into()),
+            )
+            .await?
+        {
+            return Err(Error::Invalid("terminal execution cannot be paused"));
+        }
+        Ok(())
     }
     pub async fn cancel(&self, run: &str) -> Result<()> {
         let mut s = self.load(run).await?;
-        self.transition(run, &mut s, Status::Cancelled, Some("user".into()))
-            .await
+        if s.status == Status::Cancelled {
+            return Ok(());
+        }
+        let applied = self
+            .transition_from(
+                run,
+                &mut s,
+                &["running", "paused", "blocked"],
+                Status::Cancelled,
+                Some("user".into()),
+            )
+            .await?;
+        if !applied && s.status != Status::Cancelled {
+            return Err(Error::Invalid("terminal execution cannot be cancelled"));
+        }
+        Ok(())
     }
     pub async fn resume(&self, run: &str) -> Result<()> {
         let _guard = self.journal.lock_run(run).await;
         let mut s = self.load(run).await?;
-        if s.status != Status::Paused {
+        if !self
+            .transition_from(run, &mut s, &["paused"], Status::Running, None)
+            .await?
+        {
             return Err(Error::Invalid("only paused runs can resume"));
         }
-        self.transition(run, &mut s, Status::Running, None).await
+        Ok(())
     }
     /// Trusted host budget amendment; increases are explicit durable facts, never a new run.
     pub async fn update_budget(&self, run: &str, budget: Budget) -> Result<()> {
@@ -638,7 +689,15 @@ impl Engine {
         }
         let key = tool_key(run, s.step, index);
         self.event(run,&mut s,"tool_result",format!("{key}:result"),json!({"index":index,"name":call.name,"result":result,"reconciliation_evidence":evidence})).await?;
-        self.transition(run, &mut s, Status::Running, None).await
+        if !self
+            .transition_from(run, &mut s, &["blocked"], Status::Running, None)
+            .await?
+        {
+            return Err(Error::Invalid(
+                "reconciled outcome recorded but control state prevents resuming",
+            ));
+        }
+        Ok(())
     }
     pub async fn run(&self, run: &str) -> Result<Snapshot> {
         let _guard = self.journal.lock_run(run).await;
@@ -766,6 +825,7 @@ impl Engine {
                     json!({"pending":pending,"final_text":response.message.content}),
                 )
                 .await?;
+                self.point(Boundary::GateReportConfirmed, run, s.step, None);
                 if s.gate_report.is_empty() {
                     self.transition(run, &mut s, Status::Completed, None)
                         .await?;
@@ -793,127 +853,54 @@ impl Engine {
                 .await?;
                 return Ok(s);
             }
-            let mut actions = Vec::new();
+            let mut planned = Vec::new();
             for (index, call) in response.message.tool_calls.iter().enumerate() {
                 if s.calls.get(&index).is_some_and(|c| c.result.is_some()) {
                     continue;
                 }
-                let key = tool_key(run, s.step, index);
-                let prepared = if let Some(p) = s.calls.get(&index).and_then(|c| c.prepared.clone())
-                {
-                    p
-                } else {
-                    if s.tool_calls >= s.spec.budget.max_tool_calls {
-                        self.transition(run, &mut s, Status::Paused, Some("tool budget".into()))
-                            .await?;
-                        return Ok(s);
-                    }
-                    let preparation = tokio::time::timeout(
-                        Duration::from_secs(s.spec.budget.tool_timeout_seconds),
-                        AssertUnwindSafe(self.prepare(run, call.clone())).catch_unwind(),
-                    )
-                    .await;
-                    let preparation = match preparation {
-                        Ok(Ok(result)) => result,
-                        _ => Err("tool preparation timed out or panicked; requested effect was not admitted".into()),
+                let scheduling =
+                    if let Some(prepared) = s.calls.get(&index).and_then(|c| c.prepared.as_ref()) {
+                        ToolScheduling::from_prepared(prepared)
+                    } else {
+                        self.scheduling(run, call, s.spec.budget.tool_timeout_seconds)
+                            .await
                     };
-                    let prepared = match preparation {
-                        Ok(p) => p,
-                        Err(error) => {
-                            self.event(run,&mut s,"tool_result",format!("{key}:result"),json!({"index":index,"name":call.name,"result":ToolResult::error(error)})).await?;
-                            continue;
-                        }
-                    };
-                    self.point(Boundary::BeforeToolIntent, run, s.step, Some(&key));
-                    self.event(
-                        run,
-                        &mut s,
-                        "tool_intent",
-                        key.clone(),
-                        json!({"index":index,"prepared":prepared}),
-                    )
-                    .await?;
-                    self.point(Boundary::ToolIntentConfirmed, run, s.step, Some(&key));
-                    prepared
-                };
-                actions.push((index, key, prepared));
+                planned.push((index, scheduling));
             }
-            for batch in batches(actions) {
-                let current = self.load(run).await?;
-                if current.status != Status::Running {
-                    return Ok(current);
+            for batch in batches(planned) {
+                // Acquire the shared/exclusive gate once per batch. Each call
+                // takes only its own resources, so a blocked file cannot stall
+                // independent calls and queued exclusive work cannot split readers.
+                let _gate = batch_gate(batch.iter().any(|(_, plan)| plan.exclusive)).await;
+                s = self.load(run).await?;
+                if s.status != Status::Running {
+                    return Ok(s);
                 }
-                let jobs = batch.into_iter().map(|(index, key, tool)| {
-                    let is_recovery = recovering.remove(&key);
-                    let engine = self.clone();
-                    let run = run.to_string();
-                    let step = s.step;
-                    let timeout = s.spec.budget.tool_timeout_seconds;
-                    async move {
-                        let _locks = resource_locks(&tool).await;
-                        let outcome = if is_recovery {
-                            match tokio::time::timeout(
-                                Duration::from_secs(timeout),
-                                AssertUnwindSafe(engine.reconcile(&run, &key, &tool))
-                                    .catch_unwind(),
-                            )
-                            .await
-                            {
-                                Ok(Ok(outcome)) => outcome,
-                                _ => Reconcile::Uncertain(
-                                    "recovery probe timed out or panicked".into(),
-                                ),
-                            }
-                        } else {
-                            Reconcile::Retry
-                        };
-                        let result = match outcome {
-                            Reconcile::Done(result) => result,
-                            Reconcile::Uncertain(reason) => {
-                                return Some(AttemptFailure {
-                                    retryable: false,
-                                    reason,
-                                });
-                            }
-                            Reconcile::Retry => match tokio::time::timeout(
-                                Duration::from_secs(timeout),
-                                AssertUnwindSafe(engine.execute(&run, &key, &tool)).catch_unwind(),
-                            )
-                            .await
-                            {
-                                Ok(Ok(result)) => result,
-                                _ if tool.effect == Effect::Pure => {
-                                    ToolResult::error("read-only tool interrupted or timed out")
-                                }
-                                _ => return Some(AttemptFailure {
-                                    retryable: tool.effect != Effect::NonIdempotent,
-                                    reason:
-                                        "tool interrupted or timed out without a confirmed result"
-                                            .into(),
-                                }),
-                            },
-                        };
-                        engine.point(Boundary::ToolEffectReturned, &run, step, Some(&key));
-                        // Each completed sibling confirms its own result before waiting for the batch.
-                        if let Err(error) = engine
-                            .journal
-                            .append(
-                                &run,
-                                "tool_result",
-                                &format!("{key}:result"),
-                                json!({"index":index,"name":tool.call.name,"result":result}),
-                            )
-                            .await
-                        {
-                            return Some(AttemptFailure {
-                                retryable: tool.effect != Effect::NonIdempotent,
-                                reason: format!("result could not be confirmed: {error}"),
-                            });
+                let mut slots = s.spec.budget.max_tool_calls.saturating_sub(s.tool_calls);
+                let mut tool_limit = false;
+                let mut actions = Vec::new();
+                for (index, plan) in batch {
+                    let prepared = s.calls.get(&index).and_then(|c| c.prepared.clone());
+                    if prepared.is_none() {
+                        if slots == 0 {
+                            tool_limit = true;
+                            break;
                         }
-                        engine.point(Boundary::ToolResultConfirmed, &run, step, Some(&key));
-                        None
+                        slots -= 1;
                     }
-                });
+                    let key = tool_key(run, s.step, index);
+                    actions.push(ToolJob {
+                        index,
+                        step: s.step,
+                        recovery: recovering.remove(&key),
+                        key,
+                        plan,
+                        prepared,
+                        call: response.message.tool_calls[index].clone(),
+                        timeout: s.spec.budget.tool_timeout_seconds,
+                    });
+                }
+                let jobs = actions.into_iter().map(|job| self.execute_tool(run, job));
                 let failures = join_all(jobs)
                     .await
                     .into_iter()
@@ -948,6 +935,11 @@ impl Engine {
                     .await?;
                     return Ok(s);
                 }
+                if tool_limit {
+                    self.transition(run, &mut s, Status::Paused, Some("tool budget".into()))
+                        .await?;
+                    return Ok(s);
+                }
             }
             s = self.load(run).await?;
             if s.status != Status::Running {
@@ -964,6 +956,137 @@ impl Engine {
             }
         }
     }
+    async fn execute_tool(&self, run: &str, job: ToolJob) -> Option<AttemptFailure> {
+        let ToolJob {
+            index,
+            step,
+            key,
+            plan,
+            prepared,
+            call,
+            recovery,
+            timeout,
+        } = job;
+        let _locks = resource_locks(&plan).await;
+        match self.journal.is_running(run).await {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                return Some(AttemptFailure {
+                    retryable: true,
+                    reason: format!("could not check tool admission: {error}"),
+                });
+            }
+        }
+        let prepared = if let Some(prepared) = prepared {
+            prepared
+        } else {
+            let attempt = tokio::time::timeout(
+                Duration::from_secs(timeout),
+                AssertUnwindSafe(self.prepare(run, call.clone())).catch_unwind(),
+            )
+            .await;
+            let attempt = match attempt {
+                Ok(Ok(result)) => result,
+                _ => Err(
+                    "tool preparation timed out or panicked; requested effect was not admitted"
+                        .into(),
+                ),
+            };
+            let prepared = match attempt {
+                Ok(prepared)
+                    if prepared.call.id == call.id
+                        && prepared.call.name == call.name
+                        && covers(&plan, &prepared) =>
+                {
+                    prepared
+                }
+                other => {
+                    let reason=match other{Err(error)=>error,Ok(_)=>"resource plan or call identity changed before admission; retry with current state".into()};
+                    return self.journal.append(run,"tool_result",&format!("{key}:result"),json!({"index":index,"name":call.name,"result":ToolResult::error(reason)})).await.err().map(|error|AttemptFailure{retryable:true,reason:format!("rejection could not be recorded: {error}")});
+                }
+            };
+            self.point(Boundary::BeforeToolIntent, run, step, Some(&key));
+            match self
+                .journal
+                .append_when_running(
+                    run,
+                    "tool_intent",
+                    &key,
+                    json!({"index":index,"prepared":prepared}),
+                )
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => return None,
+                Err(error) => {
+                    return Some(AttemptFailure {
+                        retryable: true,
+                        reason: format!("intention could not be confirmed: {error}"),
+                    });
+                }
+            }
+            self.point(Boundary::ToolIntentConfirmed, run, step, Some(&key));
+            prepared
+        };
+        let outcome = if recovery {
+            match tokio::time::timeout(
+                Duration::from_secs(timeout),
+                AssertUnwindSafe(self.reconcile(run, &key, &prepared)).catch_unwind(),
+            )
+            .await
+            {
+                Ok(Ok(outcome)) => outcome,
+                _ => Reconcile::Uncertain("recovery probe timed out or panicked".into()),
+            }
+        } else {
+            Reconcile::Retry
+        };
+        let result = match outcome {
+            Reconcile::Done(result) => result,
+            Reconcile::Uncertain(reason) => {
+                return Some(AttemptFailure {
+                    retryable: false,
+                    reason,
+                });
+            }
+            Reconcile::Retry => match tokio::time::timeout(
+                Duration::from_secs(timeout),
+                AssertUnwindSafe(self.execute(run, &key, &prepared)).catch_unwind(),
+            )
+            .await
+            {
+                Ok(Ok(result)) => result,
+                _ if prepared.effect == Effect::Pure => {
+                    ToolResult::error("read-only tool interrupted or timed out")
+                }
+                _ => {
+                    return Some(AttemptFailure {
+                        retryable: prepared.effect != Effect::NonIdempotent,
+                        reason: "tool interrupted or timed out without a confirmed result".into(),
+                    });
+                }
+            },
+        };
+        self.point(Boundary::ToolEffectReturned, run, step, Some(&key));
+        if let Err(error) = self
+            .journal
+            .append(
+                run,
+                "tool_result",
+                &format!("{key}:result"),
+                json!({"index":index,"name":prepared.call.name,"result":result}),
+            )
+            .await
+        {
+            return Some(AttemptFailure {
+                retryable: prepared.effect != Effect::NonIdempotent,
+                reason: format!("result could not be confirmed: {error}"),
+            });
+        }
+        self.point(Boundary::ToolResultConfirmed, run, step, Some(&key));
+        None
+    }
     async fn checkpoint(&self, run: &str, s: &mut Snapshot) -> Result<()> {
         if s.step > 0 && s.step.is_multiple_of(20) {
             let payload = serde_json::to_value(&*s)?;
@@ -972,6 +1095,26 @@ impl Engine {
             self.point(Boundary::CheckpointConfirmed, run, s.step, None);
         }
         Ok(())
+    }
+    async fn scheduling(&self, run: &str, call: &ToolCall, timeout: u64) -> ToolScheduling {
+        if matches!(
+            call.name.as_str(),
+            "leave_continuation_note" | "get_tool_output"
+        ) {
+            return ToolScheduling {
+                resources: Vec::new(),
+                exclusive: false,
+            };
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(timeout),
+            AssertUnwindSafe(self.tools.scheduling(run, call)).catch_unwind(),
+        )
+        .await
+        {
+            Ok(Ok(Some(plan))) => plan,
+            _ => ToolScheduling::isolated(),
+        }
     }
     async fn prepare(
         &self,
@@ -1077,6 +1220,16 @@ fn builtin_definitions() -> Vec<ToolDefinition> {
         },
     ]
 }
+struct ToolJob {
+    index: usize,
+    step: u64,
+    key: String,
+    call: ToolCall,
+    plan: ToolScheduling,
+    prepared: Option<PreparedTool>,
+    recovery: bool,
+    timeout: u64,
+}
 struct AttemptFailure {
     retryable: bool,
     reason: String,
@@ -1162,7 +1315,16 @@ fn closing(s: &Snapshot) -> bool {
             .is_some_and(|max| max.saturating_sub(s.usage.cost_microusd).saturating_mul(10) < max)
         || remaining_time(s).saturating_mul(10) < b.max_wall_seconds
 }
-fn conflict(a: &PreparedTool, b: &PreparedTool) -> bool {
+fn covers(plan: &ToolScheduling, tool: &PreparedTool) -> bool {
+    plan.exclusive
+        || (!tool.exclusive
+            && tool.resources.iter().all(|actual| {
+                plan.resources
+                    .iter()
+                    .any(|declared| declared.key == actual.key && (!actual.write || declared.write))
+            }))
+}
+fn conflict(a: &ToolScheduling, b: &ToolScheduling) -> bool {
     a.exclusive
         || b.exclusive
         || a.resources.iter().any(|a| {
@@ -1171,14 +1333,14 @@ fn conflict(a: &PreparedTool, b: &PreparedTool) -> bool {
                 .any(|b| a.key == b.key && (a.write || b.write))
         })
 }
-fn batches(actions: Vec<(usize, String, PreparedTool)>) -> Vec<Vec<(usize, String, PreparedTool)>> {
+fn batches(actions: Vec<(usize, ToolScheduling)>) -> Vec<Vec<(usize, ToolScheduling)>> {
     let mut result = Vec::new();
-    let mut current: Vec<(usize, String, PreparedTool)> = Vec::new();
+    let mut current: Vec<(usize, ToolScheduling)> = Vec::new();
     for action in actions {
-        if current.iter().any(|a| conflict(&a.2, &action.2)) {
+        if current.iter().any(|a| conflict(&a.1, &action.1)) {
             result.push(std::mem::take(&mut current));
         }
-        let exclusive = action.2.exclusive;
+        let exclusive = action.1.exclusive;
         current.push(action);
         if exclusive {
             result.push(std::mem::take(&mut current));
@@ -1197,15 +1359,18 @@ enum ResourceGuard {
     Read(tokio::sync::OwnedRwLockReadGuard<()>),
     Write(tokio::sync::OwnedRwLockWriteGuard<()>),
 }
-async fn resource_locks(tool: &PreparedTool) -> Vec<ResourceGuard> {
+async fn batch_gate(exclusive: bool) -> ResourceGuard {
     let global = EXCLUSIVE
         .get_or_init(|| Arc::new(tokio::sync::RwLock::new(())))
         .clone();
-    let mut held = vec![if tool.exclusive {
+    if exclusive {
         ResourceGuard::Write(global.write_owned().await)
     } else {
         ResourceGuard::Read(global.read_owned().await)
-    }];
+    }
+}
+async fn resource_locks(tool: &ToolScheduling) -> Vec<ResourceGuard> {
+    let mut held = Vec::new();
     let mut keys = BTreeMap::new();
     for r in &tool.resources {
         keys.entry(r.key.clone())

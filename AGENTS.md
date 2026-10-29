@@ -11,3 +11,5 @@
 - Storage verification: `cargo test -p excalibur-store -- --nocapture` exercises concurrency, external locking, real WAL growth and deterministic subprocess interruption tests. See [Base and storage](docs/development/storage.md).
 
 - Durable engine verification: `cargo test -p excalibur-engine --test crash -- --nocapture` covers real process interruption and effect reconciliation; `cargo test -p excalibur-engine --test end_to_end -- --nocapture` runs the shared engine through a mock provider and real local tools. See [Minimum durable engine](docs/development/durable-engine.md).
+
+- Durable control and batch verification: `cargo test -p excalibur-engine --test control_races --test batch_preparation --test batch_crash`, `cargo test -p excalibur-journal --test state_transitions` and `cargo test -p excalibur-tools --test execution_conflicts` cover control races, sequential real file edits, unadmitted batches after SIGKILL, atomic state guards and durable conflict escalation.

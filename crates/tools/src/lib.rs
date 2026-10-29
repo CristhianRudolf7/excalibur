@@ -5,7 +5,7 @@ pub mod terminal;
 use excalibur_store::{Database, Priority};
 use excalibur_types::runtime::{
     BoxFuture, Effect, PreparedTool, Reconcile, Resource, ToolCall, ToolDefinition, ToolResult,
-    ToolRuntime,
+    ToolRuntime, ToolScheduling,
 };
 use files::{FileEdit, hash, required_str};
 use serde_json::{Value, json};
@@ -68,6 +68,8 @@ pub struct LocalTools {
     terminal: Arc<terminal::TerminalManager>,
 }
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS tool_readset(run_id TEXT NOT NULL,path TEXT NOT NULL,fp TEXT NOT NULL,blob TEXT NOT NULL REFERENCES blobs(hash),mismatches INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(run_id,path)); CREATE TABLE IF NOT EXISTS tool_changed_files(path TEXT NOT NULL,run_id TEXT NOT NULL,call_id TEXT NOT NULL,created_at INTEGER NOT NULL DEFAULT(unixepoch()),PRIMARY KEY(path,run_id,call_id));";
+// Additive upgrade: absence conflicts need counters even without a prior readset row.
+const SCHEMA_2: &str = "CREATE TABLE IF NOT EXISTS tool_conflicts(run_id TEXT NOT NULL,path TEXT NOT NULL,mismatches INTEGER NOT NULL DEFAULT 0 CHECK(mismatches>=0),PRIMARY KEY(run_id,path)); INSERT OR IGNORE INTO tool_conflicts(run_id,path,mismatches) SELECT run_id,path,mismatches FROM tool_readset WHERE mismatches>0;";
 impl LocalTools {
     pub async fn new(db: Database, root: PathBuf, policy: ToolPolicy) -> Result<Self, String> {
         if policy.output_budget_bytes < 256 || policy.output_budget_bytes > 1024 * 1024 {
@@ -81,6 +83,10 @@ impl LocalTools {
             let old=conn.query_row("SELECT checksum FROM tool_schema WHERE version=1",[],|r|r.get::<_,String>(0)).optional()?;
             if let Some(old)=old {if old!=checksum{return Err(excalibur_store::Error::Invalid("tool schema checksum mismatch"));}}
             else{conn.execute_batch(SCHEMA)?;conn.execute("INSERT INTO tool_schema VALUES(1,?1)",[checksum])?;}
+            let checksum_2=hash(SCHEMA_2.as_bytes());
+            let old_2=conn.query_row("SELECT checksum FROM tool_schema WHERE version=2",[],|r|r.get::<_,String>(0)).optional()?;
+            if let Some(old)=old_2 {if old!=checksum_2{return Err(excalibur_store::Error::Invalid("tool schema checksum mismatch"));}}
+            else {conn.execute_batch(SCHEMA_2)?;conn.execute("INSERT INTO tool_schema VALUES(2,?1)",[checksum_2])?;}
             Ok(())
         }).await.map_err(|e|e.to_string())?;
         let terminal = terminal::TerminalManager::new(terminal::TerminalConfig {
@@ -199,6 +205,81 @@ impl LocalTools {
         }
         Ok(args)
     }
+    /// Discover only scheduling resources. No file bytes, fingerprints or durable
+    /// preparation data are read or written here.
+    fn scheduling_resources(
+        &self,
+        run: &str,
+        call: &ToolCall,
+    ) -> Result<(Vec<Resource>, bool), String> {
+        let args = Self::arguments(call)?;
+        let mut resources = Vec::new();
+        let mut exclusive = false;
+        let file_resource = |path: &str, write: bool| -> Result<Resource, String> {
+            let path = self.resolve(path)?;
+            Ok(Resource {
+                key: self.root.join(path).to_string_lossy().into_owned(),
+                write,
+            })
+        };
+        match call.name.as_str() {
+            "read_file" => resources.push(file_resource(required_str(&args, "path")?, false)?),
+            "write_file" | "edit_file" => {
+                resources.push(file_resource(required_str(&args, "path")?, true)?)
+            }
+            "apply_patch" => {
+                for operation in patch::parse(required_str(&args, "patch")?)? {
+                    match operation {
+                        patch::Operation::Add { path, .. } | patch::Operation::Delete { path } => {
+                            resources.push(file_resource(&path, true)?)
+                        }
+                        patch::Operation::Update { path, moved, .. } => {
+                            resources.push(file_resource(&path, true)?);
+                            if let Some(target) = moved {
+                                resources.push(file_resource(&target, true)?);
+                            }
+                        }
+                    }
+                }
+            }
+            "grep" | "glob" => {}
+            "exec" => {
+                let raw = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
+                let cwd = if raw == "." || Path::new(raw) == self.root {
+                    self.root.clone()
+                } else {
+                    self.root.join(self.resolve(raw)?)
+                };
+                if !cwd.is_dir() {
+                    return Err("cwd must be a directory".into());
+                }
+                resources.push(Resource {
+                    key: self.root.to_string_lossy().into_owned(),
+                    write: true,
+                });
+                exclusive = true;
+            }
+            "exec_io" => {
+                let read_only =
+                    matches!(args["action"].as_str(), Some("list" | "read" | "wait_for"));
+                let session = args
+                    .get("session_id")
+                    .or_else(|| args.get("session"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(run);
+                resources.push(Resource {
+                    key: format!("terminal:{session}"),
+                    write: !read_only,
+                });
+                exclusive = !read_only;
+            }
+            _ => return Err("unknown tool".into()),
+        }
+        resources
+            .sort_by(|left, right| left.key.cmp(&right.key).then(left.write.cmp(&right.write)));
+        resources.dedup_by(|left, right| left.key == right.key && left.write == right.write);
+        Ok((resources, exclusive))
+    }
     async fn prepare_call(&self, run: &str, mut call: ToolCall) -> Result<PreparedTool, String> {
         let mut args = Self::arguments(&call)?;
         let mut edits = Vec::new();
@@ -308,7 +389,7 @@ impl LocalTools {
             "exec" => {
                 self.check_permission(Permission::Exec)?;
                 let raw = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
-                let cwd = if raw == "." {
+                let cwd = if raw == "." || Path::new(raw) == self.root {
                     self.root.clone()
                 } else {
                     self.root.join(self.resolve(raw)?)
@@ -339,6 +420,7 @@ impl LocalTools {
                     key: format!(
                         "terminal:{}",
                         args.get("session_id")
+                            .or_else(|| args.get("session"))
                             .and_then(Value::as_str)
                             .unwrap_or(run)
                     ),
@@ -363,6 +445,9 @@ impl LocalTools {
                 write: true,
             });
         }
+        resources
+            .sort_by(|left, right| left.key.cmp(&right.key).then(left.write.cmp(&right.write)));
+        resources.dedup_by(|left, right| left.key == right.key && left.write == right.write);
         call.arguments = args.to_string();
         Ok(PreparedTool {
             exclusive: call.name == "exec" || (call.name == "exec_io" && effect != Effect::Pure),
@@ -540,12 +625,19 @@ impl LocalTools {
         // Check every precondition before the first requested file effect.
         for edit in &edits {
             let path = self.resolve(&edit.path)?;
-            let current = self.content(&path)?.map(|v| hash(&v));
-            if current != edit.pre && current != edit.post {
-                return Err(format!(
-                    "fingerprint_conflict during execution: {}",
-                    edit.path
-                ));
+            let current = self.content(&path)?;
+            let fingerprint = current.as_deref().map(hash);
+            if fingerprint != edit.pre && fingerprint != edit.post {
+                return Err(self
+                    .conflict_report(
+                        run,
+                        &edit.path,
+                        edit.pre.as_deref(),
+                        edit.pre.as_deref(),
+                        current.as_deref(),
+                        None,
+                    )
+                    .await?);
             }
         }
         let mut reports = Vec::new();
@@ -565,7 +657,24 @@ impl LocalTools {
                     ),
                     None => None,
                 };
-                self.atomic_write(&edit.path, bytes.as_deref())?;
+                // Blob loading may yield. Check again immediately before the atomic effect.
+                let observed = self.content(&edit.path)?;
+                let fingerprint = observed.as_deref().map(hash);
+                if fingerprint != edit.pre && fingerprint != edit.post {
+                    return Err(self
+                        .conflict_report(
+                            run,
+                            &edit.path,
+                            edit.pre.as_deref(),
+                            edit.pre.as_deref(),
+                            observed.as_deref(),
+                            None,
+                        )
+                        .await?);
+                }
+                if fingerprint != edit.post {
+                    self.atomic_write(&edit.path, bytes.as_deref())?;
+                }
             }
             self.record_edit(run, key, &tool.call.id, edit).await?;
             if let Some(hash) = &edit.post {
@@ -579,6 +688,8 @@ impl LocalTools {
                     .await
                     .map_err(|e| e.to_string())?;
                 self.remember(run, &tool.call.id, &edit.path, bytes).await?;
+            } else {
+                self.forget_snapshot(run, &edit.path).await?;
             }
             let (path, run, call) = (
                 self.root.join(&edit.path).to_string_lossy().into_owned(),
@@ -790,6 +901,20 @@ pub fn head_tail(text: &str, budget: usize) -> String {
 impl ToolRuntime for LocalTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
         ["apply_patch","edit_file","exec","exec_io","glob","grep","read_file","write_file"].into_iter().map(|name|ToolDefinition{name:name.into(),description:match name{"read_file"=>"Read a file with numbered lines and a fingerprint, default 200 lines.","write_file"=>"Create or rewrite a file after checking the run's read fingerprint.","edit_file"=>"Replace unique text using exact, typography-normalized or trailing-space matching.","apply_patch"=>"Apply Codex block patches adding, deleting or updating multiple files.","grep"=>"Search regex in files respecting gitignore; return bounded per-file summaries.","glob"=>"Find paths matching a glob while respecting gitignore.","exec"=>"Run a command in a persistent pipe or PTY session under host execution policy.",_=>"Read, write, wait for, signal or close owned terminal sessions."}.into(),input_schema:Self::schema(name).unwrap()}).collect()
+    }
+    fn scheduling<'a>(
+        &'a self,
+        run: &'a str,
+        call: &'a ToolCall,
+    ) -> BoxFuture<'a, Option<ToolScheduling>> {
+        Box::pin(async move {
+            self.scheduling_resources(run, call)
+                .ok()
+                .map(|(resources, exclusive)| ToolScheduling {
+                    resources,
+                    exclusive,
+                })
+        })
     }
     fn prepare<'a>(
         &'a self,

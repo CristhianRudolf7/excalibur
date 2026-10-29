@@ -111,6 +111,28 @@ impl Journal {
     }
     /// A confirmed event key is immutable. Retransmission must carry exactly the same payload.
     pub async fn append(&self, run: &str, kind: &str, key: &str, payload: Value) -> Result<u64> {
+        self.append_guarded(run, kind, key, payload, false)
+            .await?
+            .ok_or(Error::Invalid("unconditional event was not appended"))
+    }
+    /// Admit an effect only if its execution is still running in the same writer transaction.
+    pub async fn append_when_running(
+        &self,
+        run: &str,
+        kind: &str,
+        key: &str,
+        payload: Value,
+    ) -> Result<Option<u64>> {
+        self.append_guarded(run, kind, key, payload, true).await
+    }
+    async fn append_guarded(
+        &self,
+        run: &str,
+        kind: &str,
+        key: &str,
+        payload: Value,
+        only_running: bool,
+    ) -> Result<Option<u64>> {
         if kind.is_empty() || key.is_empty() || kind.len() > 80 || key.len() > 1024 {
             return Err(Error::Invalid("event kind/key invalid"));
         }
@@ -118,9 +140,7 @@ impl Journal {
         if text.len() > 16 * 1024 * 1024 {
             return Err(Error::Invalid("event exceeds 16 MiB"));
         }
-        let run = run.to_owned();
-        let kind = kind.to_owned();
-        let key = key.to_owned();
+        let (run, kind, key) = (run.to_owned(), kind.to_owned(), key.to_owned());
         if text.len() > 64 * 1024 {
             let blobs = self.db.blobs();
             let bytes = text.clone().into_bytes();
@@ -130,17 +150,33 @@ impl Journal {
             Ok(self
                 .db
                 .write_with_blob(prepared, Priority::Journal, move |c, hash| {
-                    append_row(c, &run, &kind, &key, None, Some(hash.as_str()))
+                    if only_running && authoritative_state(c, &run)?.0 != "running" {
+                        return Ok(None);
+                    }
+                    append_row(c, &run, &kind, &key, None, Some(hash.as_str())).map(Some)
                 })
                 .await?)
         } else {
             Ok(self
                 .db
                 .write(Priority::Journal, move |c| {
-                    append_row(c, &run, &kind, &key, Some(&text), None)
+                    if only_running && authoritative_state(c, &run)?.0 != "running" {
+                        return Ok(None);
+                    }
+                    append_row(c, &run, &kind, &key, Some(&text), None).map(Some)
                 })
                 .await?)
         }
+    }
+    /// Cheap advisory read; effect admission must still use the writer-side guard.
+    pub async fn is_running(&self, run: &str) -> Result<bool> {
+        let run = run.to_owned();
+        Ok(self
+            .db
+            .read(ReadLane::Interactive, move |c| {
+                Ok(authoritative_state(c, &run)?.0 == "running")
+            })
+            .await?)
     }
     pub async fn set_state(
         &self,
@@ -149,24 +185,89 @@ impl Journal {
         reason: Option<String>,
         key: &str,
     ) -> Result<()> {
-        if state.len() > 80 || reason.as_ref().is_some_and(|s| s.len() > 65536) {
-            return Err(Error::Invalid("state/reason too large"));
+        match self
+            .change_state(run, &["running", "paused", "blocked"], state, reason, key)
+            .await?
+        {
+            StateChange::Rejected => Err(Error::Invalid("terminal execution cannot change state")),
+            StateChange::Applied | StateChange::Unchanged => Ok(()),
         }
-        let run = run.to_string();
-        let state = state.to_string();
-        let key = key.to_string();
+    }
+
+    /// Atomically compare the authoritative journal state before appending a transition.
+    /// Replayed keys are immutable no-ops; terminal states cannot be reopened.
+    pub async fn set_state_if(
+        &self,
+        run: &str,
+        expected: &[&str],
+        state: &str,
+        reason: Option<String>,
+        key: &str,
+    ) -> Result<bool> {
+        Ok(matches!(
+            self.change_state(run, expected, state, reason, key).await?,
+            StateChange::Applied
+        ))
+    }
+    async fn change_state(
+        &self,
+        run: &str,
+        expected: &[&str],
+        state: &str,
+        reason: Option<String>,
+        key: &str,
+    ) -> Result<StateChange> {
+        if !matches!(
+            state,
+            "running" | "paused" | "blocked" | "completed" | "completed_with_pending" | "cancelled"
+        ) || reason.as_ref().is_some_and(|s| s.len() > 65536)
+            || key.is_empty()
+            || key.len() > 1024
+        {
+            return Err(Error::Invalid("invalid state transition argument"));
+        }
+        let (run, state, key) = (run.to_owned(), state.to_owned(), key.to_owned());
+        let expected = expected.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let text = serde_json::to_string(&serde_json::json!({"state":state,"reason":reason}))?;
-        self.db
+        Ok(self
+            .db
             .write(Priority::Journal, move |c| {
+                let (current, current_reason) = authoritative_state(c, &run)?;
+                // Rebuild the projection from the journal, including on a rejected CAS.
+                c.execute(
+                    "UPDATE runs SET state=?2,reason=?3 WHERE id=?1",
+                    rusqlite::params![run, current, current_reason],
+                )?;
+                let duplicate: bool = c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM journal WHERE run_id=?1 AND idempotency_key=?2)",
+                    rusqlite::params![run, key],
+                    |r| r.get(0),
+                )?;
+                if duplicate {
+                    append_row(c, &run, "state_change", &key, Some(&text), None)?;
+                    return Ok(StateChange::Unchanged);
+                }
+                if matches!(
+                    current.as_str(),
+                    "cancelled" | "completed" | "completed_with_pending" | "failed"
+                ) {
+                    return Ok(if current == state {
+                        StateChange::Unchanged
+                    } else {
+                        StateChange::Rejected
+                    });
+                }
+                if !expected.contains(&current) {
+                    return Ok(StateChange::Rejected);
+                }
                 append_row(c, &run, "state_change", &key, Some(&text), None)?;
                 c.execute(
                     "UPDATE runs SET state=?2,reason=?3,updated_at=unixepoch() WHERE id=?1",
                     rusqlite::params![run, state, reason],
                 )?;
-                Ok(())
+                Ok(StateChange::Applied)
             })
-            .await?;
-        Ok(())
+            .await?)
     }
 
     pub async fn entries(&self, run: &str, after: u64, limit: u32) -> Result<Vec<Event>> {
@@ -222,6 +323,41 @@ impl Journal {
         }
         Ok(events)
     }
+}
+fn authoritative_state(
+    c: &rusqlite::Connection,
+    run: &str,
+) -> excalibur_store::Result<(String, Option<String>)> {
+    let exists: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM durable_operations WHERE run_id=?1)",
+        [run],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Err(StoreError::Invalid("durable run does not exist"));
+    }
+    let latest:Option<Option<String>>=c.query_row("SELECT payload FROM journal WHERE run_id=?1 AND kind='state_change' ORDER BY sequence DESC LIMIT 1",[run],|r|r.get(0)).optional()?;
+    match latest {
+        None => Ok(("running".into(), None)),
+        Some(Some(payload)) => {
+            let value: Value = serde_json::from_str(&payload)
+                .map_err(|_| StoreError::Invalid("invalid durable state payload"))?;
+            Ok((
+                value["state"]
+                    .as_str()
+                    .ok_or(StoreError::Invalid("durable state missing"))?
+                    .to_string(),
+                value["reason"].as_str().map(str::to_owned),
+            ))
+        }
+        Some(None) => Err(StoreError::Invalid("durable state payload must be inline")),
+    }
+}
+#[derive(Clone, Copy)]
+enum StateChange {
+    Applied,
+    Unchanged,
+    Rejected,
 }
 fn append_row(
     c: &rusqlite::Connection,

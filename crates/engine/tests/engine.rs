@@ -253,6 +253,19 @@ struct Parallel {
     order: Mutex<Vec<String>>,
 }
 impl ToolRuntime for Parallel {
+    fn scheduling<'a>(
+        &'a self,
+        run: &'a str,
+        call: &'a ToolCall,
+    ) -> BoxFuture<'a, Option<ToolScheduling>> {
+        Box::pin(async move {
+            self.prepare(run, call.clone())
+                .await
+                .ok()
+                .map(|tool| ToolScheduling::from_prepared(&tool))
+        })
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition> {
         vec![ToolDefinition {
             name: "probe".into(),
