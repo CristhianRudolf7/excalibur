@@ -1,0 +1,1 @@
+CREATE TABLE storage_metadata(key TEXT PRIMARY KEY NOT NULL,value TEXT NOT NULL);

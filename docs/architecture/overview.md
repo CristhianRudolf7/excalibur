@@ -2,7 +2,7 @@
 
 [Español](overview.es.md)
 
-This document describes the intended architecture. A partial Rust provider library exists; the agent and interfaces are not yet implemented. See [provider coverage](provider-implementation.md).
+This document describes the intended architecture. A partial Rust provider library and base/storage libraries exist; the agent and interfaces are not yet implemented. See [provider coverage](provider-implementation.md).
 
 ## Shared core and interfaces
 

@@ -6,7 +6,9 @@ Excalibur is a planned personal AI agent that will converse with users, help pla
 
 ## Status
 
-The repository contains an initial structure, documentation and a partial Rust provider library. The agent, CLI, web interface and store have not yet been implemented. See [provider coverage and limits](docs/architecture/provider-implementation.md).
+The repository contains an initial structure, documentation, a partial Rust provider library, and shared base/storage libraries. The agent, CLI, web interface and store have not yet been implemented. See [provider coverage and limits](docs/architecture/provider-implementation.md).
+
+See [Base and storage](docs/development/storage.md) for implementation and verification evidence.
 
 For toolchain setup and available checks, see the [development environment](docs/development/environment.md).
 

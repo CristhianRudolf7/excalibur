@@ -1,0 +1,3 @@
+CREATE TABLE files(id TEXT PRIMARY KEY NOT NULL, path TEXT NOT NULL UNIQUE, hash TEXT NOT NULL, language TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
+CREATE TABLE nodes(id TEXT PRIMARY KEY NOT NULL, file_id TEXT REFERENCES files(id) ON DELETE CASCADE, kind TEXT NOT NULL, name TEXT, start_offset INTEGER, end_offset INTEGER, created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
+CREATE TABLE edges(id TEXT PRIMARY KEY NOT NULL, source_id TEXT REFERENCES nodes(id) ON DELETE CASCADE, destination_id TEXT REFERENCES nodes(id) ON DELETE CASCADE, kind TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()));

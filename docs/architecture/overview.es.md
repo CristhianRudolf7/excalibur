@@ -2,7 +2,7 @@
 
 [English](overview.md)
 
-Este documento describe la arquitectura prevista. Existe una biblioteca Rust parcial de proveedores; el agente y las interfaces aún no están implementados. Consulta la [cobertura de proveedores](provider-implementation.es.md).
+Este documento describe la arquitectura prevista. Existen una biblioteca Rust parcial de proveedores y bibliotecas de base/almacenamiento; el agente y las interfaces aún no están implementados. Consulta la [cobertura de proveedores](provider-implementation.es.md).
 
 ## Núcleo compartido e interfaces
 

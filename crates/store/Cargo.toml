@@ -1,0 +1,23 @@
+[package]
+name = "excalibur-store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+excalibur-types = { path = "../types" }
+excalibur-config = { path = "../config" }
+rusqlite = { version = "0.37", features = ["bundled", "modern_sqlite", "hooks"] }
+sqlite-vec = "=0.1.9"
+tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
+thiserror = "2"
+sha2 = "0.10"
+serde_json = "1"
+zstd = "0.13"
+fs2 = "0.4"
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

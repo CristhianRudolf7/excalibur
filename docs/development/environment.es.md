@@ -2,7 +2,7 @@
 
 [English](environment.md)
 
-Excalibur contiene actualmente una biblioteca Rust de proveedores. El agente, la CLI, el servidor Axum y el frontend están previstos; todavía no existe una aplicación ni un servidor de desarrollo que iniciar. Las comprobaciones de dependencias de esta página no son funcionalidades implementadas del producto.
+Excalibur contiene actualmente bibliotecas Rust de proveedores y de base/almacenamiento. El agente, la CLI, el servidor Axum y el frontend están previstos; todavía no existe una aplicación ni un servidor de desarrollo que iniciar. Las comprobaciones de dependencias de esta página no son funcionalidades implementadas del producto.
 
 ## Entorno comprobado en esta VPS
 
@@ -20,7 +20,7 @@ La ruta `/opt` es propia de esta máquina. En otra, instala una versión LTS com
 
 ## Comprobación de dependencias
 
-Un proyecto Rust temporal compiló Axum 0.8.9 y Tokio 1.54.1 con este entorno. Axum aún no es dependencia de Excalibur; Tokio se utiliza en las pruebas de la biblioteca de proveedores. Otro proyecto temporal con pnpm instaló e importó React 19.3.1, React DOM 19.3.1, Vite 8.3.5, su plugin React 6.1.2, Tailwind CSS y su plugin Vite 4.3.3, y TypeScript 7.0.2. `vite --version` y `tsc --version` funcionaron. Son versiones observadas en la comprobación temporal, no dependencias fijadas ni instaladas en este repositorio; cuando se cree el frontend habrá que elegir y fijar versiones compatibles.
+Un proyecto Rust temporal compiló Axum 0.8.9 y Tokio 1.54.1 con este entorno. Axum aún no es dependencia de Excalibur; Tokio se utiliza en las bibliotecas de proveedores y almacenamiento y sus pruebas backend. Otro proyecto temporal con pnpm instaló e importó React 19.3.1, React DOM 19.3.1, Vite 8.3.5, su plugin React 6.1.2, Tailwind CSS y su plugin Vite 4.3.3, y TypeScript 7.0.2. `vite --version` y `tsc --version` funcionaron. Son versiones observadas en la comprobación temporal, no dependencias fijadas ni instaladas en este repositorio; cuando se cree el frontend habrá que elegir y fijar versiones compatibles.
 
 ## Comprobaciones Rust existentes
 

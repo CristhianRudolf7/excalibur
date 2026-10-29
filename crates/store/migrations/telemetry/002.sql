@@ -1,0 +1,1 @@
+CREATE TABLE metric_daily(day TEXT NOT NULL, name TEXT NOT NULL, labels TEXT NOT NULL DEFAULT '{}', value REAL NOT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY(day,name,labels));

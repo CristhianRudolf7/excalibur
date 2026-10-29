@@ -2,7 +2,7 @@
 
 [Español](environment.es.md)
 
-Excalibur currently contains a Rust provider library. The agent, CLI, Axum server and frontend are planned; there is no application or development server to start yet. Do not treat the dependency checks below as implemented product features.
+Excalibur currently contains Rust provider and base/storage libraries. The agent, CLI, Axum server and frontend are planned; there is no application or development server to start yet. Do not treat the dependency checks below as implemented product features.
 
 ## Environment checked on this VPS
 
@@ -20,7 +20,7 @@ The `/opt` path is local to this machine. Elsewhere, install a compatible Node.j
 
 ## Dependency verification
 
-A temporary Rust project compiled Axum 0.8.9 and Tokio 1.54.1 with this toolchain. Axum is not yet a dependency of Excalibur; Tokio is used by the existing provider library tests. A separate temporary pnpm project installed and imported React 19.3.1, React DOM 19.3.1, Vite 8.3.5, its React plugin 6.1.2, Tailwind CSS and its Vite plugin 4.3.3, and TypeScript 7.0.2. `vite --version` and `tsc --version` ran successfully. These are versions observed in the temporary check, not dependencies pinned or installed into this repository; choose and lock compatible versions when the frontend is actually created.
+A temporary Rust project compiled Axum 0.8.9 and Tokio 1.54.1 with this toolchain. Axum is not yet a dependency of Excalibur; Tokio is used by provider and storage libraries and their backend tests. A separate temporary pnpm project installed and imported React 19.3.1, React DOM 19.3.1, Vite 8.3.5, its React plugin 6.1.2, Tailwind CSS and its Vite plugin 4.3.3, and TypeScript 7.0.2. `vite --version` and `tsc --version` ran successfully. These are versions observed in the temporary check, not dependencies pinned or installed into this repository; choose and lock compatible versions when the frontend is actually created.
 
 ## Existing Rust checks
 

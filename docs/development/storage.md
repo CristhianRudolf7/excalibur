@@ -1,0 +1,106 @@
+# Base and storage
+
+[Español](storage.es.md)
+
+This implements **Base and storage**, the first implementation row of Appendix E in the external `arquitectura-arnes.md`: sections 3.4, 4.1–4.6, the configuration portion of 25.2, and applicable storage checks of 4.8. The architecture source is unchanged. The provider library is preserved.
+
+## Core and host boundaries
+
+| Crate | Implemented responsibility |
+|---|---|
+| `excalibur-types` | Validated, serializable, prefixed ULIDs and canonical project short codes |
+| `excalibur-config` | Explicit TOML layers, key permissions, validation, stable path resolution and non-overwriting initialization |
+| `excalibur-store` | SQL-neutral `Store` contract; SQLite `Database` adapter, paths, writers/readers, blobs, migrations, maintenance and recovery |
+| `excalibur-providers` | Existing outbound provider library |
+
+Other crates and application capabilities in 3.4 remain planned. Foundational tables do not constitute an agent engine, journal reconciler, retriever, daemon, gateway, CLI, HTTP server or mobile interface. The existing provider crate remains the precursor to the model gateway.
+
+`Store` exposes typed messages, scope-filtered FTS search, persistent code reservation and blob operations through `Send` futures without SQLite types. `MessageRecord.scope_id` is required on append. `search_messages(query, scopes, limit)` requires explicit nonempty scopes and filters them before ranking/limiting; legacy NULL scopes map to `legacy:unscoped`, never an implicitly public scope. Lookup by message ID remains a trusted principal-level repository operation. The embedding application supplies authorization and the permitted scope set.
+
+`Database::write/read` accept short synchronous SQLite closures for trusted adapters. They must not accept client SQL, manage transaction boundaries, execute arbitrary agent code or perform long/remote work. Domain logic belongs to the shared core; filesystem, configuration and lifecycle choices belong to host adapters. No home directory, credential store, network-mount detector or process supervisor is inferred.
+
+`StoragePaths::for_principal(root, PrincipalId)` yields independent `excalibur.db`, `telemetry.db` and `projects/<ProjectId>/codegraph.db` paths. `Database::open(path, kind, config)` acquires exclusive ownership, checks SQLite, migrates and opens readers. Clones share a writer. Main databases in the same parent directory share an exclusive blob-owner lock; a second main database there is rejected, even under another filename. Different principals use different directories. Telemetry/code graph cannot publish or read principal blobs through `Database` (`PrincipalOnly`); their unused blob handles have disjoint `blob-stores/<filename>` namespaces and their maintenance never scans principal blobs. A prepared blob cannot be published by a different namespace (`BlobOwnerMismatch`).
+
+The host calls `shutdown().await` to close admissions, drain accepted writes and active blocking work, unregister maintenance and join the writer. Cancelled callers' active readers are included. A cancelled queued backup exits without publishing; an active SQLite backup observes cancellation/shutdown through a progress handler. Failure sets `is_failed()` and emits `WriterFailed`; restarting is the host's responsibility. Events and stats expose contention, full disk, recovery, blob issues, checkpoints and maintenance errors. Use `startup_events()` for opening observations; broadcast consumers must handle lag and inspect persistent state.
+
+## Configuration contract
+
+Layers are considered in order: defaults < system < user < project < scope. System/user files may override current global keys. All current settings (`data_dir` and every `storage.*` key) are installation-global, so project/scope files accept only empty/comment-only TOML until genuine local settings exist. A forbidden key, including an empty `[storage]` table or an unknown key, returns `ConfigError::ForbiddenLayerKey { layer, key, path }`; it is never silently ignored. Unknown/invalid trusted settings also fail. The host selects trusted layer files; project content cannot redirect storage or relax durability.
+
+`ConfigLayers::load` requires absolute defaults and layer paths. Relative `data_dir` declared by a trusted file resolves against that file's directory. `load_from(defaults, absolute_base)` resolves relative host-supplied defaults and layer paths against an explicit absolute base. Resolution normalizes `.`/`..` lexically, permits directories not yet created, and never consults process cwd. It does not canonicalize symlinks or claim a filesystem sandbox. `Config::validate` requires an absolute data directory. `initialize` requires an absolute configuration path and never overwrites an existing file.
+
+## Durability and scheduling
+
+- Bundled SQLite through rusqlite 0.37, FTS5 and statically linked sqlite-vec **0.1.9**; no runtime extension download or inference. Main schema contains foundational Appendix A tables, foreign keys, UTC timestamps, explicit timezone fields and cross-domain edges. Telemetry and reconstructible graphs have separate schemas/files.
+- Declared local storage uses WAL; main writer uses `synchronous=FULL`, telemetry/code graph `NORMAL`. Declared network storage uses `DELETE` and emits `NetworkJournalDegraded`. mmap defaults to zero and is explicitly controlled/disabled by the host for its lifecycle profile. Cache defaults: 8 MiB per writer, 2 MiB per reader.
+- One writer thread per file; four separately bounded lanes: Interactive > Journal > Normal > Background (1024 slots each by default). Background saturation cannot consume interactive admission. Each `BEGIN IMMEDIATE` group has at most 200 commands and checks the 5 ms budget between commands, adding only same/higher-priority work. SAVEPOINTs isolate command failures. Responses follow group commit; cancelling an admitted caller does not undo a possible commit.
+- Priority guarantees queue order, not a wall-clock bound on an individual SQL command, fsync or external lock. Stats report per-priority waiting and completion latency. Compression, hashing, duplicate preparation and scans run outside the writer. Publication never rereads/decompresses an existing blob inside a transaction.
+- External BUSY/LOCKED uses a configurable 5 s timeout and up to three bounded exponential retries with jitter. Genuine FULL pauses background work, while interactive admission remains available; the host restores space then calls `resume_background()`. `TransactionControl` preserves the original error and SAVEPOINT/ROLLBACK error; `GroupAborted` retains that cause for affected commands. Unrecoverable group rollback stops the writer. Non-FULL transaction-control failures do not emit disk-full events or pause background work.
+- Readers are read-only/query-only, off the async runtime, with snapshots rolled back before reuse even on panic. The pool reserves an independent interactive connection. Default size is `min(4, cores)` with a minimum of two; this preserves the background connection even on one-core hosts, with the decision also stored in `decisions`.
+- PASSIVE checkpoints run on idle writers; WAL above 256 MiB emits `WalLarge`. TRUNCATE attempts during maintenance never wait for a pinned reader. SQLite's normal autocheckpoint remains enabled.
+
+One process-wide maintenance thread and one current-thread Tokio runtime serve weak database registrations serially. There is no per-file maintenance thread/runtime. Default `MaintenancePolicy` waits at least 300 seconds and permits work in 03:00–04:00 UTC, with a 24-hour interval. The host can supply its own window using `open_with_maintenance`, disable automatic work with `MaintenancePolicy::manual()`, and gate low activity with `set_maintenance_allowed(false)`. Busy/paused/closed files are deferred or removed. This is a storage scheduling hook, not the later application agenda. Explicit `maintenance(now)` performs backup rotation, one bounded blob-verification step on main only, candidate GC and a nonblocking TRUNCATE attempt. Backups and scans use independent blocking workers; only short, revalidated GC deletions enter the writer. A single maintenance exclusion covers backup and GC, including completion of cancelled blocking work.
+
+## Blob publication and integrity
+
+Blobs are SHA-256 addressed by uncompressed content, stored as zstd under `blobs/sha256/ab/<remaining hash>`. Streaming preparation hashes/compresses to a same-filesystem temporary file and syncs it outside the writer. The prepared file holds an exclusive staging lease. Publication atomically renames the known content, including duplicates and repairs, and applies directory durability barriers before inserting owner rows. Windows has a native write-through rename adapter; its runtime behavior is not verified here. Reference triggers cover attachments, documents, evidence, journal payloads, file versions and packages; other owners use `blob_refs`. Each commit validates newly touched physical references.
+
+GC considers only files older than 24 hours, rechecks live references and metadata age, and protects references in retained backups. It skips prepared staging files with a live lease. Writer serialization prevents canonical publication racing GC; generation tokens prevent an older verification observation overwriting a repaired publication. Backup/GC exclusion prevents a new snapshot from racing deletion. Keep a registered reference while content is needed.
+
+SQLite health and blob availability have independent contracts. Opening runs SQLite `quick_check`, reports bounded foreign-key issues, and samples at most **32 referenced blobs using metadata only** (existence/type/compressed size). It never reads or decompresses all blob contents. Missing, invalid or unavailable blobs do not replace healthy SQLite, prevent access to unrelated data, delete owner rows or discard confirmed post-snapshot messages.
+
+`Database::verify_blobs(VerificationBudget)` performs resumable bounded background work: default **8 completed blobs / 4 MiB decoded per call**, maximum 1024 / 64 MiB. A 64 KiB buffer and capped 8 MiB zstd window avoid allocation proportional to content size; a large blob continues across calls. Progress exposes decoded bytes, completed items, observations and whether work remains. Repeated host calls advance a complete cycle; one scheduled maintenance step does not promise to finish a large store. `BlobIoStats` counts direct verified reads separately; verifier byte counts are in its progress.
+
+`Database::read_blob` / `Store::get_blob` verify decompressed content on access with the caller's size limit. `BlobMissing`, `BlobCorrupt` and `BlobTooLarge` distinguish outcomes; a too-small caller limit is not corruption. Persistent `blob_integrity` holds the last observed state/time/detail, while `blob_incidents` retains incidents and their resolution times. States are `ok`, `missing`, `corrupt`, `metadata_missing` and `unavailable`. Successful prepared publication/verification resolves incidents. Observations are last-known facts, not a guarantee against later external filesystem changes; stale generations are discarded. Integrity events expose applied issues. Independent I/O errors remain typed storage errors.
+
+## Migrations, indexes and recovery
+
+Four embedded, checksummed migrations per file role are transactional. Existing migration scripts are immutable. Schema expansion retains older readable columns/tables; a failed migration rolls back its changes. An existing schema receives a synced `VACUUM INTO` snapshot before upgrade. Backups are independently read, synced and atomically published: seven daily and four weekly; pre-upgrade copies are limited to seven and 28 days.
+
+Natural-language FTS5 uses `unicode61 remove_diacritics 2`; code graph paths/content and symbol names use `trigram`. Migration rebuilds indexes from canonical rows and preserves trigger behavior. Scoped vector tables use a real `vec0` `scope_id TEXT PARTITION KEY` with immutable dimensions/encoding and a key derived from scope plus object. `create_vector_space` defaults to Float32; `create_quantized_vector_space` supports Float32, Int8 and Bit (bit dimensions divisible by eight). `put_vector`/`delete_vector` require scope. `query_vectors` requires explicit scopes and filters each partition before KNN ranking, then merges scoped top-k results. Tests supply synthetic vectors; no embeddings are generated.
+
+Migration copies legacy `vectors_<id>` to `scoped_vectors_<id>` atomically, inferring unambiguous scopes from canonical records and quarantining unresolved scope as `legacy:unscoped`. Legacy tables remain readable snapshots for old binaries. Writes by an old binary to those derived legacy vectors are not synchronized into scoped indexes; canonical source records remain authoritative, and reindexing belongs to the future indexer. SQLite does not support triggers on virtual tables. Unknown/unsupported legacy definitions fail the migration transaction rather than silently dropping data.
+
+Only actual SQLite corruption (`quick_check` failure or SQLite CORRUPT/NOTADB) permits automatic restoration; contention and I/O errors propagate without substitution. Snapshot selection checks SQLite independently of current blob availability. The original database and existing sidecars are retained in `recovery/`. With a valid snapshot, replacement is atomic and lexical indexes are rebuilt. With no valid main snapshot, opening returns typed `Corrupt` and leaves the source in place. A reconstructible graph can be recreated and emits `RebuildRequired(CodeGraph)`; source indexing is not implemented.
+
+`RecoveryInfo(RecoveryReport)` exposes original/snapshot paths, snapshot file timestamp (not an exact commit boundary), recovery time, a separate salvage path/count, unreadable tables and `data_loss_possible`. Main also persists the report in `storage_recoveries`. Recovery preserves up to 1000 readable rows / 8 MiB as JSON values in `salvaged_rows` in a separate SQLite file, without merging uncertain data into authoritative tables. Salvage is best effort and not complete recovery from physical corruption. The consumer must surface the possible snapshot-to-recovery loss window and reconcile retained material explicitly. Offline `restore_backup(path, snapshot, kind)` requires released database and blob ownership and returns the same report contract.
+
+## Requirements and executable evidence
+
+| Requirement | Backend evidence |
+|---|---|
+| Workspace, IDs, stable short codes | `crates/types`; `tests/lifecycle.rs`: codes survive deletion/reopen; `tests/old_reader.rs`: separately compiled baseline reader |
+| Layer permissions, precedence and cwd-independent paths | `crates/config` tests reject every global key in project/scope, check trusted priorities and launch helpers in two different cwd directories |
+| Four-priority concurrent load, zero internal BUSY, reserved reader, overtaking | `tests/storage.rs`: 200 writes with simultaneous reads, external lock subprocess, reader reservation, queue ordering |
+| Error classification and isolation | `tests/integrity.rs`: constraint auto-rollback, denied SAVEPOINT, premature RELEASE, denied group ROLLBACK; storage tests use genuine SQLITE_FULL |
+| Durable blobs and interruption recovery | `tests/crash.rs`: four synchronized process termination phases; `tests/boundary.rs`: attachment/ref integrity; lifecycle GC/backup protection |
+| Missing/corrupt blobs preserve every confirmed message | `tests/integrity.rs`: six combinations (without snapshot, snapshot before/after blob × missing/corrupt), six confirmed messages retained, typed errors/ledger; lifecycle metadata-missing test retains post-snapshot content |
+| Bounded startup/scrub, repair race and duplicate priority | `tests/integrity.rs`: no startup decode, 64 KiB incremental budget, stale observation suppression, gated duplicate preparation allowing interactive completion without timing-only assertions, GC/staging leases |
+| Ownership and maintenance across all roles | `tests/integrity.rs`: simultaneous main/telemetry/graph maintenance, live blob retained; rejects conflicting main/foreign staging |
+| Structural recovery and consumer-visible loss | `tests/integrity.rs`: damaged real index page, snapshot recovery, all five post-snapshot messages readable in separate salvage; valid SQLite snapshot usable despite missing blob |
+| Normalization, trigram, scoped vectors, safe expansion | `tests/indexes.rs`: preserved legacy rows/triggers, scoped identity/query/delete, inferred/quarantined scopes, atomic unsupported upgrade; schema transaction/checksum tests |
+| Shared scheduler, resource usage, cancellation/close | `tests/maintenance.rs`: every minute of window policy, 12 projects/one worker/no startup runs, registrations released, cancelled queued backup; boundary test drains cancelled readers |
+| WAL >256 MiB, snapshot pinning, PASSIVE/TRUNCATE | `long_reader_triggers_real_wal_limit_and_checkpoint_events` in `tests/storage.rs` |
+| Backup rotation, offline restore, panics | `tests/lifecycle.rs`, `tests/boundary.rs`, `tests/storage.rs` |
+
+Paths under `tests/` in this table refer to `crates/store/tests/`. Run from the repository root:
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo test -p excalibur-store -- --nocapture
+cargo build --workspace
+```
+
+Verification on this VPS: **111 passing tests** (47 provider, 64 foundation/storage), no failures. Two ignored subprocess helper entries are invoked by their active parent tests (configuration cwd and external lock); no verification is skipped by that annotation. Formatting, warnings-denied Clippy and workspace build pass. Runtime reports SQLite **3.50.2**, FTS5 enabled, sqlite-vec **v0.1.9**. The four-priority load reports zero BUSY errors/internal retries; interruption cases reopen with `quick_check=ok` and zero dangling physical references. The WAL test exceeds its 268,435,456-byte threshold and truncates to zero. The resource check with 12 project databases verifies one maintenance worker, no immediate maintenance and at most one added dedicated writer thread per file; One Linux run observed 12 added writer threads and 6228 KiB additional RSS. These are observations, not portable memory limits.
+
+The exact sqlite-vec **=0.1.9** pin is a published non-yanked stable crate verified in the [official registry index](https://index.crates.io/sq/li/sqlite-vec) and [crate documentation](https://docs.rs/crate/sqlite-vec/0.1.9). The [upstream release](https://github.com/asg017/sqlite-vec/releases/tag/v0.1.9) includes the long-text metadata DELETE fix; the backend regression exercises it, Float32/Int8/Bit and the bundled SQLite combination. A newer alpha listing is not evidence that a stable crate is unavailable.
+
+## Verified environment and application limits
+
+Built and run on Ubuntu 24.04, x86-64 Linux, Rust/Cargo 1.99.1. No build/runtime verification is claimed for Windows, macOS, Android or iOS. The core exposes explicit filesystem/configuration/lifecycle boundaries without imposing a new platform restriction. Declared network-storage pragmas are tested, not a physical NFS/SMB mount. Process termination tests do not represent a physical disk/VM power cut; fsync durability depends on the filesystem and hardware honoring flushes. All test data is synthetic, in temporary directories; provider calls use mocks. No model, credentials, embeddings service, GPU or paid service is needed.
+
+These 4.8 application checks belong to capabilities outside this row: client retention/retry of messages after full-disk rejection (gateway/client), semantic user-confirmed retention/purge across journals and backups (4.7), source-derived graph repopulation (indexer), daemon termination/restart (supervision). Their storage errors, isolation, GC, restoration and lifecycle mechanisms are implemented and tested here; the later application workflows are not claimed.
+
+Sources: [SQLite WAL](https://sqlite.org/wal.html), [transactions](https://sqlite.org/lang_transaction.html), [PRAGMAs](https://sqlite.org/pragma.html), [VACUUM INTO](https://sqlite.org/lang_vacuum.html), [FTS5 tokenizers](https://sqlite.org/fts5.html#tokenizers), [sqlite-vec partition keys](https://alexgarcia.xyz/sqlite-vec/features/vec0.html#partition-key-columns), [virtual-table limitations](https://sqlite.org/lang_createtrigger.html).

@@ -1,0 +1,4 @@
+CREATE TABLE events(id TEXT PRIMARY KEY NOT NULL, principal_id TEXT, scope_id TEXT, run_id TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
+CREATE TABLE metrics(id INTEGER PRIMARY KEY, principal_id TEXT, scope_id TEXT, run_id TEXT, name TEXT NOT NULL, value REAL NOT NULL, labels TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
+CREATE TABLE traces(id TEXT PRIMARY KEY NOT NULL, principal_id TEXT, scope_id TEXT, run_id TEXT, parent_id TEXT, name TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, attributes TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
+CREATE INDEX events_run ON events(run_id,created_at);
