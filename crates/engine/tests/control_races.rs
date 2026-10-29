@@ -31,6 +31,7 @@ impl ModelGateway for Model {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ModelResponse {
                 message: Message {
+                    provider_state: None,
                     role: "assistant".into(),
                     content: String::new(),
                     tool_calls: vec![

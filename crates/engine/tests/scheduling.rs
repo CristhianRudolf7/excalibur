@@ -26,6 +26,7 @@ fn call(id: &str, resource: &str, mode: &str) -> ToolCall {
 fn response(calls: Vec<ToolCall>) -> ModelResponse {
     ModelResponse {
         message: Message {
+            provider_state: None,
             role: "assistant".into(),
             content: if calls.is_empty() {
                 "Verified synthetic result".into()

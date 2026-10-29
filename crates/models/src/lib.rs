@@ -1,7 +1,10 @@
 //! Provider-neutral model boundary over the existing outbound provider transport.
 //! No model selection, credentials discovery, paid inference or agent loop occurs here.
+mod cache;
 mod metrics;
+mod native;
 mod replay;
+pub use cache::*;
 use excalibur_providers::ProviderClient;
 use excalibur_types::runtime::{BoxFuture, Message, ModelRequest, ModelResponse, ToolCall, Usage};
 pub use metrics::*;
@@ -61,6 +64,9 @@ pub type StreamSink = Arc<dyn Fn(StreamDelta) + Send + Sync>;
 /// Stream deltas are provisional UI data. Only the returned complete response may
 /// enter the durable execution protocol; callbacks must never execute tool fragments.
 pub trait ModelGateway: Send + Sync {
+    fn cache_settings(&self) -> CacheSettings {
+        CacheSettings::default()
+    }
     /// True only for adapters supplying actual pricing in Usage.cost_microusd.
     fn cost_is_known(&self) -> bool {
         false
@@ -75,6 +81,14 @@ pub trait ModelGateway: Send + Sync {
         }
     }
     fn request_time_override(&self, _step: u64) -> Option<String> {
+        None
+    }
+    /// Recorded host context policy as neutral JSON; the engine validates it.
+    fn context_policy_override(&self) -> Option<Value> {
+        None
+    }
+    /// Exact cache metadata for provider-free durable replay, when recorded.
+    fn request_cache_override(&self, _step: u64) -> Option<excalibur_types::runtime::PromptCache> {
         None
     }
     fn call_bound(&self, _request: &ModelRequest) -> Option<ModelCallBound> {
@@ -107,6 +121,15 @@ pub trait ModelGateway: Send + Sync {
                 }
             }
         })
+    }
+    /// Internal cache-warming stream for the first real sibling. UI buffering
+    /// policy remains the responsibility of the ordinary streaming methods.
+    fn complete_cache_warm_observed<'a>(
+        &'a self,
+        request: ModelRequest,
+        sink: StreamSink,
+    ) -> BoxFuture<'a, Result<ObservedResponse, ModelCallError>> {
+        self.complete_stream_observed(request, sink)
     }
     fn complete_stream_observed<'a>(
         &'a self,
@@ -164,6 +187,7 @@ pub enum ModelRole {
     Master,
     Worker,
     Expert,
+    Extractor,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GatewayConfig {
@@ -177,6 +201,10 @@ pub struct GatewayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     pub native_tools: bool,
+    /// Override only after the host verifies this model's native mid-conversation
+    /// system role. None uses the adapter's conservative documented model list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_system_updates: Option<bool>,
     pub max_output_tokens: u32,
 }
 impl GatewayConfig {
@@ -188,10 +216,13 @@ impl GatewayConfig {
             seed: None,
             temperature: None,
             native_tools: true,
+            native_system_updates: None,
             max_output_tokens: 4096,
         }
     }
 }
+/// Backward-compatible name for the shared native/compatible provider gateway.
+pub type ProviderGateway = OpenAiGateway;
 pub struct OpenAiGateway {
     client: ProviderClient,
     config: GatewayConfig,
@@ -234,6 +265,7 @@ impl OpenAiGateway {
         Ok(self)
     }
     fn wire_request(&self, request: &ModelRequest) -> Result<Value, ModelError> {
+        cache::validate_cache(request)?;
         if request
             .reasoning_effort
             .as_ref()
@@ -283,7 +315,9 @@ impl OpenAiGateway {
                 // Tool-less models receive the exact durable call/result records in a textual envelope.
                 let mut text = message.content.clone();
                 if !message.tool_calls.is_empty() || message.tool_call_id.is_some() {
-                    text = serde_json::to_string(message)
+                    let mut record = message.clone();
+                    record.provider_state = None;
+                    text = serde_json::to_string(&record)
                         .map_err(|_| ModelError::Configuration("history serialization".into()))?;
                 }
                 let role = if message.role == "tool" {
@@ -318,13 +352,31 @@ impl OpenAiGateway {
                 body["response_format"] = json!({"type":"json_schema","json_schema":{"name":"excalibur_output","strict":true,"schema":schema}});
             }
         } else {
-            let instruction = json!({"protocol":"Return only a JSON object with exactly content (string) and tool_calls (array). Each tool call has id, name and arguments (JSON object). Use [] when no tool is needed. Tools may only be called when enabled. Tool results are replayed as user JSON records.","tools":definitions,"tools_enabled":request.tools_enabled,"content_schema":request.output_schema});
+            let instruction = json!({"protocol":"Return only a JSON object with exactly content (string) and tool_calls (array). Each tool call has id, name and arguments (JSON object). Use [] when no tool is needed. Tools may only be called when enabled. Tool results are replayed as user JSON records.","tools":definitions,"content_schema":request.output_schema});
             body["messages"].as_array_mut().unwrap().insert(
                 0,
                 json!({"role":"system","content":instruction.to_string()}),
             );
+            let enabled = format!(
+                "Tool calls enabled for this response: {}",
+                request.tools_enabled
+            );
+            let messages = body["messages"].as_array_mut().unwrap();
+            if let Some(last) = messages.last_mut()
+                && let Some(text) = last["content"].as_str()
+                && text.starts_with("[L5]\n")
+            {
+                last["content"] = json!(format!("{text}\n{enabled}"));
+            } else {
+                messages.push(json!({"role":"system","content":enabled}));
+            }
         }
-        Ok(body)
+        if self.client.provider() == excalibur_providers::Provider::OpenAi
+            && let Some(cache) = &request.cache
+        {
+            body["prompt_cache_key"] = json!(cache.namespace_key);
+        }
+        native::request(self.client.provider(), &self.config, request, body)
     }
     async fn run(
         &self,
@@ -357,7 +409,14 @@ impl OpenAiGateway {
             let mut counted_wire = body.clone();
             counted_wire["model"] = json!(self.config.model);
             counted_wire["stream"] = json!(sink.is_some());
-            if sink.is_some() {
+            if sink.is_some()
+                && !matches!(
+                    self.client.provider(),
+                    excalibur_providers::Provider::Anthropic
+                        | excalibur_providers::Provider::GoogleAi
+                        | excalibur_providers::Provider::Vertex
+                )
+            {
                 counted_wire["stream_options"] = json!({"include_usage":true});
             }
             let input_bytes = counted_wire.to_string().len() as u64;
@@ -369,6 +428,7 @@ impl OpenAiGateway {
                     .native_chat(&self.config.model, body.clone())
                     .await
                     .map_err(provider_error)
+                    .and_then(|raw| native::response(self.client.provider(), raw))
             };
             let raw = match raw {
                 Ok(raw) => raw,
@@ -394,6 +454,21 @@ impl OpenAiGateway {
             };
             let used = usage(&raw, input_bytes);
             let detail = usage_breakdown(&raw, &used);
+            if let Err(error) = detail.validate() {
+                let reported = UsageBreakdown::from_usage(&used);
+                metrics.usage.add(&reported);
+                metrics.cost_microusd = None;
+                metrics.usage_known &= !used.estimated;
+                metrics.duration_ms = elapsed_ms(started);
+                metrics.attempts.push(ModelAttemptMetrics {
+                    index: attempt,
+                    duration_ms: elapsed_ms(attempt_started),
+                    usage: reported,
+                    cost_microusd: None,
+                    error: Some(error.classification()),
+                });
+                return Err(ModelCallError { error, metrics });
+            }
             metrics.usage_known &= !used.estimated;
             let price = match &self.pricing {
                 Some(table) => match table.price(
@@ -466,13 +541,12 @@ impl OpenAiGateway {
                     {
                         return Err(ModelCallError { error, metrics });
                     }
-                    let content = raw
-                        .pointer("/choices/0/message/content")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let messages = body["messages"].as_array_mut().unwrap();
-                    messages.push(json!({"role":"assistant","content":content}));
-                    messages.push(json!({"role":"system","content":format!("Output validation failed: {reason}. Return one corrected output conforming to the specified schemas and tool protocol.")}));
+                    native::retry(
+                        self.client.provider(),
+                        &mut body,
+                        &raw["choices"][0]["message"],
+                        &reason,
+                    );
                 }
                 Err(error) => return Err(ModelCallError { error, metrics }),
             }
@@ -522,6 +596,7 @@ impl OpenAiGateway {
                 content,
                 tool_calls: calls,
                 tool_call_id: None,
+                provider_state: message.get("provider_state").cloned(),
             }
         } else {
             parse_text_protocol(
@@ -531,6 +606,9 @@ impl OpenAiGateway {
                     .ok_or(ModelError::Provider)?,
             )?
         };
+        if normalized.provider_state.is_none() {
+            normalized.provider_state = message.get("provider_state").cloned();
+        }
         validate_calls(&mut normalized, request)?;
         if normalized.tool_calls.is_empty()
             && let Some(schema) = &request.output_schema
@@ -550,6 +628,19 @@ impl OpenAiGateway {
         sink: &StreamSink,
         attempt: u8,
     ) -> Result<Value, ModelError> {
+        if matches!(
+            self.client.provider(),
+            excalibur_providers::Provider::Anthropic
+                | excalibur_providers::Provider::GoogleAi
+                | excalibur_providers::Provider::Vertex
+        ) {
+            let stream = self
+                .client
+                .stream_native_chat(&self.config.model, body)
+                .await
+                .map_err(provider_error)?;
+            return native::stream(self.client.provider(), stream, sink, attempt).await;
+        }
         body["stream_options"] = json!({"include_usage":true});
         let mut stream = self
             .client
@@ -645,6 +736,9 @@ impl OpenAiGateway {
     }
 }
 impl ModelGateway for OpenAiGateway {
+    fn cache_settings(&self) -> CacheSettings {
+        CacheSettings::provider(self.client.provider())
+    }
     fn cost_is_known(&self) -> bool {
         self.pricing.is_some()
     }
@@ -693,6 +787,17 @@ impl ModelGateway for OpenAiGateway {
         request: ModelRequest,
     ) -> BoxFuture<'a, Result<ObservedResponse, ModelCallError>> {
         Box::pin(self.run_observed(request, None))
+    }
+    fn complete_cache_warm_observed<'a>(
+        &'a self,
+        request: ModelRequest,
+        sink: StreamSink,
+    ) -> BoxFuture<'a, Result<ObservedResponse, ModelCallError>> {
+        if self.cache_settings().first_delta_warming {
+            Box::pin(self.run_observed(request, Some(sink)))
+        } else {
+            self.complete_stream_observed(request, sink)
+        }
     }
     fn complete_stream_observed<'a>(
         &'a self,
@@ -866,6 +971,7 @@ fn parse_text_protocol(text: &str) -> Result<Message, ModelError> {
         content,
         tool_calls: normalized,
         tool_call_id: None,
+        provider_state: None,
     })
 }
 fn required_string_allow_empty(v: &Value, key: &str) -> Result<String, ModelError> {
@@ -975,9 +1081,17 @@ fn usage_breakdown(raw: &Value, used: &Usage) -> UsageBreakdown {
         input_tokens: used.input_tokens,
         output_tokens: used.output_tokens,
         estimated: used.estimated,
-        cache_read_tokens: count("/usage/prompt_tokens_details/cached_tokens"),
+        cache_read_tokens: count("/usage/prompt_tokens_details/cached_tokens")
+            .or_else(|| count("/usage/prompt_cache_hit_tokens"))
+            .or_else(|| count("/usage/cached_tokens")),
         cache_write_tokens: count("/usage/prompt_tokens_details/cache_write_tokens"),
         reasoning_tokens: count("/usage/completion_tokens_details/reasoning_tokens"),
-        cache_write_by_ttl: BTreeMap::new(),
+        cache_write_by_ttl: [
+            ("5m", "/usage/cache_creation/ephemeral_5m_input_tokens"),
+            ("1h", "/usage/cache_creation/ephemeral_1h_input_tokens"),
+        ]
+        .into_iter()
+        .filter_map(|(ttl, path)| count(path).map(|tokens| (ttl.into(), tokens)))
+        .collect(),
     }
 }

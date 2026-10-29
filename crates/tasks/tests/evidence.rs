@@ -1213,6 +1213,7 @@ async fn execution_trace_preserves_old_definition_and_environment_when_a_check_c
     assert_eq!(edges, 4);
 }
 struct PendingCheck {
+    execution_guard: tokio::sync::Mutex<()>,
     started: tokio::sync::Notify,
     interrupted: AtomicUsize,
 }
@@ -1242,6 +1243,7 @@ impl ToolRuntime for PendingCheck {
         _: &'a PreparedTool,
     ) -> BoxFuture<'a, ToolResult> {
         Box::pin(async move {
+            let _guard = self.execution_guard.lock().await;
             self.started.notify_one();
             std::future::pending().await
         })
@@ -1261,6 +1263,7 @@ impl ToolRuntime for PendingCheck {
         _: Option<&'a PreparedTool>,
     ) -> BoxFuture<'a, Result<bool, String>> {
         Box::pin(async move {
+            let _guard = self.execution_guard.lock().await;
             self.interrupted.fetch_add(1, Ordering::SeqCst);
             Ok(true)
         })
@@ -1276,6 +1279,7 @@ async fn declared_timeout_interrupts_a_hung_adapter_deterministically_and_preser
     )
     .await;
     let runtime = Arc::new(PendingCheck {
+        execution_guard: tokio::sync::Mutex::new(()),
         started: tokio::sync::Notify::new(),
         interrupted: AtomicUsize::new(0),
     });
@@ -1285,7 +1289,11 @@ async fn declared_timeout_interrupts_a_hung_adapter_deterministically_and_preser
     let task = tokio::spawn(async move { runner.run(&store, "task", "check", &run).await });
     runtime.started.notified().await;
     tokio::time::advance(std::time::Duration::from_millis(250)).await;
-    let error = task.await.unwrap().unwrap_err();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("interruption must acquire the released execution guard")
+        .unwrap()
+        .unwrap_err();
     assert!(error.to_string().contains("timed out"));
     assert_eq!(runtime.interrupted.load(Ordering::SeqCst), 1);
     assert!(f.store.task_evidence("task").await.unwrap().is_empty());

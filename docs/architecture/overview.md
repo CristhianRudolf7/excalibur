@@ -21,3 +21,5 @@ See [planned provider support](providers.md) for the target integrations and oth
 See [Minimum durable engine](../development/durable-engine.md) for the current contract and backend checks.
 
 The shared task/planning and evidence contracts are described in [Verifiable work](../development/verifiable-work.md).
+
+Context compilation, durable sessions and provider caches are described in [Context and cache](../development/context-cache.md).

@@ -130,8 +130,16 @@ fn dns_is_revalidated_and_pinned_for_each_new_connection() {
     let proxy = HostProxy::start(cfg).unwrap();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut buf = [0; 4096];
-        let _ = stream.read(&mut buf);
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(
+                head.len() < 16 * 1024,
+                "fixture request headers exceeded limit"
+            );
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .unwrap();

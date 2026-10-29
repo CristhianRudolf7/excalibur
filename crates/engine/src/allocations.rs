@@ -67,6 +67,17 @@ pub fn remaining_budget(state: &Snapshot) -> Budget {
         processes: 0,
         terminal_sessions: 0,
     };
+    if let Some(pending) = &state.pending_context_summary {
+        used.steps = used.steps.saturating_add(1);
+        used.tokens = used
+            .tokens
+            .saturating_add(pending["bound"]["max_tokens"].as_u64().unwrap_or(u64::MAX));
+        used.cost_microusd = used.cost_microusd.saturating_add(
+            pending["bound"]["max_cost_microusd"]
+                .as_u64()
+                .unwrap_or(u64::MAX),
+        );
+    }
     for allocation in state.child_allocations.values() {
         let held = allocation.held();
         used.steps = used.steps.saturating_add(held.steps);
@@ -129,7 +140,9 @@ pub async fn reserve_child_budget(
                 "child must be ready with exactly the allocated budget",
             ));
         }
-        if state.request.is_some() && state.response.is_none() {
+        if (state.request.is_some() && state.response.is_none())
+            || state.pending_context_summary.is_some()
+        {
             return Err(Error::Invalid(
                 "cannot reserve child budget during an unaccounted model call",
             ));

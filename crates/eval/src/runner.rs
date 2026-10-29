@@ -38,6 +38,8 @@ pub struct ExecOptions {
     pub profile: ExecutionProfile,
     pub autonomy: Autonomy,
     pub budget: Budget,
+    /// Host-configured model window and context lifecycle policy.
+    pub context_policy: excalibur_context::SessionPolicy,
     pub output_schema: Option<Value>,
     pub criteria: Vec<Criterion>,
     pub metadata: RunMetadata,
@@ -70,6 +72,7 @@ impl ExecOptions {
             profile: ExecutionProfile::Project,
             autonomy: Autonomy::Supervised,
             budget: Budget::default(),
+            context_policy: excalibur_context::SessionPolicy::default(),
             output_schema: None,
             criteria: vec![],
             metadata: RunMetadata::default(),
@@ -534,6 +537,7 @@ impl Execution {
         .with_verifier(verifier)
         .with_checklist(checklist_runtime, checklist_path);
         let engine = Engine::new(journal, model, tools)
+            .with_context_policy(options.context_policy.clone())
             .with_completion_gate(Arc::new(gate))
             .with_durable_sink(Arc::new(Projection(telemetry.clone(), task_store.clone())));
         let mut context = ContextInput::new(

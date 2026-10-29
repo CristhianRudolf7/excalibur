@@ -33,6 +33,11 @@ pub(crate) fn export(
     events: &[EventEnvelope],
     metrics: &TaskMetrics,
 ) -> Value {
+    let projected = crate::auxiliary::events(events);
+    let events = projected
+        .iter()
+        .map(|event| event.as_ref())
+        .collect::<Vec<_>>();
     let mut spans = Vec::new();
     let mut omissions = Vec::new();
     let root = digest(format!("{run}\0agent").as_bytes());
@@ -70,14 +75,23 @@ pub(crate) fn export(
     for event in events.iter().filter(|e| e.source == "journal") {
         let p = &event.payload;
         match event.journal_kind.as_str() {
-            "model_request" if !event.recovered => {
+            "model_request" | "model_dispatch" if !event.recovered => {
                 requests.insert(
-                    event.key.trim_end_matches(":request").to_owned(),
+                    event
+                        .key
+                        .trim_end_matches(":request")
+                        .trim_end_matches(":dispatch")
+                        .trim_end_matches(":started")
+                        .to_owned(),
                     event.timestamp_unix_ms,
                 );
             }
             "model_response" | "model_failure" => {
                 let m = call_metrics(p);
+                if p["_context_summary_unconfirmed"] == true {
+                    omissions.push("context-summary response and provider timing unconfirmed");
+                    continue;
+                }
                 if event.recovered
                     || (m["provider_calls_known"] == true
                         && m["provider_calls"].as_u64() == Some(0))
@@ -96,7 +110,8 @@ pub(crate) fn export(
                 let key = event
                     .key
                     .trim_end_matches(":response")
-                    .trim_end_matches(":failure");
+                    .trim_end_matches(":failure")
+                    .trim_end_matches(":completed");
                 let start = m["duration_ms"]
                     .as_u64()
                     .and_then(|n| i64::try_from(n).ok())
@@ -116,6 +131,9 @@ pub(crate) fn export(
                     attr("gen_ai.conversation.id", run),
                     attr("excalibur.journal.sequence", event.sequence),
                 ];
+                if p["_context_summary"] == true {
+                    attrs.push(attr("excalibur.model.purpose", "context-summary"));
+                }
                 if let Some(model) = model {
                     attrs.push(attr("gen_ai.request.model", model));
                 }
@@ -127,7 +145,8 @@ pub(crate) fn export(
                         attrs.push(attr(target, n));
                     }
                 }
-                let failed = event.journal_kind == "model_failure";
+                let failed = event.journal_kind == "model_failure"
+                    || (p["_context_summary"] == true && m["failure_class"].is_string());
                 if failed {
                     attrs.push(attr(
                         "error.type",

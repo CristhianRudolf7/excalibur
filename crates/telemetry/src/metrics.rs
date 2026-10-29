@@ -149,10 +149,17 @@ pub(crate) fn response_cost(payload: &Value) -> Option<u64> {
     }
 }
 fn model_operation(key: &str) -> &str {
-    [":request", ":dispatch", ":response", ":failure"]
-        .iter()
-        .find_map(|suffix| key.strip_suffix(suffix))
-        .unwrap_or(key)
+    [
+        ":request",
+        ":dispatch",
+        ":response",
+        ":failure",
+        ":started",
+        ":completed",
+    ]
+    .iter()
+    .find_map(|suffix| key.strip_suffix(suffix))
+    .unwrap_or(key)
 }
 pub(crate) fn aggregate(
     run: &str,
@@ -161,6 +168,11 @@ pub(crate) fn aggregate(
     snapshot: Option<&Value>,
     resources: ResourceSummary,
 ) -> TaskMetrics {
+    let projected = crate::auxiliary::events(events);
+    let events = projected
+        .iter()
+        .map(|event| event.as_ref())
+        .collect::<Vec<_>>();
     let mut result = TaskMetrics {
         schema_version: "excalibur.metrics.v1".into(),
         run_id: run.into(),
@@ -226,12 +238,20 @@ pub(crate) fn aggregate(
                         .map(str::to_owned)
                         .or(result.failure_class);
                 }
-                if p.get("metrics").is_none() && p.pointer("/response/usage").is_none() {
+                if (p.get("metrics").is_none() && p.pointer("/response/usage").is_none())
+                    || p["_context_summary_usage_unknown"] == true
+                {
                     result.unmeasured_model_calls += 1;
+                }
+                if p["_context_summary_unconfirmed"] == true {
+                    result.limitations.push("unconfirmed context-summary usage is a local reservation in its receipt, not measured provider consumption".into());
                 }
                 let first = result.model_calls == 0;
                 result.model_calls += 1;
                 let metrics = call_metrics(p);
+                if p["_context_summary"] == true && metrics["failure_class"].is_string() {
+                    result.errors = result.errors.saturating_add(1);
+                }
                 if let (Some(version), Some(hash)) = (
                     metrics
                         .pointer("/metadata/price_table_version")
@@ -289,7 +309,7 @@ pub(crate) fn aggregate(
                     .get("duration_ms")
                     .and_then(Value::as_u64)
                     .or_else(|| {
-                        if e.recovered {
+                        if e.recovered || p["_context_summary_unconfirmed"] == true {
                             None
                         } else {
                             started.map(|start| {

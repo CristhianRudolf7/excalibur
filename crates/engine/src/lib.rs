@@ -1,6 +1,7 @@
 //! A durable single-run step engine. Applications embed it; no CLI or HTTP server.
 mod allocations;
 mod completion;
+mod context_runtime;
 mod episode_utilities;
 mod loops;
 pub use allocations::{
@@ -8,7 +9,7 @@ pub use allocations::{
     reserve_child_budget, settle_child_budget,
 };
 pub use completion::*;
-use excalibur_context::{ContextInput, compile};
+use excalibur_context::ContextInput;
 use excalibur_journal::{Event, Journal};
 use excalibur_models::ModelGateway;
 use excalibur_store::unix_seconds;
@@ -186,6 +187,18 @@ pub struct Snapshot {
     pub confirmed_model_failure: Option<Value>,
     #[serde(default)]
     pub request_revision: u64,
+    #[serde(default)]
+    pub context_session: Option<Box<excalibur_context::ContextSession>>,
+    #[serde(default)]
+    pub context_policy: Option<excalibur_context::SessionPolicy>,
+    #[serde(default)]
+    pub context_history_cursor: usize,
+    #[serde(default)]
+    pub context_instruction_digest: Option<String>,
+    #[serde(default)]
+    pub context_summaries: BTreeMap<String, excalibur_context::SummaryOutcome>,
+    #[serde(default)]
+    pub pending_context_summary: Option<Value>,
 }
 impl Snapshot {
     fn started(seed: &Value) -> Result<Self> {
@@ -229,6 +242,16 @@ impl Snapshot {
             last_loop_step: None,
             confirmed_model_failure: None,
             request_revision: 0,
+            context_session: None,
+            context_policy: seed
+                .get("context_policy")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?,
+            context_history_cursor: 0,
+            context_instruction_digest: None,
+            context_summaries: BTreeMap::new(),
+            pending_context_summary: None,
         })
     }
     fn apply(&mut self, event: &Event) -> Result<()> {
@@ -242,6 +265,13 @@ impl Snapshot {
             }
             "model_response" => {
                 let response: ModelResponse = serde_json::from_value(p["response"].clone())?;
+                if let (Some(session), Some(request)) = (&mut self.context_session, &self.request) {
+                    session.observe_usage(
+                        request,
+                        response.usage.input_tokens,
+                        response.usage.estimated,
+                    );
+                }
                 self.usage.estimated |= response.usage.estimated;
                 self.usage.input_tokens = self
                     .usage
@@ -306,11 +336,6 @@ impl Snapshot {
                     } else {
                         self.pinned_observations.insert(id, result.output.clone());
                     }
-                    while self.pinned_observations.len() > 8
-                        || serde_json::to_vec(&self.pinned_observations)?.len() > 4096
-                    {
-                        self.pinned_observations.pop_first();
-                    }
                 }
                 self.calls
                     .entry(index)
@@ -333,6 +358,7 @@ impl Snapshot {
                         .and_then(|c| c.result.as_ref())
                         .ok_or(Error::Invalid("completed step lacks result"))?;
                     self.history.push(Message {
+                        provider_state: None,
                         role: "tool".into(),
                         content: serde_json::to_string(result)?,
                         tool_call_id: Some(call.id.clone()),
@@ -485,7 +511,36 @@ impl Snapshot {
                 );
             }
             "model_failure" => self.confirmed_model_failure = Some(p.clone()),
-            "checkpoint" | "wake_event" => {}
+            "context_prepared" => {
+                self.context_session = Some(serde_json::from_value(p["session"].clone())?);
+                self.context_instruction_digest =
+                    p["instruction_digest"].as_str().map(str::to_owned);
+                self.context_history_cursor = p["history_cursor"]
+                    .as_u64()
+                    .ok_or(Error::Invalid("context history cursor missing"))?
+                    as usize;
+            }
+            "context_summary_started" => self.pending_context_summary = Some(p.clone()),
+            "context_summary_completed" => {
+                let id = p["id"]
+                    .as_str()
+                    .ok_or(Error::Invalid("summary identity missing"))?;
+                self.context_summaries
+                    .insert(id.into(), serde_json::from_value(p["outcome"].clone())?);
+                self.pending_context_summary = None;
+                let usage: Usage = serde_json::from_value(p["usage"].clone())?;
+                self.usage.input_tokens =
+                    self.usage.input_tokens.saturating_add(usage.input_tokens);
+                self.usage.output_tokens =
+                    self.usage.output_tokens.saturating_add(usage.output_tokens);
+                self.usage.cost_microusd =
+                    self.usage.cost_microusd.saturating_add(usage.cost_microusd);
+                self.usage.estimated |= usage.estimated;
+                self.model_calls = self
+                    .model_calls
+                    .saturating_add(p["model_calls"].as_u64().unwrap_or(0));
+            }
+            "checkpoint" | "wake_event" | "context_observation_archived" => {}
             _ => return Err(Error::Invalid("unknown durable event")),
         }
         self.last_sequence = event.sequence;
@@ -565,6 +620,7 @@ fn index(p: &Value) -> Result<usize> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Boundary {
     BeforeModelRequest,
+    ContextPreparedConfirmed,
     ModelRequestConfirmed,
     ModelReturned,
     ModelResponseConfirmed,
@@ -601,6 +657,8 @@ pub struct Engine {
     projection: Option<Projection>,
     stream_sink: Option<excalibur_models::StreamSink>,
     completion_gate: Option<Arc<dyn CompletionGate>>,
+    context_policy: excalibur_context::SessionPolicy,
+    context_extractor: Option<Arc<dyn ModelGateway>>,
 }
 impl Engine {
     pub fn new(
@@ -616,6 +674,8 @@ impl Engine {
             projection: None,
             stream_sink: None,
             completion_gate: None,
+            context_policy: excalibur_context::SessionPolicy::default(),
+            context_extractor: None,
         }
     }
     pub fn with_completion_gate(mut self, gate: Arc<dyn CompletionGate>) -> Self {
@@ -667,7 +727,14 @@ impl Engine {
             o.reached(phase, run, step, key);
         }
     }
-    pub async fn create(&self, operation: &str, mut spec: RunSpec) -> Result<String> {
+    pub fn create<'a>(
+        &'a self,
+        operation: &'a str,
+        spec: RunSpec,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(self.create_inner(operation, spec))
+    }
+    async fn create_inner(&self, operation: &str, mut spec: RunSpec) -> Result<String> {
         let _creation = self
             .journal
             .lock_run(&format!("operation:{operation}"))
@@ -690,7 +757,11 @@ impl Engine {
         spec.context.tools = self.tools.definitions();
         spec.context.tools.extend(builtin_definitions());
         spec.context.tools.sort_by(|a, b| a.name.cmp(&b.name));
-        compile(&spec.context).map_err(|_| Error::Invalid("invalid initial context"))?;
+        excalibur_context::ContextSession::new(
+            spec.context.clone(),
+            self.effective_context_policy()?,
+        )
+        .map_err(|_| Error::Invalid("invalid initial context"))?;
         let spec_value = serde_json::to_value(&spec)?;
         if self.sanitize(&spec_value)? != spec_value {
             return Err(Error::Invalid(
@@ -725,7 +796,17 @@ impl Engine {
                 .pop()
                 .ok_or(Error::Invalid("run seed missing"))?;
             let original: RunSpec = serde_json::from_value(seed.payload["spec"].clone())?;
-            if original != spec || state.gateway_identity != self.model.identity() {
+            let original_policy: Option<excalibur_context::SessionPolicy> = seed
+                .payload
+                .get("context_policy")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?;
+            let effective_policy = self.effective_context_policy()?;
+            if original != spec
+                || state.gateway_identity != self.model.identity()
+                || original_policy.is_some_and(|policy| policy != effective_policy)
+            {
                 return Err(Error::Invalid(
                     "operation reused with different run specification",
                 ));
@@ -733,7 +814,7 @@ impl Engine {
             self.flush_events(&run).await?;
             return Ok(run);
         }
-        let seed = json!({"spec":spec,"started_at":unix_seconds(),"gateway_identity":self.model.identity(),"model_dispatch_protocol":1,"initial_state":"created"});
+        let seed = json!({"spec":spec,"started_at":unix_seconds(),"gateway_identity":self.model.identity(),"model_dispatch_protocol":1,"initial_state":"created","context_policy":self.effective_context_policy()?});
         if self.sanitize(&seed)? != seed {
             return Err(Error::Invalid("secret literal in durable run identity"));
         }
@@ -1248,8 +1329,11 @@ impl Engine {
         .await?;
         Ok(true)
     }
-    pub async fn run(&self, run: &str) -> Result<Snapshot> {
-        match self.drive(run).await {
+    pub fn run<'a>(&'a self, run: &'a str) -> BoxFuture<'a, Result<Snapshot>> {
+        Box::pin(self.run_inner(run))
+    }
+    async fn run_inner(&self, run: &str) -> Result<Snapshot> {
+        match Box::pin(self.drive(run)).await {
             Ok(mut state) => {
                 if matches!(
                     state.status,
@@ -1397,7 +1481,7 @@ impl Engine {
             .filter(|(_, c)| c.prepared.is_some() && c.result.is_none())
             .map(|(i, _)| tool_key(run, initial.step, *i))
             .collect();
-        loop {
+        'execution: loop {
             self.flush_events(run).await?;
             let mut s = self.load(run).await?;
             if s.status != Status::Running {
@@ -1417,6 +1501,8 @@ impl Engine {
                 .execution_tool_budget(run)
                 .await
                 .map_err(|_| Error::Invalid("execution capability unavailable"))?;
+            self.refresh_context_instructions(run, &s).await?;
+            s = self.load(run).await?;
             for (id, text) in s.pending_directives.clone() {
                 self.event(
                     run,
@@ -1436,6 +1522,20 @@ impl Engine {
             }
             if !s.pending_directives.is_empty() {
                 continue;
+            }
+            if s.request_revision != s.revision
+                && let Some(response) = s.response.clone()
+            {
+                for (index, call) in response.message.tool_calls.iter().enumerate() {
+                    if !s
+                        .calls
+                        .get(&index)
+                        .is_some_and(|state| state.prepared.is_some() || state.result.is_some())
+                    {
+                        let key = format!("{}:result", tool_key(run, s.step, index));
+                        self.event(run,&mut s,"tool_result",key,json!({"index":index,"name":call.name,"result":ToolResult::error("Tool was not executed: its response predates the current instruction revision")})).await?;
+                    }
+                }
             }
             if s.request_revision != s.revision
                 && s.response.as_ref().is_some_and(|response| {
@@ -1491,12 +1591,6 @@ impl Engine {
                 if !s.loops.note.is_empty() {
                     input.volatile.recovery_notices.push(s.loops.note.clone());
                 }
-                for pin in s.pinned_observations.values() {
-                    input.volatile.recovery_notices.push(format!(
-                        "Pinned observation (untrusted data): {}",
-                        serde_json::to_string(pin)?
-                    ));
-                }
                 input.volatile.budget_status = serde_json::to_string(
                     &json!({"step":s.step,"budget":s.spec.budget,"usage":s.usage,"tool_calls":s.tool_calls}),
                 )?;
@@ -1510,7 +1604,7 @@ impl Engine {
                 input.volatile.finalization_report = s.gate_report.join("\n");
                 input.tools_enabled = !closing(&s)
                     && capability_tool_budget.is_none_or(|budget| s.tool_calls < budget);
-                let compiled = match compile(&input) {
+                let compiled = match Box::pin(self.prepare_context(run, &mut s, input)).await {
                     Ok(c) => c,
                     Err(e) => {
                         self.transition(
@@ -1523,6 +1617,19 @@ impl Engine {
                         return Ok(s);
                     }
                 };
+                let compiled_revision = s.revision;
+                s = self.load(run).await?;
+                if s.status != Status::Running {
+                    return Ok(s);
+                }
+                if s.revision != compiled_revision || !s.pending_directives.is_empty() {
+                    continue;
+                }
+                if budget_exhausted(&s) {
+                    self.transition(run, &mut s, Status::Paused, Some("budget".into()))
+                        .await?;
+                    return Ok(s);
+                }
                 self.point(Boundary::BeforeModelRequest, run, s.step, None);
                 let key = format!("model:{}:request", s.step);
                 let revision = s.revision;
@@ -1790,6 +1897,9 @@ impl Engine {
             if self.honor_approval_wait(run, &mut s).await? {
                 return Ok(s);
             }
+            if self.refresh_context_instructions(run, &s).await? {
+                continue;
+            }
             let response = s.response.clone().unwrap();
             if response.message.tool_calls.is_empty() {
                 self.transition(run, &mut s, Status::Verifying, None)
@@ -1858,6 +1968,21 @@ impl Engine {
                 if s.status != Status::Verifying {
                     return Ok(s);
                 }
+                let (instructions, instruction_guard) =
+                    self.journal.context_instruction_guard(run).await?;
+                let changed = s.context_instruction_digest.as_ref().map_or(
+                    !instructions.stable.is_empty() || !instructions.task.is_empty(),
+                    |old| old != &instructions.revision,
+                );
+                if changed {
+                    drop(instruction_guard);
+                    drop(external_guard);
+                    self.refresh_context_instructions(run, &s).await?;
+                    self.transition(run, &mut s, Status::Running, None).await?;
+                    continue 'execution;
+                }
+                // Keep instruction mutation ordered with the terminal journal CAS.
+                let _instruction_guard = instruction_guard;
                 let assessment = external_guard
                     .as_ref()
                     .map(|guard| guard.report())
@@ -1972,6 +2097,11 @@ impl Engine {
                 }
                 if self.honor_admission(run, &mut s).await? {
                     return Ok(s);
+                }
+                if self.refresh_context_instructions(run, &s).await?
+                    || !s.pending_directives.is_empty()
+                {
+                    continue 'execution;
                 }
                 let mut slots = remaining_budget(&s).max_tool_calls.min(
                     capability_tool_budget

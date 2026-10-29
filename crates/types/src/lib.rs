@@ -81,6 +81,7 @@ identifier!(CriterionId, "crt_");
 identifier!(CheckId, "chk_");
 identifier!(EvidenceId, "evd_");
 identifier!(MemoryId, "mem_");
+identifier!(InstructionId, "ins_");
 identifier!(SkillId, "skl_");
 identifier!(JobId, "job_");
 
@@ -198,12 +199,13 @@ mod tests {
             CheckId::new().to_string(),
             EvidenceId::new().to_string(),
             MemoryId::new().to_string(),
+            InstructionId::new().to_string(),
             SkillId::new().to_string(),
             JobId::new().to_string(),
         ];
         let prefixes = [
             "usr_", "prj_", "cnv_", "msg_", "tsk_", "run_", "agt_", "req_", "crt_", "chk_", "evd_",
-            "mem_", "skl_", "job_",
+            "mem_", "ins_", "skl_", "job_",
         ];
         for (id, prefix) in ids.iter().zip(prefixes) {
             assert!(id.starts_with(prefix));

@@ -6,7 +6,7 @@ Excalibur is a planned personal AI agent that will converse with users, help pla
 
 ## Status
 
-The repository contains documentation and shared Rust provider, storage, minimum durable engine, durable task/planning and evidence, security, vault, Linux sandbox, telemetry and evaluation libraries. The complete personal agent, interactive CLI, web interface and marketplace remain planned. See [provider coverage and limits](docs/architecture/provider-implementation.md).
+The repository contains documentation and shared Rust provider, storage, minimum durable engine, durable task/planning and evidence, context/cache, security, vault, Linux sandbox, telemetry and evaluation libraries. The complete personal agent, interactive CLI, web interface and marketplace remain planned. See [provider coverage and limits](docs/architecture/provider-implementation.md).
 
 See [Base and storage](docs/development/storage.md) for implementation and verification evidence. See [Minimum durable engine](docs/development/durable-engine.md) for the embedded step loop, effect recovery, context, gateway and local tools.
 
@@ -29,3 +29,5 @@ See [ROADMAP.md](ROADMAP.md), [AGENTS.md](AGENTS.md), [CHANGELOG.md](CHANGELOG.m
 The `excalibur exec` command, evaluation profile, metrics/ATIF and replay are documented in [Noninteractive execution and evaluation](docs/development/noninteractive.md). The concrete Harbor adapter is supplied by the user.
 
 See [Verifiable work](docs/development/verifiable-work.md) for durable tasks, plans, fresh evidence, the completion gate and independent verification.
+
+See [Context and cache](docs/development/context-cache.md) for durable context views, compaction, literal instructions and provider cache contracts.

@@ -23,6 +23,9 @@ pub struct Message {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// Opaque response state retransmitted only by its originating provider adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_state: Option<Value>,
 }
 impl Message {
     pub fn text(role: &str, content: impl Into<String>) -> Self {
@@ -31,16 +34,37 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            provider_state: None,
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
     pub tools_enabled: bool,
     pub reasoning_effort: Option<String>,
     pub output_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<PromptCache>,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheTtl {
+    FiveMinutes,
+    OneHour,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CacheBreakpoint {
+    pub message_index: usize,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptCache {
+    /// The host hashes principal, role and scope; no raw personal identity.
+    pub namespace_key: String,
+    pub ttl: CacheTtl,
+    pub breakpoints: Vec<CacheBreakpoint>,
+    pub stable_prefix_hash: String,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Usage {

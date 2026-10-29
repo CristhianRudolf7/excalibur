@@ -376,6 +376,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
 dependencies = [
  "memchr",
+ "regex-automata",
  "serde_core",
 ]
 
@@ -834,7 +835,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.21",
+ "tiktoken-rs",
 ]
 
 [[package]]
@@ -849,6 +852,7 @@ dependencies = [
  "excalibur-store",
  "excalibur-tools",
  "excalibur-types",
+ "excalibur-vault",
  "futures",
  "json5",
  "jsonschema",
@@ -891,6 +895,7 @@ version = "0.1.0"
 dependencies = [
  "excalibur-store",
  "excalibur-types",
+ "excalibur-vault",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -999,6 +1004,7 @@ name = "excalibur-tasks"
 version = "0.1.0"
 dependencies = [
  "cap-std",
+ "excalibur-context",
  "excalibur-engine",
  "excalibur-journal",
  "excalibur-sandbox",
@@ -3117,6 +3123,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "tiktoken-rs"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2aeff724640cfe13037336ddf35befdffd2909cbdb65cf041cc8a4cf8c584cfa"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bstr",
+ "fancy-regex",
+ "regex",
+ "rustc-hash",
 ]
 
 [[package]]

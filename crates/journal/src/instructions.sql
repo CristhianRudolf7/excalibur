@@ -1,0 +1,9 @@
+CREATE TABLE IF NOT EXISTS context_instruction_schema(version INTEGER PRIMARY KEY,checksum TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS context_instruction_scopes(instruction_id TEXT PRIMARY KEY REFERENCES instructions(id),kind TEXT NOT NULL,scope_key TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS context_instruction_revisions(instruction_id TEXT NOT NULL REFERENCES instructions(id),revision INTEGER NOT NULL,literal_text TEXT NOT NULL,origin TEXT,state TEXT NOT NULL,principal_key TEXT NOT NULL,kind TEXT NOT NULL,scope_key TEXT NOT NULL,recorded_at INTEGER NOT NULL DEFAULT(unixepoch()),PRIMARY KEY(instruction_id,revision));
+CREATE TABLE IF NOT EXISTS context_instruction_receipts(principal_key TEXT NOT NULL,operation_key TEXT NOT NULL,request_hash TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(principal_key,operation_key));
+CREATE TABLE IF NOT EXISTS context_instruction_run_bindings(run_id TEXT PRIMARY KEY REFERENCES runs(id),principal_key TEXT NOT NULL,scopes TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS context_instruction_delegations(child_run TEXT NOT NULL REFERENCES runs(id),parent_run TEXT NOT NULL REFERENCES runs(id),instruction_id TEXT NOT NULL REFERENCES instructions(id),source_revision INTEGER NOT NULL,PRIMARY KEY(child_run,instruction_id));
+CREATE TRIGGER IF NOT EXISTS context_instruction_history_no_update BEFORE UPDATE ON context_instruction_revisions BEGIN SELECT RAISE(ABORT,'instruction revisions are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS context_instruction_history_no_delete BEFORE DELETE ON context_instruction_revisions BEGIN SELECT RAISE(ABORT,'instruction revisions are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS context_instruction_delete_guard BEFORE DELETE ON instructions WHEN EXISTS(SELECT 1 FROM context_instruction_revisions WHERE instruction_id=OLD.id) BEGIN SELECT RAISE(ABORT,'retire instructions instead of deleting history'); END;

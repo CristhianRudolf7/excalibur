@@ -229,7 +229,7 @@ impl IndependentVerifier for GatewayVerifier {
                 }
                 security.register_run(&verifier_run,RunSecurity{parent:None,project:"verification".into(),workspace:self.workspace.clone(),token,autonomy:vec![Autonomy::Full],full_acknowledged:true,user_requested:true},excalibur_store::unix_seconds()).await.map_err(|e|e.to_string())?;
                 tokio::select! {
-                    result=tokio::time::timeout(std::time::Duration::from_secs(input.budget.timeout_seconds),self.verify_with_tools(input,&verifier_run,tools))=>result.unwrap_or_else(|_|Err("independent verification exceeded its wall budget".into())),
+                    result=tokio::time::timeout(std::time::Duration::from_secs(input.budget.timeout_seconds),Box::pin(self.verify_with_tools(input,&verifier_run,tools)))=>result.unwrap_or_else(|_|Err("independent verification exceeded its wall budget".into())),
                     result=wait_for_control(&journal,&input.root_run_id,&verifier_run)=>Err(result),
                 }
             }.await;
@@ -390,6 +390,7 @@ impl GatewayVerifier {
                 tools_enabled: step < 3 && tool_calls < input.budget.max_tool_calls,
                 reasoning_effort: None,
                 output_schema: None,
+                cache: None,
             };
             preflight(self.model.as_ref(), &request, &usage, &input.budget)?;
             ensure_active(&journal, &input.root_run_id, verifier_run).await?;
@@ -549,7 +550,7 @@ impl GatewayVerifier {
                     .await
                     .map_err(|e| e.to_string())?;
                 journal.append(verifier_run,"verification_usage",&format!("verification:{verifier_run}:tool:{step}:{}",call.id),json!({"usage":Usage::default(),"model_calls":0,"tool_calls":1,"step_count":0,"verifier_run_id":verifier_run})).await.map_err(|e|e.to_string())?;
-                messages.push(Message {role:"tool".into(), content:tools.sanitize_durable(&json!({"result":result,"independent_evidence_id":format!("journal:{verifier_run}:{}",event)}))?.to_string(), tool_calls:vec![], tool_call_id:Some(call.id)});
+                messages.push(Message {role:"tool".into(), content:tools.sanitize_durable(&json!({"result":result,"independent_evidence_id":format!("journal:{verifier_run}:{}",event)}))?.to_string(), tool_calls:vec![], tool_call_id:Some(call.id),provider_state:None});
             }
         }
         Err("independent verification reached its bounded step limit".into())

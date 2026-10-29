@@ -31,6 +31,7 @@ fn response(call: bool) -> ModelResponse {
                     arguments: json!({"ops":[{"op":"run_check","check":"proof"}]}).to_string(),
                 }],
                 tool_call_id: None,
+                provider_state: None,
             }
         } else {
             Message::text("assistant", "The requested proof is ready.")

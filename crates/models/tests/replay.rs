@@ -211,3 +211,155 @@ async fn first_divergence_is_safe_and_only_explicit_budget_allows_bounded_live_c
     assert_eq!(live.load(Ordering::SeqCst), 1);
     db.shutdown().await.unwrap();
 }
+/// A real HTTP adapter records cache controls and reported usage, then replay
+/// regenerates both cached requests exactly without opening another connection.
+#[tokio::test]
+async fn cached_http_engine_tape_replays_namespace_boundaries_and_calibration_without_http() {
+    use excalibur_providers::{Provider, ProviderClient, Secret};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = calls.clone();
+    let server = tokio::spawn(async move {
+        let replies = [
+            json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"cached-call","type":"function","function":{"name":"fixture","arguments":"{}"}}]}}],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":0}}}),
+            json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"Synthetic done"}}],"usage":{"prompt_tokens":110,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":80}}}),
+        ];
+        let mut bodies = Vec::new();
+        for reply in replies {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&bytes[..end]);
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        bodies.push(
+                            serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length])
+                                .unwrap(),
+                        );
+                        break;
+                    }
+                }
+            }
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+            let body = reply.to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        }
+        bodies
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(
+        temp.path().join("main.db"),
+        DatabaseKind::Main,
+        StorageConfig::default(),
+    )
+    .unwrap();
+    let journal = Journal::new(db.clone()).await.unwrap();
+    let client = ProviderClient::with_base_url(
+        Provider::OpenAi,
+        Secret::new("synthetic").unwrap(),
+        &format!("http://{address}/v1/"),
+    )
+    .unwrap();
+    let gateway = Arc::new(
+        OpenAiGateway::new(
+            client,
+            GatewayConfig::new("synthetic-cache-model", ModelRole::Worker),
+        )
+        .unwrap(),
+    );
+    let custom_policy = excalibur_context::SessionPolicy {
+        model_window: 65_536,
+        output_reserve: 4096,
+        compaction_cap: 25_000,
+        cache_ttl_ms: 3_600_000,
+        conversation: true,
+        counter: excalibur_context::TokenCounter::for_model("synthetic-custom-counter"),
+        ..Default::default()
+    };
+    let expected_policy = serde_json::to_value(&custom_policy).unwrap();
+    let engine = Engine::new(journal.clone(), gateway, Arc::new(FixtureTools))
+        .with_context_policy(custom_policy);
+    let spec = RunSpec {
+        context: ContextInput::new(
+            "Synthetic cache instructions",
+            "Compute synthetic cache result",
+            "fixed",
+        ),
+        budget: Budget::default(),
+        criteria: vec![Criterion::ToolSuccess {
+            name: "fixture".into(),
+        }],
+    };
+    let run = engine
+        .create("record-cached-http", spec.clone())
+        .await
+        .unwrap();
+    assert_eq!(engine.run(&run).await.unwrap().status, Status::Completed);
+    let sent = server.await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(sent[0]["prompt_cache_key"], sent[1]["prompt_cache_key"]);
+    let tape = ReplayTape::from_journal(&journal, &run).await.unwrap();
+    assert_eq!(tape.entries.len(), 2);
+    assert!(tape.entries.iter().all(|e| e.request.cache.is_some()));
+    let expected = tape
+        .entries
+        .iter()
+        .map(|e| e.request.clone())
+        .collect::<Vec<_>>();
+    let replay = Arc::new(ReplayGateway::new(tape).unwrap());
+    assert_eq!(
+        replay.context_policy_override(),
+        Some(expected_policy.clone())
+    );
+    assert_eq!(replay.request_cache_override(0), expected[0].cache);
+    assert_eq!(replay.request_cache_override(1), expected[1].cache);
+    assert!(replay.request_cache_override(2).is_none());
+    let engine = Engine::new(journal.clone(), replay.clone(), Arc::new(FixtureTools));
+    let replay_run = engine.create("replay-cached-http", spec).await.unwrap();
+    let result = engine.run(&replay_run).await.unwrap();
+    assert_eq!(
+        result.status,
+        Status::Completed,
+        "{:?}",
+        replay.divergence()
+    );
+    assert!(replay.divergence().is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let events = journal.replay(&replay_run, 0).await.unwrap();
+    let created = events.iter().find(|e| e.kind == "run_started").unwrap();
+    assert_eq!(created.payload["context_policy"], expected_policy);
+    let requests = events
+        .iter()
+        .filter(|e| e.kind == "model_request")
+        .map(|e| serde_json::from_value::<ModelRequest>(e.payload["request"].clone()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(requests, expected);
+    for event in events.iter().filter(|e| e.kind == "model_response") {
+        assert_eq!(event.payload["metrics"]["provider_calls"], 0);
+        assert_eq!(event.payload["metrics"]["usage"]["input_tokens"], 0);
+        assert!(
+            event.payload["metrics"]["recorded_usage"]["input_tokens"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+    db.shutdown().await.unwrap();
+}

@@ -144,6 +144,7 @@ async fn noninteractive_denial_returns_to_model_without_approval_and_final_outpu
             content: String::new(),
             tool_calls: vec![call],
             tool_call_id: None,
+            provider_state: None,
         },
         usage: Usage::default(),
     };
@@ -391,6 +392,7 @@ async fn model_reported_missing_input_blocks_without_a_followup_inference() {
                     .to_string(),
             }],
             tool_call_id: None,
+            provider_state: None,
         },
         usage: Usage::default(),
     }]));

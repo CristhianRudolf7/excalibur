@@ -6,7 +6,7 @@ Excalibur será un agente de inteligencia artificial personal capaz de conversar
 
 ## Estado
 
-El repositorio contiene documentación y bibliotecas Rust compartidas de proveedores, almacenamiento, motor durable mínimo, tareas/planificación y evidencias durables, seguridad, baúl, sandbox Linux, telemetría y evaluación. El agente personal completo, la CLI interactiva, la interfaz web y la tienda siguen previstos. Consulta la [cobertura y los límites de proveedores](docs/architecture/provider-implementation.es.md).
+El repositorio contiene documentación y bibliotecas Rust compartidas de proveedores, almacenamiento, motor durable mínimo, tareas/planificación y evidencias durables, contexto/caché, seguridad, baúl, sandbox Linux, telemetría y evaluación. El agente personal completo, la CLI interactiva, la interfaz web y la tienda siguen previstos. Consulta la [cobertura y los límites de proveedores](docs/architecture/provider-implementation.es.md).
 
 Consulta [Base y almacenamiento](docs/development/storage.es.md) para la implementación y sus comprobaciones. Revisa [Motor durable mínimo](docs/development/durable-engine.es.md) para el ciclo embebido, recuperación de efectos, contexto, pasarela y herramientas locales.
 
@@ -29,3 +29,5 @@ Consulta [ROADMAP.es.md](ROADMAP.es.md), [AGENTS.md](AGENTS.md), [CHANGELOG.es.m
 La ejecución no interactiva `excalibur exec`, el perfil de evaluación, las métricas/ATIF y la réplica están descritos en [Ejecución no interactiva y evaluación](docs/development/noninteractive.es.md). El adaptador concreto de Harbor lo aporta el usuario.
 
 Consulta [Trabajo verificable](docs/development/verifiable-work.es.md) para tareas y planes durables, evidencia vigente, puerta de cierre y verificación independiente.
+
+Consulta [Contexto y caché](docs/development/context-cache.es.md) para las vistas durables de contexto, compactación, instrucciones literales y contratos de caché de proveedores.

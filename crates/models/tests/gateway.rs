@@ -68,6 +68,7 @@ fn request() -> ModelRequest {
         tools_enabled: true,
         reasoning_effort: None,
         output_schema: None,
+        cache: None,
     }
 }
 fn gateway(url: &str, native_tools: bool, role: ModelRole) -> OpenAiGateway {
@@ -96,12 +97,14 @@ async fn native_tool_history_and_results_translate_without_losing_call_identity(
             arguments: "{\"path\":\"old\"}".into(),
         }],
         tool_call_id: None,
+        provider_state: None,
     });
     req.messages.push(Message {
         role: "tool".into(),
         content: "synthetic result".into(),
         tool_calls: vec![],
         tool_call_id: Some("call_old".into()),
+        provider_state: None,
     });
     let result = gateway.complete(req).await.unwrap();
     assert_eq!(result.message.tool_calls[0].id, "call_next");

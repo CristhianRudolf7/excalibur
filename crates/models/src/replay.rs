@@ -479,6 +479,22 @@ impl ReplayGateway {
     }
 }
 impl ModelGateway for ReplayGateway {
+    fn context_policy_override(&self) -> Option<Value> {
+        self.tape
+            .seed
+            .as_ref()?
+            .get("context_policy")
+            .filter(|v| !v.is_null())
+            .cloned()
+    }
+    fn request_cache_override(&self, step: u64) -> Option<excalibur_types::runtime::PromptCache> {
+        self.tape
+            .entries
+            .get(usize::try_from(step).ok()?)?
+            .request
+            .cache
+            .clone()
+    }
     fn identity(&self) -> String {
         self.tape.original_gateway_identity.clone()
     }

@@ -34,6 +34,11 @@ pub(crate) fn trajectory(
     metrics: &TaskMetrics,
     finalized: bool,
 ) -> Result<Value> {
+    let projected = crate::auxiliary::events(events);
+    let events = projected
+        .iter()
+        .map(|event| event.as_ref())
+        .collect::<Vec<_>>();
     let mut initial = metadata.instruction.clone();
     if initial.is_empty() {
         initial = events
@@ -48,7 +53,10 @@ pub(crate) fn trajectory(
         1,
         "user",
         json!(initial),
-        events.iter().find(|e| e.journal_kind == "run_started"),
+        events
+            .iter()
+            .find(|e| e.journal_kind == "run_started")
+            .copied(),
     )];
     let mut current = None;
     let mut intent_calls = std::collections::BTreeMap::new();
@@ -76,7 +84,9 @@ pub(crate) fn trajectory(
                 }
                 // Replayed responses are deterministic dispatch in the current
                 // execution; historical LLM usage remains in extra, not metrics.
-                if value["llm_call_count"] != 0 {
+                if value["llm_call_count"] != 0
+                    && event.payload["_context_summary_usage_unknown"] != true
+                {
                     value["metrics"] = json!({"prompt_tokens":usage.input_tokens,"completion_tokens":usage.output_tokens,"cached_tokens":usage.cache_read_tokens,"cost_usd":cost.map(|n|n as f64/1_000_000.0),"extra":{"cache_write_tokens":usage.cache_write_tokens,"cache_write_by_ttl":usage.cache_write_by_ttl,"reasoning_tokens":usage.reasoning_tokens,"estimated":usage.estimated}});
                 }
                 if !detail.is_null() {
@@ -101,9 +111,16 @@ pub(crate) fn trajectory(
                         json!({"tool_call_id":call["id"],"function_name":call["name"],"arguments":parsed.unwrap_or_else(||json!({"_unparsed_arguments":raw}))})
                     }).collect());
                 }
+                let auxiliary = event.payload["_context_summary"] == true;
+                if auxiliary {
+                    value["extra"]["purpose"] = json!("context-summary");
+                    value["extra"]["outcome"] = event.payload["outcome"].clone();
+                }
                 steps.push(value);
-                current = Some(steps.len() - 1);
-                intent_calls.clear();
+                if !auxiliary {
+                    current = Some(steps.len() - 1);
+                    intent_calls.clear();
+                }
             }
             "tool_intent" => {
                 let call = &event.payload["prepared"]["call"];

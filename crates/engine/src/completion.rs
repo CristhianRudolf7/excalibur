@@ -99,6 +99,13 @@ pub trait CompletionGate: Send + Sync {
         run: &'a str,
         input: &'a GateInput,
     ) -> BoxFuture<'a, Result<Box<dyn CompletionGateGuard>, String>>;
+    /// Authoritative, scoped backend task facts used for deltas and compaction.
+    fn structured_context<'a>(
+        &'a self,
+        _run: &'a str,
+    ) -> BoxFuture<'a, Result<Option<excalibur_context::StructuredState>, String>> {
+        Box::pin(async { Ok(None) })
+    }
     /// Return a bounded current micro-plan projection, never instructions from tools.
     fn context<'a>(&'a self, _run: &'a str) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async { Ok(String::new()) })

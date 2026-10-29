@@ -1,4 +1,5 @@
 //! Declared checks, independent-verifier jobs and the task completion gate.
+mod context_state;
 use crate::{Result, TaskStore, WorkLevel, evidence::*, fail, new_id};
 use excalibur_store::{
     Priority, ReadLane,
@@ -201,7 +202,17 @@ impl CheckRunner {
         self.run_keyed(store, task_id, check_id, run, &new_id("check-op"))
             .await
     }
-    pub async fn run_keyed(
+    pub fn run_keyed<'a>(
+        &'a self,
+        store: &'a TaskStore,
+        task_id: &'a str,
+        check_id: &'a str,
+        run: &'a str,
+        operation_key: &'a str,
+    ) -> BoxFuture<'a, Result<EvidenceRecord>> {
+        Box::pin(self.run_keyed_inner(store, task_id, check_id, run, operation_key))
+    }
+    async fn run_keyed_inner(
         &self,
         store: &TaskStore,
         task_id: &str,
@@ -363,8 +374,7 @@ impl CheckRunner {
                 Reconcile::Retry
                     if prepared.effect != excalibur_types::runtime::Effect::NonIdempotent =>
                 {
-                    self.invoke_monitored(store, run, &key, &prepared, deadline)
-                        .await?
+                    Box::pin(self.invoke_monitored(store, run, &key, &prepared, deadline)).await?
                 }
                 Reconcile::Retry | Reconcile::Uncertain(_) => {
                     return Err(fail(
@@ -373,8 +383,7 @@ impl CheckRunner {
                 }
             }
         } else {
-            self.invoke_monitored(store, run, &key, &prepared, deadline)
-                .await?
+            Box::pin(self.invoke_monitored(store, run, &key, &prepared, deadline)).await?
         };
         let mut tool_calls = 1u64;
         while result.output["exited"] == false && result.output["session_id"].is_string() {
@@ -493,12 +502,39 @@ impl CheckRunner {
                 "check execution is not admitted in the current run state",
             ));
         }
-        let execution = self.invoke(run, key, prepared);
-        tokio::pin!(execution);
-        loop {
-            tokio::select! {result=&mut execution=>return Ok(result),_=tokio::time::sleep_until(deadline)=>{self.runtime.interrupt_execution(run,false,Some(prepared)).await.map_err(fail)?;return Err(fail("declared check timed out; outcome remains uncertain"))},_=tokio::time::sleep(Duration::from_millis(25))=>{let(state,_)=journal.state(run).await?;if !matches!(state.as_str(),"running"|"verifying"){self.runtime.interrupt_execution(run,state=="cancelled",Some(prepared)).await.map_err(fail)?;return Err(fail("check interrupted by run control; outcome remains uncertain"))}}}
+        // End the execution future's scope before awaiting interruption: the
+        // runtime may retain the very process/session guard cleanup must take.
+        let outcome = {
+            let execution = self.invoke(run, key, prepared);
+            tokio::pin!(execution);
+            loop {
+                tokio::select! {
+                    biased;
+                    _=tokio::time::sleep_until(deadline)=>break Err(None),
+                    result=&mut execution=>break Ok(result),
+                    _=tokio::time::sleep(Duration::from_millis(25))=>{
+                        let (state,_)=journal.state(run).await?;
+                        if !matches!(state.as_str(),"running"|"verifying") {break Err(Some(state=="cancelled"));}
+                    }
+                }
+            }
+        };
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(control) => {
+                self.runtime
+                    .interrupt_execution(run, control.unwrap_or(false), Some(prepared))
+                    .await
+                    .map_err(fail)?;
+                Err(fail(if control.is_some() {
+                    "check interrupted by run control; outcome remains uncertain"
+                } else {
+                    "declared check timed out; outcome remains uncertain"
+                }))
+            }
         }
     }
+
     async fn invoke(&self, run: &str, key: &str, prepared: &PreparedTool) -> ToolResult {
         let mut used = self.calls.load(Ordering::Relaxed);
         loop {
@@ -1301,6 +1337,23 @@ impl TaskCompletionGate {
                 });
             }
         }
+        // The manual verifier gateway does not compile the executor's context.
+        // Explicitly deliver every active scoped registry literal, including the
+        // initial general/project instructions that have no directive event.
+        let instruction_journal = excalibur_journal::Journal::new(self.store.db.clone()).await?;
+        let registry = instruction_journal.context_instructions(run).await?;
+        for instruction in registry.records() {
+            if let Some(current) = applicable.iter_mut().find(|item| item.id == instruction.id) {
+                current.text = instruction.literal_text.clone();
+                current.revision = instruction.revision;
+            } else {
+                applicable.push(ApplicableInstruction {
+                    id: instruction.id.clone(),
+                    text: instruction.literal_text.clone(),
+                    revision: instruction.revision,
+                });
+            }
+        }
         let evidence = self.store.task_evidence(&task.id).await?;
         let mut waived = std::collections::BTreeMap::new();
         for criterion in criteria {
@@ -1854,9 +1907,20 @@ impl excalibur_engine::CompletionGate for TaskCompletionGate {
     ) -> BoxFuture<'a, std::result::Result<Box<dyn excalibur_engine::CompletionGateGuard>, String>>
     {
         Box::pin(async move {
-            self.evaluate_gate(run, input)
+            Box::pin(self.evaluate_gate(run, input))
                 .await
                 .map_err(|e| e.to_string())
+        })
+    }
+    fn structured_context<'a>(
+        &'a self,
+        run: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<Option<excalibur_context::StructuredState>, String>>
+    {
+        Box::pin(async move {
+            context_state::load(&self.store, run)
+                .await
+                .map_err(|error| error.to_string())
         })
     }
     fn context<'a>(&'a self, run: &'a str) -> BoxFuture<'a, std::result::Result<String, String>> {

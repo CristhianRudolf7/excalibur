@@ -1,4 +1,6 @@
 //! Confirmed append-only execution events on the principal SQLite writer.
+pub mod context_memory;
+pub mod instructions;
 use excalibur_store::{
     Database, Error as StoreError, Priority, ReadLane,
     rusqlite::{self, OptionalExtension},

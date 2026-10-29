@@ -63,6 +63,7 @@ fn request() -> ModelRequest {
         tools_enabled: false,
         reasoning_effort: None,
         output_schema: None,
+        cache: None,
     }
 }
 async fn server(status: u16, body: String) -> (String, tokio::task::JoinHandle<()>) {

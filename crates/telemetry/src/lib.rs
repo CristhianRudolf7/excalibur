@@ -1,6 +1,8 @@
 //! Durable, redacted backend telemetry and pinned interoperable trial artifacts.
 pub mod atif;
+mod auxiliary;
 mod config;
+mod context_projection;
 mod event;
 mod export;
 mod metrics;
@@ -286,7 +288,21 @@ impl Telemetry {
                 "durable event identity contains sensitive data",
             ));
         }
-        let payload = sanitize(&self.inner.redactor, &event.payload);
+        // Only the principal journal owns recoverable ContextSession snapshots.
+        // Keep source identity over the ORIGINAL payload, including omitted data.
+        let source_hash = if event.kind == "context_prepared" {
+            context_projection::payload_hash(&event.payload)?
+        } else {
+            digest(&serde_json::to_vec(&event.payload)?)
+        };
+        let payload = if event.kind == "context_prepared" {
+            sanitize(
+                &self.inner.redactor,
+                &context_projection::receipt(run, event, &source_hash),
+            )
+        } else {
+            sanitize(&self.inner.redactor, &event.payload)
+        };
         let envelope = self
             .insert(
                 run,
@@ -297,7 +313,7 @@ impl Telemetry {
                 payload,
                 stamp,
                 recovered,
-                Some(digest(&serde_json::to_vec(&event.payload)?)),
+                Some(source_hash),
             )
             .await?;
         self.export_run(run).await?;

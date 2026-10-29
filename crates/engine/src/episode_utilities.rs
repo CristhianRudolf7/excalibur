@@ -12,7 +12,7 @@ pub(crate) fn is_builtin(name: &str) -> bool {
 }
 pub(crate) fn definitions() -> Vec<ToolDefinition> {
     let schema = |required: Vec<&str>, properties: Value| json!({"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":required,"properties":properties,"additionalProperties":false});
-    vec![ToolDefinition{name:"history_search".into(),description:"Search one bounded page of this run's confirmed journal, with sanitized snippets and a continuation cursor.".into(),input_schema:schema(vec!["query"],json!({"query":{"type":"string","minLength":1,"maxLength":256},"cursor":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":16}}))},ToolDefinition{name:"pin_observation".into(),description:"Pin or unpin a confirmed tool observation in this run by call ID and optional source sequence; retain its durable source reference.".into(),input_schema:schema(vec!["call_id"],json!({"call_id":{"type":"string","minLength":1,"maxLength":256},"source_sequence":{"type":"integer","minimum":1},"note":{"type":"string","maxLength":2048},"pinned":{"type":"boolean"}}))},ToolDefinition{name:"ack_directive".into(),description:"Acknowledge an existing directive received in this run. This cannot create a directive or approve permissions.".into(),input_schema:schema(vec!["id"],json!({"id":{"type":"string","minLength":1,"maxLength":256}}))}]
+    vec![ToolDefinition{name:"history_search".into(),description:"Search one bounded page of this run's confirmed journal, with sanitized snippets and a continuation cursor.".into(),input_schema:schema(vec![],json!({"query":{"type":"string","maxLength":256},"from_sequence":{"type":"integer","minimum":1},"to_sequence":{"type":"integer","minimum":1},"cursor":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":16}}))},ToolDefinition{name:"pin_observation".into(),description:"Pin or unpin a confirmed tool observation in this run by call ID and optional source sequence; retain its durable source reference.".into(),input_schema:schema(vec!["call_id"],json!({"call_id":{"type":"string","minLength":1,"maxLength":256},"source_sequence":{"type":"integer","minimum":1},"note":{"type":"string","maxLength":2048},"pinned":{"type":"boolean"}}))},ToolDefinition{name:"ack_directive".into(),description:"Acknowledge an existing directive received in this run. This cannot create a directive or approve permissions.".into(),input_schema:schema(vec!["id"],json!({"id":{"type":"string","minLength":1,"maxLength":256}}))}]
 }
 pub(crate) fn prepare(call: ToolCall) -> Result<PreparedTool, String> {
     let definition = definitions()
@@ -27,7 +27,13 @@ pub(crate) fn prepare(call: ToolCall) -> Result<PreparedTool, String> {
     if !validator.is_valid(&data) {
         return Err("invalid episode utility arguments; use the advertised schema".into());
     }
-    for field in ["cursor", "limit", "source_sequence"] {
+    for field in [
+        "cursor",
+        "limit",
+        "source_sequence",
+        "from_sequence",
+        "to_sequence",
+    ] {
         if data
             .get(field)
             .is_some_and(|value| value.as_u64().is_none_or(|number| number > i64::MAX as u64))
@@ -46,6 +52,11 @@ pub(crate) fn prepare(call: ToolCall) -> Result<PreparedTool, String> {
         if data[field].as_str().is_some_and(|text| text.len() > max) {
             return Err(format!("{field} exceeds its UTF-8 byte limit"));
         }
+    }
+    if let (Some(from), Some(to)) = (data["from_sequence"].as_u64(), data["to_sequence"].as_u64())
+        && from > to
+    {
+        return Err("from_sequence must not exceed to_sequence".into());
     }
     Ok(PreparedTool {
         call,
@@ -92,12 +103,11 @@ async fn history(
     run: &str,
     args: &Value,
 ) -> Result<Value, String> {
-    let after = args["cursor"].as_u64().unwrap_or(0);
+    let first = args["from_sequence"].as_u64().unwrap_or(1);
+    let last = args["to_sequence"].as_u64().unwrap_or(u64::MAX);
+    let after = args["cursor"].as_u64().unwrap_or(0).max(first - 1);
     let limit = args["limit"].as_u64().unwrap_or(PAGE as u64) as usize;
-    let query = args["query"]
-        .as_str()
-        .ok_or("query required")?
-        .to_lowercase();
+    let query = args["query"].as_str().unwrap_or("").to_lowercase();
     let page = journal
         .entries(run, after, PAGE as u32)
         .await
@@ -106,6 +116,9 @@ async fn history(
     let mut cursor = after;
     let mut scanned = 0;
     for event in &page {
+        if event.sequence > last {
+            break;
+        }
         cursor = event.sequence;
         scanned += 1;
         // Sanitize the COMPLETE event before matching or truncating. In particular a
@@ -119,9 +132,11 @@ async fn history(
             }
         }
     }
-    let more = scanned < page.len() || page.len() == PAGE;
+    let more = cursor < last
+        && (scanned < page.len() || page.len() == PAGE)
+        && page.get(scanned).is_none_or(|event| event.sequence <= last);
     Ok(
-        json!({"results":results,"next_cursor":more.then_some(cursor),"scanned":scanned,"scope":"current_run"}),
+        json!({"results":results,"next_cursor":more.then_some(cursor),"scanned":scanned,"scope":"current_run","from_sequence":first,"to_sequence":args["to_sequence"]}),
     )
 }
 struct Observation {
@@ -340,6 +355,61 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|row| row["sequence"].as_u64().unwrap() > next)
+        );
+        db.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn history_recovers_an_exact_discarded_range_without_another_runs_events() {
+        let (_temp, db, journal, run) = fixture().await;
+        for index in 0..40 {
+            journal
+                .append(
+                    &run,
+                    "discarded",
+                    &format!("key-{index}"),
+                    json!({"index":index}),
+                )
+                .await
+                .unwrap();
+        }
+        let other = journal
+            .create_run("foreign-history", json!({}))
+            .await
+            .unwrap();
+        journal
+            .append(&other, "discarded", "foreign", json!({"index":"foreign"}))
+            .await
+            .unwrap();
+        let selected = execute(
+            &journal,
+            &Sanitizer,
+            &run,
+            "range",
+            &call(
+                "history_search",
+                json!({"from_sequence":12,"to_sequence":14}),
+            ),
+        )
+        .await;
+        assert!(selected.success);
+        assert_eq!(
+            selected.output["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["sequence"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![12, 13, 14]
+        );
+        assert!(selected.output["next_cursor"].is_null());
+        assert!(!selected.output.to_string().contains("foreign"));
+        assert!(
+            prepare(ToolCall {
+                id: "invalid".into(),
+                name: "history_search".into(),
+                arguments: json!({"from_sequence":14,"to_sequence":12}).to_string()
+            })
+            .is_err()
         );
         db.shutdown().await.unwrap();
     }

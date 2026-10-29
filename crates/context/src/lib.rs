@@ -1,7 +1,13 @@
-//! Deterministic context assembly. Selection, retrieval and compaction are host inputs.
+//! Deterministic context assembly and recoverable history views.
+pub mod compaction;
+pub mod session;
+pub mod tokens;
+pub use compaction::*;
 use excalibur_types::runtime::{Message, ModelRequest, ToolDefinition};
 use serde::{Deserialize, Serialize};
+pub use session::*;
 use sha2::{Digest, Sha256};
+pub use tokens::*;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolatileContext {
@@ -179,6 +185,7 @@ pub fn compile(input: &ContextInput) -> Result<CompiledContext, ContextError> {
         tools_enabled: input.tools_enabled,
         reasoning_effort: input.reasoning_effort.clone(),
         output_schema: input.output_schema.clone(),
+        cache: None,
     };
     let bytes = serde_json::to_vec(&request)?;
     Ok(CompiledContext {
