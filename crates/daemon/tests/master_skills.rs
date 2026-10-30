@@ -212,7 +212,7 @@ fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopeni
             .await
             .unwrap();
         let (first, answer) = next(&mut rx).await;
-        assert!(first.messages[1].content.contains("reactor"));
+        assert!(first.messages[1].content.contains("- reactor:"));
         assert!(!first.messages[1].content.contains("private-b"));
         assert!(first.messages[2].content.contains("A_MEMORY_MARKER"));
         assert!(!first.messages[2].content.contains("B_MEMORY_MARKER"));
@@ -329,7 +329,7 @@ fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopeni
             host.master.set_scope("skills-chat", scope).await.unwrap();
             let receipt = host.master.receive(incoming(scope, scope)).await.unwrap();
             let (request, answer) = next(&mut rx).await;
-            assert!(!request.messages[1].content.contains("reactor"));
+            assert!(!request.messages[1].content.contains("- reactor:"));
             assert_eq!(request.messages[1].content.contains("private-b"), private);
             assert!(!request.messages[2].content.contains("A_MEMORY_MARKER"));
             answer.send(reply(None, json!({}), "")).unwrap();
