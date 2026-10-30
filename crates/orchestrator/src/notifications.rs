@@ -11,11 +11,63 @@ pub struct HostNotificationBinding {
     /// Host-configured routes. This grants no external delivery adapter.
     pub approved_channels: Vec<String>,
 }
+impl HostNotificationBinding {
+    fn valid_shape(&self) -> bool {
+        !([
+            &self.principal,
+            &self.scope,
+            &self.conversation,
+            &self.source,
+        ]
+        .iter()
+        .any(|v| v.is_empty() || v.len() > 512)
+            || self.approved_channels.len() > 32
+            || self.approved_channels.iter().any(|v| {
+                v.is_empty()
+                    || v.len() > 512
+                    || v.starts_with("conversation:")
+                        && v != &format!("conversation:{}", self.conversation)
+            }))
+    }
+    /// Host-configured routes do not widen the accepted source's authority.
+    pub fn allows_channel(&self, preferred: Option<&str>) -> bool {
+        preferred.is_none_or(|channel| {
+            self.approved_channels
+                .iter()
+                .any(|allowed| allowed == channel)
+        })
+    }
+    /// Synchronous source and route validation for a host reminder mutation.
+    pub fn validate_reminder(
+        &self,
+        c: &rusqlite::Connection,
+        preferred: Option<&str>,
+    ) -> excalibur_store::Result<()> {
+        if !self.valid_shape() {
+            return Err(excalibur_store::Error::Invalid(
+                "invalid host notification binding",
+            ));
+        }
+        validate_host_source(c, self)?;
+        if !self.allows_channel(preferred) {
+            return Err(excalibur_store::Error::Invalid(
+                "unapproved host reminder route",
+            ));
+        }
+        Ok(())
+    }
+}
 /// Sealed host-only handle. Not exposed through model tools or deserialization.
 #[derive(Clone, Debug)]
 pub struct HostNotificationTarget {
     id: String,
     binding: HostNotificationBinding,
+}
+impl HostNotificationTarget {
+    /// Revalidate this sealed accepted-source binding inside another host writer.
+    pub fn validate(&self, c: &rusqlite::Connection) -> excalibur_store::Result<()> {
+        validate_host_source(c, &self.binding)
+    }
 }
 /// Live delivery eligibility, distinct from an immutable origin receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,11 +114,49 @@ fn host_authority(
     };
     let binding: HostNotificationBinding = serde_json::from_str(&body)
         .map_err(|_| excalibur_store::Error::Invalid("invalid host notification binding"))?;
-    if host_source_authorized(c, &binding)? {
+    if host_source_authorized(c, &binding)? && notification_condition(c, id)? {
         Ok(HostNotificationAuthority::Authorized(binding))
     } else {
         Ok(HostNotificationAuthority::Revoked(binding))
     }
+}
+fn notification_condition(c: &rusqlite::Connection, id: &str) -> excalibur_store::Result<bool> {
+    excalibur_scheduler::reminders::notification_eligible(c, id)
+}
+/// Host sink transaction guard; no SQL or authority is accepted from model arguments.
+pub fn host_notification_effect_allowed(
+    c: &rusqlite::Connection,
+    id: &str,
+    at: i64,
+) -> excalibur_store::Result<bool> {
+    match host_authority(c, id)? {
+        HostNotificationAuthority::Revoked(_) => return Ok(false),
+        HostNotificationAuthority::Authorized(_) => {}
+        HostNotificationAuthority::NotHost => {
+            let known:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM orchestration_notifications n WHERE n.id=?1 AND (n.agent_id!='' OR EXISTS(SELECT 1 FROM daemon_recovery_notification_receipts r WHERE r.notification_id=n.id)))",[id],|r|r.get(0))?;
+            if !known {
+                return Ok(false);
+            }
+        }
+    }
+    let exists: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='scheduler_notification_conditions')",
+        [],
+        |r| r.get(0),
+    )?;
+    if exists {
+        let guarded:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM scheduler_notification_conditions WHERE notification_id=?1)",[id],|r|r.get(0))?;
+        if guarded {
+            return c
+                .query_row(
+                    "SELECT recovering=0 AND safe_until<=?1 FROM daemon_recovery_state WHERE id=1",
+                    [at],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into);
+        }
+    }
+    Ok(true)
 }
 impl Orchestrator {
     /// Bind only host-authenticated metadata and configured routing. An accepted
@@ -75,22 +165,7 @@ impl Orchestrator {
         &self,
         binding: HostNotificationBinding,
     ) -> Result<HostNotificationTarget> {
-        if [
-            &binding.principal,
-            &binding.scope,
-            &binding.conversation,
-            &binding.source,
-        ]
-        .iter()
-        .any(|v| v.is_empty() || v.len() > 512)
-            || binding.approved_channels.len() > 32
-            || binding.approved_channels.iter().any(|v| {
-                v.is_empty()
-                    || v.len() > 512
-                    || v.starts_with("conversation:")
-                        && v != &format!("conversation:{}", binding.conversation)
-            })
-        {
+        if !binding.valid_shape() {
             return Err(invalid("invalid host notification binding"));
         }
         let body = serde_json::to_string(&binding)?;
@@ -151,6 +226,51 @@ impl Orchestrator {
         preferred: Option<&str>,
         at: i64,
     ) -> Result<Notification> {
+        self.notify_host_condition(target, key, class, text, preferred, at, None)
+            .await
+    }
+    /// Host-only atomic generation admission. None means the generation was cancelled.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn notify_host_guarded(
+        &self,
+        target: &HostNotificationTarget,
+        key: &str,
+        class: &str,
+        text: &str,
+        preferred: Option<&str>,
+        at: i64,
+        condition: excalibur_scheduler::reminders::FireCondition,
+        admission_at: i64,
+    ) -> Result<Option<Notification>> {
+        match self
+            .notify_host_condition(
+                target,
+                key,
+                class,
+                text,
+                preferred,
+                at,
+                Some((condition, admission_at)),
+            )
+            .await
+        {
+            Err(Error::Storage(excalibur_store::Error::Invalid(
+                "reminder generation cancelled" | "host notification source is not authorized",
+            ))) => Ok(None),
+            result => result.map(Some),
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn notify_host_condition(
+        &self,
+        target: &HostNotificationTarget,
+        key: &str,
+        class: &str,
+        text: &str,
+        preferred: Option<&str>,
+        at: i64,
+        condition: Option<(excalibur_scheduler::reminders::FireCondition, i64)>,
+    ) -> Result<Notification> {
         if key.is_empty()
             || key.len() > 256
             || !matches!(class, "urgent" | "normal" | "informational")
@@ -167,7 +287,12 @@ impl Orchestrator {
             return Err(invalid("invalid host notice or unapproved route"));
         }
         self.validate_durable(&json!({"content":text}))?;
-        let request = serde_json::to_string(&(target.id.clone(), class, text, preferred))?;
+        let request = match &condition {
+            None => serde_json::to_string(&(target.id.clone(), class, text, preferred))?,
+            Some((guard, _)) => {
+                serde_json::to_string(&(target.id.clone(), class, text, preferred, guard))?
+            }
+        };
         let n = Notification {
             id: format!("hntf_{}", digest(key.as_bytes())),
             agent_id: String::new(),
@@ -189,6 +314,12 @@ impl Orchestrator {
             if let Some((old,response))=old {
                 if old!=request {return Err(excalibur_store::Error::Invalid("host notification key reused"));}
                 return Ok(response);
+            }
+            if let Some((condition,admission_at))=&condition {
+                let ready:bool=c.query_row("SELECT recovering=0 AND safe_until<=?1 FROM daemon_recovery_state WHERE id=1",[admission_at],|r|r.get(0))?;
+                if !ready {return Err(excalibur_store::Error::Invalid("reminder generation cancelled"));}
+                if !condition.eligible(c)? {return Err(excalibur_store::Error::Invalid("reminder generation cancelled"));}
+                c.execute("INSERT INTO scheduler_notification_conditions VALUES(?1,?2)",rusqlite::params![n.id,serde_json::to_string(condition).map_err(|_|excalibur_store::Error::Invalid("invalid condition"))?])?;
             }
             c.execute("INSERT INTO orchestration_notifications VALUES(?1,'',?2,?3,?4,?5,0)",rusqlite::params![n.id,n.conversation,n.class,n.content,n.created])?;
             c.execute("INSERT INTO orchestration_host_notification_origins VALUES(?1,?2,?3,?4,?5,'host')",rusqlite::params![n.id,binding,request,snapshot,preferred])?;
@@ -273,7 +404,7 @@ impl Orchestrator {
         Ok(db.write(Priority::Interactive,move|c|{
             let notifications={let mut q=c.prepare("SELECT id,agent_id,conversation,class,content,created,acknowledged FROM orchestration_notifications WHERE acknowledged=0 ORDER BY created,id")?;q.query_map([],notification_row)?.collect::<std::result::Result<Vec<_>,_>>()?};
             let mut out=vec![];for n in notifications {
-                if matches!(host_authority(c,&n.id)?,HostNotificationAuthority::Revoked(_)){continue;}
+                if !host_notification_effect_allowed(c,&n.id,at)? {continue;}
 
                 let mut policy:NotificationPolicy=c.query_row("SELECT body FROM orchestration_notify_policy WHERE conversation=?1",[&n.conversation],|r|r.get::<_,String>(0)).optional()?.and_then(|s|serde_json::from_str(&s).ok()).unwrap_or_default();
                 let preferred:Option<String>=c.query_row("SELECT preferred_channel FROM orchestration_host_notification_origins WHERE notification_id=?1",[&n.id],|r|r.get(0)).optional()?.flatten();

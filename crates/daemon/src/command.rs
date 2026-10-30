@@ -369,7 +369,12 @@ pub async fn deliver_notifications(
     {
         deliver_notification(master, orchestrator, &delivery).await?;
     }
-    master.flush_notices(now).await.map_err(|e| e.to_string())?;
+    master
+        .flush_notices_checked(now, move |c, origin| {
+            excalibur_orchestrator::host_notification_effect_allowed(c, origin, now)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -425,13 +430,22 @@ pub async fn deliver_notification(
         content
     };
     let key = format!("{}:{}", delivery.notification.id, delivery.channel);
-    let published = if delivery.cross_conversation.is_some() {
-        master.publish_link(&key, target, content).await
+    let notice_id = delivery.notification.id.clone();
+    let class = if delivery.cross_conversation.is_some() {
+        "informational"
     } else {
-        master
-            .publish_notice(&key, target, content, &delivery.notification.class)
-            .await
+        &delivery.notification.class
     };
+    let origin = notice_id.clone();
+    let published = master
+        .publish_notice_checked(&key, target, content, class, &origin, move |c| {
+            excalibur_orchestrator::host_notification_effect_allowed(
+                c,
+                &notice_id,
+                excalibur_store::unix_seconds(),
+            )
+        })
+        .await;
     if published.is_ok() {
         orchestrator
             .confirm_delivery(&delivery.notification.id, &delivery.channel)
