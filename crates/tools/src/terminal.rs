@@ -891,7 +891,11 @@ impl TerminalManager {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let (file, total, exited) = {
+                #[cfg(test)]
+                exit_publication_tests::wait_trace("wait_attempt");
                 let output = session.output.lock().unwrap();
+                #[cfg(test)]
+                exit_publication_tests::wait_trace("wait_acquire");
                 (
                     output.file.try_clone().map_err(|e| e.to_string())?,
                     output.total,
@@ -2184,6 +2188,253 @@ fn process_group_rss(groups: &[u32]) -> Result<BTreeMap<u32, u64>, String> {
 #[cfg(test)]
 mod exit_publication_tests {
     use super::*;
+
+    thread_local! {
+        static TRACE_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn trace(event: &str) {
+        static START: OnceLock<Instant> = OnceLock::new();
+        println!(
+            "HCC_TRACE {}",
+            json!({"event": event, "elapsed_ns": START.get_or_init(Instant::now).elapsed().as_nanos()})
+        );
+        std::io::stdout().flush().unwrap();
+    }
+
+    pub(super) fn wait_trace(event: &str) {
+        TRACE_WAIT.with(|enabled| {
+            if enabled.get() {
+                trace(event);
+            }
+        });
+    }
+
+    // Executed only by the external watchdog below. Default tokio::test flavor
+    // deliberately matches HCC-1: one executor thread and a real clock.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess helper for real_clock_spool_barrier_ab"]
+    async fn real_clock_spool_barrier_child() {
+        let old = std::env::var("HCC_TEST_ORDERING").unwrap() == "old";
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::new(TerminalConfig {
+            spool_dir: directory.path().into(),
+            ..TerminalConfig::default()
+        })
+        .unwrap();
+        let spool = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "printf ready"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let code = child.wait().unwrap().code();
+        assert_eq!(reader.join().unwrap(), b"ready");
+        trace("process_exit_readers_joined");
+        let session = Arc::new(Session {
+            id: "barrier-test".into(),
+            owner: "test".into(),
+            command: "printf ready".into(),
+            pid,
+            last_used: AtomicU64::new(0),
+            manager: Arc::downgrade(&manager.inner),
+            output: Mutex::new(Output {
+                file: spool.reopen().unwrap(),
+                path: spool.path().into(),
+                head: Vec::new(),
+                tail: VecDeque::new(),
+                total: 0,
+                exited: false,
+                exit_code: None,
+                timed_out: false,
+                termination_reason: None,
+                error: None,
+                persisted_blob: None,
+            }),
+            input: Mutex::new(None),
+            notify: Notify::new(),
+            termination_requested: AtomicBool::new(false),
+            signals_closed: Mutex::new(false),
+            monitor: Mutex::new(None),
+        });
+        let observed = session.clone();
+        let file = spool.reopen().unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let monitor = std::thread::spawn(move || {
+            let barrier = || {
+                trace("barrier_enter");
+                entered_tx.send(()).unwrap();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), "release");
+                trace("barrier_release");
+                file.sync_all().unwrap();
+            };
+            if old {
+                // Test-only mutation of the former ordering, sharing the actual
+                // output state and the production wait/snapshot paths.
+                *observed.signals_closed.lock().unwrap() = true;
+                let mut output = observed.output.lock().unwrap();
+                barrier();
+                output.exited = true;
+                output.exit_code = code;
+            } else {
+                finish_output(
+                    &observed.output,
+                    &observed.signals_closed,
+                    code,
+                    false,
+                    barrier,
+                );
+            }
+            trace("durable_exit");
+            observed.notify.notify_waiters();
+        });
+        entered_rx.await.unwrap();
+        signal_if_running(&session.signals_closed, || panic!("signals must be closed"));
+        let (heartbeat_tx, heartbeat_rx) = tokio::sync::oneshot::channel();
+        let heartbeat = tokio::spawn(async {
+            let mut heartbeat_tx = Some(heartbeat_tx);
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                trace("heartbeat");
+                if let Some(sender) = heartbeat_tx.take() {
+                    sender.send(()).unwrap();
+                }
+            }
+        });
+        TRACE_WAIT.with(|enabled| enabled.set(true));
+        let completed = manager
+            .wait(&session, None, Duration::from_millis(100))
+            .await
+            .unwrap();
+        heartbeat_rx.await.unwrap();
+        trace(if completed {
+            "wait_completed"
+        } else {
+            "timeout_result"
+        });
+        let status = manager.snapshot(&session, 0, 100);
+        if !old {
+            assert!(!completed);
+            assert_eq!(status.output["exited"], false);
+            trace("status_unpublished");
+        }
+        heartbeat.abort();
+        // Parent releases after observing the timeout/status markers, or after
+        // its independent deadline when the old ordering blocks this executor.
+        tokio::task::spawn_blocking(move || monitor.join().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(manager.snapshot(&session, 0, 100).output["exited"], true);
+        assert!(*session.signals_closed.lock().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_clock_spool_barrier_ab() {
+        for ordering in ["old", "fixed"] {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "terminal::exit_publication_tests::real_clock_spool_barrier_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("HCC_TEST_ORDERING", ordering)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if tx.send(line.unwrap()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let started = Instant::now();
+            let mut attempt = None;
+            let mut released = false;
+            let mut events = Vec::new();
+            loop {
+                if started.elapsed() > Duration::from_secs(8) {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("external watchdog killed {ordering}: {events:?}");
+                }
+                if let Ok(line) = rx.recv_timeout(Duration::from_millis(10)) {
+                    println!(
+                        "{ordering} parent_ns={} {line}",
+                        started.elapsed().as_nanos()
+                    );
+                    if let Some(raw) = line.strip_prefix("HCC_TRACE ") {
+                        let value: Value = serde_json::from_str(raw).unwrap();
+                        let event = value["event"].as_str().unwrap().to_owned();
+                        if event == "wait_attempt" {
+                            attempt = Some(Instant::now());
+                        }
+                        events.push((event, released));
+                    }
+                }
+                let ready = if ordering == "old" {
+                    attempt.is_some_and(|time| time.elapsed() >= Duration::from_millis(350))
+                } else {
+                    events
+                        .iter()
+                        .any(|(event, _)| event == "status_unpublished")
+                };
+                if ready && !released {
+                    child
+                        .stdin
+                        .as_mut()
+                        .unwrap()
+                        .write_all(b"release\n")
+                        .unwrap();
+                    released = true;
+                }
+                if let Some(status) = child.try_wait().unwrap() {
+                    reader.join().unwrap();
+                    // Drain all lines, including durable publication after release.
+                    for line in rx.try_iter() {
+                        println!(
+                            "{ordering} parent_ns={} {line}",
+                            started.elapsed().as_nanos()
+                        );
+                        if let Some(raw) = line.strip_prefix("HCC_TRACE ") {
+                            let value: Value = serde_json::from_str(raw).unwrap();
+                            events.push((value["event"].as_str().unwrap().into(), released));
+                        }
+                    }
+                    assert!(status.success(), "{ordering}: {events:?}");
+                    break;
+                }
+            }
+            let before = |name: &str| {
+                events
+                    .iter()
+                    .any(|(event, released)| event == name && !released)
+            };
+            assert!(before("barrier_enter") && before("wait_attempt"));
+            assert_eq!(before("wait_acquire"), ordering == "fixed");
+            assert_eq!(before("heartbeat"), ordering == "fixed");
+            assert_eq!(before("timeout_result"), ordering == "fixed");
+            assert!(!before("durable_exit"));
+            assert!(events.iter().any(|(event, _)| event == "durable_exit"));
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn slow_spool_sync_keeps_status_readable_and_exit_unpublished() {
