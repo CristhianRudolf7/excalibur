@@ -1,4 +1,6 @@
 //! Durable, principal-local agent trees, controls, mailboxes and admission.
+#[cfg(test)]
+extern crate self as excalibur_orchestrator;
 mod agent_wait;
 mod control;
 mod gate;
@@ -7,6 +9,9 @@ mod notifications;
 mod profiles;
 mod progress;
 mod projects;
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod recovery_test_support;
 pub use profiles::CustomProfile;
 pub mod recovery;
 mod scheduling;
