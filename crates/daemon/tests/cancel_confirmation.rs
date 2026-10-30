@@ -152,6 +152,28 @@ fn authenticated_confirmation_survives_restart_and_cancels_once_with_full_inbox(
         ))
         .unwrap();
     runtimes.block_on(async {
+        // Opening the host retries its independent unavailable inbox. Wait for
+        // that startup probe to fail before measuring confirmation-only calls.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let unavailable: bool = db
+                    .read(ReadLane::Interactive, |c| {
+                        Ok(c.query_row(
+                            "SELECT unavailable FROM master_health WHERE id=1",
+                            [],
+                            |r| r.get(0),
+                        )?)
+                    })
+                    .await
+                    .unwrap();
+                if unavailable {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         let (url, server) = serve(&host).await;
         let calls = model.0.load(Ordering::SeqCst);
         send(&url, "affirm", "sí", Some(&question)).await;
