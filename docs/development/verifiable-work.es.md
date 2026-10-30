@@ -36,12 +36,14 @@ El README de pruebas es una proyección de la BD. Solo se reemplaza la sección 
 
 El detector determinista cubre resultados idénticos, errores repetidos, ciclos de dos a cinco llamadas, falta de progreso, texto repetido y conflictos reiterados de huella. Escala de nota correctiva a cambio de estrategia y después bloqueo. `exec_io wait_for` es una espera explícita, no un bucle de sondeo. Los presupuestos de ejecución y reservas atómicas de hijos cubren pasos, tokens, coste cuando hay tarifa, tiempo y llamadas. Al admitirlo, un hijo debe caber en el presupuesto restante del padre, incluido el tiempo transcurrido; las relaciones de reserva se comprueban contra ciclos en la misma transacción del portero. Una reserva rechazada deja ambos registros sin cambios. Los límites de grupos de comandos gestionados y sesiones retenidas se aplican al admitir terminales; no afirman contar ni limitar todos los descendientes del sistema operativo. El aislamiento y cgroup del host son otra frontera.
 
+El monitor de control del verificador trata la publicación `completed` del propio hijo como entrega correcta a quien produce el resultado. El productor publica este estado antes de devolver el veredicto: competir con el monitor no debe convertir una revisión terminada en un job interrumpido ni admitir otra revisión. La finalización del padre y las pausas, bloqueos, cancelaciones y fallos de padre/hijo siguen siendo controles. Una regresión determinista con journal real comprueba estos estados sin carreras de temporizadores; no demuestra la causa de timeouts anteriores de terminal.
+
 ## Comprobaciones y límites
 
 ```sh
 cargo test -p excalibur-tasks
 cargo test -p excalibur-engine --test verifiable_work
-cargo test -p excalibur-eval --test verifiable
+cargo test -p excalibur-eval --lib --test verifiable
 cargo test -p excalibur-tools --test terminal
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings

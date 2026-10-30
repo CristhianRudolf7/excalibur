@@ -107,6 +107,7 @@ struct Session {
     input: Mutex<Option<Box<dyn Write + Send>>>,
     notify: Notify,
     termination_requested: AtomicBool,
+    signals_closed: Mutex<bool>,
     monitor: Mutex<Option<std::thread::JoinHandle<()>>>,
     #[cfg(windows)]
     job: WindowsJob,
@@ -130,6 +131,24 @@ struct Output {
     termination_reason: Option<TerminationReason>,
     error: Option<String>,
     persisted_blob: Option<String>,
+}
+// Runtime status and wait futures take this mutex synchronously. A slow spool
+// fsync must not park their Tokio thread and prevent its deadlines from firing.
+// Readers have joined before this call; publish the exit only after the existing
+// best-effort durability barrier returns.
+fn finish_output(
+    output: &Mutex<Output>,
+    signals_closed: &Mutex<bool>,
+    code: Option<i32>,
+    timed_out: bool,
+    synchronize: impl FnOnce(),
+) {
+    *signals_closed.lock().unwrap() = true;
+    synchronize();
+    let mut output = output.lock().unwrap();
+    output.exited = true;
+    output.exit_code = code;
+    output.timed_out = timed_out;
 }
 impl Output {
     fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
@@ -964,6 +983,9 @@ impl TerminalManager {
         }
         let file = opts.open(&path).map_err(|e| e.to_string())?;
         fs2::FileExt::lock_exclusive(&file).map_err(|e| e.to_string())?;
+        // Keep a handle for durable exit publication without retaining the output
+        // mutex across filesystem I/O. Clone before launching any process.
+        let sync_file = file.try_clone().map_err(|e| e.to_string())?;
         let (sender, receiver) = std::sync::mpsc::channel();
         let manager = self.clone();
         let cmd = cmd.to_string();
@@ -998,6 +1020,7 @@ impl TerminalManager {
                     input: Mutex::new(Some(launched.input)),
                     notify: Notify::new(),
                     termination_requested: AtomicBool::new(false),
+                    signals_closed: Mutex::new(false),
                     monitor: Mutex::new(None),
                     #[cfg(windows)]
                     job: launched.job,
@@ -1090,12 +1113,15 @@ impl TerminalManager {
                     drop(launched.guardian);
                     #[cfg(target_os = "linux")]
                     drop(launched.sandbox);
-                    let mut output = observed.output.lock().unwrap();
-                    output.exited = true;
-                    output.exit_code = code;
-                    output.timed_out = timed_out;
-                    let _ = output.file.sync_all();
-                    drop(output);
+                    finish_output(
+                        &observed.output,
+                        &observed.signals_closed,
+                        code,
+                        timed_out,
+                        || {
+                            let _ = sync_file.sync_all();
+                        },
+                    );
                     observed.notify.notify_waiters();
                 }
 
@@ -1233,46 +1259,54 @@ impl Drop for KillOnDrop {
         self.0.signal(Signal::Kill);
     }
 }
+// Keep eligibility and the actual dispatch in one critical section so finalization
+// cannot close the process group between a status check and the signal syscall.
+fn signal_if_running(signals_closed: &Mutex<bool>, dispatch: impl FnOnce()) {
+    let closed = signals_closed.lock().unwrap();
+    if !*closed {
+        dispatch();
+    }
+}
 impl Session {
     fn signal(&self, signal: Signal) {
-        if self.output.lock().unwrap().exited {
-            return;
-        }
-        #[cfg(unix)]
-        unsafe {
-            let sig = match signal {
-                Signal::Interrupt => libc::SIGINT,
-                Signal::Terminate => libc::SIGTERM,
-                Signal::Kill => libc::SIGKILL,
-            };
-            libc::kill(-(self.pid as i32), sig);
-        }
-        #[cfg(windows)]
-        {
-            match signal {
-                Signal::Kill => self.job.terminate(),
-                Signal::Interrupt | Signal::Terminate => {
-                    if self.tty {
-                        if let Some(input) = self.input.lock().unwrap().as_mut() {
-                            let _ = input.write_all(b"\x03");
-                            let _ = input.flush();
-                        }
-                    } else {
-                        unsafe {
-                            use windows_sys::Win32::System::Console::{
-                                CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent,
-                            };
-                            if GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.pid) == 0 {
-                                self.output.lock().unwrap().error =
-                                    Some(std::io::Error::last_os_error().to_string());
+        signal_if_running(&self.signals_closed, || {
+            #[cfg(unix)]
+            unsafe {
+                let sig = match signal {
+                    Signal::Interrupt => libc::SIGINT,
+                    Signal::Terminate => libc::SIGTERM,
+                    Signal::Kill => libc::SIGKILL,
+                };
+                libc::kill(-(self.pid as i32), sig);
+            }
+            #[cfg(windows)]
+            {
+                match signal {
+                    Signal::Kill => self.job.terminate(),
+                    Signal::Interrupt | Signal::Terminate => {
+                        if self.tty {
+                            if let Some(input) = self.input.lock().unwrap().as_mut() {
+                                let _ = input.write_all(b"\x03");
+                                let _ = input.flush();
+                            }
+                        } else {
+                            unsafe {
+                                use windows_sys::Win32::System::Console::{
+                                    CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent,
+                                };
+                                if GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.pid) == 0 {
+                                    self.output.lock().unwrap().error =
+                                        Some(std::io::Error::last_os_error().to_string());
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+        });
     }
 }
+
 fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
     #[cfg(unix)]
     {
@@ -2144,5 +2178,70 @@ fn process_group_rss(groups: &[u32]) -> Result<BTreeMap<u32, u64>, String> {
     {
         let _ = groups;
         Err("native process-tree RSS accounting unavailable".into())
+    }
+}
+
+#[cfg(test)]
+mod exit_publication_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_spool_sync_keeps_status_readable_and_exit_unpublished() {
+        let spool = tempfile::NamedTempFile::new().unwrap();
+        let output = Arc::new(Mutex::new(Output {
+            file: spool.reopen().unwrap(),
+            path: spool.path().into(),
+            head: Vec::new(),
+            tail: VecDeque::new(),
+            total: 0,
+            exited: false,
+            exit_code: None,
+            timed_out: false,
+            termination_reason: None,
+            error: None,
+            persisted_blob: None,
+        }));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let signals_closed = Arc::new(Mutex::new(false));
+        // Dispatch may block on terminal input on Windows. Its gate must be
+        // independent from the state mutex used by output readers and status.
+        let mut dispatched = false;
+        signal_if_running(&signals_closed, || {
+            dispatched = true;
+            assert!(output.try_lock().is_ok());
+        });
+        assert!(dispatched);
+        let observed_signals = signals_closed.clone();
+        let observed = output.clone();
+        let monitor = std::thread::spawn(move || {
+            finish_output(&observed, &observed_signals, Some(23), true, || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+        });
+        started_rx.await.unwrap();
+        // The blocked durability barrier must neither monopolize the mutex used
+        // by async wait/status nor make the exit visible before it completes.
+        {
+            let state = output
+                .try_lock()
+                .expect("spool sync must release status mutex");
+            assert!(!state.exited);
+            assert_eq!(state.exit_code, None);
+            assert!(!state.timed_out);
+        }
+        signal_if_running(&signals_closed, || {
+            panic!("a finished process must not receive signals during spool sync")
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        release_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || monitor.join().unwrap())
+            .await
+            .unwrap();
+        let state = output.lock().unwrap();
+        assert!(state.exited);
+        assert_eq!(state.exit_code, Some(23));
+        assert!(state.timed_out);
     }
 }

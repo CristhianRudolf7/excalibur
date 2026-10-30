@@ -46,11 +46,15 @@ La integración es serial y durable: rebase sobre la rama de integración de tar
 
 El host conserva un monitor mientras el proyecto está activo, consulta `last_error` y llama a `stop` al cerrarlo. El trabajo interrumpido permanece en la cola. El backend no interactivo ejecuta una exploración final, detiene vigilancia y servidores de lenguaje y cierra grafo y bases.
 
+La publicación de salida de terminal ejecuta la barrera `sync_all` del spool sin retener el mutex de estado de salida. Estado, contabilidad de recursos y plazos de espera async pueden consultar la sesión en ejecución mientras la sincronización está pendiente; `exited`, código de salida y estado de timeout se publican juntos cuando retorna la barrera. Se deshabilitan las señales antes de la barrera para que una cancelación no alcance un grupo de procesos reutilizado durante una sincronización lenta. Se conserva la política existente de sincronización de mejor esfuerzo. La prueba backend determinista `slow_spool_sync_keeps_status_readable_and_exit_unpublished` bloquea esa barrera y comprueba disponibilidad del mutex y orden de publicación. Esto demuestra el defecto del mutex y su corrección, no la causa de todos los timeouts históricos HCC-1.
+
 ## Verificación
 
 ```sh
 cargo test -p excalibur-workspace --test concurrency --test shadow_entries --test typed_checkpoint
 cargo test -p excalibur-code-intelligence
+cargo test -p excalibur-tools --lib slow_spool_sync_keeps_status_readable_and_exit_unpublished
+cargo test -p excalibur-tools --test terminal
 cargo test -p excalibur-tools --test tool_retrieval --test terminal_vs_tools
 cargo test -p excalibur-tools --test project_tools --test project_monitor --test project_monitor_races --test child_integration
 cargo test -p excalibur-models --test deferred --test replay

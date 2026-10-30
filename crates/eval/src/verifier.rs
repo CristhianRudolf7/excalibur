@@ -593,20 +593,35 @@ impl GatewayVerifier {
     }
 }
 
+async fn control_interruption(
+    journal: &excalibur_journal::Journal,
+    parent: &str,
+    child: &str,
+) -> Option<String> {
+    for run in [parent, child] {
+        match journal.state(run).await {
+            Ok((state, _))
+                if matches!(state.as_str(), "ready" | "running" | "verifying")
+                    // The producer publishes its child's successful terminal
+                    // state before returning its verdict to the select caller.
+                    || (run == child && state == "completed") => {}
+            Ok((state, _)) => {
+                return Some(format!("independent verification interrupted by {state}"));
+            }
+            Err(_) => return Some("independent verification control unavailable".into()),
+        }
+    }
+    None
+}
+
 async fn wait_for_control(
     journal: &excalibur_journal::Journal,
     parent: &str,
     child: &str,
 ) -> String {
     loop {
-        for run in [parent, child] {
-            match journal.state(run).await {
-                Ok((state, _)) if matches!(state.as_str(), "ready" | "running" | "verifying") => {}
-                Ok((state, _)) => {
-                    return format!("independent verification interrupted by {state}");
-                }
-                Err(_) => return "independent verification control unavailable".into(),
-            }
+        if let Some(interruption) = control_interruption(journal, parent, child).await {
+            return interruption;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -1116,6 +1131,97 @@ mod accounting_tests {
             model.requests.lock().unwrap()[0].messages[0]
                 .content
                 .contains(&skill.instructions)
+        );
+        db.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn completed_verifier_is_not_control_but_parent_control_still_interrupts() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = excalibur_store::Database::open(
+            temp.path().join("main.db"),
+            excalibur_store::DatabaseKind::Main,
+            excalibur_store::StorageConfig::default(),
+        )
+        .unwrap();
+        let journal = excalibur_journal::Journal::new(db.clone()).await.unwrap();
+        let parent = journal
+            .create_run("control-parent", json!({}))
+            .await
+            .unwrap();
+        let child = journal
+            .create_run("control-verifier", json!({}))
+            .await
+            .unwrap();
+        journal
+            .set_state(&parent, "verifying", None, "parent:verifying")
+            .await
+            .unwrap();
+        journal
+            .set_state(&child, "completed", None, "verifier:completed")
+            .await
+            .unwrap();
+        // The result producer publishes the terminal state before returning its
+        // verdict. Its own successful publication is not an external control.
+        assert_eq!(control_interruption(&journal, &parent, &child).await, None);
+        assert_eq!(journal.state(&child).await.unwrap().0, "completed");
+        journal
+            .set_state(&parent, "paused", None, "parent:paused")
+            .await
+            .unwrap();
+        assert_eq!(
+            control_interruption(&journal, &parent, &child)
+                .await
+                .as_deref(),
+            Some("independent verification interrupted by paused")
+        );
+        journal
+            .set_state(&parent, "running", None, "parent:resumed")
+            .await
+            .unwrap();
+        assert_eq!(control_interruption(&journal, &parent, &child).await, None);
+        for state in [
+            "paused",
+            "blocked",
+            "cancelled",
+            "failed",
+            "completed_with_pending",
+        ] {
+            let controlled_child = journal
+                .create_run(&format!("controlled-child:{state}"), json!({}))
+                .await
+                .unwrap();
+            journal
+                .set_state(&controlled_child, state, None, &format!("child:{state}"))
+                .await
+                .unwrap();
+            assert_eq!(
+                control_interruption(&journal, &parent, &controlled_child).await,
+                Some(format!("independent verification interrupted by {state}"))
+            );
+        }
+        for state in ["blocked", "cancelled", "failed", "completed_with_pending"] {
+            let controlled_parent = journal
+                .create_run(&format!("controlled-parent:{state}"), json!({}))
+                .await
+                .unwrap();
+            journal
+                .set_state(&controlled_parent, state, None, &format!("parent:{state}"))
+                .await
+                .unwrap();
+            assert_eq!(
+                control_interruption(&journal, &controlled_parent, &child).await,
+                Some(format!("independent verification interrupted by {state}"))
+            );
+        }
+        journal
+            .set_state(&parent, "completed", None, "parent:completed")
+            .await
+            .unwrap();
+        assert_eq!(
+            control_interruption(&journal, &parent, &child)
+                .await
+                .as_deref(),
+            Some("independent verification interrupted by completed")
         );
         db.shutdown().await.unwrap();
     }

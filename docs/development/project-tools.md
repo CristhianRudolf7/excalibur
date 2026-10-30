@@ -46,11 +46,15 @@ Integration is serialized and durable: rebase onto the task integration branch, 
 
 The host retains one monitor handle while a project is active, inspects `last_error` and calls `stop` when closing it. Queued work remains durable if interrupted. The noninteractive backend performs a final scan, stops the monitor, closes language sessions and shuts down its graph/database resources.
 
+Terminal exit publication runs the spool `sync_all` barrier without holding the output-state mutex. Status, resource accounting and async wait deadlines can still inspect the running session while synchronization is pending; `exited`, exit code and timeout status become visible together after the barrier returns. Signal dispatch is disabled before the barrier so cancellation cannot target a process group reused during a slow synchronization. Synchronization retains the existing best-effort error policy. The deterministic `slow_spool_sync_keeps_status_readable_and_exit_unpublished` backend test blocks that barrier and checks both mutex availability and publication ordering. This establishes the mutex defect and its correction, not the cause of every historical HCC-1 timeout.
+
 ## Verification
 
 ```sh
 cargo test -p excalibur-workspace --test concurrency --test shadow_entries --test typed_checkpoint
 cargo test -p excalibur-code-intelligence
+cargo test -p excalibur-tools --lib slow_spool_sync_keeps_status_readable_and_exit_unpublished
+cargo test -p excalibur-tools --test terminal
 cargo test -p excalibur-tools --test tool_retrieval --test terminal_vs_tools
 cargo test -p excalibur-tools --test project_tools --test project_monitor --test project_monitor_races --test child_integration
 cargo test -p excalibur-models --test deferred --test replay
