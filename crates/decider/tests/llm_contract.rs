@@ -244,3 +244,25 @@ fn descriptions_and_total_request_size_are_bounded() {
     }
     assert!(request.validate().is_err());
 }
+
+#[test]
+fn aggregate_request_budget_counts_serialized_descriptions() {
+    for description in ["x".repeat(MAX_INSTRUCTIONS_BYTES), "\u{0001}".repeat(2048)] {
+        let mut request = request();
+        let values = (0..40).map(|i| format!("option-{i}")).collect::<Vec<_>>();
+        request.questions = vec![Question::choice(
+            "kind",
+            "choose",
+            &values.iter().map(String::as_str).collect::<Vec<_>>(),
+        )];
+        if let Question::Choice { choices, .. } = &mut request.questions[0] {
+            for choice in choices {
+                choice.description = Some(description.clone());
+            }
+        }
+        assert!(
+            serde_json::to_vec(&request).unwrap().len() > MAX_INPUT_BYTES + MAX_INSTRUCTIONS_BYTES
+        );
+        assert!(request.validate().is_err());
+    }
+}

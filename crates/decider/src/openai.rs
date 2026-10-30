@@ -208,21 +208,27 @@ impl Decider for OpenAiDecisions {
         Box::pin(async move {
             request.validate()?;
             let body = self.body(request);
-            let response = match self.client.openai_decision(body.clone()).await {
-                Err(ProviderError::ClassifiedHttp {
-                    kind: KnownFailure::Quota,
-                    ..
-                }) if self.fallback_client.is_some() => {
-                    self.fallback_client
-                        .as_ref()
-                        .unwrap()
-                        .openai_decision(body)
-                        .await
-                }
-                other => other,
-            }
-            .map_err(|e| DeciderError::Unavailable(e.to_string()))?;
+            let (response, effective_client, route) =
+                match self.client.openai_decision(body.clone()).await {
+                    Err(ProviderError::ClassifiedHttp {
+                        kind: KnownFailure::Quota,
+                        ..
+                    }) if self.fallback_client.is_some() => {
+                        let client = self.fallback_client.as_ref().unwrap();
+                        (client.openai_decision(body).await, client, "quota_fallback")
+                    }
+                    other => (other, &self.client, "primary"),
+                };
+            let response = response.map_err(|e| DeciderError::Unavailable(e.to_string()))?;
             let mut decision = parse_response(request, &response)?;
+            decision.backend = format!(
+                "openai-decisions:{}:{route}",
+                crate::ledger::digest(effective_client.configuration_identity().as_bytes())
+            );
+            if route == "quota_fallback" {
+                decision.fallback_questions =
+                    request.questions.iter().map(|q| q.name().into()).collect();
+            }
             if decision.model.is_none() {
                 decision.model = Some(self.model.clone());
             }
