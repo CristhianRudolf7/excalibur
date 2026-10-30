@@ -108,6 +108,11 @@ impl Master {
     }
     pub async fn answer_question(&self, conversation: &str, id: &str, answer: &str) -> Result<()> {
         self.authorize_conversation(conversation).await?;
+        if self.is_cancel_question(id).await? {
+            return Err(Error::Invalid(
+                "cancellation requires an authenticated client message".into(),
+            ));
+        }
         if answer.is_empty() || answer.len() > 8192 {
             return Err(Error::Invalid("invalid answer size".into()));
         }
@@ -202,6 +207,9 @@ impl Master {
             else {
                 continue;
             };
+            if self.route_cancel_source(conversation, &source).await? {
+                continue;
+            }
             if matches!(
                 self.route_question_source(conversation, &source).await?,
                 QuestionRoute::Continue

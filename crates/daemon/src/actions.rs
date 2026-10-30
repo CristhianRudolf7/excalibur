@@ -591,7 +591,14 @@ impl DaemonActions {
                 "resume" => Control::Resume,
                 "interrupt" => Control::Interrupt,
                 "cancel" => {
-                    return Ok(json!({"confirmation_required":true,"target":id,"action":"cancel"}));
+                    let agent = self
+                        .orchestrator
+                        .agent(&id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    return Ok(
+                        json!({"confirmation_required":true,"target":id,"scope":agent.scope,"action":"cancel"}),
+                    );
                 }
                 _ => return Err("unknown fast command".into()),
             };
@@ -621,6 +628,53 @@ fn definition(
     }
 }
 impl FastActions for DaemonActions {
+    fn confirm_cancel<'a>(
+        &'a self,
+        conversation: &'a str,
+        scope: &'a str,
+        target: &'a str,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Value, String>> {
+        Box::pin(async move {
+            let master = self.master()?;
+            if !master
+                .authorizes_cancel(conversation, scope, target, key)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                return Err("cancellation lacks an authenticated accepted decision".into());
+            }
+            if master
+                .conversation_scope(conversation)
+                .await
+                .map_err(|e| e.to_string())?
+                != scope
+            {
+                return Err("cancellation scope changed".into());
+            }
+            let agent = self
+                .orchestrator
+                .agent(target)
+                .await
+                .map_err(|e| e.to_string())?;
+            let ceiling = self
+                .orchestrator
+                .agent(&self.master_agent)
+                .await
+                .map_err(|e| e.to_string())?;
+            if agent.scope != scope || !ceiling.token.data_scopes.contains(scope) {
+                return Err("cancellation target exceeds conversation authority".into());
+            }
+            serde_json::to_value(
+                self.orchestrator
+                    .control_keyed(key, target, Control::Cancel { confirmed: true })
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())
+        })
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition> {
         vec![
             ToolDefinition{name:"task_db".into(),description:"Query or update versioned tasks and criteria in this turn scope; corrections propagate to affected work".into(),input_schema:excalibur_tasks::task_schema()},

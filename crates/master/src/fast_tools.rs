@@ -52,6 +52,16 @@ impl MasterFastTools {
     }
 }
 impl FastActions for MasterFastTools {
+    fn confirm_cancel<'a>(
+        &'a self,
+        conversation: &'a str,
+        scope: &'a str,
+        target: &'a str,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Value, String>> {
+        self.core.confirm_cancel(conversation, scope, target, key)
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = self.core.definitions();
         definitions.extend(

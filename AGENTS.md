@@ -34,3 +34,5 @@
 
 - Skill/decider library verification: `cargo test -p excalibur-skills --test catalog` and `cargo test -p excalibur-decider --test contract` cover local manifest validation, precedence, catalog freezing, authority intersection, quarantine, labeled decisions and calibration. See [Skills and bounded decisions](docs/development/skills-decider.md) for integration limits.
 - Decider adapter verification: `cargo test -p excalibur-decider --test llm_contract` checks strict LLM response validation, retry/fallback through local mock gateways, per-answer attribution and calibration isolation by backend/model and question semantics.
+
+- Conversational cancellation verification: `cargo test -p excalibur-master --test cancel_confirmation` and `cargo test -p excalibur-daemon --test cancel_confirmation` cover authenticated confirmation, durable decision replay, principal/scope isolation, denial, ambiguous/generated inputs, full-inbox intake and local HTTP through gateway/master/orchestrator. See [Daemon, master and subagents](docs/development/daemon.md).
