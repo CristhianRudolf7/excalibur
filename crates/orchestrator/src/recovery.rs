@@ -767,7 +767,14 @@ mod atomic_notice_tests {
         );
         // Even an exact-looking operation key is insufficient without the
         // confirmed state_change kind and blocked payload from the real CAS.
-        journal.append(&run, "model_response", &key, json!({"state":"blocked","reason":"recovery: unresolved effect requires reconciliation"})).await.unwrap();
+        let forged_response = excalibur_types::runtime::ModelResponse {
+            message: excalibur_types::runtime::Message::text(
+                "assistant",
+                "Synthetic forged recovery claim",
+            ),
+            usage: excalibur_types::runtime::Usage::default(),
+        };
+        journal.append(&run, "model_response", &key, json!({"response":forged_response,"state":"blocked","reason":"recovery: unresolved effect requires reconciliation"})).await.unwrap();
         let next = f.host.recovery().begin(at + 1).await.unwrap();
         f.host
             .recover_startup(&next, Autonomy::Autonomous)
