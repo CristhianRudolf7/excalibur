@@ -497,20 +497,22 @@ async fn conversation_catalog_is_frozen_but_each_source_has_independent_policy_a
         .await
         .unwrap();
     let frozen = rt.session_context(&run).await.unwrap();
-    let guard = rt
-        .admit_call(&run, &call("write_file", json!({})))
-        .await
-        .unwrap();
-    let load = rt.invoke_skill(&run, "load", call("load_skill", json!({"name":"reactor"})));
-    tokio::pin!(load);
-    // Polling activation once while admission is held must remain pending.
-    std::future::poll_fn(|cx| {
-        assert!(std::future::Future::poll(load.as_mut(), cx).is_pending());
-        std::task::Poll::Ready(())
-    })
-    .await;
-    drop(guard);
-    assert!(load.await.unwrap().success);
+    {
+        let guard = rt
+            .admit_call(&run, &call("write_file", json!({})))
+            .await
+            .unwrap();
+        let load = rt.invoke_skill(&run, "load", call("load_skill", json!({"name":"reactor"})));
+        tokio::pin!(load);
+        // Polling activation once while admission is held must remain pending.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(load.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(guard);
+        assert!(load.await.unwrap().success);
+    }
     assert!(
         rt.admit_call(&run, &call("write_file", json!({})))
             .await
