@@ -31,7 +31,9 @@ Cada agente registrado no terminal recibe una decisión y un hecho de recuperaci
 ## Verificación backend y resto de H9
 
 ```sh
+cargo test -p excalibur-orchestrator --lib atomic_notice_tests
 cargo test -p excalibur-orchestrator --test startup_recovery
+cargo test -p excalibur-daemon --test provisioning_restore
 cargo test -p excalibur-cli --test startup_recovery
 cargo test -p excalibur-daemon --test service_supervision
 ```
@@ -39,3 +41,11 @@ cargo test -p excalibur-daemon --test service_supervision
 La suite del orquestador usa SQLite temporal real, relojes deterministas y modelos/herramientas simulados. Cubre umbral, cuarentena por paso y liberación, frontera real de despacho, expiración/controles manuales, replay, autonomía/seis horas, hechos de aprobación conservados, intenciones pendientes y deduplicación de avisos urgentes con ámbito tras reapertura real de la base. El fixture CLI de Linux lanza el daemon foreground real, lo mata tres veces con SIGKILL, consulta HTTP autenticado, recibe conversación del maestro durante modo seguro, comprueba un resumen durable, sale del modo y verifica reinicio limpio. No configura modelos de proveedor ni llama a APIs pagadas.
 
 Es una base conectada de arranque/admisión, no H9 completo. Sesiones de proyectos largos, watchdog de diez minutos, reconciliación completa, despacho de agenda, retención/purga, instaladores y supervisores del SO, actualizaciones firmadas/drenaje/reversión y ejecución nativa multiplataforma siguen siendo requisitos pendientes. El registro de arranque foreground no implica servicio del SO ni actualización implementados.
+
+## Checkpoint de fuente verificado (2026-10-30)
+
+El commit de fuente `c3aad83b3907bb0bba4e0820e0a1d722c3678563` pasó formato, las dos regresiones unitarias de avisos atómicos, los siete tests de integración de arranque, ambos tests de provisión/entrega del daemon, los tests CLI de arranque y daemon, la suite completa del orquestador, los cuatro tests de supervisión del daemon, clippy de orchestrator/daemon/CLI con todos los targets y warnings denegados, y los builds de daemon/CLI. El fixture foreground real incluye tres SIGKILL/reinicios y HTTP autenticado; la regresión del resumen de proyecto alcanza el inbox real del maestro sin agentes del proyecto. Se usaron fixtures sintéticos locales, jobs=2 y el lock global de compilación pesada. El log conservado es `startup-atomic-c3aad83-final.log`; esta evidencia corresponde a esa fuente, no a un snapshot integrado aún sin probar.
+
+Los resultados anteriores se conservan separados: `ce3d96b` recibió el hallazgo SR1 y su checker con prerrequisito se detuvo en lint del host; `d1c812e` falló dos tests de arranque por la columna SQL de ámbito inexistente; `4ae15ab` pasó siete tests de arranque pero su nuevo fixture de entrega falló por la clave foránea del principal ausente antes de entregar; `fdefb2f` pasó la regresión post-CAS/reapertura pero su fixture negativo usó un payload de respuesta de modelo inválido. La corrección final del fixture mantiene las aserciones de CAS rechazado, bloqueo de usuario y evento de modelo falsificado. Ninguno de esos checkpoints fallidos se presenta como verificación final aprobada.
+
+La interrupción se mide desde el heartbeat durable anterior y el cierre no limpio solo se detecta en el siguiente arranque. La regresión post-CAS inyecta una pérdida exactamente después de la transición confirmada y antes de su decisión, cierra/reabre la base real e inicia otro arranque; no es un test SIGKILL separado en esa frontera precisa. La recuperación bloquea efectos inciertos sin despacharlos de nuevo y conserva pausas de usuario y aprobaciones. Los requisitos H9 restantes enumerados arriba siguen pendientes.
