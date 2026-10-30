@@ -500,15 +500,23 @@ impl Execution {
             )
             .with_skills(skills.clone()),
         );
+        let tools: Arc<dyn ToolRuntime> = excalibur_web_adapter::harness::WebHarness::wrap_from_env(
+            tools,
+            options.task_network_allowed,
+            options.profile == ExecutionProfile::Eval,
+        );
         let available = tools
             .definitions()
             .into_iter()
             .map(|d| d.name)
             .collect::<std::collections::BTreeSet<_>>();
-        let domains = excalibur_tools::project::deferred_catalog()
+        let mut domains = excalibur_tools::project::deferred_catalog()
             .into_iter()
             .filter(|d| available.contains(&d.name))
-            .collect();
+            .collect::<Vec<_>>();
+        if options.task_network_allowed && excalibur_web_adapter::harness::registration_enabled() {
+            domains.extend(excalibur_web_adapter::harness::browser_catalog());
+        }
         let domain_catalog =
             Arc::new(excalibur_tools::deferred::ToolCatalog::new(domains).map_err(config_error)?);
         let tools: Arc<dyn ToolRuntime> = Arc::new(
@@ -540,7 +548,13 @@ impl Execution {
                 .extra
                 .insert("profile_hash".into(), json!(hash(p)));
         }
-        options.metadata.extra.insert("capability_availability".into(),json!({"tools":catalog.iter().map(|d|&d.name).collect::<Vec<_>>(),"subagent_orchestrator":false,"durable_task_planning":true,"independent_task_verifier":true,"full_skill_catalog":false,"deferred_adapters":[],"rewards_source":"external_host_adapter_only"}));
+        let deferred_adapters: Vec<&str> = if excalibur_web_adapter::harness::registration_enabled()
+        {
+            vec!["browser"]
+        } else {
+            Vec::new()
+        };
+        options.metadata.extra.insert("capability_availability".into(),json!({"tools":catalog.iter().map(|d|&d.name).collect::<Vec<_>>(),"subagent_orchestrator":false,"durable_task_planning":true,"independent_task_verifier":true,"full_skill_catalog":false,"deferred_adapters":deferred_adapters,"rewards_source":"external_host_adapter_only"}));
         options.metadata.tool_catalog_hash = Some(tools_hash);
         options.metadata.skill_catalog_hash = Some(hash(&skills));
         options.metadata.environment = json!({"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"cpus":options.task_cpu_count,"timezone":"UTC","language":frozen.as_ref().map(|p|p.language.as_str()).unwrap_or("en")});

@@ -8,6 +8,7 @@ excalibur-security = { path = "../security" }
 excalibur-vault = { path = "../vault" }
 excalibur-store = { path = "../store" }
 excalibur-types = { path = "../types" }
+excalibur-tools = { path = "../tools" }
 excalibur-sandbox = { path = "../sandbox" }
 cap-std = "3"
 serde_json = "1"

@@ -921,3 +921,63 @@ afirman. Pendientes: gestión del scope del cgroup, supervisión real de
 Chrome, señales del intermediario, llamadas CDP de GC/presión/caché,
 recorridos de perfiles con `Storage.getUsageAndQuota` y mediciones VPS. Ver
 [Fundamento de recursos](browser-resources.es.md).
+
+## Integración con el arnés
+
+`excalibur-web-adapter::harness` aporta el `ToolRuntime` del arnés, el
+catálogo de herramientas y los manifiestos de capacidad (arq. 16). Las doce
+herramientas `browser_*` se registran como diferidas (fuera del prefijo
+ansioso, vía `search_tools`/`call_tool`); `web_search` y `web_read` son
+núcleo (arq. 14.3). Los metadatos estáticos siguen 16.2 (efecto,
+idempotencia, riesgo, `timeout_ms`, fast, clase de cancelación);
+`browser_act` degrada su efecto por llamada en `prepare` (`observe` a
+`Pure`, `input` a `Idempotent`, las clases de commit quedan
+`NonIdempotent`).
+
+La reconciliación sigue 16.3: las lecturas puras reintentan,
+`browser_navigate` sondea la URL de la pestaña (`Done` si ya muestra el
+documento destino, `Retry` si no), las herramientas con clave reenvían con
+la misma clave, y las clases de commit consultan `op.get(op_key)`
+(`completed` a `Done` con el resultado guardado, `received` a `Retry`,
+`failed`/`dispatched`/reiniciado a `Uncertain`, sin repetir a ciegas). La
+cancelación sigue 16.5: `immediate` detiene el sondeo del cliente,
+`graceful` y `after_completion` además cierran las sesiones efímeras
+rastreadas de la ejecución al cancelar, mientras las persistentes siguen
+vivas; `execution_state` libera el rastreo en pausa y estados terminales.
+El perfil `eval` (16.8) deniega perfiles persistentes, bloquea fuentes de
+benchmark en `web_read`/`browser_navigate`/resultados de búsqueda y
+convierte los bloqueos humanos en fallos inmediatos. El registro en la
+composición del host (cadena
+`DeferredTools(ExecutionTools(SecuredTools(...)))` en
+`crates/eval/src/runner.rs`) solo ocurre con el arnés habilitado
+explícitamente vía `EXCALIBUR_WEB_HARNESS=1` con `EXCALIBUR_WEB_SOCKET`
+apuntando al socket de webd y el flag de red del host permitiendo
+herramientas web; la ruta por defecto no cambia. Un RPC
+`op.cancel` dedicado para operaciones ya despachadas sigue pendiente en
+webd, así que su cancelación depende del paro del sondeo más la limpieza
+efímera. La intervención sigue siendo un envoltorio fino: `takeover_start`
+llama al RPC existente `takeover.start` y `viewer_issue` al existente
+`viewer.issue` con las mismas comprobaciones de propiedad; no se añade
+autorización nueva. Conectar el comando `excalibur browser takeover
+<sesión>` en el binario CLI sigue pendiente (el CLI hoy solo implementa
+`exec`).
+
+```sh
+cargo test -p excalibur-web-adapter
+cargo test -p excalibur-cdp -p excalibur-browser -p excalibur-search -p excalibur-web-adapter
+cargo test -p excalibur-webd --test web_integration -- --nocapture
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+`web_integration` cubre las filas 16.10 solo con fixtures sintéticas
+locales: recorrido efímero del arnés (apertura, navegación a URL local,
+espera, captura, acción de entrada, `web_read`) con eventos de fuente,
+reconciliación tras caída a `Done` sin reenvío, reinicio de webd que vuelve
+`Uncertain` un commit despachado sin reenviar, re-lanzamiento de escucha,
+cancelación que cierra sesiones efímeras y conserva persistentes,
+recuperación de `search_tools` con `browser_snapshot`/`browser_act` entre
+los cinco primeros con hash de catálogo estable, denegaciones `eval` y
+conflicto por clave reutilizada. Las filas con caídas del demonio real y
+los recorridos manuales 18.4 con sitios reales siguen pendientes del
+usuario y nunca se afirman.

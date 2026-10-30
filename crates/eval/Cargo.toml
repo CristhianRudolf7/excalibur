@@ -16,6 +16,7 @@ excalibur-sandbox = { path = "../sandbox" }
 excalibur-security = { path = "../security" }
 excalibur-telemetry = { path = "../telemetry" }
 excalibur-vault = { path = "../vault" }
+excalibur-web-adapter = { path = "../web-adapter" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
