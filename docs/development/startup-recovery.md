@@ -31,7 +31,9 @@ Every nonterminal registered agent receives a durable recovery decision and host
 ## Backend verification and remaining H9 scope
 
 ```sh
+cargo test -p excalibur-orchestrator --lib atomic_notice_tests
 cargo test -p excalibur-orchestrator --test startup_recovery
+cargo test -p excalibur-daemon --test provisioning_restore
 cargo test -p excalibur-cli --test startup_recovery
 cargo test -p excalibur-daemon --test service_supervision
 ```
@@ -39,3 +41,11 @@ cargo test -p excalibur-daemon --test service_supervision
 The orchestrator suite uses real temporary SQLite databases, deterministic clock samples and mock model/tools. It covers the boot threshold, exact-step quarantine and release, the real dispatch gate, expiry/manual controls, replay, autonomy/six-hour policy, preserved approval facts, unresolved tool intentions and scoped urgent notification deduplication after a real database reopen. The Linux CLI fixture starts the real foreground daemon, kills it with SIGKILL three times, queries authenticated HTTP, exercises master conversation intake during safe mode, verifies one durable summary, exits safe mode and checks a clean restart. It uses no provider model configuration or paid API.
 
 This is a connected startup/admission foundation, not H9 completion. Long-running project sessions, the ten-minute stuck-run watchdog, full world reconciliation, scheduled-fire dispatch, retention/purge, installers and operating-system supervisors, signed updates/drain/rollback and native platform execution remain separate unfinished requirements. No OS service or update path is implied by the foreground boot ledger.
+
+## Verified source checkpoint (2026-10-30)
+
+Source commit `c3aad83b3907bb0bba4e0820e0a1d722c3678563` passed format, both atomic-notice unit regressions, all seven startup-recovery integration tests, both daemon provisioning/delivery tests, CLI startup-recovery and daemon tests, the complete orchestrator suite, all four daemon service-supervision tests, clippy for orchestrator/daemon/CLI with all targets and warnings denied, and daemon/CLI builds. The real foreground fixture includes three SIGKILL/restarts and authenticated HTTP; the project-summary regression reaches the real master inbox without project agents. These checks used local synthetic fixtures, jobs=2 and the global heavy-build lock. The retained run log is `startup-atomic-c3aad83-final.log`; this evidence applies to that source commit, not an untested integration snapshot.
+
+Earlier results remain distinct: `ce3d96b` received the SR1 finding and its prerequisite-assisted checker stopped at the host lint; `d1c812e` failed two startup tests on the invalid SQL scope column; `4ae15ab` passed seven startup tests but its new delivery fixture failed a missing-principal foreign key before delivery; `fdefb2f` passed the post-CAS/reopen regression but its negative fixture used an invalid model-response payload. The final fixture correction preserves the rejected-CAS, user-block and forged-model-event assertions. None of those failed checkpoints is presented as a passing final verification.
+
+Downtime is measured from the previous durable heartbeat, and an unclean stop is detected only at the next boot. The post-CAS regression injects loss exactly after the confirmed state transition and before its decision, then closes/reopens the real database and begins another boot; it is not a separate SIGKILL test at that precise boundary. Recovery blocks uncertain effects without dispatching them again, and preserves user pauses and approvals. The remaining H9 requirements listed above are still unfinished.
