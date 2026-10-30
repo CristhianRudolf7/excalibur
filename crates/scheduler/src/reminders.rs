@@ -1,21 +1,84 @@
 //! Host-only reminder domain. Authority is supplied by the authenticated host,
 //! never inferred from reminder text, timer payloads, or model arguments.
 use super::*;
-use std::{collections::BTreeMap, path::PathBuf, sync::{Arc, Mutex, OnceLock, Weak}};
 
-/// Process-local wake hint shared by host handles for the same database path.
-/// Durable timers remain authoritative; a lost hint never loses a fire.
-pub fn changes(db: &Database) -> Arc<tokio::sync::Notify> {
-    static SIGNALS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<tokio::sync::Notify>>>> = OnceLock::new();
-    let mut signals = SIGNALS.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
-    signals.retain(|_, signal| signal.strong_count() > 0);
-    let key = db.path().to_path_buf();
-    if let Some(signal) = signals.get(&key).and_then(Weak::upgrade) { return signal; }
-    let signal = Arc::new(tokio::sync::Notify::new());
-    signals.insert(key, Arc::downgrade(&signal));
-    signal
+/// Sealed scheduler namespace for host-authenticated authority fields. The
+/// same derivation backs `Reminders::open`, so a host can prove that persisted
+/// creator metadata describes exactly the namespace whose fire it dispatches.
+pub fn namespace_of(
+    scope: &str,
+    principal: &str,
+    conversation: &str,
+    source: Option<&str>,
+) -> Result<String> {
+    if [scope, principal, conversation]
+        .iter()
+        .any(|s| !bounded(s, 512))
+        || source.is_some_and(|s| !bounded(s, 512))
+    {
+        return Err(invalid());
+    }
+    let authority = encode(&(scope, principal, conversation, source))?;
+    Ok(format!(
+        "reminder:{:x}",
+        Sha256::digest(authority.as_bytes())
+    ))
 }
 
+/// Host recovery index entry. It carries no authority: `binding` is only the
+/// newest creator metadata, which the host must re-derive into this sealed
+/// namespace and revalidate live before opening or dispatching anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamespaceIndex {
+    pub namespace: String,
+    /// Earliest enabled durable timer, including overdue work.
+    pub next_at: Option<i64>,
+    /// Recorded, uncancelled fires not yet admitted by the host.
+    pub pending: bool,
+    pub binding: Option<serde_json::Value>,
+}
+/// Keyset page over every reminder namespace in a principal database. Used by
+/// a daemon-owned runtime to rebuild its in-memory wake index after start.
+pub async fn index(
+    db: &Database,
+    after: Option<String>,
+    limit: u32,
+) -> Result<Vec<NamespaceIndex>> {
+    if limit == 0 || limit > 1000 || after.as_ref().is_some_and(|s| !bounded(s, 512)) {
+        return Err(invalid());
+    }
+    if db.kind() != DatabaseKind::Main {
+        return Err(Error::PrincipalOnly);
+    }
+    db.read(ReadLane::Background, move |c| {
+        let present: bool = c.query_row("SELECT count(*)=2 FROM sqlite_master WHERE type='table' AND name IN ('scheduler_reminder_timers','scheduler_reminder_metadata')", [], |r| r.get(0))?;
+        if !present {
+            return Ok(Vec::new());
+        }
+        let mut q = c.prepare("SELECT n.scope,(SELECT min(t.next_at) FROM scheduler_timers t WHERE t.scope=n.scope),EXISTS(SELECT 1 FROM scheduler_fires f WHERE f.scope=n.scope AND f.delivered=0 AND NOT EXISTS(SELECT 1 FROM scheduler_cancelled_fires x WHERE x.scope=f.scope AND x.fire_id=f.id)),(SELECT m.body FROM scheduler_reminder_metadata m WHERE m.scope=n.scope ORDER BY m.generation DESC,m.id LIMIT 1) FROM (SELECT DISTINCT scope FROM scheduler_reminder_timers WHERE ?1 IS NULL OR scope>?1 ORDER BY scope LIMIT ?2) n ORDER BY n.scope")?;
+        let rows = q
+            .query_map(rusqlite::params![after, limit], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(namespace, next_at, pending, binding)| {
+                Ok(NamespaceIndex {
+                    namespace,
+                    next_at,
+                    pending,
+                    binding: binding.map(|b| decode(&b)).transpose()?,
+                })
+            })
+            .collect()
+    })
+    .await
+}
 
 #[derive(Clone)]
 pub struct Reminders {
@@ -102,15 +165,7 @@ impl Reminders {
         conversation: String,
         source: Option<String>,
     ) -> Result<Self> {
-        if [&scope, &principal, &conversation]
-            .iter()
-            .any(|s| !bounded(s, 512))
-            || source.as_ref().is_some_and(|s| !bounded(s, 512))
-        {
-            return Err(invalid());
-        }
-        let authority = encode(&(scope, principal, conversation, source))?;
-        let sealed = format!("reminder:{:x}", Sha256::digest(authority.as_bytes()));
+        let sealed = namespace_of(&scope, &principal, &conversation, source.as_deref())?;
         Ok(Self {
             scheduler: Scheduler::open(db, sealed).await?,
         })
@@ -245,7 +300,9 @@ impl Reminders {
             c.execute("INSERT INTO scheduler_reminder_receipts(scope,operation_key,request,response) VALUES(?1,?2,?3,?4)",rusqlite::params![scope,key,request,record])?;
             Ok(reminder)
         }).await;
-        if result.is_ok() { changes(&self.scheduler.db).notify_one(); }
+        if result.is_ok() {
+            signal_mutation(&self.scheduler.db);
+        }
         result
     }
     /// Keyed, bounded snapshot with keyset pagination; includes tombstones.
@@ -276,15 +333,25 @@ impl Reminders {
     pub async fn tick(&self, now: i64, recovering: bool, limit: u32) -> Result<usize> {
         self.scheduler.tick(now, recovering, limit).await
     }
-    /// Earliest durable timer in this sealed namespace, including overdue work.
+    /// Earliest enabled durable timer in this sealed namespace, including overdue work.
     pub async fn next_at(&self) -> Result<Option<i64>> {
         let scope = self.scheduler.scope.clone();
-        self.scheduler.db.read(ReadLane::Background, move |c| {
-            c.query_row("SELECT min(next_at) FROM scheduler_timers WHERE scope=?1", [scope], |r| r.get(0)).map_err(Error::from)
-        }).await
+        self.scheduler
+            .db
+            .read(ReadLane::Background, move |c| {
+                c.query_row(
+                    "SELECT min(next_at) FROM scheduler_timers WHERE scope=?1",
+                    [scope],
+                    |r| r.get(0),
+                )
+                .map_err(Error::from)
+            })
+            .await
     }
-    /// Verify that host metadata describes this handle's sealed namespace.
-    pub fn has_namespace(&self, scope: &str) -> bool { self.scheduler.scope == scope }
+    /// Sealed namespace of this handle, for host comparison with `namespace_of`.
+    pub fn namespace(&self) -> &str {
+        &self.scheduler.scope
+    }
     /// This is a snapshot, not authorization for an external delivery. Hosts
     /// must atomically guard this generation with the notice and effect receipts.
     pub async fn pending(&self, limit: u32) -> Result<Vec<PendingReminder>> {

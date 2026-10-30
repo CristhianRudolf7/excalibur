@@ -234,6 +234,13 @@ fn execute(args: &[String]) -> Result<(), String> {
             async move { housekeeping_iteration(lanes, actions, master, orchestrator).await }
         },
     );
+    // Automatic Agenda: startup missed-fire recomputation, then a wake at the
+    // earliest durable reminder timer. Admission reuses the guarded host path.
+    let agenda = crate::agenda::AgendaRuntime::new(
+        host.orchestrator.clone(),
+        Arc::new(crate::agenda::SystemClock),
+    )
+    .spawn(&work, host.shutdown.clone(), stopping.clone());
     let writer = crate::services::supervise_writer(
         &runtimes.interactive(),
         host.orchestrator.database().clone(),
@@ -258,18 +265,23 @@ fn execute(args: &[String]) -> Result<(), String> {
     let background_result = runtimes
         .block_on(background)
         .unwrap_or_else(|_| Err("orchestration task failed".into()));
+    let agenda_result = runtimes
+        .block_on(agenda)
+        .unwrap_or_else(|_| Err("agenda task failed".into()));
     let writer_result = runtimes
         .block_on(writer)
         .unwrap_or_else(|_| Err("writer watcher task failed".into()));
     let orderly = result.is_ok()
         && housekeeping_result.is_ok()
         && background_result.is_ok()
+        && agenda_result.is_ok()
         && writer_result.is_ok();
     let close = runtimes.block_on(host.close_with_outcome(orderly));
     runtimes.shutdown(Duration::from_secs(10));
     result
         .and(housekeeping_result)
         .and(background_result)
+        .and(agenda_result)
         .and(writer_result)
         .and(close)
 }

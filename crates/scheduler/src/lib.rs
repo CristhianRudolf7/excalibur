@@ -52,6 +52,35 @@ pub struct Scheduler {
     scope: String,
     calendar_runtime: tokio::runtime::Handle,
 }
+/// Process-local wake hint shared by every handle of the same database path.
+/// Durable timers remain authoritative: a missed hint delays a fire only until
+/// the host's bounded re-check, it never loses or duplicates one.
+pub fn mutation_signal(db: &Database) -> std::sync::Arc<tokio::sync::Notify> {
+    use std::{
+        collections::BTreeMap,
+        path::PathBuf,
+        sync::{Arc, Mutex, OnceLock, Weak},
+    };
+    type Signals = Mutex<BTreeMap<PathBuf, Weak<tokio::sync::Notify>>>;
+    static SIGNALS: OnceLock<Signals> = OnceLock::new();
+    let mut signals = SIGNALS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    signals.retain(|_, signal| signal.strong_count() > 0);
+    let key = db.path().to_path_buf();
+    if let Some(signal) = signals.get(&key).and_then(Weak::upgrade) {
+        return signal;
+    }
+    let signal = Arc::new(tokio::sync::Notify::new());
+    signals.insert(key, Arc::downgrade(&signal));
+    signal
+}
+/// Wake a registered host runtime. A stored permit covers a runtime that is
+/// between its durable scan and its wait, so no mutation hint is lost.
+fn signal_mutation(db: &Database) {
+    mutation_signal(db).notify_one();
+}
 fn invalid() -> Error {
     Error::Invalid("nonempty bounded schedule IDs, scope, payload and positive interval required")
 }
@@ -139,7 +168,9 @@ impl Scheduler {
             let stored: String = c.query_row("SELECT definition FROM scheduler_timers WHERE scope=?1 AND id=?2",rusqlite::params![schedule.scope,schedule.id],|r|r.get(0))?;
             if stored != definition { return Err(Error::Invalid("schedule ID already has another definition")); }
             Ok(())
-        }).await
+        }).await?;
+        signal_mutation(&self.db);
+        Ok(())
     }
     /// Atomically advances timers and records pending fires. No external effects.
     /// `recovering` applies missed policies; ordinary ticks deliver every due fire.
@@ -299,7 +330,7 @@ impl Scheduler {
             changed_at: now,
         };
         let scope = self.scope.clone();
-        self.db.write(Priority::Journal,move|c|{
+        let changed = self.db.write(Priority::Journal,move|c|{
             let existing:Option<String>=c.query_row("SELECT note FROM scheduler_timezone_changes WHERE scope=?1 AND change_key=?2",rusqlite::params![scope,note.key],|r|r.get(0)).optional()?;
             if let Some(existing)=existing{return replay_change(&existing,&note.schedule,&note.timezone);}
             let current:(String,Option<i64>)=c.query_row("SELECT definition,next_at FROM scheduler_timers WHERE scope=?1 AND id=?2",rusqlite::params![scope,note.schedule],|r|Ok((r.get(0)?,r.get(1)?)))?;
@@ -307,7 +338,9 @@ impl Scheduler {
             c.execute("UPDATE scheduler_timers SET definition=?3,next_at=?4 WHERE scope=?1 AND id=?2",rusqlite::params![scope,note.schedule,updated,next])?;
             c.execute("INSERT INTO scheduler_timezone_changes(scope,change_key,note,old_definition,new_definition) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![scope,note.key,serde_json::to_string(&note).map_err(json_error)?,definition,updated])?;
             Ok(note)
-        }).await
+        }).await?;
+        signal_mutation(&self.db);
+        Ok(changed)
     }
     pub async fn timezone_changes(&self, limit: u32) -> Result<Vec<TimezoneChange>> {
         if limit == 0 || limit > 1000 {
