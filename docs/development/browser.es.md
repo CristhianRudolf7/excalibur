@@ -313,15 +313,33 @@ exclusión para entrada comprueba la URL real del frame y devuelve
 `denied(human_only_origin)` en un origen de login. Observación, envío de acciones,
 detección de login e intervención humana todavía no se exponen por RPC.
 
+Los bloqueos de origen conservan `blocked_reason` (`needs_login` o
+`document_origin`). La reconciliación lee el frame superior real, incluidas las
+páginas de error de red, para todos los propietarios de una escucha compartida.
+Cuando todas las pestañas vivas vuelven a orígenes permitidos, levanta esos
+bloqueos, emite `session_state` y vuelve a admitir exclusiones del agente.
+Un cambio de URL no levanta bloqueos de seguridad/versión ni control humano.
+Los cambios de ciclo de vida usan la tabla de transiciones validada; volver a un
+origen permitido no afirma por sí solo que haya una cuenta autenticada.
+
 Las instancias en escucha usan los tres flags contra la retención en segundo
 plano y emulación de foco. No reciben suspensión, congelación, descarte ni presión
 de memoria. El gestor reconcilia periódicamente los metadatos de targets; los
 cambios de título producen `listener_activity` sin contenido de mensajes, como
-máximo una vez cada cinco segundos por sitio. Un selector opcional instala un
+máximo una vez cada cinco segundos por sitio. Los cambios dentro de esa ventana
+se agrupan en una notificación pendiente que se emite al cerrar la ventana,
+aunque la página ya no cambie. Conserva el último recuento; `kinds` identifica
+actividad de título y/o no leídos y `kind` sigue siendo `unread_count` si cambió el
+recuento, o `title_changed` en otro caso. No copia títulos ni mensajes al evento.
+Un selector opcional instala un
 MutationObserver en un mundo aislado y comunica solo el número de no leídos por
 un binding limitado a ese mundo. Un canal de ciclo de vida separado y sondas
 periódicas de salud/conteo reconcilian la contrapresión de eventos generales. Tras caer un renderizador en escucha, se sustituye
-el target, restaura su URL, foco y sonda y aumenta la época; conserva el ID lógico.
+el target, restaura foco y sonda y aumenta la época; conserva el ID lógico.
+La recuperación valida la URL guardada antes de crear una página y usa un origen
+configurado de lectura/escritura si encuentra login o un documento de error.
+Si falla la preparación, cierra el target candidato. Un fallo de recuperación de
+una pestaña no interrumpe el resto de pestañas o instancias.
 Las caídas de una instancia persistente pasan a recovering con esperas de 1, 5 y
 30 segundos y hasta cinco relanzamientos en diez minutos. Agotarlos produce
 `instance_failed` y sesiones lost. Reiniciar explícitamente el servicio limpia
@@ -380,3 +398,16 @@ acortar una ejecución de desarrollo; solo los 600 segundos por defecto satisfac
 la escucha prolongada. Evidencias en
 `target/test-evidence/browser/{sessions,webd_boundary}/`. No hay frontend visor
 para revisión visual.
+
+
+`cargo test -p excalibur-browser --test sessions listener_events_and_document_recovery -- --nocapture`
+ejecuta el fixture de ráfagas/recuperación con Chrome real sin la escucha prolongada.
+Comprueba la entrega del recuento final tras cambios dentro de cinco segundos,
+recuperación de login/red para propietarios compartidos y contabilidad de targets
+tras caer una escucha en login. Guarda evidencia en
+`target/test-evidence/browser/listener_reconciliation/reconciliation.json`.
+El fixture de long-polling desactiva la caché, consume el cuerpo de cada respuesta
+y registra los cambios reales de la página junto al número de notificaciones.
+El fixture del servicio espera el bloqueo por documento de error que corresponde
+a su proxy de rechazo total; los fixtures conservan explícitamente el ID de la
+sesión viva.

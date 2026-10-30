@@ -25,6 +25,13 @@ fn identity() -> (u32, u32) {
 }
 #[test]
 fn durable_sessions_and_protocol() {
+    run_fixture("session_child", "sessions");
+}
+#[test]
+fn listener_events_and_document_recovery() {
+    run_fixture("reconciliation_child", "listener_reconciliation");
+}
+fn run_fixture(child: &str, suite: &str) {
     if std::env::var("EXCALIBUR_BROWSER_TESTS").as_deref() == Ok("skip") {
         eprintln!("real sessions explicitly skipped");
         return;
@@ -36,12 +43,12 @@ fn durable_sessions_and_protocol() {
         std::os::unix::fs::chown(d.path(), Some(uid), Some(gid)).unwrap();
     }
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--ignored", "--exact", "session_child", "--nocapture"])
+        .args(["--ignored", "--exact", child, "--nocapture"])
         .env("EXCALIBUR_SESSION_DIR", d.path())
         .output()
         .unwrap();
-    let evidence =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-evidence/browser/sessions");
+    let evidence = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../../target/test-evidence/browser/{suite}"));
     fs::create_dir_all(&evidence).unwrap();
     fs::write(
         evidence.join("runner.log"),
@@ -79,8 +86,16 @@ fn session_child() {
         .block_on(contract(root));
 }
 async fn eval(m: &Manager, run: &str, sid: &str, tid: &str, source: &str) -> Value {
-    for _ in 0..200 {
-        let (c, s) = m.diagnostic_client(run, sid, tid).await.unwrap();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(30) {
+        let (c, s) = match m.diagnostic_client(run, sid, tid).await {
+            Ok(value) => value,
+            Err(error) if matches!(error.kind.as_str(), "tab_crashed" | "session_recovering") => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(error) => panic!("fixture authority error: {error}"),
+        };
         let frame = match c.send(Method::PageGetFrameTree, json!({}), Some(&s)).await {
             Ok(v) => v["frameTree"]["frame"]["id"].as_str().unwrap().to_owned(),
             Err(_) => {
@@ -94,8 +109,11 @@ async fn eval(m: &Manager, run: &str, sid: &str, tid: &str, source: &str) -> Val
                 json!({"frameId":frame,"worldName":"fixture"}),
                 Some(&s),
             )
-            .await
-            .unwrap();
+            .await;
+        let Ok(world) = world else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
         let result=c.send(Method::RuntimeCallFunctionOn,json!({"executionContextId":world["executionContextId"],"functionDeclaration":format!("async function(){{{source}}}"),"awaitPromise":true,"returnByValue":true}),Some(&s)).await;
         if let Ok(v) = result
             && v["exceptionDetails"].is_null()
@@ -153,12 +171,12 @@ async fn contract(root: PathBuf) {
                     tokio::time::sleep(Duration::from_secs(20)).await;
                     let _ = s
                         .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
                         )
                         .await;
                     return;
                 }
-                let body = r#"<!doctype html><title>chat 0</title><body><span class='unread'></span><script>let ticks=0;setInterval(()=>{document.body.dataset.ticks=String(++ticks)},50);let n=0;(async()=>{for(;;){await fetch('/poll');document.title='chat '+(++n)}})();</script>"#;
+                let body = r#"<!doctype html><title>chat 0</title><body><span class='unread'></span><script>let ticks=0;setInterval(()=>{document.body.dataset.ticks=String(++ticks)},50);let n=0;(async()=>{for(;;){await (await fetch('/poll',{cache:'no-store'})).text();document.title='chat '+(++n);document.body.dataset.polls=String(n)}})();</script>"#;
                 let _=s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
             });
         }
@@ -226,16 +244,7 @@ async fn contract(root: PathBuf) {
     m.site_state("one", &sid, "logged_in").await.unwrap();
     tokio::time::sleep(Duration::from_secs(6)).await;
     eval(&m,"one",&sid,&tid,"const span=document.createElement('span');span.className='unread';document.body.append(span);return true").await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(
-        m.db.events(0)
-            .await
-            .unwrap()
-            .iter()
-            .any(|e| e["type"] == "listener_activity"
-                && e["kind"] == "unread_count"
-                && e["count"] == 2)
-    );
+    wait_count(&m, 0, 2).await;
     let guard = m.lease("one", &sid, &tid, false).await.unwrap();
     let queued = m.clone();
     let qs = s2.clone();
@@ -568,14 +577,21 @@ async fn contract(root: PathBuf) {
         .send(Method::BrowserGetVersion, json!({}), None)
         .await
         .unwrap();
-    let pid = m.status().await["instances"][0]["pid"].as_u64().unwrap() as u32;
+    let status = m.status().await;
+    let pid = status["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "personal")
+        .unwrap()["pid"]
+        .as_u64()
+        .unwrap() as u32;
     let tree = excalibur_browser::process::tree(pid);
     for process in tree.iter().filter(|p| p.kind == "renderer") {
         unsafe {
             libc::kill(process.pid as i32, libc::SIGKILL);
         }
     }
-    tokio::time::sleep(Duration::from_secs(3)).await;
     let _ = cs;
     assert!(
         eval(
@@ -600,8 +616,7 @@ async fn contract(root: PathBuf) {
     unsafe {
         libc::kill(persistent_pid as i32, libc::SIGKILL);
     }
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert_eq!(m.tabs("one", &sid).await.unwrap()[0]["tab_id"], tid);
+
     eval(
         &m,
         "one",
@@ -610,8 +625,8 @@ async fn contract(root: PathBuf) {
         "if(location.hostname!=='chat.test')throw Error('loading');return true",
     )
     .await;
-    let rpc_sessions = m.list("rpc").await;
-    let rpc_sid = rpc_sessions[0]["session_id"].as_str().unwrap();
+    assert_eq!(m.tabs("one", &sid).await.unwrap()[0]["tab_id"], tid);
+    let rpc_sid = a["result"]["result"]["session_id"].as_str().unwrap();
     let other = m
         .new_tab(
             "rpc",
@@ -626,6 +641,16 @@ async fn contract(root: PathBuf) {
         .ok()
         .map(|s| s.parse::<u64>().unwrap())
         .unwrap_or(600);
+    let initial_polls = eval(
+        &m,
+        "one",
+        &sid,
+        &tid,
+        "return Number(document.body.dataset.polls||0)",
+    )
+    .await
+    .as_u64()
+    .unwrap();
     let cursor = m.db.events(0).await.unwrap().last().unwrap()["cursor"]
         .as_u64()
         .unwrap();
@@ -651,12 +676,6 @@ async fn contract(root: PathBuf) {
         .iter()
         .filter(|e| e["type"] == "listener_activity")
         .collect::<Vec<_>>();
-    if duration >= 25 {
-        assert!(
-            activity.len() as u64 >= (duration / 20).saturating_sub(2).max(1),
-            "{events:?}"
-        );
-    }
     let mut last = 0;
     for event in &activity {
         let at = event["at"].as_i64().unwrap();
@@ -669,11 +688,43 @@ async fn contract(root: PathBuf) {
         "one",
         &sid,
         &tid,
-        "return {visibility:document.visibilityState,cookies:document.cookie,ticks:Number(document.body.dataset.ticks)}",
+        "return {visibility:document.visibilityState,cookies:document.cookie,ticks:Number(document.body.dataset.ticks),title:document.title,polls:Number(document.body.dataset.polls||0)}",
     )
     .await;
+    let poll_changes = state["polls"]
+        .as_u64()
+        .unwrap()
+        .saturating_sub(initial_polls);
+    let title_events = activity
+        .iter()
+        .filter(|e| {
+            e["kinds"]
+                .as_array()
+                .is_some_and(|k| k.iter().any(|kind| kind == "title_changed"))
+        })
+        .count() as u64;
+    eprintln!(
+        "listener measurement: elapsed={} events={} state={}",
+        started.elapsed().as_secs(),
+        activity.len(),
+        state
+    );
     assert!(state["ticks"].as_u64().unwrap() > duration * 10);
-    fs::write(root.join("contract.json"),serde_json::to_vec_pretty(&json!({"chrome":version,"restored":restored,"session_cookie_preserved":restored["cookie"].as_str().unwrap().contains("session_cookie=yes"),"ephemeral_isolated":true,"owner_denied":true,"tab_limits":true,"queue_timeout_seconds":30,"listener_seconds":started.elapsed().as_secs(),"listener_events":activity,"listener_state":state,"renderer_recovered":true,"rpc":true})).unwrap()).unwrap();
+    fs::write(root.join("contract.json"),serde_json::to_vec_pretty(&json!({"chrome":version,"restored":restored,"session_cookie_preserved":restored["cookie"].as_str().unwrap().contains("session_cookie=yes"),"ephemeral_isolated":true,"owner_denied":true,"tab_limits":true,"queue_timeout_seconds":30,"listener_seconds":started.elapsed().as_secs(),"initial_polls":initial_polls,"poll_changes":poll_changes,"title_events":title_events,"listener_events":activity,"listener_state":state,"renderer_recovered":true,"rpc":true})).unwrap()).unwrap();
+    if duration >= 25 {
+        assert!(
+            poll_changes >= (duration / 20).saturating_sub(1),
+            "long-poll cadence: {state}, initial={initial_polls}"
+        );
+        assert!(
+            title_events >= poll_changes.saturating_sub(1) && title_events <= poll_changes + 1,
+            "title notifications {title_events} for {poll_changes} page changes"
+        );
+        assert!(
+            activity.len() as u64 >= (duration / 20).saturating_sub(2).max(1),
+            "{events:?}"
+        );
+    }
     monitor.abort();
     let _ = monitor.await;
     m.shutdown().await.unwrap();
@@ -875,4 +926,293 @@ async fn operation_contract() {
             .unwrap(),
         "wal"
     );
+}
+
+#[test]
+#[ignore = "privilege dropping subprocess"]
+fn reconciliation_child() {
+    let root = PathBuf::from(std::env::var_os("EXCALIBUR_SESSION_DIR").unwrap());
+    if unsafe { libc::geteuid() } == 0 {
+        let (uid, gid) = identity();
+        unsafe {
+            assert_eq!(libc::setgroups(0, std::ptr::null()), 0);
+            assert_eq!(libc::setgid(gid), 0);
+            assert_eq!(libc::setuid(uid), 0);
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(reconciliation_contract(root));
+}
+async fn all_events(m: &Manager, mut cursor: u64) -> Vec<Value> {
+    let mut events = vec![];
+    loop {
+        let page = m.db.events(cursor).await.unwrap();
+        if page.is_empty() {
+            return events;
+        }
+        cursor = page.last().unwrap()["cursor"].as_u64().unwrap();
+        events.extend(page);
+    }
+}
+async fn wait_session(
+    m: &Manager,
+    run: &str,
+    sid: &str,
+    state: &str,
+    reason: Option<&str>,
+) -> Value {
+    let start = Instant::now();
+    loop {
+        let list = m.list(run).await;
+        let session = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session_id"] == sid)
+            .unwrap();
+        if session["state"] == state && reason.is_none_or(|r| session["blocked_reason"] == r) {
+            return session.clone();
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "waiting for {state}/{reason:?}: {session}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+async fn wait_count(m: &Manager, cursor: u64, count: i64) -> Vec<Value> {
+    let start = Instant::now();
+    loop {
+        let events = all_events(m, cursor).await;
+        if events
+            .iter()
+            .any(|e| e["type"] == "listener_activity" && e["count"] == count)
+        {
+            return events;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "missing unread {count}: {events:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+async fn go(m: &Manager, run: &str, sid: &str, tid: &str, url: &str) {
+    let (c, s) = m.diagnostic_client(run, sid, tid).await.unwrap();
+    c.send(Method::PageNavigate, json!({"url":url}), Some(&s))
+        .await
+        .unwrap();
+}
+async fn reconciliation_contract(root: PathBuf) {
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = match proxy.local_addr().unwrap() {
+        std::net::SocketAddr::V4(v) => v,
+        _ => unreachable!(),
+    };
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = proxy.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = [0; 8192];
+                let n = stream.read(&mut request).await.unwrap();
+                if String::from_utf8_lossy(&request[..n]).contains("/network-error") {
+                    return;
+                }
+                let body = "<!doctype html><title>quiet</title><body></body>";
+                let _=stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
+            });
+        }
+    });
+    let mut profiles = BTreeMap::new();
+    profiles.insert(
+        "personal".into(),
+        Profile {
+            sites: vec![Site {
+                name: "chat".into(),
+                rw: vec!["http://chat.test".into()],
+                login: vec!["http://login.test".into()],
+                listen: true,
+                listen_probe: ListenProbe {
+                    unread_selector: ".unread".into(),
+                },
+            }],
+            ..Default::default()
+        },
+    );
+    let manager = Manager::open(Options {
+        data_dir: root.clone(),
+        binary: "/usr/bin/google-chrome-stable".into(),
+        proxy: address,
+        profiles,
+        compact: false,
+        version: VersionPolicy::default(),
+        chrome_args: vec![],
+    })
+    .await
+    .unwrap();
+    let monitor = manager.start();
+    let request = Open {
+        profile: "personal".into(),
+        site: Some("chat".into()),
+        ..Default::default()
+    };
+    let (sid, tid) = ids(&manager.open_session("one", request.clone()).await.unwrap());
+    let (shared, shared_tab) = ids(&manager.open_session("two", request).await.unwrap());
+    assert_eq!(tid, shared_tab);
+    eval(
+        &manager,
+        "one",
+        &sid,
+        &tid,
+        "if(location.hostname!=='chat.test')throw Error('loading');return true",
+    )
+    .await;
+    wait_count(&manager, 0, 0).await;
+    tokio::time::sleep(Duration::from_millis(5200)).await;
+    let cursor = all_events(&manager, 0).await.last().unwrap()["cursor"]
+        .as_u64()
+        .unwrap();
+    eval(&manager,"one",&sid,&tid,"document.title='burst 1';const s=document.createElement('span');s.className='unread';document.body.replaceChildren(s);return true").await;
+    wait_count(&manager, cursor, 1).await;
+    let burst = Instant::now();
+    eval(&manager,"one",&sid,&tid,"for(let n=2;n<=3;n++){document.title='burst '+n;document.body.replaceChildren(...Array.from({length:n},()=>{const s=document.createElement('span');s.className='unread';return s}));await new Promise(r=>setTimeout(r,250));}return true").await;
+    assert!(burst.elapsed() < Duration::from_secs(5));
+    wait_count(&manager, cursor, 3).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let events = all_events(&manager, cursor).await;
+    let activity = events
+        .iter()
+        .filter(|e| e["type"] == "listener_activity")
+        .collect::<Vec<_>>();
+    assert_eq!(activity.len(), 2, "{activity:?}");
+    assert_eq!(activity[0]["count"], 1);
+    assert_eq!(activity[1]["count"], 3);
+    assert_eq!(
+        activity[1]["kinds"],
+        json!(["title_changed", "unread_count"])
+    );
+    assert!(activity[1]["at"].as_i64().unwrap() - activity[0]["at"].as_i64().unwrap() >= 5);
+    assert!(activity.iter().all(|e| e.get("content").is_none()));
+    // Every owner of the shared listener follows the actual top-level document.
+    go(&manager, "one", &sid, &tid, "http://login.test/signin").await;
+    for (run, s) in [("one", &sid), ("two", &shared)] {
+        wait_session(&manager, run, s, "blocked", Some("needs_login")).await;
+        assert_eq!(
+            manager.lease(run, s, &tid, false).await.unwrap_err().kind,
+            "blocked"
+        );
+    }
+    go(&manager, "one", &sid, &tid, "http://chat.test/?back=1").await;
+    for (run, s) in [("one", &sid), ("two", &shared)] {
+        wait_session(&manager, run, s, "ready", None).await;
+        drop(manager.lease(run, s, &tid, false).await.unwrap());
+    }
+    go(
+        &manager,
+        "one",
+        &sid,
+        &tid,
+        "http://chat.test/network-error",
+    )
+    .await;
+    wait_session(&manager, "one", &sid, "blocked", Some("document_origin")).await;
+    go(
+        &manager,
+        "one",
+        &sid,
+        &tid,
+        "http://chat.test/?network_back=1",
+    )
+    .await;
+    wait_session(&manager, "one", &sid, "ready", None).await;
+    drop(manager.lease("one", &sid, &tid, false).await.unwrap());
+    let (healthy, healthy_tab) = ids(&manager
+        .open_session("healthy", Open::default())
+        .await
+        .unwrap());
+    // A listener crashed on a human-only origin restores an allowed URL without leaking a page.
+    go(&manager, "one", &sid, &tid, "http://login.test/signin").await;
+    wait_session(&manager, "one", &sid, "blocked", Some("needs_login")).await;
+    let (client, _) = manager.diagnostic_client("one", &sid, &tid).await.unwrap();
+    let targets = client
+        .send(Method::TargetGetTargets, json!({}), None)
+        .await
+        .unwrap();
+    let count_pages = |v: &Value| {
+        v["targetInfos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["type"] == "page")
+            .count()
+    };
+    let before = count_pages(&targets);
+    assert_eq!(before, 1);
+    let old_target = manager.tabs("one", &sid).await.unwrap()[0]["target_id"].clone();
+    let status = manager.status().await;
+    let pid = status["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "personal")
+        .unwrap()["pid"]
+        .as_u64()
+        .unwrap() as u32;
+    for process in excalibur_browser::process::tree(pid)
+        .iter()
+        .filter(|p| p.kind == "renderer")
+    {
+        unsafe {
+            libc::kill(process.pid as i32, libc::SIGKILL);
+        }
+    }
+    let started = Instant::now();
+    loop {
+        let tabs = manager.tabs("one", &sid).await.unwrap();
+        if tabs[0]["target_id"] != old_target {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(20));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    wait_session(&manager, "one", &sid, "ready", None).await;
+    wait_session(&manager, "two", &shared, "ready", None).await;
+    eval(
+        &manager,
+        "one",
+        &sid,
+        &tid,
+        "if(location.hostname!=='chat.test')throw Error('loading');return true",
+    )
+    .await;
+    manager
+        .switch("healthy", &healthy, &healthy_tab)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let after = count_pages(
+        &client
+            .send(Method::TargetGetTargets, json!({}), None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(before, after);
+    assert_eq!(
+        manager
+            .tabs("one", &sid)
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    fs::write(root.join("reconciliation.json"),serde_json::to_vec_pretty(&json!({"burst_events":activity,"final_unread_count":3,"login_return_ready":true,"network_return_ready":true,"shared_owners_recovered":true,"pages_before_crash":before,"pages_after_recovery":after,"other_instance_usable":true})).unwrap()).unwrap();
+    monitor.abort();
+    let _ = monitor.await;
+    manager.shutdown().await.unwrap();
+    server.abort();
 }

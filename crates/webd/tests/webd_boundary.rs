@@ -207,8 +207,21 @@ fn service_identity_socket_restart_and_parent_death() {
     daemon = start(&binary, &config, &log, &socket);
     let list = rpc(&socket, "session.list", "list", "e", json!({}));
     assert_eq!(list["result"]["result"][0]["state"], "lost");
-    let listp = rpc(&socket, "session.list", "list-p", "p", json!({}));
-    assert_eq!(listp["result"]["result"][0]["state"], "ready");
+    // The diagnostic proxy deliberately refuses this URL. Wait for its error document,
+    // rather than racing the initial ready state against network failure.
+    let started = Instant::now();
+    let listp = loop {
+        let list = rpc(&socket, "session.list", "list-p", "p", json!({}));
+        if list["result"]["result"][0]["state"] == "blocked" {
+            break list;
+        }
+        assert!(started.elapsed() < Duration::from_secs(15), "{list}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        listp["result"]["result"][0]["blocked_reason"],
+        "document_origin"
+    );
     assert_eq!(
         p["result"]["result"]["session_id"],
         listp["result"]["result"][0]["session_id"]

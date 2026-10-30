@@ -298,15 +298,31 @@ checks the actual current frame URL under exclusion and returns
 `denied(human_only_origin)` for a login origin. Observation, action dispatch,
 login detection and human takeover are not yet exposed by RPC.
 
+Document-origin blocks retain a `blocked_reason` (`needs_login` or
+`document_origin`). Reconciliation reads the actual top-level frame, including
+network error documents, for every owner of a shared listener. Returning all live
+tabs to permitted document origins clears those blocks, emits `session_state`
+and admits agent leases again. Security/version blocks and human control are
+not cleared by a URL change. Lifecycle changes use the checked transition table;
+returning to a permitted origin does not by itself assert a logged-in account.
+
 Listening instances use the three background throttling flags and focus emulation.
 No suspend, freeze, discard or memory pressure command is sent to a listener.
 Target metadata is reconciled periodically; title changes produce
 `listener_activity` with no message content, at most once per five seconds per
-site. A configured unread selector runs a MutationObserver in an isolated world
+site. Changes inside that window are merged into a pending notification and
+flushed when the window closes, even if the page then stays unchanged. The event
+retains the newest unread count; `kinds` identifies title and/or unread activity,
+while `kind` remains `unread_count` when a count changed, otherwise
+`title_changed`. Titles and message bodies are not copied into the event.
+A configured unread selector runs a MutationObserver in an isolated world
 and emits only an unread count through a scoped binding. A separate lifecycle
 channel and periodic health/count probes reconcile ordinary event backpressure. A crashed listener
-renderer is replaced with a new target, its URL restored, focus/probe reinstalled
-and document epoch advanced; its logical tab ID remains unchanged. Persistent
+renderer is replaced with a new target, focus/probe reinstalled and document epoch
+advanced; its logical tab ID remains unchanged. Recovery validates the saved URL
+before creating a page and falls back to a configured read/write origin for login
+or error documents. Failed replacement setup closes its candidate target; one
+tab's recovery failure does not interrupt other tabs or instances. Persistent
 browser crashes enter recovering, with delays of 1, 5 and 30 seconds and at most
 five relaunches in ten minutes; exhaustion produces `instance_failed` and lost
 sessions. Restarting the service explicitly clears that retry circuit. Ephemeral
@@ -362,3 +378,14 @@ to verify recovery. `EXCALIBUR_LISTEN_TEST_SECONDS` can shorten a development ru
 only the default 600-second run satisfies the prolonged listening check. Evidence
 is in `target/test-evidence/browser/{sessions,webd_boundary}/`. There is no viewer
 frontend to validate visually.
+
+
+`cargo test -p excalibur-browser --test sessions listener_events_and_document_recovery -- --nocapture`
+runs the real-Chrome burst/recovery fixture without the prolonged listening run.
+It verifies final unread delivery after changes inside five seconds, shared-owner
+login/network recovery and target accounting after a listener crashes on login.
+Its evidence is `target/test-evidence/browser/listener_reconciliation/reconciliation.json`.
+The long-polling fixture disables response caching, consumes each response body
+and records its actual page changes alongside notification counts.
+The service boundary fixture waits for the error-document block expected from its
+deny-all proxy, and session fixtures keep the live session ID explicitly.

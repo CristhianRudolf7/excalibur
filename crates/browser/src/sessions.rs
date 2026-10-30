@@ -208,18 +208,24 @@ pub enum SessionState {
 impl SessionState {
     pub fn transition(&mut self, next: Self) -> Result<()> {
         use SessionState::*;
+        if *self == next {
+            return Ok(());
+        }
         let allowed = matches!(
             (&*self, &next),
-            (Opening, Ready | Blocked | Lost)
+            (Opening, Ready | Blocked | Lost | Recovering | Closing)
                 | (
                     Ready,
                     Busy | Blocked | Suspended | Closing | Lost | Recovering
                 )
-                | (Busy, Ready | Blocked | Lost | Recovering)
-                | (Blocked, HumanControl | Ready | Closing | Recovering | Lost)
-                | (HumanControl, Ready | Blocked | Lost | Recovering)
+                | (Busy, Ready | Blocked | Lost | Recovering | Closing)
+                | (
+                    Blocked,
+                    HumanControl | Ready | Closing | Suspended | Recovering | Lost
+                )
+                | (HumanControl, Ready | Blocked | Lost | Recovering | Closing)
                 | (Suspended, Opening | Closing | Lost)
-                | (Recovering, Ready | Lost | Blocked)
+                | (Recovering, Ready | Lost | Blocked | Closing)
                 | (Closing, Closed)
         );
         if !allowed {
@@ -244,10 +250,32 @@ pub struct Session {
     pub site: Option<String>,
     pub listen: bool,
     pub state: SessionState,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
     pub origins: Vec<String>,
     pub credentials: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+impl Session {
+    fn set_state(&mut self, next: SessionState, reason: Option<&str>) -> Result<()> {
+        self.state.transition(next)?;
+        self.blocked_reason = if self.state == SessionState::Blocked {
+            reason.map(str::to_owned)
+        } else {
+            None
+        };
+        Ok(())
+    }
+}
+#[derive(Clone, Default)]
+struct PendingActivity {
+    session_id: String,
+    profile: String,
+    site: Option<String>,
+    title_changed: bool,
+    unread_changed: bool,
+    count: Option<i64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Tab {
@@ -295,6 +323,8 @@ struct Model {
     idle_since: HashMap<String, tokio::time::Instant>,
     failed: std::collections::HashSet<String>,
     last_activity: HashMap<String, tokio::time::Instant>,
+    pending_activity: HashMap<String, PendingActivity>,
+    tab_retry: HashMap<String, tokio::time::Instant>,
     titles: HashMap<String, String>,
     counts: HashMap<String, i64>,
     streams: HashMap<String, tokio::sync::broadcast::Receiver<excalibur_cdp::Event>>,
@@ -401,7 +431,14 @@ impl Drop for TabLease {
                 if let Some(count) = m.busy.get_mut(&session) {
                     *count = count.saturating_sub(1);
                     if *count == 0 && m.sessions[&session].state == SessionState::Busy {
-                        m.sessions.get_mut(&session).unwrap().state = SessionState::Ready;
+                        if m.sessions
+                            .get_mut(&session)
+                            .unwrap()
+                            .set_state(SessionState::Ready, None)
+                            .is_err()
+                        {
+                            return;
+                        }
                         let _ = manager.db.save(&mut m).await;
                         let _ = manager
                             .db
@@ -465,15 +502,15 @@ impl Manager {
             let mut s: Session =
                 serde_json::from_str(&row).map_err(|e| Fault::new("storage_error", e))?;
             if s.state == SessionState::Closing {
-                s.state = SessionState::Closed;
+                s.set_state(SessionState::Closed, None)?;
             }
             if !matches!(s.state, SessionState::Closed | SessionState::Lost) {
                 s.context_id = None;
-                s.state = if s.profile == "ephemeral" {
-                    SessionState::Lost
-                } else {
-                    SessionState::Recovering
-                };
+                if s.profile == "ephemeral" {
+                    s.set_state(SessionState::Lost, None)?;
+                } else if s.state != SessionState::Suspended {
+                    s.set_state(SessionState::Recovering, None)?;
+                }
             }
             model.sessions.insert(s.id.clone(), s);
         }
@@ -524,11 +561,14 @@ impl Manager {
                             | "denied"
                     );
                     let key = m.sessions[&sid].instance_id.clone();
-                    m.sessions.get_mut(&sid).unwrap().state = if terminal {
-                        SessionState::Blocked
-                    } else {
-                        SessionState::Recovering
-                    };
+                    m.sessions.get_mut(&sid).unwrap().set_state(
+                        if terminal {
+                            SessionState::Blocked
+                        } else {
+                            SessionState::Recovering
+                        },
+                        Some(&e.kind),
+                    )?;
                     if !terminal {
                         m.pending_retry
                             .insert(key, tokio::time::Instant::now() + Duration::from_secs(1));
@@ -821,6 +861,7 @@ impl Manager {
             site: request.site,
             listen: site.as_ref().is_some_and(|s| s.listen),
             state: SessionState::Opening,
+            blocked_reason: None,
             origins: site.as_ref().map(|s| s.rw.clone()).unwrap_or_default(),
             credentials: request.credentials,
             created_at: now(),
@@ -858,8 +899,7 @@ impl Manager {
                 m.sessions
                     .get_mut(&sid)
                     .unwrap()
-                    .state
-                    .transition(SessionState::Ready)?;
+                    .set_state(SessionState::Ready, None)?;
                 self.db.save(&mut m).await?;
                 self.db
                     .event("session_state", json!({"session_id":sid,"state":"ready"}))
@@ -870,7 +910,7 @@ impl Manager {
             }
             Err(e) => {
                 let s = m.sessions.get_mut(&sid).unwrap();
-                s.state = SessionState::Lost;
+                s.set_state(SessionState::Lost, None)?;
                 if let Some(context) = s.context_id.take() {
                     let key = s.instance_id.clone();
                     let _ = m.instances[&key]
@@ -1215,7 +1255,10 @@ impl Manager {
         {
             let mut m = self.model.lock().await;
             *m.busy.entry(sid.into()).or_default() += 1;
-            m.sessions.get_mut(sid).unwrap().state = SessionState::Busy;
+            m.sessions
+                .get_mut(sid)
+                .unwrap()
+                .set_state(SessionState::Busy, None)?;
             self.db.save(&mut m).await?;
             self.db
                 .event("session_state", json!({"session_id":sid,"state":"busy"}))
@@ -1331,8 +1374,17 @@ impl Manager {
         }
         let mut m = self.model.lock().await;
         let s = Self::owned(&m, run, sid)?.clone();
+        if m.sessions[sid].state == SessionState::Busy {
+            m.sessions
+                .get_mut(sid)
+                .unwrap()
+                .set_state(SessionState::Ready, None)?;
+        }
         if !suspend {
-            m.sessions.get_mut(sid).unwrap().state = SessionState::Closing;
+            m.sessions
+                .get_mut(sid)
+                .unwrap()
+                .set_state(SessionState::Closing, None)?;
             self.db.save(&mut m).await?;
             self.db
                 .event("session_state", json!({"session_id":sid,"state":"closing"}))
@@ -1382,11 +1434,14 @@ impl Manager {
         }
         let session = m.sessions.get_mut(sid).unwrap();
         session.context_id = None;
-        session.state = if suspend {
-            SessionState::Suspended
-        } else {
-            SessionState::Closed
-        };
+        session.set_state(
+            if suspend {
+                SessionState::Suspended
+            } else {
+                SessionState::Closed
+            },
+            None,
+        )?;
         self.db.save(&mut m).await?;
         self.db
             .event(
@@ -1399,6 +1454,17 @@ impl Manager {
     async fn revive_tab(&self, m: &mut Model, tid: &str) -> Result<()> {
         let old = m.tabs[tid].clone();
         let s = m.sessions[&old.session_id].clone();
+        let url = if self.document_allowed(&s, &old.url, false).is_ok() {
+            old.url.clone()
+        } else if let Some(site) = self.site(&s.profile, s.site.as_deref())? {
+            site.rw
+                .first()
+                .cloned()
+                .ok_or_else(|| Fault::new("denied", "no recovery origin"))?
+        } else {
+            "about:blank".into()
+        };
+        self.document_allowed(&s, &url, false)?;
         let i = m.instances[&s.instance_id].clone();
         let mut args = json!({"url":"about:blank","newWindow":true});
         if let Some(c) = &s.context_id {
@@ -1411,36 +1477,62 @@ impl Manager {
             .as_str()
             .ok_or_else(|| Fault::new("cdp_error", "no target"))?
             .to_owned();
-        let cdp = i.attach_page(&target).await?;
-        i.client()
-            .send(Method::PageEnable, json!({}), Some(&cdp))
-            .await?;
-        if s.listen {
+        let setup = async {
+            let cdp = i.attach_page(&target).await?;
             i.client()
-                .send(
-                    Method::EmulationSetFocusEmulationEnabled,
-                    json!({"enabled":true}),
-                    Some(&cdp),
-                )
+                .send(Method::PageEnable, json!({}), Some(&cdp))
                 .await?;
-            self.install_probe(&i, &cdp, &s).await?;
+            if s.listen {
+                i.client()
+                    .send(
+                        Method::EmulationSetFocusEmulationEnabled,
+                        json!({"enabled":true}),
+                        Some(&cdp),
+                    )
+                    .await?;
+                self.install_probe(&i, &cdp, &s).await?;
+            }
+            i.client()
+                .send(Method::PageNavigate, json!({"url":url}), Some(&cdp))
+                .await?;
+            if let Some(previous) = &old.target_id
+                && let Err(error) = i
+                    .client()
+                    .send(
+                        Method::TargetCloseTarget,
+                        json!({"targetId":previous}),
+                        None,
+                    )
+                    .await
+            {
+                let infos = i
+                    .client()
+                    .send(Method::TargetGetTargets, json!({}), None)
+                    .await?;
+                if infos["targetInfos"].as_array().is_some_and(|infos| {
+                    infos
+                        .iter()
+                        .any(|v| v["targetId"].as_str() == Some(previous))
+                }) {
+                    return Err(Fault::from(error));
+                }
+            }
+            Ok::<_, Fault>(cdp)
         }
-        self.document_allowed(&s, &old.url, false)?;
-        i.client()
-            .send(Method::PageNavigate, json!({"url":old.url}), Some(&cdp))
-            .await?;
-        if let Some(previous) = old.target_id {
-            let _ = i
-                .client()
-                .send(
-                    Method::TargetCloseTarget,
-                    json!({"targetId":previous}),
-                    None,
-                )
-                .await;
-        }
+        .await;
+        let cdp = match setup {
+            Ok(cdp) => cdp,
+            Err(error) => {
+                let _ = i
+                    .client()
+                    .send(Method::TargetCloseTarget, json!({"targetId":target}), None)
+                    .await;
+                return Err(error);
+            }
+        };
         let tab = m.tabs.get_mut(tid).unwrap();
         tab.target_id = Some(target);
+        tab.url = url;
         tab.cdp_session = Some(cdp);
         tab.document_epoch += 1;
         tab.state = "loading".into();
@@ -1507,7 +1599,16 @@ impl Manager {
         for tid in tids {
             self.revive_tab(m, &tid).await?;
         }
-        m.sessions.get_mut(sid).unwrap().state = SessionState::Ready;
+        if m.sessions[sid].state == SessionState::Suspended {
+            m.sessions
+                .get_mut(sid)
+                .unwrap()
+                .set_state(SessionState::Opening, None)?;
+        }
+        m.sessions
+            .get_mut(sid)
+            .unwrap()
+            .set_state(SessionState::Ready, None)?;
         self.db.event("session_state",json!({"session_id":sid,"state":"ready","reason":"browser_restarted","references":"stale_ref(browser_restarted)"})).await?;
         Ok(())
     }
@@ -1593,11 +1694,14 @@ impl Manager {
                     .collect::<Vec<_>>();
                 for sid in ids {
                     let s = m.sessions.get_mut(&sid).unwrap();
-                    s.state = if persistent && s.profile != "ephemeral" {
-                        SessionState::Recovering
-                    } else {
-                        SessionState::Lost
-                    };
+                    s.set_state(
+                        if persistent && s.profile != "ephemeral" {
+                            SessionState::Recovering
+                        } else {
+                            SessionState::Lost
+                        },
+                        None,
+                    )?;
                     self.db
                         .event("session_state", json!({"session_id":sid,"state":s.state}))
                         .await?;
@@ -1618,7 +1722,10 @@ impl Manager {
                         .values_mut()
                         .filter(|s| s.instance_id == key && s.state == SessionState::Recovering)
                     {
-                        s.state = SessionState::Blocked;
+                        s.set_state(
+                            SessionState::Blocked,
+                            Some("instance_security_or_version_blocked"),
+                        )?;
                     }
                     self.db.event("blocked",json!({"instance_id":key,"reason":"instance_security_or_version_blocked"})).await?;
                 } else {
@@ -1678,7 +1785,7 @@ impl Manager {
                         .event("tab_state", json!({"tab_id":tid,"state":"crashed"}))
                         .await?;
                     if t.listen {
-                        self.revive_tab(&mut m, &tid).await?;
+                        self.revive_listener(&mut m, &tid).await?;
                     }
                     changed = true;
                 } else if event.method == "Page.frameNavigated"
@@ -1728,7 +1835,15 @@ impl Manager {
                     .iter()
                     .find(|v| v["targetId"].as_str() == t.target_id.as_deref());
                 if let Some(info) = info {
-                    let url = info["url"].as_str().unwrap_or(&t.url).to_owned();
+                    let mut url = info["url"].as_str().unwrap_or(&t.url).to_owned();
+                    if let Some(cdp) = &t.cdp_session
+                        && let Ok(frame) = client
+                            .send(Method::PageGetFrameTree, json!({}), Some(cdp))
+                            .await
+                        && let Some(actual) = frame["frameTree"]["frame"]["url"].as_str()
+                    {
+                        url = actual.into();
+                    }
                     let title = info["title"]
                         .as_str()
                         .unwrap_or("")
@@ -1741,30 +1856,6 @@ impl Manager {
                         live.url = url.clone();
                         live.document_epoch += 1;
                         changed = true;
-                        if self.document_allowed(&s, &url, false).is_err() {
-                            m.sessions.get_mut(&s.id).unwrap().state = SessionState::Blocked;
-                            let login =
-                                self.site(&s.profile, s.site.as_deref())?
-                                    .is_some_and(|site| {
-                                        origin(&url).is_some_and(|o| site.login.contains(&o))
-                                    });
-                            let reason = if login {
-                                "needs_login"
-                            } else {
-                                "document_origin"
-                            };
-                            if login {
-                                let profile = s.profile.clone();
-                                let site = s.site.clone().unwrap();
-                                self.db.call(move|c|{c.execute("INSERT OR REPLACE INTO web_site_state VALUES(?1,?2,'needs_login',?3)",params![profile,site,now()])?;Ok(())}).await?;
-                            }
-                            self.db
-                                .event(
-                                    "session_state",
-                                    json!({"session_id":s.id,"state":"blocked","reason":reason}),
-                                )
-                                .await?;
-                        }
                     }
                     if title != t.title {
                         m.tabs.get_mut(&tid).unwrap().title = title.clone();
@@ -1785,7 +1876,7 @@ impl Manager {
                                 Err(excalibur_cdp::Error::Protocol { message, .. })
                                     if message.contains("crashed") =>
                                 {
-                                    self.revive_tab(&mut m, &tid).await?;
+                                    self.revive_listener(&mut m, &tid).await?;
                                     changed = true;
                                     continue;
                                 }
@@ -1834,7 +1925,7 @@ impl Manager {
                         }
                     }
                 } else if t.listen {
-                    self.revive_tab(&mut m, &tid).await?;
+                    self.revive_listener(&mut m, &tid).await?;
                     changed = true;
                 }
             }
@@ -1890,7 +1981,10 @@ impl Manager {
             if history.len() >= 5 {
                 m.failed.insert(key.clone());
                 for sid in ids {
-                    m.sessions.get_mut(&sid).unwrap().state = SessionState::Lost;
+                    m.sessions
+                        .get_mut(&sid)
+                        .unwrap()
+                        .set_state(SessionState::Lost, None)?;
                 }
                 m.pending_retry.remove(&key);
                 self.db
@@ -1918,8 +2012,100 @@ impl Manager {
             }
             changed = true;
         }
+        changed |= self.reconcile_documents(&mut m).await?;
         if changed {
             self.db.save(&mut m).await?;
+        }
+        self.flush_activity(&mut m).await?;
+        Ok(())
+    }
+    async fn reconcile_documents(&self, m: &mut Model) -> Result<bool> {
+        let ids = m.sessions.keys().cloned().collect::<Vec<_>>();
+        let mut changed = false;
+        for sid in ids {
+            let session = m.sessions[&sid].clone();
+            if !matches!(
+                session.state,
+                SessionState::Ready | SessionState::Busy | SessionState::Blocked
+            ) {
+                continue;
+            }
+            if session.state == SessionState::Blocked
+                && !matches!(
+                    session.blocked_reason.as_deref(),
+                    Some("needs_login" | "document_origin")
+                )
+            {
+                continue;
+            }
+            let tabs = m
+                .tabs
+                .values()
+                .filter(|t| {
+                    Self::visible(m, &session, t) && t.target_id.is_some() && t.state != "closed"
+                })
+                .collect::<Vec<_>>();
+            if tabs.is_empty() {
+                continue;
+            }
+            let invalid = tabs
+                .iter()
+                .find(|t| self.document_allowed(&session, &t.url, false).is_err());
+            if let Some(tab) = invalid {
+                let login = self
+                    .site(&session.profile, session.site.as_deref())?
+                    .is_some_and(|site| origin(&tab.url).is_some_and(|o| site.login.contains(&o)));
+                let reason = if login {
+                    "needs_login"
+                } else {
+                    "document_origin"
+                };
+                if session.state != SessionState::Blocked
+                    || session.blocked_reason.as_deref() != Some(reason)
+                {
+                    m.sessions
+                        .get_mut(&sid)
+                        .unwrap()
+                        .set_state(SessionState::Blocked, Some(reason))?;
+                    if login {
+                        let profile = session.profile.clone();
+                        let site = session.site.clone().unwrap();
+                        self.db.call(move|c|{c.execute("INSERT OR REPLACE INTO web_site_state VALUES(?1,?2,'needs_login',?3)",params![profile,site,now()])?;Ok(())}).await?;
+                    }
+                    self.db
+                        .event(
+                            "session_state",
+                            json!({"session_id":sid,"state":"blocked","reason":reason}),
+                        )
+                        .await?;
+                    changed = true;
+                }
+            } else if session.state == SessionState::Blocked
+                && tabs.iter().all(|t| t.state != "crashed")
+            {
+                let session = m.sessions.get_mut(&sid).unwrap();
+                session.set_state(SessionState::Ready, None)?;
+                if m.busy.get(&sid).copied().unwrap_or(0) > 0 {
+                    session.set_state(SessionState::Busy, None)?;
+                }
+                self.db.event("session_state",json!({"session_id":sid,"state":session.state,"reason":"document_condition_cleared"})).await?;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+    async fn revive_listener(&self, m: &mut Model, tid: &str) -> Result<()> {
+        if m.tab_retry
+            .get(tid)
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.revive_tab(m, tid).await {
+            m.tab_retry.insert(tid.into(), tokio::time::Instant::now());
+            self.db.event("tab_state",json!({"tab_id":tid,"state":"crashed","reason":"recovery_failed","error":error.kind})).await?;
+        } else {
+            m.tab_retry.remove(tid);
         }
         Ok(())
     }
@@ -1931,20 +2117,60 @@ impl Manager {
         kind: &str,
         count: Option<i64>,
     ) -> Result<()> {
-        if m.last_activity
-            .get(key)
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
-        {
-            return Ok(());
+        let pending = m.pending_activity.entry(key.into()).or_default();
+        pending.session_id = s.id.clone();
+        pending.profile = s.profile.clone();
+        pending.site = s.site.clone();
+        if kind == "title_changed" {
+            pending.title_changed = true;
         }
-        m.last_activity
-            .insert(key.into(), tokio::time::Instant::now());
-        self.db
-            .event(
-                "listener_activity",
-                json!({"session_id":s.id,"site":s.site,"kind":kind,"count":count}),
-            )
-            .await?;
+        if kind == "unread_count" {
+            pending.unread_changed = true;
+            pending.count = count;
+        }
+        Ok(())
+    }
+    async fn flush_activity(&self, m: &mut Model) -> Result<()> {
+        let keys = m.pending_activity.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            if m.last_activity
+                .get(&key)
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+            {
+                continue;
+            }
+            let p = m.pending_activity[&key].clone();
+            let session = m
+                .sessions
+                .values()
+                .find(|s| {
+                    s.id == p.session_id
+                        && !matches!(s.state, SessionState::Closed | SessionState::Lost)
+                })
+                .or_else(|| {
+                    m.sessions.values().find(|s| {
+                        s.profile == p.profile
+                            && s.site == p.site
+                            && s.listen
+                            && !matches!(s.state, SessionState::Closed | SessionState::Lost)
+                    })
+                });
+            let Some(session) = session else {
+                m.pending_activity.remove(&key);
+                continue;
+            };
+            let mut kinds = vec![];
+            if p.title_changed {
+                kinds.push("title_changed")
+            }
+            if p.unread_changed {
+                kinds.push("unread_count")
+            }
+            self.db.event("listener_activity",json!({"session_id":session.id,"site":p.site,"kind":if p.unread_changed{"unread_count"}else{"title_changed"},"kinds":kinds,"count":p.count})).await?;
+            m.last_activity
+                .insert(key.clone(), tokio::time::Instant::now());
+            m.pending_activity.remove(&key);
+        }
         Ok(())
     }
 }
@@ -2011,5 +2237,94 @@ mod lifecycle_tests {
         for attempts in 2..10 {
             assert_eq!(retry_delay(attempts), Duration::from_secs(30));
         }
+    }
+    #[tokio::test]
+    async fn only_document_blocks_clear_when_the_origin_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "personal".into(),
+            Profile {
+                sites: vec![Site {
+                    name: "chat".into(),
+                    rw: vec!["http://chat.test".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let manager = Manager::open(Options {
+            data_dir: dir.path().into(),
+            binary: "/not-used".into(),
+            proxy: "127.0.0.1:12345".parse().unwrap(),
+            profiles,
+            compact: false,
+            version: VersionPolicy::default(),
+            chrome_args: vec![],
+        })
+        .await
+        .unwrap();
+        let mut model = manager.model.lock().await;
+        let mut session = Session {
+            id: "s".into(),
+            owner_run: "r".into(),
+            profile: "personal".into(),
+            context_id: None,
+            instance_id: "personal".into(),
+            mode: "headless".into(),
+            site: Some("chat".into()),
+            listen: false,
+            state: SessionState::Ready,
+            blocked_reason: None,
+            origins: vec![],
+            credentials: vec![],
+            created_at: now(),
+            updated_at: now(),
+        };
+        session
+            .set_state(SessionState::Blocked, Some("version_blocked"))
+            .unwrap();
+        model.sessions.insert("s".into(), session);
+        model.tabs.insert(
+            "t".into(),
+            Tab {
+                id: "t".into(),
+                session_id: "s".into(),
+                target_id: Some("target".into()),
+                cdp_session: None,
+                owner_run: "r".into(),
+                label: None,
+                url: "http://chat.test/".into(),
+                title: String::new(),
+                state: "ready".into(),
+                document_epoch: 1,
+                listen: false,
+            },
+        );
+        assert!(!manager.reconcile_documents(&mut model).await.unwrap());
+        assert_eq!(model.sessions["s"].state, SessionState::Blocked);
+        model
+            .sessions
+            .get_mut("s")
+            .unwrap()
+            .set_state(SessionState::Blocked, Some("document_origin"))
+            .unwrap();
+        assert!(manager.reconcile_documents(&mut model).await.unwrap());
+        assert_eq!(model.sessions["s"].state, SessionState::Ready);
+        assert_eq!(model.sessions["s"].blocked_reason, None);
+        model
+            .sessions
+            .get_mut("s")
+            .unwrap()
+            .set_state(SessionState::Blocked, Some("needs_login"))
+            .unwrap();
+        model
+            .sessions
+            .get_mut("s")
+            .unwrap()
+            .set_state(SessionState::HumanControl, None)
+            .unwrap();
+        assert!(!manager.reconcile_documents(&mut model).await.unwrap());
+        assert_eq!(model.sessions["s"].state, SessionState::HumanControl);
     }
 }
