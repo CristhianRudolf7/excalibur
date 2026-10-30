@@ -393,9 +393,10 @@ impl TerminalManager {
         let run = run.to_string();
         let cmd = cmd.to_string();
         let tty = args.get("tty").and_then(Value::as_bool).unwrap_or(false);
+        let spawn_run = run.clone();
         let session = match tokio::task::spawn_blocking(move || {
             manager.spawn(
-                &run,
+                &spawn_run,
                 &cmd,
                 &cwd,
                 tty,
@@ -420,6 +421,7 @@ impl TerminalManager {
         {
             result.success = false;
         }
+        self.attach_notices(&run, &mut result);
         result
     }
     pub async fn io(&self, run: &str, args: Value) -> ToolResult {
@@ -524,6 +526,7 @@ impl TerminalManager {
                 let mut result = self.snapshot(&session, cursor, output_limit(&args));
                 result.output["matched"] = json!(matched);
                 result.output["wait_timed_out"] = json!(!matched);
+                self.attach_notices(run, &mut result);
                 return result;
             }
             "signal" => {
@@ -541,7 +544,17 @@ impl TerminalManager {
             "close" => self.close(&session).await,
             _ => return ToolResult::error("unsupported exec_io action"),
         }
-        self.snapshot(&session, cursor, output_limit(&args))
+        let mut result = self.snapshot(&session, cursor, output_limit(&args));
+        self.attach_notices(run, &mut result);
+        result
+    }
+    /// Drain pending session notices for the owner into its next tool
+    /// result, so an eviction warning is not only visible via `list`.
+    fn attach_notices(&self, run: &str, result: &mut ToolResult) {
+        let notices = self.take_notices(run);
+        if !notices.is_empty() {
+            result.output["notices"] = json!(notices);
+        }
     }
     pub fn set_execution_limits(
         &self,

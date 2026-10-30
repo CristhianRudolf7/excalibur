@@ -2,7 +2,10 @@ use excalibur_store::{Database, DatabaseKind, Priority, ReadLane, StorageConfig}
 use excalibur_tools::{Access, LocalTools, ToolPolicy, monitor::*};
 use excalibur_types::runtime::{BoxFuture, ToolCall, ToolRuntime};
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 struct Observed(Mutex<Vec<(ProjectChange, Option<Vec<u8>>)>>);
 impl ChangeObserver for Observed {
     fn changed<'a>(
@@ -273,5 +276,157 @@ async fn managed_checklist_updates_preserve_fresh_evidence_but_outside_edits_inv
         CriterionState::Unverified
     );
     monitor.stop().await;
+    db.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn configured_projection_path_canonicalizes_generated_checklist_sections() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir_all(root.join("test")).unwrap();
+    std::fs::write(
+        root.join("test/README.md"),
+        "# Notes\n<!-- excalibur:checklist -->\n- [ ] old\n<!-- /excalibur:checklist -->\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("notes.txt"), "user notes\n").unwrap();
+    let db = Database::open(
+        temp.path().join("data/main.db"),
+        DatabaseKind::Main,
+        StorageConfig::default(),
+    )
+    .unwrap();
+    let tools = LocalTools::new(db.clone(), root.clone(), ToolPolicy::default())
+        .await
+        .unwrap();
+    let seen = Arc::new(Observed(Mutex::new(vec![])));
+    let monitor = ProjectMonitor::start_with_projections(
+        tools.clone(),
+        Some(seen.clone()),
+        vec![],
+        vec![PathBuf::from("test/README.md")],
+    )
+    .await
+    .unwrap();
+    seen.0.lock().unwrap().clear();
+    // Only the generated section changes; user text is untouched.
+    std::fs::write(
+        root.join("test/README.md"),
+        "# Notes\n<!-- excalibur:checklist -->\n- [x] new\n<!-- /excalibur:checklist -->\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("notes.txt"), "edited notes\n").unwrap();
+    monitor.scan_now().await.unwrap();
+    let mut changes = seen.0.lock().unwrap().clone();
+    changes.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+    assert_eq!(changes.len(), 2);
+    let readme = changes
+        .iter()
+        .find(|(change, _)| change.path == Path::new("test/README.md"))
+        .unwrap();
+    assert!(
+        !readme.0.semantic_changed,
+        "a configured projection must canonicalize its generated section"
+    );
+    let notes = changes
+        .iter()
+        .find(|(change, _)| change.path == Path::new("notes.txt"))
+        .unwrap();
+    assert!(notes.0.semantic_changed);
+    monitor.stop().await;
+    drop(monitor);
+    drop(tools);
+    db.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn gitignore_excluded_files_never_queue_project_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+    std::fs::write(root.join("ignored.txt"), "v1\n").unwrap();
+    std::fs::write(root.join("tracked.txt"), "v1\n").unwrap();
+    let db = Database::open(
+        temp.path().join("data/main.db"),
+        DatabaseKind::Main,
+        StorageConfig::default(),
+    )
+    .unwrap();
+    let tools = LocalTools::new(db.clone(), root.clone(), ToolPolicy::default())
+        .await
+        .unwrap();
+    let seen = Arc::new(Observed(Mutex::new(vec![])));
+    let monitor = ProjectMonitor::start(tools.clone(), Some(seen.clone()), vec![])
+        .await
+        .unwrap();
+    seen.0.lock().unwrap().clear();
+    std::fs::write(root.join("ignored.txt"), "v2\n").unwrap();
+    std::fs::write(root.join("tracked.txt"), "v2\n").unwrap();
+    monitor.scan_now().await.unwrap();
+    let changes = seen.0.lock().unwrap().clone();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].0.path, PathBuf::from("tracked.txt"));
+    monitor.stop().await;
+    drop(monitor);
+    drop(tools);
+    db.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn agent_exec_changes_are_attributed_before_marking_them_external() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    excalibur_tools::terminal::prepare_project_boundary(&root).unwrap();
+    let db = Database::open(
+        temp.path().join("data/main.db"),
+        DatabaseKind::Main,
+        StorageConfig::default(),
+    )
+    .unwrap();
+    let journal = excalibur_journal::Journal::new(db.clone()).await.unwrap();
+    let run = journal
+        .create_run("exec-owner", json!({"synthetic": true}))
+        .await
+        .unwrap();
+    let tools = LocalTools::new(
+        db.clone(),
+        root.clone(),
+        ToolPolicy {
+            write: Access::Allow,
+            exec: Access::Allow,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let seen = Arc::new(Observed(Mutex::new(vec![])));
+    let monitor = ProjectMonitor::start(tools.clone(), Some(seen.clone()), vec![])
+        .await
+        .unwrap();
+    seen.0.lock().unwrap().clear();
+    let prepared = tools
+        .prepare(
+            &run,
+            ToolCall {
+                id: "spawn".into(),
+                name: "exec".into(),
+                arguments: json!({"cmd": "sh -c 'printf agent > agent.txt'"}).to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    let result = tools.execute(&run, "spawn", &prepared).await;
+    assert!(result.success, "{result:?}");
+    tools.end_step(&run, 0).await.unwrap();
+    monitor.scan_now().await.unwrap();
+    let changes = seen.0.lock().unwrap().clone();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].0.path, PathBuf::from("agent.txt"));
+    assert!(
+        !changes[0].0.external,
+        "the agent's own exec output is not an outside change: {changes:?}"
+    );
+    monitor.stop().await;
+    drop(monitor);
+    drop(tools);
     db.shutdown().await.unwrap();
 }

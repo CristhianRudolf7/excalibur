@@ -687,3 +687,49 @@ async fn failed_checks_retry_with_new_checkpoint_integrates() {
     f.assert_user_branch_untouched();
     f.db.shutdown().await.unwrap();
 }
+#[tokio::test]
+async fn worktree_assign_overlap_warns_the_parent_run() {
+    let f = Fixture::new().await;
+    let first = invoke(
+        &f.tools,
+        "parent",
+        "assign-a",
+        "worktree",
+        json!({"action": "assign", "owner": "owner-a", "paths": ["base.txt"]}),
+    )
+    .await;
+    assert!(first.success, "{first:?}");
+    assert!(
+        first.output["overlaps"].as_array().unwrap().is_empty(),
+        "{first:?}"
+    );
+    let second = invoke(
+        &f.tools,
+        "parent",
+        "assign-b",
+        "worktree",
+        json!({"action": "assign", "owner": "owner-b", "paths": ["base.txt"]}),
+    )
+    .await;
+    assert!(second.success, "{second:?}");
+    assert!(
+        !second.output["overlaps"].as_array().unwrap().is_empty(),
+        "{second:?}"
+    );
+    let journal = excalibur_journal::Journal::new(f.db.clone()).await.unwrap();
+    let directives: Vec<String> = journal
+        .entries("parent", 0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "directive_received")
+        .filter_map(|event| event.payload["text"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        directives
+            .iter()
+            .any(|text| text.contains("overlap") && text.contains("base.txt")),
+        "{directives:?}"
+    );
+    f.db.shutdown().await.unwrap();
+}

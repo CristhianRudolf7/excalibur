@@ -51,13 +51,16 @@ impl Shadow {
     }
     /// Input is supplied by the host's existing capability-aware file reader. This
     /// library never walks/reads project files or follows private hardlinks itself.
+    ///
+    /// Returns the stored snapshot plus non-fatal skip warnings (oversized or
+    /// secret content is excluded from the snapshot instead of failing it).
     pub async fn snapshot_files(
         &self,
         run: &str,
         step: u64,
         phase: &str,
         files: BTreeMap<PathBuf, Vec<u8>>,
-    ) -> Result<Snapshot> {
+    ) -> Result<(Snapshot, Vec<String>)> {
         self.snapshot_entries(
             run,
             step,
@@ -75,13 +78,13 @@ impl Shadow {
         step: u64,
         phase: &str,
         files: BTreeMap<PathBuf, SnapshotEntry>,
-    ) -> Result<Snapshot> {
+    ) -> Result<(Snapshot, Vec<String>)> {
         if phase.is_empty() || phase.len() > 64 || phase.chars().any(char::is_control) {
             return Err(Error::Invalid("snapshot phase invalid"));
         }
         let id = hash(format!("{}:{run}:{step}:{phase}", self.workspace.root.display()).as_bytes());
         if let Some(existing) = self.lookup(&id).await? {
-            return Ok(existing);
+            return Ok((existing, Vec::new()));
         }
         let directory = self.directory();
         std::fs::create_dir_all(&directory)?;
@@ -112,18 +115,17 @@ impl Shadow {
         .await?;
         let result = async {
             let mut total = 0usize;
-            // Stage every blob first, then update the index in a single
-            // process: one git invocation per snapshot instead of one per
-            // file, with identical resulting objects.
-            let mut staged: Vec<(String, String, String)> = Vec::new();
+            let mut warnings: Vec<String> = Vec::new();
+            // Validate every entry before touching the object store, so an
+            // oversized or secret file degrades to a skipped path with a
+            // warning instead of failing the whole snapshot.
+            let mut plan: Vec<(String, String, Vec<u8>)> = Vec::new();
             for (path, entry) in files {
                 if entry.kind == EntryKind::Symlink && entry.executable {
                     return Err(Error::Invalid(
                         "symbolic-link executable flag must be false",
                     ));
                 }
-                let mode = entry.mode();
-                let bytes = entry.content;
                 if path.is_absolute()
                     || path
                         .components()
@@ -134,39 +136,89 @@ impl Shadow {
                         "snapshot paths must be normalized relative files",
                     ));
                 }
-                total = total
-                    .checked_add(bytes.len())
-                    .ok_or(Error::Invalid("snapshot size overflow"))?;
-                if bytes.len() > 64 * 1024 * 1024 || total > 256 * 1024 * 1024 {
-                    return Err(Error::Invalid("snapshot exceeds bounded content limits"));
-                }
-                if self.workspace.redactor.contains_secret(&bytes) {
-                    return Err(Error::Invalid(
-                        "secret content cannot enter a shadow snapshot",
-                    ));
-                }
-                let oid = self
-                    .git(
-                        vec!["hash-object".into(), "-w".into(), "--stdin".into()],
-                        Some(&index),
-                        Some(bytes),
-                    )
-                    .await?;
-                let oid =
-                    String::from_utf8(oid).map_err(|_| Error::Invalid("invalid shadow object"))?;
                 let name = path
                     .to_str()
                     .ok_or(Error::Invalid("snapshot path must be UTF-8"))?
                     .to_owned();
-                staged.push((mode.to_owned(), oid.trim().to_owned(), name));
+                if name.bytes().any(|b| b == 0) {
+                    return Err(Error::Invalid(
+                        "snapshot path contains an embedded NUL byte",
+                    ));
+                }
+                let mode = entry.mode().to_owned();
+                let bytes = entry.content;
+                total = total
+                    .checked_add(bytes.len())
+                    .ok_or(Error::Invalid("snapshot size overflow"))?;
+                if bytes.len() > 64 * 1024 * 1024 || total > 256 * 1024 * 1024 {
+                    warnings.push(format!("snapshot skips oversized path: {name}"));
+                    continue;
+                }
+                if self.workspace.redactor.contains_secret(&bytes) {
+                    warnings.push(format!("snapshot skips path with secret content: {name}"));
+                    continue;
+                }
+                plan.push((mode, name, bytes));
+            }
+            // Materialize every blob once, then hash all of them in a single
+            // hash-object process instead of one process per file, with
+            // identical resulting objects. Staging names are positional, so
+            // hostile project names never reach argv or stdin.
+            let mut staged: Vec<(String, String, String)> = Vec::new();
+            if !plan.is_empty() {
+                let staging = directory.join(format!("staging-{}", excalibur_types::JobId::new()));
+                std::fs::create_dir_all(&staging)?;
+                let hashed = async {
+                    let mut input = Vec::new();
+                    for (sequence, (_, _, bytes)) in plan.iter().enumerate() {
+                        let staging_name = format!("{sequence:06}");
+                        std::fs::write(staging.join(&staging_name), bytes)?;
+                        input.extend_from_slice(
+                            staging.join(&staging_name).to_string_lossy().as_bytes(),
+                        );
+                        input.push(b'\n');
+                    }
+                    let out = self
+                        .git(
+                            vec![
+                                "hash-object".into(),
+                                "-w".into(),
+                                "--no-filters".into(),
+                                "--stdin-paths".into(),
+                            ],
+                            Some(&index),
+                            Some(input),
+                        )
+                        .await?;
+                    String::from_utf8(out).map_err(|_| Error::Invalid("invalid shadow object"))
+                }
+                .await;
+                let _ = std::fs::remove_dir_all(&staging);
+                let oids = hashed?;
+                let mut oids: Vec<&str> = oids.lines().collect();
+                if oids.len() != plan.len() {
+                    return Err(Error::Invalid("shadow object count mismatch"));
+                }
+                for ((mode, name, _), oid) in plan.drain(..).zip(oids.drain(..)) {
+                    staged.push((mode, oid.trim().to_owned(), name));
+                }
             }
             if !staged.is_empty() {
+                // NUL-terminated entries (`-z`): names travel literally, so
+                // quotes are never interpreted and embedded newlines cannot
+                // start a forged entry.
                 let mut info = Vec::new();
                 for (mode, oid, name) in &staged {
-                    info.extend_from_slice(format!("{mode} {oid} 0\t{name}\n").as_bytes());
+                    info.extend_from_slice(format!("{mode} {oid} 0\t{name}").as_bytes());
+                    info.push(0);
                 }
                 self.git(
-                    vec!["update-index".into(), "--add".into(), "--index-info".into()],
+                    vec![
+                        "update-index".into(),
+                        "--add".into(),
+                        "-z".into(),
+                        "--index-info".into(),
+                    ],
                     Some(&index),
                     Some(info),
                 )
@@ -210,11 +262,73 @@ impl Shadow {
                 })
                 .await?;
             let found = self.lookup(&id).await?;
-            found.ok_or(Error::Invalid("snapshot receipt missing"))
+            let snapshot = found.ok_or(Error::Invalid("snapshot receipt missing"))?;
+            self.prune_old_snapshots(run).await?;
+            Ok((snapshot, warnings))
         }
         .await;
         let _ = std::fs::remove_file(index);
         result
+    }
+    /// Keep only the newest snapshots of a run so explicit diff/restore of
+    /// recent steps keeps working, then collect unreachable objects. The
+    /// shadow store would otherwise grow without bound because the helper
+    /// disables git's automatic housekeeping on every invocation.
+    async fn prune_old_snapshots(&self, run: &str) -> Result<()> {
+        let (run, root) = (
+            run.to_owned(),
+            self.workspace.root.to_string_lossy().into_owned(),
+        );
+        self.workspace
+            .db
+            .write(Priority::Journal, move |c| {
+                c.execute(
+                    "DELETE FROM workspace_snapshots WHERE run_id=?1 AND root=?2 AND id NOT IN(SELECT id FROM workspace_snapshots WHERE run_id=?1 AND root=?2 ORDER BY created_at DESC,id DESC LIMIT 32)",
+                    excalibur_store::rusqlite::params![run, root],
+                )?;
+                Ok(())
+            })
+            .await?;
+        self.collect_garbage().await;
+        Ok(())
+    }
+    /// Rate-limited explicit `gc`: loose objects accumulate on every
+    /// snapshot, and only a collection older than one hour is eligible.
+    async fn collect_garbage(&self) {
+        let loose = self
+            .git(vec!["count-objects".into(), "-v".into()], None, None)
+            .await
+            .ok()
+            .and_then(|out| {
+                String::from_utf8(out).ok()?.lines().find_map(|line| {
+                    line.strip_prefix("count: ")
+                        .and_then(|n| n.trim().parse::<usize>().ok())
+                })
+            })
+            .unwrap_or(0);
+        if loose < 1000 {
+            return;
+        }
+        let marker = self.directory().join("last-shadow-gc");
+        let stale = std::fs::metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .map(|modified| {
+                modified
+                    .elapsed()
+                    .is_ok_and(|age| age > std::time::Duration::from_secs(3600))
+            })
+            .unwrap_or(true);
+        if !stale {
+            return;
+        }
+        let _ = self
+            .git(
+                vec!["gc".into(), "--prune=1.hour.ago".into(), "--quiet".into()],
+                None,
+                None,
+            )
+            .await;
+        let _ = std::fs::write(&marker, excalibur_store::unix_seconds().to_string());
     }
     pub(crate) async fn lookup(&self, id: &str) -> Result<Option<Snapshot>> {
         let (id, root) = (

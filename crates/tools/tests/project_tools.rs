@@ -1,4 +1,4 @@
-use excalibur_store::{Database, DatabaseKind, Priority, StorageConfig};
+use excalibur_store::{Database, DatabaseKind, Priority, ReadLane, StorageConfig};
 use excalibur_tools::{Access, LocalTools, ToolPolicy};
 use excalibur_types::runtime::*;
 use serde_json::{Value, json};
@@ -506,5 +506,87 @@ async fn shadow_snapshots_cover_exec_io_only_steps_and_cancelled_transitions() {
         "{diff:?}"
     );
     tools.terminals().shutdown().await;
+    db.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn engine_pause_and_block_release_file_leases_through_execution_state() {
+    let (dir, db, tools) = fixture().await;
+    let root = dir.path().join("project");
+    std::fs::write(root.join("file.txt"), "v1\n").unwrap();
+    let journal = excalibur_journal::Journal::new(db.clone()).await.unwrap();
+    let run = journal
+        .create_run("lease-release", json!({"synthetic": true}))
+        .await
+        .unwrap();
+    let holders = || {
+        let db = db.clone();
+        async move {
+            db.read(ReadLane::Interactive, |c| {
+                let mut q = c.prepare("SELECT holder_id FROM leases ORDER BY path")?;
+                Ok(q.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?)
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let write = || {
+        let tools = &tools;
+        let run = run.clone();
+        async move {
+            let prepared = tools
+                .prepare(&run, call("r", "read_file", json!({"path": "file.txt"})))
+                .await
+                .unwrap();
+            let read = tools.execute(&run, "r", &prepared).await;
+            assert!(read.success, "{read:?}");
+            let prepared = tools
+                .prepare(
+                    &run,
+                    call(
+                        "w",
+                        "write_file",
+                        json!({"path": "file.txt", "content": "v2\n"}),
+                    ),
+                )
+                .await
+                .unwrap();
+            tools.execute(&run, "w", &prepared).await
+        }
+    };
+    // The engine marks the run active before driving tools, so the write
+    // keeps its lease instead of releasing it as a standalone call would.
+    tools.execution_state(&run, "running", None).await.unwrap();
+    assert!(write().await.success);
+    assert_eq!(holders().await, vec![run.clone()]);
+    // A pause releases the run's leases through the same engine hook. Like
+    // the engine, the test journals the transition first; the hook then
+    // follows the durable state instead of the hint alone.
+    journal
+        .set_state(&run, "paused", None, "lease-test-pause")
+        .await
+        .unwrap();
+    tools.execution_state(&run, "paused", None).await.unwrap();
+    assert!(holders().await.is_empty());
+    // A block releases them the same way.
+    journal
+        .set_state(&run, "running", None, "lease-test-resume")
+        .await
+        .unwrap();
+    tools.execution_state(&run, "running", None).await.unwrap();
+    let second = write().await;
+    assert!(second.success, "{second:?}");
+    assert_eq!(holders().await, vec![run.clone()]);
+    journal
+        .set_state(
+            &run,
+            "blocked",
+            Some("lease-test-block".into()),
+            "lease-test-block",
+        )
+        .await
+        .unwrap();
+    tools.execution_state(&run, "blocked", None).await.unwrap();
+    assert!(holders().await.is_empty());
     db.shutdown().await.unwrap();
 }

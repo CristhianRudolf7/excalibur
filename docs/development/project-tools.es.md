@@ -12,7 +12,7 @@ El host puede componer `DeferredTools(ExecutionTools(EpisodeTools(SecuredTools(L
 
 Cada restauración reutiliza preparación, preimágenes durables, huellas, arrendamientos de escritura, publicación atómica y `file_versions`. `file_history` enumera las versiones registradas. `revert_edit` calcula una reversión a tres bandas contra el archivo actual: conserva cambios posteriores independientes y devuelve conflictos sin sobrescribir. La reapertura y reconciliación reutilizan preparación e identidad de versión.
 
-Los pasos de una ejecución que usa exec toman una instantánea sombra al inicio del paso y otra al final; los exec intermedios reutilizan la instantánea inicial del paso en vez de recorrer el árbol de nuevo. Salir de la ejecución activa por pausa, cancelación, espera de aprobación o bloqueo también cierra el paso actual con una instantánea final, para que los pasos que terminan fuera del límite normal sigan siendo restaurables. Las ejecuciones que nunca tocan exec no registran instantáneas. Los blobs se resumen una vez y el índice se actualiza con un solo comando por lotes por instantánea. No preparan archivos ni crean commits en el repositorio del usuario. `workspace_snapshot` enumera las instantáneas de la ejecución actual, muestra diferencias o restaura archivos seleccionados explícitamente. Se rechazan identificadores de otras ejecuciones. Un comando vivo puede abarcar varios pasos; cada uno registra el estado observado del sistema de archivos, sin afirmar que el comando terminó.
+Los pasos de una ejecución que usa exec toman una instantánea sombra al inicio del paso y otra al final; los exec intermedios reutilizan la instantánea inicial del paso en vez de recorrer el árbol de nuevo. Salir de la ejecución activa por pausa, cancelación, espera de aprobación o bloqueo también cierra el paso actual con una instantánea final, para que los pasos que terminan fuera del límite normal sigan siendo restaurables. Las ejecuciones que nunca tocan exec no registran instantáneas. Los blobs se resumen en un solo proceso por instantánea y el índice se escribe con terminadores NUL, para que los nombres hostiles viajen literales y no puedan corromper ni falsear entradas; el contenido excesivo o secreto se omite con un aviso en lugar de fallar la instantánea, y las fronteras de paso degradan a un aviso en el siguiente resultado exec en vez de fallar el paso. El historial por ejecución conserva las instantáneas recientes y una recolección limitada poda los objetos inalcanzables, porque el mantenimiento automático está desactivado en estos repositorios. No preparan archivos ni crean commits en el repositorio del usuario. `workspace_snapshot` enumera las instantáneas de la ejecución actual, muestra diferencias o restaura archivos seleccionados explícitamente. Se rechazan identificadores de otras ejecuciones. Un comando vivo puede abarcar varios pasos; cada uno registra el estado observado del sistema de archivos, sin afirmar que el comando terminó.
 
 Las entradas pasan comprobaciones de raíz vinculadas a descriptores y de hardlinks privados. Se excluyen nombres de credenciales, metadatos sensibles, rutas protegidas del host, `.git`, `target`, `node_modules` y reglas de ignorados. El grafo recibe archivos normales UTF-8 autorizados; las instantáneas también conservan metadatos de ejecutable y enlaces donde el sistema de archivos los admite. Una restauración no sigue un enlace externo para leer o sobrescribir su destino. Los cambios de entrada no admitidos o conflictivos se informan explícitamente.
 
@@ -30,7 +30,7 @@ Un diagnóstico de versión coincidente no demuestra que el servidor haya termin
 
 ## Arrendamientos, partición e integración
 
-`excalibur-workspace` combina arrendamientos durables por ruta canónica, mapa en memoria y bloqueos del sistema operativo entre procesos que cooperan. Caducan tras diez minutos sin latido; las ejecuciones activas los renuevan durante herramientas largas. Esperas humanas, pausa, bloqueo y estados terminales los liberan. Una colisión espera hasta treinta segundos e informa titular y actividad. Un efecto no interrumpible ya admitido conserva su guarda SO hasta terminar aunque se libere el arrendamiento durable. Las huellas detectan también cambios del usuario, que no pide arrendamientos.
+`excalibur-workspace` combina arrendamientos durables por ruta canónica, mapa en memoria y bloqueos del sistema operativo entre procesos que cooperan. Caducan tras diez minutos sin latido; las ejecuciones activas los renuevan durante herramientas largas. El bucle de renovación reintenta al titular fallido en el siguiente ciclo en vez de detenerse, y sigue renovando mientras quede vivo cualquier gestor. Esperas humanas, pausa, bloqueo y estados terminales los liberan. Una colisión espera hasta treinta segundos e informa titular y actividad. Un efecto no interrumpible ya admitido conserva su guarda SO hasta terminar aunque se libere el arrendamiento durable. Las huellas detectan también cambios del usuario, que no pide arrendamientos.
 
 El host reenvía `ToolRuntime::execution_state`, `begin_step` y `end_step` por los decoradores. Las herramientas independientes sin notificaciones del motor liberan sus arrendamientos después de cada llamada. Las ejecuciones gestionadas los conservan hasta la transición correspondiente. Admisión y renovación comprueban el estado durable; un aviso obsoleto no reactiva una ejecución terminal.
 
@@ -42,18 +42,19 @@ La integración es serial y durable: rebase sobre la rama de integración de tar
 
 ## Cambios externos y ciclo de vida
 
-`ProjectMonitor` controla un vigilante nativo y una cola durable. Los avisos de archivos calculan hashes solo de los candidatos admisibles afectados; cambios de directorios/ignorados o desbordamiento provocan una reexploración. Se reintenta trabajo pendiente sin releer periódicamente todo el árbol. Los cambios invalidan evidencia del ámbito, actualizan/retiran nodos del grafo y envían una directiva durable al titular del arrendamiento. Se conservan las preimágenes de lectura para mostrar el diff de un conflicto.
+`ProjectMonitor` controla un vigilante nativo y una cola durable. Los avisos de archivos calculan hashes solo de los candidatos admisibles afectados; cambios de directorios/ignorados o desbordamiento provocan una reexploración, y `.git/info/exclude` siempre llega al vigilante aunque el resto de `.git` nunca se explora. El host configura las rutas de proyección cuya sección generada se canoniza antes de la comparación semántica. El contenido que el agente produjo con `exec` se atribuye a Excalibur: los cambios observados con un paso exec abierto no se marcan externos, la instantánea de cierre registra el contenido producido y las filas pendientes de un análisis que compitió con el cierre se corrigen. Se reintenta trabajo pendiente sin releer periódicamente todo el árbol. Los cambios invalidan evidencia del ámbito, actualizan/retiran nodos del grafo y envían una directiva durable al titular del arrendamiento. Se conservan las preimágenes de lectura para mostrar el diff de un conflicto.
 
 El host conserva un monitor mientras el proyecto está activo, consulta `last_error` y llama a `stop` al cerrarlo. El trabajo interrumpido permanece en la cola. El backend no interactivo ejecuta una exploración final, detiene vigilancia y servidores de lenguaje y cierra grafo y bases.
 
 ## Verificación
 
 ```sh
-cargo test -p excalibur-workspace
+cargo test -p excalibur-workspace --test concurrency --test shadow_entries --test typed_checkpoint
 cargo test -p excalibur-code-intelligence
 cargo test -p excalibur-tools --test tool_retrieval --test terminal_vs_tools
-cargo test -p excalibur-tools --test project_tools --test project_monitor
+cargo test -p excalibur-tools --test project_tools --test project_monitor --test project_monitor_races --test child_integration
 cargo test -p excalibur-models --test deferred --test replay
+cargo test -p excalibur-tasks --test verification
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace

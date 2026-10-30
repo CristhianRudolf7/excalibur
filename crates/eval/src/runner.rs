@@ -475,13 +475,26 @@ impl Execution {
         let observer = local
             .project_intelligence()
             .map(|services| services as Arc<dyn excalibur_tools::monitor::ChangeObserver>);
-        let project_monitor = excalibur_tools::monitor::ProjectMonitor::start(
+        // The checklist projection lives under `tests/`, `test/` or
+        // `scripts/` (whatever exists first); the eval profile keeps its own
+        // projection outside the project root, so nothing is passed then.
+        let projection_folder = ["tests", "test", "scripts"]
+            .into_iter()
+            .find(|folder| root.join(folder).is_dir())
+            .unwrap_or("tests");
+        let projection_paths = if options.profile == ExecutionProfile::Eval {
+            Vec::new()
+        } else {
+            vec![PathBuf::from(projection_folder).join("README.md")]
+        };
+        let project_monitor = excalibur_tools::monitor::ProjectMonitor::start_with_projections(
             (*local).clone(),
             observer,
             vec![excalibur_tools::monitor::EvidenceTarget {
                 tasks: task_store.clone(),
                 scope: "episode".into(),
             }],
+            projection_paths,
         )
         .await
         .map_err(config_error)?;

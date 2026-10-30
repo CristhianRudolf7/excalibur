@@ -98,7 +98,7 @@ struct Shared {
 #[derive(Default)]
 struct Refresher {
     running: bool,
-    context: Weak<TickContext>,
+    contexts: Vec<Weak<TickContext>>,
 }
 struct TickContext {
     db: Database,
@@ -124,7 +124,10 @@ impl LeaseManager {
     fn start_refresher(&self) {
         {
             let mut state = self.shared.refresher.lock().unwrap();
-            state.context = Arc::downgrade(&self.tick);
+            state
+                .contexts
+                .retain(|c| c.strong_count() > 0 && !c.ptr_eq(&Arc::downgrade(&self.tick)));
+            state.contexts.push(Arc::downgrade(&self.tick));
             if state.running {
                 return;
             }
@@ -144,13 +147,12 @@ impl LeaseManager {
                     .collect::<Vec<_>>();
                 let context = {
                     let mut state = shared.refresher.lock().unwrap();
-                    match state.context.upgrade() {
-                        Some(context) => context,
-                        None => {
-                            state.running = false;
-                            break;
-                        }
-                    }
+                    state.contexts.retain(|c| c.strong_count() > 0);
+                    let Some(context) = state.contexts.iter().find_map(Weak::upgrade) else {
+                        state.running = false;
+                        break;
+                    };
+                    context
                 };
                 let manager = LeaseManager {
                     db: context.db.clone(),
@@ -160,11 +162,10 @@ impl LeaseManager {
                     shared,
                     tick: context.clone(),
                 };
+                // A transient failure for one owner must not stop renewal
+                // for the rest: retry that owner on the next tick.
                 for owner in owners {
-                    if manager.heartbeat(&owner, "running", None).await.is_err() {
-                        manager.shared.refresher.lock().unwrap().running = false;
-                        return;
-                    }
+                    let _ = manager.heartbeat(&owner, "running", None).await;
                 }
             }
         });

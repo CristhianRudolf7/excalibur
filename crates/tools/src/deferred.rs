@@ -538,8 +538,13 @@ pub fn mcp_name(server: &str, tool: &str) -> Result<String, String> {
             .collect::<String>()
     };
     let raw = format!("mcp__{}__{}", normalize(server), normalize(tool));
+    // A leading or trailing underscore in one part merges with the `__`
+    // separators, so `("a_","b")` and `("a","_b")` would collide without a
+    // hash; treat those the same as any other lossy normalization.
     let changed = [server, tool].iter().any(|s| {
         s.contains("__")
+            || s.starts_with('_')
+            || s.ends_with('_')
             || s.bytes()
                 .any(|b| !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'_')
     });

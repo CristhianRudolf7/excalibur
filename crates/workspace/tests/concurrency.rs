@@ -320,7 +320,8 @@ async fn malicious_git_filters_are_rejected_without_executing_and_shadow_does_no
             BTreeMap::from([(PathBuf::from("a.txt"), b"base\n".to_vec())]),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(!snapshot.tree.is_empty());
     assert_eq!(std::fs::read(w.root().join(".git/index")).unwrap(), before);
     assert_eq!(git(w.root(), &["log", "--format=%s"]).lines().count(), 1);
@@ -338,7 +339,8 @@ async fn shadow_restore_merges_later_nonoverlapping_edits_and_reports_conflicts_
             BTreeMap::from([(PathBuf::from("a"), b"one\ntwo\nthree\n".to_vec())]),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let after = shadow
         .snapshot_files(
             "one",
@@ -347,7 +349,8 @@ async fn shadow_restore_merges_later_nonoverlapping_edits_and_reports_conflicts_
             BTreeMap::from([(PathBuf::from("a"), b"changed\ntwo\nthree\n".to_vec())]),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let plan = shadow
         .plan_restore(
             &before.id,
@@ -618,7 +621,8 @@ async fn selected_shadow_restore_never_requires_or_returns_unselected_contents()
             ]),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     shadow
         .snapshot_files(
             "one",
@@ -931,17 +935,33 @@ async fn known_secrets_are_rejected_before_shadow_or_checkpoint_publication() {
     )
     .await
     .unwrap();
+    // Secret content degrades to a skipped path with a warning instead of
+    // failing the snapshot, and it never enters the object store.
+    let empty = secured
+        .shadow()
+        .snapshot_files("one", 3, "before", BTreeMap::new())
+        .await
+        .unwrap()
+        .0;
+    let (snapshot, warnings) = secured
+        .shadow()
+        .snapshot_files(
+            "one",
+            3,
+            "after",
+            BTreeMap::from([(PathBuf::from("sensitive"), secret.to_vec())]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("sensitive"));
     assert!(
         secured
             .shadow()
-            .snapshot_files(
-                "one",
-                3,
-                "before",
-                BTreeMap::from([(PathBuf::from("sensitive"), secret.to_vec())])
-            )
+            .changed_files(&empty.id, &snapshot.id)
             .await
-            .is_err()
+            .unwrap()
+            .is_empty()
     );
     let g = secured.git();
     let tree = g.create("secret", "child").await.unwrap();

@@ -15,6 +15,51 @@ use std::{
 struct SlowRuntime {
     executions: Arc<AtomicUsize>,
 }
+struct SteadyRuntime {
+    delay_ms: u64,
+    executions: Arc<AtomicUsize>,
+}
+impl ToolRuntime for SteadyRuntime {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![]
+    }
+    fn prepare<'a>(
+        &'a self,
+        _run: &'a str,
+        call: ToolCall,
+    ) -> BoxFuture<'a, Result<PreparedTool, String>> {
+        Box::pin(async move {
+            Ok(PreparedTool {
+                call,
+                effect: Effect::NonIdempotent,
+                resources: vec![],
+                exclusive: false,
+                data: json!({}),
+            })
+        })
+    }
+    fn execute<'a>(
+        &'a self,
+        _run: &'a str,
+        _key: &'a str,
+        _tool: &'a PreparedTool,
+    ) -> BoxFuture<'a, ToolResult> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        let delay = self.delay_ms;
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            ToolResult::ok(json!({"exited": true, "exit_code": 0}))
+        })
+    }
+    fn reconcile<'a>(
+        &'a self,
+        _run: &'a str,
+        _key: &'a str,
+        _tool: &'a PreparedTool,
+    ) -> BoxFuture<'a, Reconcile> {
+        Box::pin(async { Reconcile::Uncertain("synthetic stall".into()) })
+    }
+}
 impl ToolRuntime for SlowRuntime {
     fn definitions(&self) -> Vec<ToolDefinition> {
         vec![]
@@ -188,6 +233,64 @@ async fn timed_out_check_expires_attempt_and_never_repeats_implicitly() {
     // the command again: still exactly the single execution from the first run.
     assert_eq!(f.executions.load(Ordering::SeqCst), 1);
     f.db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn check_longer_than_grace_completes_once_within_its_timeout() {
+    // A fixed setup grace must not cut a legitimate check that runs longer
+    // than the grace but below its declared timeout: execution is bounded by
+    // deadline plus grace, and a dispatched attempt is never retried.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let db = Database::open(
+        temp.path().join("data/main.db"),
+        DatabaseKind::Main,
+        StorageConfig::default(),
+    )
+    .unwrap();
+    let store = TaskStore::open(db.clone()).await.unwrap();
+    let journal = Journal::new(db.clone()).await.unwrap();
+    let run = journal
+        .create_run("root", json!({"test": true}))
+        .await
+        .unwrap();
+    store
+        .host_batch(
+            "general",
+            "seed",
+            json!({"ops":[
+                {"op":"create_task","id":"task","title":"Synthetic work","data":{"request_card":{"original":"Check the synthetic source"},"metadata":{"workspace":root}}},
+                {"op":"create_requirement","id":"req","data":{"text":"Synthetic source is correct","state":"accepted"}},
+                {"op":"create_criterion","id":"criterion","data":{"requirement_id":"req","statement":"Synthetic check passes","method":"test","impact_area":[],"metadata":{"implicit_final_response":false}}},
+                {"op":"create_check","id":"check","data":{"criterion_id":"criterion","definition":{"kind":"test","command":"synthetic-slow","timeout_ms":5000}}},
+                {"op":"link_requirement","task":"task","requirement":"req"}
+            ]}),
+        )
+        .await
+        .unwrap();
+    store.bind_root("task", &run).await.unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let runtime = Arc::new(SteadyRuntime {
+        delay_ms: 600,
+        executions: executions.clone(),
+    });
+    let runner =
+        CheckRunner::new(runtime, root.clone()).with_attempt_grace(Duration::from_millis(300));
+    let evidence = runner
+        .run_keyed(&store, "task", "check", &run, "op-long")
+        .await
+        .expect("a check below its declared timeout must complete");
+    assert_eq!(
+        evidence.result,
+        excalibur_tasks::evidence::EvidenceResult::Pass
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        1,
+        "a dispatched check must run exactly once"
+    );
+    db.shutdown().await.unwrap();
 }
 
 #[tokio::test]

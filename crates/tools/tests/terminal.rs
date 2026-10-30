@@ -183,20 +183,25 @@ async fn session_limit_evicts_oldest_unprotected_and_notifies_its_owner() {
     })
     .unwrap();
     let mut ids = Vec::new();
+    let mut delivered = Vec::new();
     for _ in 0..4 {
-        ids.push(session(
-            &manager
-                .exec(
-                    "owner",
-                    json!({"cmd":"sleep 30","cwd":dir.path(),"yield_ms":250}),
-                )
-                .await,
-        ));
+        let result = manager
+            .exec(
+                "owner",
+                json!({"cmd":"sleep 30","cwd":dir.path(),"yield_ms":250}),
+            )
+            .await;
+        ids.push(session(&result));
+        if let Some(notices) = result.output.get("notices").and_then(|n| n.as_array()) {
+            delivered.extend(notices.iter().cloned());
+        }
     }
     assert_eq!(manager.live_status("owner").len(), 3);
-    let notices = manager.take_notices("owner");
-    assert_eq!(notices.len(), 1);
-    assert_eq!(notices[0]["session_id"], ids[0]);
+    // The eviction warning travels on the owner's next tool result, so the
+    // explicit drain afterwards is empty.
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0]["session_id"], ids[0]);
+    assert!(manager.take_notices("owner").is_empty());
     assert!(
         !manager
             .io("owner", json!({"action":"read","session_id":ids[0]}))

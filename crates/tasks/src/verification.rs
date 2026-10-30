@@ -163,6 +163,21 @@ const TIMEOUT_NO_EVIDENCE: &str = "declared check timed out; outcome remains unc
 /// retries exactly once with a fresh key on this error only.
 const OUTER_BOUND_MESSAGE: &str =
     "declared check timed out before its attempt timers confirmed an outcome";
+enum SetupOutcome {
+    Execute(Box<AttemptSetup>),
+    Done(Box<EvidenceRecord>),
+}
+struct AttemptSetup {
+    row_key: String,
+    producer: Value,
+    criterion: CriterionBrief,
+    check: CheckBrief,
+    prepared: PreparedTool,
+    snapshot: WorkspaceSnapshot,
+    deadline: tokio::time::Instant,
+    calls_at_start: u64,
+    recovery: bool,
+}
 impl CheckRunner {
     /// Mark an admitted attempt terminal when its outcome can never be
     /// confirmed (deadline, interruption, wait budget). The row keeps no
@@ -254,74 +269,88 @@ impl CheckRunner {
         operation_key: &'a str,
     ) -> BoxFuture<'a, Result<EvidenceRecord>> {
         Box::pin(async move {
-            // Attempt 1, bounded end to end. The setup stages (admission,
-            // baseline snapshot, preparation, attempt INSERT) run before any
-            // timer exists, so a stall there would otherwise park forever
-            // with no row to expire and no deadline to fire.
+            // Phase 1: pre-timer setup (admission, baseline snapshot,
+            // preparation, attempt INSERT), bounded by the attempt grace. Only
+            // a wedge here is retried once with a fresh operation key: no
+            // attempt row exists yet, so execution provably never started and
+            // the retry cannot repeat effects. Genuine and deterministic errors
+            // fail fast without a retry.
+
             let first_row = format!("{run}:{operation_key}");
-            let first = match tokio::time::timeout_at(
+            let outcome = match tokio::time::timeout_at(
                 tokio::time::Instant::now() + self.attempt_grace,
-                self.run_keyed_inner(store, task_id, check_id, run, operation_key),
+                self.prepare_attempt(store, task_id, check_id, run, operation_key),
+            )
+            .await
+            {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    Self::expire_attempt(store, &first_row);
+                    let retry_key = format!("{operation_key}#retry");
+                    let retry_row = format!("{run}:{retry_key}");
+                    match tokio::time::timeout_at(
+                        tokio::time::Instant::now() + self.attempt_grace,
+                        self.prepare_attempt(store, task_id, check_id, run, &retry_key),
+                    )
+                    .await
+                    {
+                        Ok(Ok(outcome)) => outcome,
+                        Ok(Err(second)) => {
+                            return Err(fail(format!(
+                                "declared check retry failed: {second} (first attempt: {OUTER_BOUND_MESSAGE})"
+                            )));
+                        }
+                        Err(_) => {
+                            Self::expire_attempt(store, &retry_row);
+                            return Err(fail(format!(
+                                "declared check retry failed: {OUTER_BOUND_MESSAGE} (first attempt: {OUTER_BOUND_MESSAGE})"
+                            )));
+                        }
+                    }
+                }
+            };
+            let setup = match outcome {
+                SetupOutcome::Done(evidence) => return Ok(*evidence),
+                SetupOutcome::Execute(setup) => setup,
+            };
+            // Phase 2: execution bounded by the declared check deadline plus
+            // the grace. Checks longer than the grace keep their own timeout;
+            // this backstop only fires when the attempt timers themselves
+            // wedge. It never retries: the attempt row proves dispatch, so a
+            // retry could repeat effects. On expiry the execution is always
+            // interrupted so no runaway process survives the failure.
+
+            let row = setup.row_key.clone();
+            let outer = setup.deadline + self.attempt_grace;
+            match tokio::time::timeout_at(
+                outer,
+                self.execute_attempt(store, task_id, check_id, run, &setup),
             )
             .await
             {
                 Ok(outcome) => outcome,
                 Err(_) => {
-                    Self::expire_attempt(store, &first_row);
-                    Err(fail(OUTER_BOUND_MESSAGE))
-                }
-            };
-            match first {
-                ok @ Ok(_) => ok,
-                Err(first_err) => {
-                    // Only a pre-timer wedge (an admitted check with no
-                    // confirmed outcome whose timers never fired, or never
-                    // existed) is retried once with a fresh operation key:
-                    // execution provably never started, so the retry is
-                    // explicit, never an implicit repeat. Inner deadline
-                    // timeouts already interrupted their execution, so they
-                    // expire and fail fast instead of dispatching again.
-                    // Genuine check failures arrive as evidence, not errors,
-                    // and deterministic errors fail fast below.
-                    if first_err.to_string() != OUTER_BOUND_MESSAGE {
-                        return Err(first_err);
-                    }
-                    Self::expire_attempt(store, &first_row);
-                    let retry_key = format!("{operation_key}#retry");
-                    let retry_row = format!("{run}:{retry_key}");
-                    // The retry re-runs the same setup stages, so it gets the
-                    // same end-to-end bound rather than running unbounded.
-                    match tokio::time::timeout_at(
-                        tokio::time::Instant::now() + self.attempt_grace,
-                        self.run_keyed_inner(store, task_id, check_id, run, &retry_key),
-                    )
-                    .await
-                    {
-                        Ok(outcome) => outcome.map_err(|second| {
-                            fail(format!(
-                                "declared check retry failed: {second} (first attempt: {first_err})"
-                            ))
-                        }),
-                        Err(_) => {
-                            Self::expire_attempt(store, &retry_row);
-                            Err(fail(format!(
-                                "declared check retry failed: {} (first attempt: {first_err})",
-                                OUTER_BOUND_MESSAGE
-                            )))
-                        }
-                    }
+                    Self::expire_attempt(store, &row);
+                    let _ = self
+                        .runtime
+                        .interrupt_execution(run, false, Some(&setup.prepared))
+                        .await;
+                    Err(fail(
+                        "declared check timed out before its attempt timers confirmed an outcome; execution interrupted, command was not repeated",
+                    ))
                 }
             }
         })
     }
-    async fn run_keyed_inner(
+    async fn prepare_attempt(
         &self,
         store: &TaskStore,
         task_id: &str,
         check_id: &str,
         run: &str,
         operation_key: &str,
-    ) -> Result<EvidenceRecord> {
+    ) -> Result<SetupOutcome> {
         let task = store
             .task_for_run(run)
             .await?
@@ -351,7 +380,9 @@ impl CheckRunner {
             return Err(fail("invalid check operation key"));
         }
         // The same operation cannot run twice, including concurrent callers.
+
         let admission_lease = store.mutation_lock.write().await;
+
         let key = format!("{run}:{operation_key}");
         let lookup = key.clone();
         let known=store.db.read(ReadLane::Interactive,move|c|Ok(c.query_row("SELECT task_id,check_id,run_id,prepared,snapshot,evidence_id,producer_snapshot FROM task_check_attempts WHERE operation_key=?1",[lookup],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,String>(6)?))).optional()?)).await?;
@@ -359,10 +390,12 @@ impl CheckRunner {
             if task != task_id || check != check_id || owner != run {
                 return Err(fail("check operation key reused"));
             }
-            return store
-                .evidence(id)
-                .await?
-                .ok_or_else(|| fail("check evidence receipt missing"));
+            return Ok(SetupOutcome::Done(Box::new(
+                store
+                    .evidence(id)
+                    .await?
+                    .ok_or_else(|| fail("check evidence receipt missing"))?,
+            )));
         }
         if matches!(
             check.definition,
@@ -399,9 +432,11 @@ impl CheckRunner {
         };
         let check: CheckBrief = serde_json::from_value(producer["check"].clone())?;
         let revision = store.criterion_revision(&criterion.id).await?;
+
         let before = self
             .snapshot(criterion.impact_area.clone(), revision)
             .await?;
+
         let call = match &check.definition {
             CheckDefinition::FileContains { path, .. } => ToolCall {
                 id: new_id("check-read"),
@@ -443,6 +478,7 @@ impl CheckRunner {
             )
         } else {
             let prepared = self.runtime.prepare(run, call).await.map_err(fail)?;
+
             let sanitized = self
                 .runtime
                 .sanitize_durable(&serde_json::to_value(&prepared)?)
@@ -460,6 +496,7 @@ impl CheckRunner {
                 producer.to_string(),
             );
             store.db.write(Priority::Journal,move|c|{c.execute("INSERT INTO task_check_attempts(operation_key,task_id,check_id,run_id,prepared,snapshot,producer_snapshot) VALUES(?1,?2,?3,?4,?5,?6,?7)",rusqlite::params![op,task,check,owner,prep,snap,trace])?;Ok(())}).await?;
+
             (prepared, before)
         };
         let timeout = match check.definition {
@@ -470,9 +507,51 @@ impl CheckRunner {
         };
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout);
         drop(admission_lease);
-        // The end-to-end setup bound lives in `run_keyed`: the stages above
-        // run before this deadline exists, so a stall there is bounded and
-        // retried there with a fresh key instead of parking here forever.
+        // The setup bound lives in `run_keyed`: the stages above run before
+        // this deadline exists, so a stall there is bounded and retried there
+        // with a fresh key instead of parking here forever.
+        Ok(SetupOutcome::Execute(Box::new(AttemptSetup {
+            row_key: key.clone(),
+            producer,
+            criterion,
+            check,
+            prepared,
+            snapshot,
+            deadline,
+            calls_at_start,
+            recovery,
+        })))
+    }
+    async fn execute_attempt(
+        &self,
+        store: &TaskStore,
+        task_id: &str,
+        check_id: &str,
+        run: &str,
+        setup: &AttemptSetup,
+    ) -> Result<EvidenceRecord> {
+        let key = setup.row_key.clone();
+        let AttemptSetup {
+            producer,
+            criterion,
+            check,
+            prepared,
+            snapshot,
+            deadline,
+            calls_at_start,
+            recovery,
+            ..
+        } = setup;
+        let (producer, criterion, check, prepared, snapshot, deadline, calls_at_start, recovery) = (
+            producer.clone(),
+            criterion.clone(),
+            check.clone(),
+            prepared.clone(),
+            snapshot.clone(),
+            *deadline,
+            *calls_at_start,
+            *recovery,
+        );
         let attempt = async {
             let mut result = if recovery {
                 match self.runtime.reconcile(run, &key, &prepared).await {
@@ -519,7 +598,9 @@ impl CheckRunner {
                     return Err(fail("declared check exceeded bounded session waits"));
                 }
             }
+
             let _publication_lease = store.mutation_lock.write().await;
+
             let (passed, explanation) = self.evaluate(store, &check.definition, &result).await?;
             let current_revision = store.criterion_revision(&criterion.id).await?;
             let id = check.id.clone();
@@ -787,6 +868,7 @@ impl TaskCompletionGate {
         input: &excalibur_engine::GateInput,
     ) -> Result<Box<dyn excalibur_engine::CompletionGateGuard>> {
         use excalibur_engine::{DeliveryReference, GateAssessment, GateIssueKind as Kind};
+
         let mut report = GateAssessment::default();
         let Some(task) = self.store.task_for_run(run).await? else {
             issue(
@@ -1667,6 +1749,7 @@ impl TaskCompletionGate {
             serde_json::to_string(&verdict)?,
         );
         self.store.db.write(Priority::Journal,move|c|{c.execute("UPDATE task_verifier_jobs SET verifier_run_id=?1,verdict=?2,state='completed',error=NULL WHERE id=?3",rusqlite::params![owner,text,id])?;Ok(())}).await?;
+
         Ok(verdict)
     }
     async fn fail_verifier_attempt(&self, id: &str, error: &str) -> Result<()> {

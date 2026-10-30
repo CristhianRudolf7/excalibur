@@ -263,6 +263,8 @@ fn schema_names_mcp_identity_and_skill_references_are_validated() {
         mcp_name("a__b", "c").unwrap(),
         mcp_name("a", "b__c").unwrap()
     );
+    // A separator-adjacent underscore would merge without a hash.
+    assert_ne!(mcp_name("a_", "b").unwrap(), mcp_name("a", "_b").unwrap());
     assert_ne!(
         mcp_name("server-a", "tool").unwrap(),
         mcp_name("server_a", "tool").unwrap()

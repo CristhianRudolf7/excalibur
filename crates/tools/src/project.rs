@@ -279,7 +279,7 @@ impl LocalTools {
             .iter()
             .any(|s| s.step == step && s.phase == phase))
     }
-    pub(crate) async fn start_shadow_command(&self, run: &str) -> Result<(), String> {
+    pub(crate) async fn start_shadow_command(&self, run: &str) -> Result<Vec<String>, String> {
         self.mark_exec_run(run);
         let step = self
             .steps
@@ -291,42 +291,96 @@ impl LocalTools {
         // The per-step entry is idempotent; check before walking the tree so a
         // repeated exec in the same step does not re-read every file.
         if self.has_shadow_snapshot(run, step, "before").await? {
-            return Ok(());
+            self.mark_exec_step_open(run);
+            return Ok(Vec::new());
         }
-        self.workspace
+        let (_, warnings) = self
+            .workspace
             .shadow()
             .snapshot_entries(run, step, "before", self.authorized_snapshot_entries()?)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(())
+        self.mark_exec_step_open(run);
+        Ok(warnings)
     }
-    pub(crate) async fn begin_shadow_step(&self, run: &str, step: u64) -> Result<(), String> {
+    pub(crate) async fn begin_shadow_step(
+        &self,
+        run: &str,
+        step: u64,
+    ) -> Result<Vec<String>, String> {
         if !self.uses_exec(run) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if self.has_shadow_snapshot(run, step, "before").await? {
-            return Ok(());
+            self.mark_exec_step_open(run);
+            return Ok(Vec::new());
         }
-        self.workspace
+        let (_, warnings) = self
+            .workspace
             .shadow()
             .snapshot_entries(run, step, "before", self.authorized_snapshot_entries()?)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(())
+        self.mark_exec_step_open(run);
+        Ok(warnings)
     }
-    pub(crate) async fn finish_shadow_step(&self, run: &str, step: u64) -> Result<(), String> {
+    pub(crate) async fn finish_shadow_step(
+        &self,
+        run: &str,
+        step: u64,
+    ) -> Result<Vec<String>, String> {
         if self.has_shadow_snapshot(run, step, "after").await? {
-            return Ok(());
+            self.mark_exec_step_closed(run);
+            return Ok(Vec::new());
         }
         if !self.uses_exec(run) && !self.has_shadow_snapshot(run, step, "before").await? {
-            return Ok(());
+            self.mark_exec_step_closed(run);
+            return Ok(Vec::new());
         }
-        self.workspace
+        let entries = self.authorized_snapshot_entries()?;
+        let attribution = entries
+            .iter()
+            .map(|(path, entry)| (path.to_string_lossy().into_owned(), hash(&entry.content)))
+            .collect::<Vec<_>>();
+        let (_, warnings) = self
+            .workspace
             .shadow()
-            .snapshot_entries(run, step, "after", self.authorized_snapshot_entries()?)
+            .snapshot_entries(run, step, "after", entries)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(())
+        // Attribute the closing content to the agent's own `exec` work so
+        // the project monitor does not report it as an outside change.
+        // Pending rows queued by a scan that raced the step close are
+        // corrected as well; only already-processed rows keep their verdict.
+        let project = self.root.to_string_lossy().into_owned();
+        self.db
+            .write(excalibur_store::Priority::Normal, move |c| {
+                c.execute_batch("CREATE TABLE IF NOT EXISTS project_exec_attribution(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path))")?;
+                for (path, file_hash) in &attribution {
+                    c.execute(
+                        "INSERT INTO project_exec_attribution(project,path,hash) VALUES(?1,?2,?3) ON CONFLICT(project,path) DO UPDATE SET hash=excluded.hash",
+                        excalibur_store::rusqlite::params![project, path, file_hash],
+                    )?;
+                }
+                // `project_changes` only exists where a monitor ran; without
+                // it there is nothing to correct.
+                let has_changes: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='project_changes'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if has_changes > 0 {
+                    c.execute(
+                        "UPDATE project_changes SET external=0 WHERE state='pending' AND EXISTS(SELECT 1 FROM project_exec_attribution a WHERE a.project=project_changes.project AND a.path=project_changes.path AND a.hash=project_changes.current_hash)",
+                        [],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        self.mark_exec_step_closed(run);
+        Ok(warnings)
     }
     pub(crate) async fn prepare_domain(
         &self,

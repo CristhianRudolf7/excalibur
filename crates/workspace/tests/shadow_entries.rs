@@ -59,12 +59,14 @@ async fn shadow_captures_modes_and_link_targets_and_selected_restore_preserves_o
         .shadow()
         .snapshot_entries("run", 0, "before", before.clone())
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let post = workspace
         .shadow()
         .snapshot_entries("run", 0, "after", after.clone())
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(
         workspace
             .shadow()
@@ -159,7 +161,8 @@ async fn outside_link_restore_conflicts_and_newer_user_link_change_is_preserved(
             )]),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     workspace
         .shadow()
         .snapshot_entries(
@@ -201,5 +204,182 @@ async fn outside_link_restore_conflicts_and_newer_user_link_change_is_preserved(
         .unwrap();
     assert_eq!(plan.conflicts.len(), 1);
     assert!(plan.files.is_empty());
+    db.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn snapshot_names_with_newlines_quotes_and_fake_entries_round_trip_literally() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let db = Database::open(
+        temp.path().join("db/main.db"),
+        DatabaseKind::Main,
+        StorageConfig::default(),
+    )
+    .unwrap();
+    db.write(Priority::Journal, |c| {
+        c.execute("INSERT INTO runs(id) VALUES('run')", [])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let workspace = Workspace::open(
+        db.clone(),
+        root,
+        temp.path().join("data"),
+        Redactor::default(),
+    )
+    .await
+    .unwrap();
+    let newline = PathBuf::from("a\nb.txt");
+    let quoted = PathBuf::from("\"q\".txt");
+    let forged = PathBuf::from("x\n100644 0000000000000000000000000000000000000000\tinjected.txt");
+    let files = BTreeMap::from([
+        (
+            PathBuf::from("ok.txt"),
+            SnapshotEntry::file(b"control".to_vec(), false),
+        ),
+        (
+            newline.clone(),
+            SnapshotEntry::file(b"newline".to_vec(), false),
+        ),
+        (
+            quoted.clone(),
+            SnapshotEntry::file(b"quoted".to_vec(), false),
+        ),
+        (
+            forged.clone(),
+            SnapshotEntry::file(b"forged".to_vec(), false),
+        ),
+    ]);
+    // A newline in a name must not fail the snapshot, quotes must not be
+    // interpreted, and an embedded fake entry must not create extra paths.
+    let filled = workspace
+        .shadow()
+        .snapshot_entries("run", 0, "before", files)
+        .await
+        .unwrap()
+        .0;
+    let empty = workspace
+        .shadow()
+        .snapshot_entries("run", 0, "after", BTreeMap::new())
+        .await
+        .unwrap()
+        .0;
+    let mut changed = workspace
+        .shadow()
+        .changed_files(&empty.id, &filled.id)
+        .await
+        .unwrap();
+    changed.sort();
+    let mut expected = vec![PathBuf::from("ok.txt"), forged, newline, quoted];
+    expected.sort();
+    assert_eq!(changed, expected);
+    db.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn oversized_paths_degrade_to_warnings_instead_of_failing_the_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let db = Database::open(
+        temp.path().join("db/main.db"),
+        DatabaseKind::Main,
+        StorageConfig::default(),
+    )
+    .unwrap();
+    db.write(Priority::Journal, |c| {
+        c.execute("INSERT INTO runs(id) VALUES('run')", [])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let workspace = Workspace::open(
+        db.clone(),
+        root,
+        temp.path().join("data"),
+        Redactor::default(),
+    )
+    .await
+    .unwrap();
+    let big = vec![0u8; 64 * 1024 * 1024 + 1];
+    let (snapshot, warnings) = workspace
+        .shadow()
+        .snapshot_entries(
+            "run",
+            0,
+            "before",
+            BTreeMap::from([
+                (PathBuf::from("big.bin"), SnapshotEntry::file(big, false)),
+                (
+                    PathBuf::from("small.txt"),
+                    SnapshotEntry::file(b"kept".to_vec(), false),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("big.bin"));
+    let empty = workspace
+        .shadow()
+        .snapshot_entries("run", 0, "after", BTreeMap::new())
+        .await
+        .unwrap()
+        .0;
+    let changed = workspace
+        .shadow()
+        .changed_files(&empty.id, &snapshot.id)
+        .await
+        .unwrap();
+    assert_eq!(changed, vec![PathBuf::from("small.txt")]);
+    db.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn old_per_run_snapshots_are_pruned_while_recent_steps_survive() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let db = Database::open(
+        temp.path().join("db/main.db"),
+        DatabaseKind::Main,
+        StorageConfig::default(),
+    )
+    .unwrap();
+    db.write(Priority::Journal, |c| {
+        c.execute("INSERT INTO runs(id) VALUES('run')", [])?;
+        c.execute("INSERT INTO runs(id) VALUES('prune')", [])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let workspace = Workspace::open(
+        db.clone(),
+        root,
+        temp.path().join("data"),
+        Redactor::default(),
+    )
+    .await
+    .unwrap();
+    for step in 0..35u64 {
+        let (snapshot, warnings) = workspace
+            .shadow()
+            .snapshot_files(
+                "prune",
+                step,
+                "before",
+                BTreeMap::from([(
+                    PathBuf::from("file.txt"),
+                    format!("revision {step}\n").into_bytes(),
+                )]),
+            )
+            .await
+            .unwrap();
+        assert!(warnings.is_empty());
+        assert!(!snapshot.tree.is_empty());
+    }
+    let kept = workspace.shadow().list_snapshots("prune").await.unwrap();
+    assert_eq!(kept.len(), 32);
+    assert!(kept.iter().any(|s| s.step == 34));
     db.shutdown().await.unwrap();
 }

@@ -31,10 +31,27 @@ pub struct ProjectChange {
 fn semantic_change_default() -> bool {
     true
 }
-fn semantic_hash(path: &Path, bytes: &[u8]) -> String {
-    if path == Path::new("tests/README.md")
-        && let Ok(bytes) = excalibur_tasks::checklist::canonical_content(bytes)
+/// Watch-callback admission: protected roots and build directories never
+/// enter the queue, except `.git/info/exclude`, whose edits change ignore
+/// semantics and must trigger a rescan.
+fn watch_path_allowed(root: &Path, ignored: &[PathBuf], path: &Path) -> bool {
+    if path
+        .strip_prefix(root)
+        .map(|relative| relative == Path::new(".git/info/exclude"))
+        .unwrap_or(false)
     {
+        return true;
+    }
+    !ignored.iter().any(|ignored| path.starts_with(ignored))
+        && !path.components().any(|p| {
+            matches!(
+                p.as_os_str().to_str(),
+                Some(".git" | "target" | "node_modules")
+            )
+        })
+}
+fn semantic_hash(bytes: &[u8], projected: bool) -> String {
+    if projected && let Ok(bytes) = excalibur_tasks::checklist::canonical_content(bytes) {
         return crate::files::hash(&bytes);
     }
     crate::files::hash(bytes)
@@ -60,6 +77,10 @@ struct MonitorInner {
     tools: LocalTools,
     observer: Option<Arc<dyn ChangeObserver>>,
     evidence: Vec<EvidenceTarget>,
+    /// Checklist projection paths (project-relative) whose generated section
+    /// is canonicalized before semantic comparison. Defaults to the legacy
+    /// `tests/README.md`; the host overrides it with the configured path.
+    projections: std::sync::Mutex<BTreeSet<String>>,
     serial: Mutex<()>,
     failure: std::sync::Mutex<Option<String>>,
     worker: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -84,12 +105,34 @@ impl ProjectMonitor {
         observer: Option<Arc<dyn ChangeObserver>>,
         evidence: Vec<EvidenceTarget>,
     ) -> Result<Self, String> {
-        tools.db.write(Priority::Normal,|c| {c.execute_batch("CREATE TABLE IF NOT EXISTS project_observations(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path));CREATE TABLE IF NOT EXISTS project_changes(id INTEGER PRIMARY KEY AUTOINCREMENT,project TEXT NOT NULL,path TEXT NOT NULL,previous_hash TEXT,current_hash TEXT,external INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'pending');CREATE INDEX IF NOT EXISTS project_changes_pending ON project_changes(project,state,id);CREATE TABLE IF NOT EXISTS project_semantics(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path));CREATE TABLE IF NOT EXISTS project_change_semantics(change_id INTEGER PRIMARY KEY REFERENCES project_changes(id),changed INTEGER NOT NULL);")?;Ok(())}).await.map_err(|e|e.to_string())?;
+        Self::start_with_projections(
+            tools,
+            observer,
+            evidence,
+            vec![PathBuf::from("tests/README.md")],
+        )
+        .await
+    }
+    /// Same as [`Self::start`], with explicit checklist projection paths
+    /// (project-relative). The baseline scan already canonicalizes them.
+    pub async fn start_with_projections(
+        tools: LocalTools,
+        observer: Option<Arc<dyn ChangeObserver>>,
+        evidence: Vec<EvidenceTarget>,
+        projections: Vec<PathBuf>,
+    ) -> Result<Self, String> {
+        tools.db.write(Priority::Normal,|c| {c.execute_batch("CREATE TABLE IF NOT EXISTS project_observations(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path));CREATE TABLE IF NOT EXISTS project_changes(id INTEGER PRIMARY KEY AUTOINCREMENT,project TEXT NOT NULL,path TEXT NOT NULL,previous_hash TEXT,current_hash TEXT,external INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'pending');CREATE INDEX IF NOT EXISTS project_changes_pending ON project_changes(project,state,id);CREATE TABLE IF NOT EXISTS project_semantics(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path));CREATE TABLE IF NOT EXISTS project_change_semantics(change_id INTEGER PRIMARY KEY REFERENCES project_changes(id),changed INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS project_exec_attribution(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path));")?;Ok(())}).await.map_err(|e|e.to_string())?;
         let monitor = Self {
             inner: Arc::new(MonitorInner {
                 tools,
                 observer,
                 evidence,
+                projections: std::sync::Mutex::new(
+                    projections
+                        .into_iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect(),
+                ),
                 serial: Mutex::new(()),
                 failure: std::sync::Mutex::new(None),
                 worker: std::sync::Mutex::new(None),
@@ -100,6 +143,7 @@ impl ProjectMonitor {
         let overflow = Arc::new(AtomicBool::new(false));
         let callback_overflow = overflow.clone();
         let ignored = monitor.inner.tools.policy.protected_paths.clone();
+        let callback_root = monitor.inner.tools.root.clone();
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 let mut paths = match event {
@@ -118,15 +162,7 @@ impl ProjectMonitor {
                         Vec::new()
                     }
                 };
-                paths.retain(|path| {
-                    !ignored.iter().any(|ignored| path.starts_with(ignored))
-                        && !path.components().any(|p| {
-                            matches!(
-                                p.as_os_str().to_str(),
-                                Some(".git" | "target" | "node_modules")
-                            )
-                        })
-                });
+                paths.retain(|path| watch_path_allowed(&callback_root, &ignored, path));
                 if paths.is_empty() && !callback_overflow.load(Ordering::Acquire) {
                     return;
                 }
@@ -246,30 +282,41 @@ impl ProjectMonitor {
                 }
             }
         }
+        let projections = self
+            .inner
+            .projections
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_default();
         let mut semantics = BTreeMap::new();
         for (path, bytes) in tools.authorized_project_files_selected(paths)? {
+            let relative = path.to_string_lossy().into_owned();
             semantics.insert(
-                path.to_string_lossy().into_owned(),
-                semantic_hash(&path, &bytes),
+                relative.clone(),
+                semantic_hash(&bytes, projections.contains(&relative)),
             );
-            current.insert(
-                path.to_string_lossy().into_owned(),
-                crate::files::hash(&bytes),
-            );
+            current.insert(relative, crate::files::hash(&bytes));
         }
+        // Content the agent produced through `exec` is recorded when its
+        // step closes its shadow snapshot; the write below attributes it to
+        // Excalibur before any change is marked external. Changes observed
+        // while an exec step is still open are attributed the same way.
+        let exec_open = tools.has_open_exec_step();
         let project = tools.root.to_string_lossy().into_owned();
         tools.db.write(Priority::Normal,move|c| {
             let old={let mut stmt=c.prepare("SELECT path,hash FROM project_observations WHERE project=?1")?;stmt.query_map([&project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<BTreeMap<_,_>,_>>()?};
             let old_semantics={let mut q=c.prepare("SELECT path,hash FROM project_semantics WHERE project=?1")?;q.query_map([&project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<BTreeMap<_,_>,_>>()?};
+            let old_attribution={let mut q=c.prepare("SELECT path,hash FROM project_exec_attribution WHERE project=?1")?;q.query_map([&project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<BTreeMap<_,_>,_>>()?};
             let initial=baseline&&old.is_empty();
             for path in old.keys().chain(current.keys()).collect::<std::collections::BTreeSet<_>>() {
                 if old.get(path)==current.get(path) {if let Some(hash)=semantics.get(path){c.execute("INSERT INTO project_semantics VALUES(?1,?2,?3) ON CONFLICT(project,path) DO UPDATE SET hash=excluded.hash",params![project,path,hash])?;}continue}
                 {
                     let absolute=Path::new(&project).join(path).to_string_lossy().into_owned();
                     let latest:Option<Option<String>>=c.query_row("SELECT postimage_blob FROM file_versions WHERE path=?1 ORDER BY rowid DESC LIMIT 1",[absolute],|r|r.get(0)).optional()?;
-                    let external=!initial && latest.as_ref().is_none_or(|hash|hash.as_ref()!=current.get(path));
+                    let agent_made=exec_open || old_attribution.get(path).is_some_and(|hash|Some(hash)==current.get(path));
+                    let external=!initial && !agent_made && latest.as_ref().is_none_or(|hash|hash.as_ref()!=current.get(path));
                     c.execute("INSERT INTO project_changes(project,path,previous_hash,current_hash,external) VALUES(?1,?2,?3,?4,?5)",params![project,path,old.get(path),current.get(path),external])?;
-                    let projected=path.as_str()=="tests/README.md";let empty=crate::files::hash(b"");
+                    let projected=projections.contains(path);let empty=crate::files::hash(b"");
                     let before=old_semantics.get(path).or_else(||old.get(path)).or(if projected{Some(&empty)}else{None});
                     let after=semantics.get(path).or(if projected{Some(&empty)}else{None});
                     c.execute("INSERT INTO project_change_semantics VALUES(?1,?2)",params![c.last_insert_rowid(),before!=after])?;
@@ -402,5 +449,45 @@ impl ProjectMonitor {
                 .map_err(|e| e.to_string())?;
         }
         Ok(changes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn git_info_exclude_passes_the_watch_filter() {
+        let root = Path::new("/project");
+        let ignored = vec![PathBuf::from("/project/secret")];
+        assert!(watch_path_allowed(
+            root,
+            &ignored,
+            Path::new("/project/.git/info/exclude")
+        ));
+        assert!(!watch_path_allowed(
+            root,
+            &ignored,
+            Path::new("/project/.git/HEAD")
+        ));
+        assert!(watch_path_allowed(
+            root,
+            &ignored,
+            Path::new("/project/src/main.rs")
+        ));
+        assert!(!watch_path_allowed(
+            root,
+            &ignored,
+            Path::new("/project/target/debug/app")
+        ));
+        assert!(!watch_path_allowed(
+            root,
+            &ignored,
+            Path::new("/project/node_modules/pkg/index.js")
+        ));
+        assert!(!watch_path_allowed(
+            root,
+            &ignored,
+            Path::new("/project/secret/data.txt")
+        ));
     }
 }
