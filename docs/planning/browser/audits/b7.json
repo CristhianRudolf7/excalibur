@@ -1,0 +1,86 @@
+{
+  "state": "done",
+  "scope": "B7 light reading and citations at e5e4d90 (arch 19.2 B7; 14.2 web_read incl. rules 1-7, HTTP-first heuristic, fallback render, extraction, fragments, cache; 14.3 cite; close 14.4; NB-19/NB-23). Name checks exactly format/clippy/tests/build. Keep necessary_unverified empty; describe out-of-scope future work only in summary. No prior findings.",
+  "request_id": "b7",
+  "audit": {
+    "blocker_kind": "quality",
+    "checks": [
+      {
+        "evidence": "cargo fmt --check at e5e4d90 exited 0 with no diff output; tree left clean",
+        "name": "format",
+        "status": "passed"
+      },
+      {
+        "evidence": "cargo clippy -p excalibur-browser -p excalibur-webd --all-targets -- -D warnings exited 0 with zero warnings (isolated target /tmp/b7-meta-target, flock heavy-build.lock, CARGO_BUILD_JOBS=2)",
+        "name": "clippy",
+        "status": "passed"
+      },
+      {
+        "evidence": "cargo test -p excalibur-browser --test read_cite: 5 passed/0 failed; cargo test -p excalibur-browser --lib: 31 passed/0 failed; cargo test -p excalibur-webd --lib read: 3 passed/0 failed; all exit 0 over local synthetic fixtures, no Chrome, no accounts",
+        "name": "tests",
+        "status": "passed"
+      },
+      {
+        "evidence": "cargo build --workspace exited 0 (Finished dev profile in 4m00s; isolated target /tmp/b7-meta-target, flock heavy-build.lock, CARGO_BUILD_JOBS=2)",
+        "name": "build",
+        "status": "passed"
+      }
+    ],
+    "findings": [
+      {
+        "blocking": true,
+        "evidence": "crates/browser/src/read.rs:197 `markdown[..INLINE_LIMIT]`; Rust str slicing panics when 51200 is not a char boundary, reachable with non-ASCII docs over 50 KiB",
+        "id": "F-B7-01",
+        "recommendation": "Truncate at floor_char_boundary(INLINE_LIMIT) and add a non-ASCII >50 KiB fixture test",
+        "severity": "medium",
+        "status": "open"
+      },
+      {
+        "blocking": false,
+        "evidence": "crates/browser/src/read.rs:411-413 `response.bytes()` buffers the whole body before the MAX_BODY_BYTES check; arch 14.2 step 3 requires chunked reads with a 10 MiB cap",
+        "id": "F-B7-02",
+        "recommendation": "Consume the body by chunks with a running counter, abort past 10 MiB, and cover with the 50 MiB matrix row",
+        "severity": "medium",
+        "status": "open"
+      },
+      {
+        "blocking": true,
+        "evidence": "fetch_http goes through reqwest directly with no broker/loopback guard; docs honestly state broker wiring stays pending, so 14.4 rows (loopback redirect rejection, robots/index, cookie isolation) cannot close",
+        "id": "F-B7-03",
+        "recommendation": "Route fetch through the broker with a loopback guard plus the full 14.4 adversarial matrix before declaring B7 closed",
+        "severity": "high",
+        "status": "open"
+      },
+      {
+        "blocking": false,
+        "evidence": "crates/browser/src/cite.rs:75-77 approximate normalized-match offsets via first-long-token heuristic while presenting exact byte offsets; tests assert existence only",
+        "id": "F-B7-04",
+        "recommendation": "Map normalized matches to true raw offsets or mark them approximate, with exact-offset test assertions",
+        "severity": "low",
+        "status": "open"
+      }
+    ],
+    "necessary_unverified": [],
+    "report_path": "/home/cristhian/.local/state/excalibur-browser-owner/reports/b7-meta.md",
+    "requirements": {
+      "complete": false,
+      "evidence": [
+        "R1-R7,R9-R11 verified by code inspection plus 39 passing backend assertions (read_cite 5, browser lib 31, webd lib read 3)",
+        "R8 fails for non-ASCII input over 50 KiB (F-B7-01); R12 14.4 matrix not closed without broker path (F-B7-03)",
+        "AGENTS.md and paired EN/ES docs honestly declare broker, production extractors, PDF/feed/charset, robots-to-index, live render and RPC as pending"
+      ],
+      "missing": [
+        "R8 50 KiB inline truncation is not panic-free for non-ASCII documents (F-B7-01)",
+        "R12 14.4 verification matrix not closed: fetch bypasses the broker with no loopback/SSRF refusal (F-B7-03)"
+      ],
+      "total": 12,
+      "verified": 10
+    },
+    "reviewed_commit": "e5e4d90b4664ed0cb6941f7ce18d07b5b719a251",
+    "summary": "B7 delivers the deterministic web_read/cite backend slice (validation, 24 h cache, HTTP-first heuristic with embedded-data avoidance, 7.4-1 wait gating, extraction with pN offsets, 50 KiB inline, hashes/IDs, verifiable citations) with all required checks green and honest bilingual docs. Not approved: F-B7-01 byte-index truncation panics on non-ASCII docs over 50 KiB, and F-B7-03 download path bypasses the broker so SSRF/loopback refusal and the full 14.4 matrix cannot close. Out-of-scope future work only: broker wiring, production dom_smoothie/htmd extractors, PDF/feed/charset, robots-to-index ingestion, live ephemeral-context rendering, RPC registration, and the rest of the full B0-B9 architecture including the search engine and integrated resources.",
+    "verdict": "changes_required"
+  },
+  "model": "muse-spark-1.3-contributor",
+  "effort": "xhigh",
+  "session_id": "01a18d42-aaa0-72e0-b050-ea88f633e55e"
+}

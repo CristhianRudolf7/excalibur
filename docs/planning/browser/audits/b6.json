@@ -1,0 +1,93 @@
+{
+  "state": "done",
+  "scope": "B6 resources wiring at 9a374a2 (arch 19.2 B6; 13.1-13.6 budgets/admission/eviction/disk gates with listener protection, 18.3 measurement procedure; close 13.6; NB-17/18). Name checks exactly format/clippy/tests/build. Keep necessary_unverified empty; describe out-of-scope future work only in summary. No prior findings.",
+  "request_id": "b6",
+  "audit": {
+    "blocker_kind": "none",
+    "checks": [
+      {
+        "evidence": "cargo fmt --check exit 0, clean tree at 9a374a2",
+        "name": "format",
+        "status": "passed"
+      },
+      {
+        "evidence": "cargo clippy --workspace --all-targets -- -D warnings exit 0, no warnings (/tmp/b6meta-clippy.log CLIPPY_EXIT:0, flock + CARGO_BUILD_JOBS=2, isolated target)",
+        "name": "clippy",
+        "status": "passed"
+      },
+      {
+        "evidence": "resources_gates 6/6 ok (GATES_EXIT:0); resources_measure 1/1 ok + measure.json (MEASURE_EXIT:0); browser-resources suite 8+7+7+8+3 ok (FOUNDATION_EXIT:0); viewer_http 2/2 ok corroboration (VIEWER_HTTP_EXIT:0); synthetic fixtures + one live /proc/self read, no accounts, no paid APIs, no launched Chrome",
+        "name": "tests",
+        "status": "passed"
+      },
+      {
+        "evidence": "cargo build -p excalibur-webd -p excalibur-browser-resources exit 0 (BUILD_EXIT:0)",
+        "name": "build",
+        "status": "passed"
+      }
+    ],
+    "findings": [
+      {
+        "blocking": true,
+        "evidence": "Arch 13.6 table needs cgroup+memory.high, real heavy-tab fill with LIVE continuity, sampling cost <1%, small-FS rejection, live same-user oom_score_adj raise (arch 13.3 assigns it to B6); commit delivers decision-layer subset only (own test headers say synthetic-only) while docs admit full B6 acceptance stays main-lane and AGENTS.md claims 13.6 coverage.",
+        "id": "F-B6-01",
+        "recommendation": "Add the missing rows (real Chrome/cgroup fixtures, live oom raise of own child, small-tmpfs gate test, cost microbench) or scope claims to synthetic decision-logic rows and keep 13.6 open for the main lane.",
+        "severity": "high",
+        "status": "open"
+      },
+      {
+        "blocking": true,
+        "evidence": "browser.md/.es.md hunks claim no served viewer endpoint, but main.rs still wires serve_viewer + viewer ready field and viewer_http (2 tests, real TCP) passes at this commit; contradicts AGENTS.md B5 viewer lines. Out-of-scope churn.",
+        "id": "F-B6-02",
+        "recommendation": "Revert the viewer hunks to the 4ad646e wording.",
+        "severity": "medium",
+        "status": "open"
+      },
+      {
+        "blocking": true,
+        "evidence": "serve() creates ResourceGate then discards it as _resource_gate (main.rs:85); admit/eviction_plan/disk_growth_allowed/telemetry_json/denial_code/capacity message/suspend wrapper have zero service call sites. Only the startup reserve check executes.",
+        "id": "F-B6-03",
+        "recommendation": "Hold the gate in service state, enforce it on growth operations with telemetry, or document enforcement as pending main-lane work.",
+        "severity": "medium",
+        "status": "open"
+      },
+      {
+        "blocking": false,
+        "evidence": "AdmissionReadings.soft_budget_bytes silently overridden in admit(); InstanceClass vs InstanceKind duplication; disk_growth_allowed double reserve check; denial_code maps Wait to capacity_exceeded pre-expiry; listener_cannot_suspend enforced only in browser sessions while resources/webd wrappers are unenforced.",
+        "id": "F-B6-04",
+        "recommendation": "Drop/rename the ignored field, unify the instance enum, document the wait code, designate the enforcing layer per guard.",
+        "severity": "low",
+        "status": "open"
+      }
+    ],
+    "necessary_unverified": [],
+    "report_path": "/home/cristhian/.local/state/excalibur-browser-owner/reports/b6-meta.md",
+    "requirements": {
+      "complete": false,
+      "evidence": [
+        "budget_constants_match_architecture ok; budgets.rs matches arch 13.2/13.5 tables",
+        "admission_moving_average_gates + budgets_admission 8 ok (120 s wait, breakdown, tab/PSI/reserve denies)",
+        "eviction_order_protects_live + suspend_refuses_listening_without_approval ok; plan_eviction reproduces steps 1-7 with LIVE only in step 7",
+        "disk_gates_and_low_disk_cleanup ok; reserve 5 GiB, search gates, 7 GiB low-disk sparing listeners",
+        "telemetry_fields_report_peaks_separately ok",
+        "measurement_procedure_three_reps_with_report ok; measure.json procedure 18.3 x3 reps, settle 30, blank/static/ten-heavy, live /proc/self anchor, 18.4 pending-user notes",
+        "13.6 real-environment rows absent (cgroup, real Chrome fill, cost bench, small FS, live oom raise)",
+        "ResourceGate discarded as _resource_gate; no service call sites",
+        "viewer doc hunks contradict code + passing viewer_http + AGENTS.md"
+      ],
+      "missing": [
+        "R7 13.6 closure on real-environment rows",
+        "R8 service-side enforcement of the gate",
+        "R9 EN/ES docs accuracy (viewer regression)"
+      ],
+      "total": 9,
+      "verified": 6
+    },
+    "reviewed_commit": "9a374a274631d626946bd5c773d18ef2016994a9",
+    "summary": "B6 wires resource budgets as a tested decision layer (budgets/admission/eviction/disk/telemetry units green, 18.3 shape with JSON report) but cannot close 13.6 on synthetic-only evidence, never enforces the gate in serve, and regresses viewer docs out of scope: changes_required. Out-of-scope future work stays main-lane: cgroup scope management, real Chrome supervision, broker pressure signals, CDP GC/pressure/cache calls, profile walks with Storage.getUsageAndQuota, VPS measurement runs, logged-in 18.4 figures, and full B0-B9 architecture acceptance.",
+    "verdict": "changes_required"
+  },
+  "model": "muse-spark-1.3-contributor",
+  "effort": "xhigh",
+  "session_id": "01a18dbb-c2f0-72d3-b81b-60f89336c378"
+}

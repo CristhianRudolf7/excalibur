@@ -1,0 +1,100 @@
+{
+  "state": "done",
+  "scope": "B7 light reading and citations correction 1 at bd8676c (arch 19.2 B7; 14.2 web_read rules 1-7, HTTP-first heuristic, wait-gated capture, extraction, fragments, cache; 14.3 cite; close 14.4; NB-19/23). Name checks exactly format/clippy/tests/build. Keep necessary_unverified empty; describe out-of-scope future work only in summary. Disposition prior findings F-B7-01 (char-boundary truncation), F-B7-02 (chunked 10 MiB cap), F-B7-03 (browser-side SSRF guards; DNS-bound broker egress pending B9), F-B7-04 (exact normalized spans) with evidence.",
+  "request_id": "b7-reaudit",
+  "audit": {
+    "blocker_kind": "none",
+    "checks": [
+      {
+        "evidence": "cargo fmt --check exit 0, clean",
+        "name": "format",
+        "status": "passed"
+      },
+      {
+        "evidence": "cargo clippy -p excalibur-browser -p excalibur-webd --all-targets -- -D warnings exit 0, no warnings (full run under heavy-build.lock, CARGO_BUILD_JOBS=2, isolated target)",
+        "name": "clippy",
+        "status": "passed"
+      },
+      {
+        "evidence": "read_cite 13 passed; browser lib 31 passed; webd lib read 3 passed; all exit 0, local synthetic fixtures, no Chrome",
+        "name": "tests",
+        "status": "passed"
+      },
+      {
+        "evidence": "cargo build -p excalibur-browser -p excalibur-webd exit 0",
+        "name": "build",
+        "status": "passed"
+      }
+    ],
+    "findings": [
+      {
+        "blocking": false,
+        "evidence": "read.rs floor_char_boundary used by build_read; read_cite::inline_limit_floors_char_boundary_for_non_ascii passes (e9/emoji straddling INLINE_LIMIT, char-boundary asserts)",
+        "id": "F-B7-01",
+        "recommendation": "None; fix verified.",
+        "severity": "medium",
+        "status": "resolved"
+      },
+      {
+        "blocking": false,
+        "evidence": "read.rs read_capped_body chunked counter; read_cite::large_body_aborts_past_cap_without_buffering_all streams 50 MiB and gets body_too_large",
+        "id": "F-B7-02",
+        "recommendation": "None; fix verified.",
+        "severity": "medium",
+        "status": "resolved"
+      },
+      {
+        "blocking": false,
+        "evidence": "FetchPolicy::secure/test_loopback, host/ip_block_error, per-hop check_fetch_url, is_downgrade, no-cookie-jar reqwest build; 5 guard tests green incl. 2130706433, redirect-to-private, zero-cookie replay; DNS-bound broker egress documented pending B9",
+        "id": "F-B7-03",
+        "recommendation": "None in B7 scope; broker egress tracked as B9 future work (summary).",
+        "severity": "high",
+        "status": "resolved"
+      },
+      {
+        "blocking": false,
+        "evidence": "cite.rs find_normalized_span token-window exact span; read_cite::normalized_cite_returns_exact_covering_span asserts normalize(slice)==normalized quote with raw casing preserved",
+        "id": "F-B7-04",
+        "recommendation": "None; fix verified.",
+        "severity": "low",
+        "status": "resolved"
+      },
+      {
+        "blocking": false,
+        "evidence": "unsupported_type and too_many_redirects paths implemented in read.rs but lack dedicated read_cite fixtures; docs honestly scope browser-side 14.4 rows only",
+        "id": "N-01",
+        "recommendation": "Add octet-stream and 6-redirect loopback fixtures as follow-up polish.",
+        "severity": "info",
+        "status": "open"
+      }
+    ],
+    "necessary_unverified": [],
+    "report_path": "/home/cristhian/.local/state/excalibur-browser-owner/reports/b7-reaudit-meta.md",
+    "requirements": {
+      "complete": true,
+      "evidence": [
+        "R1 URL validation via normalize_url + rejects_userinfo_and_scheme + loopback fetch",
+        "R2 24h ReadCache TTL + caches_with_original_date + TTL expiry",
+        "R3 timeouts/redirects/downgrade/10MiB cap via 50MiB live test + downgrade unit + loopback/redirect guards",
+        "R4 HTTP-first heuristic + embedded-data avoidance unit tests",
+        "R5 wait-gate rule 7.4-1 via WaitGate unit + long-poll/SPA tests",
+        "R6 extraction with pN fragments and exact UTF-8 offsets",
+        "R7 50KiB char-boundary inline cut + slice_fragments tests",
+        "R8 exact/normalized cite with exact spans + hash/text-fragment link",
+        "R9 browser-side 14.4 rows: SSRF guards, redirect refusal, downgrade, robots hooks, cookie isolation",
+        "R10 webd Service cache/pages without agent tool",
+        "R11 paired EN/ES docs, natural-language message, scope discipline",
+        "R12 honest 14.4 browser-side closure with B9 pendings documented"
+      ],
+      "missing": [],
+      "total": 12,
+      "verified": 12
+    },
+    "reviewed_commit": "bd8676c0c89bab7dbb2bef2e74d5fccdb6ea0c62",
+    "summary": "B7 light-reading correction 1 approved: all four prior findings closed with test evidence (47 backend assertions green: 13 read_cite + 31 browser lib + 3 webd lib; fmt/clippy/build clean; isolated target; tree untouched). Char-boundary truncation, chunked 10 MiB cap, browser-side SSRF guards with per-hop redirect revalidation and cookie isolation, and exact normalized cite spans are implemented and tested; docs EN/ES honestly scope pendings. Out-of-scope future work only: full broker egress with DNS-bound binding, robots.txt retrieval/caching and real index enqueue, dom_smoothie/htmd extractors, PDF/feeds/charsets, live ephemeral rendering, RPC registration, plus the rest of the full B0-B9 architecture with search and integrated resources, none declared complete here. One info-level open polish note (dedicated unsupported_type/too_many_redirects fixtures) is non-blocking.",
+    "verdict": "approved"
+  },
+  "model": "muse-spark-1.3-contributor",
+  "effort": "xhigh",
+  "session_id": "01a18d76-9907-7053-95f7-ca59b92e369f"
+}

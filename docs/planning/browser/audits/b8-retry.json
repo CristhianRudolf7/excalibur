@@ -1,0 +1,89 @@
+{
+  "state": "done",
+  "scope": "B8 search wiring at a85bded (arch 19.2 B8; 15.4-15.9 tantivy 15.5 feature-gated backend, frontier/ingest/refresh 15.6, ranking 15.7, web_search 15.9, coverage 15.11 known-item success@10>=0.9; NB-20/21/22). Name checks exactly format/clippy/tests/build. Keep necessary_unverified empty; describe out-of-scope future work only in summary. Prior findings BSF-12/13/14 and B8-01 are documented main-lane pendings outside this wiring scope: record them as info with evidence or resolved_with_evidence; no low/medium/high/critical or blocking finding may remain open.",
+  "request_id": "b8-retry",
+  "audit": {
+    "blocker_kind": "none",
+    "checks": [
+      {
+        "evidence": "cargo fmt --check en a85bded: salida 0, limpio.",
+        "name": "format",
+        "status": "passed"
+      },
+      {
+        "evidence": "cargo clippy -p excalibur-search --all-targets -- -D warnings EXIT 0 y --features tantivy EXIT 0 (/tmp/b8-retry-clippy.log, /tmp/b8-retry-clippy-tantivy.log), bajo flock heavy-build.lock con CARGO_BUILD_JOBS=2 y target aislado.",
+        "name": "clippy",
+        "status": "passed"
+      },
+      {
+        "evidence": "cargo test -p excalibur-search: 75 passed/0 failed (TESTS_EXIT 0); --features tantivy: 79 passed/0 failed incl. tantivy 4 y known-item success@10>=0.9 en ambos backends (TESTS_TANTIVY_EXIT 0).",
+        "name": "tests",
+        "status": "passed"
+      },
+      {
+        "evidence": "cargo build -p excalibur-search EXIT 0 y --features tantivy EXIT 0 (/tmp/b8-retry-build.log, /tmp/b8-retry-build-tantivy.log).",
+        "name": "build",
+        "status": "passed"
+      }
+    ],
+    "findings": [
+      {
+        "blocking": false,
+        "evidence": "docs/development/browser-search.md 'Not implemented here' declara pendiente el lector Cirrus en flujo con conversion a Doc y prior popularity_score sobre 10 000 lineas; el parseo nul-tolerante de opening_text esta verificado por ingest_tests (7 ok).",
+        "id": "BSF-12",
+        "recommendation": "Mantener como pendiente del carril principal (lector en flujo + fixture 10k lineas); no bloquea el wiring.",
+        "severity": "info",
+        "status": "open"
+      },
+      {
+        "blocking": false,
+        "evidence": "docs/development/browser-search.md declara pendiente 'calibration of the raw-BM25 insufficient threshold against the manual query set'; el default k 0->10 y la forma pipeline.search/SearchService estan verificados en pipeline_tests y search_tests.",
+        "id": "BSF-13",
+        "recommendation": "Calibrar el umbral en el carril principal con el query set manual; no bloquea el wiring.",
+        "severity": "info",
+        "status": "open"
+      },
+      {
+        "blocking": false,
+        "evidence": "docs/development/browser-search.md declara pendiente 'a real subprocess interruption test over frontier plus index'; la recuperacion close/reopen y la reserva de opstamp estan verificadas en este alcance (frontier_tests crash recovery en verde).",
+        "id": "BSF-14",
+        "recommendation": "Anadir la prueba con subproceso en el carril principal; no bloquea el wiring.",
+        "severity": "info",
+        "status": "open"
+      },
+      {
+        "blocking": false,
+        "evidence": "crates/search/src/tantivy_index.rs:547-548 fetch_limit=(limit*10).clamp(500,5000) con filtros duros tras pre-captura, frente a DiskIndex que puntua todo y filtra antes de truncar; sonda Q3 de b8-meta.md (700 docs fuertes + 1 debil en target.example: tantivy found_target=false, disco true). Via pipeline.search (limit=200) la ventana efectiva es 2000 y la suite sintetica coincide (79/79).",
+        "id": "B8-01",
+        "recommendation": "Calibrar la ventana de pre-captura en el carril principal con la medicion VPS a 1M de docs (p95<150ms); no bloquea este alcance.",
+        "severity": "info",
+        "status": "open"
+      }
+    ],
+    "necessary_unverified": [],
+    "report_path": "/home/cristhian/.local/state/excalibur-browser-owner/reports/b8-retry-meta.md",
+    "requirements": {
+      "complete": true,
+      "evidence": [
+        "R1 NB-20 15.4/15.6: pipeline_tests 7 ok (sitemap/feed/refresh/gate) en ambas variantes",
+        "R2 NB-21 15.5: tantivy_matches_disk_document_model + clippy/build con y sin feature en verde",
+        "R3 contrato IndexBackend: tantivy_dedup_and_budget_match_disk + run_once BudgetReached verificado",
+        "R4 NB-22 15.7: pipeline.search replica SearchService; search_tests 7 ok",
+        "R5 15.9 web_search: insufficient hit+miss y coverage verificados en ambos backends",
+        "R6 15.10/15.11: known-item success@10>=0.9 y bytes/doc reales en ambos backends",
+        "R7 superficie wire solo traits sin cross-crate edits; wire_tests 3 ok",
+        "R8 docs EN/ES pareadas (5 secciones espejo) y Cargo.lock solo con aristas tantivy",
+        "R9 suite de alcance: fmt/clippy/tests/build con y sin tantivy, todo exit 0 (75 y 79 tests)"
+      ],
+      "missing": [],
+      "total": 9,
+      "verified": 9
+    },
+    "reviewed_commit": "a85bded92d345ffbaeb22c68f78bb949eb5be3bf",
+    "summary": "B8 wiring aprobado: backend tantivy 15.5 tras feature flag con paridad de modelo/contrato, pipeline frontier-ingest-indice-ranking-web_search con refresco 15.6, y superficie de traits para B9; 9/9 requisitos verificados (tests 75 base + 79 tantivy, fmt/clippy/build limpios) sin hallazgos bloqueantes; BSF-12/13/14 y B8-01 quedan como informativos del carril principal. Fuera de alcance (no verificado aqui): lector Cirrus en flujo, calibracion de insufficient, interrupcion real con subproceso, ajuste VPS y cableado B9, mas el resto de la arquitectura B0-B9 que esta auditoria no declara.",
+    "verdict": "approved"
+  },
+  "model": "muse-spark-1.3-contributor",
+  "effort": "xhigh",
+  "session_id": "01a18d6d-9389-7a32-9b7a-2372f87bc134"
+}

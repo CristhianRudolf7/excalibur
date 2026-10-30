@@ -1,0 +1,72 @@
+{
+  "state": "done",
+  "scope": "B5 network/content/blocks/intervention correction 1 at 4ad646e (arch 12.3, C2-C4, 12.6, 12.5, 9.1-9.3; closes 9.5/12.9/18.5; NB-05/10/15/16). Name checks exactly format/clippy/tests/build. Keep necessary_unverified empty; describe out-of-scope future work only in summary. Prior finding B5-01 (low, 3 stale viewer phrases) fixed with doc evidence in this tree; F-B4-01 already closed with evidence in e662bac still in history.",
+  "request_id": "b5-retry",
+  "audit": {
+    "blocker_kind": "none",
+    "checks": [
+      {
+        "evidence": "cargo fmt --check EXIT=0, limpio en 4ad646e",
+        "name": "format",
+        "status": "passed"
+      },
+      {
+        "evidence": "cargo clippy --workspace --all-targets -- -D warnings EXIT=0; cached Finished in 1.09s bajo flock heavy-build.lock CARGO_BUILD_JOBS=2",
+        "name": "clippy",
+        "status": "passed"
+      },
+      {
+        "evidence": "browser --lib 36 passed; webd --lib 15 passed; viewer_http 2 passed TCP real; block_matrix 1 passed 1 ignored Chrome156 matrix.json; viewer_viewport 1 passed 1 ignored Chrome156 small/large.png viewports.json; webd_boundary 1 passed; policy 6 passed",
+        "name": "tests",
+        "status": "passed"
+      },
+      {
+        "evidence": "cargo build -p excalibur-webd EXIT=0 Finished in 0.28s; binario target/debug/excalibur-webd 221M 2026-10-30",
+        "name": "build",
+        "status": "passed"
+      }
+    ],
+    "findings": [
+      {
+        "blocking": false,
+        "evidence": "4ad646e sustituye 3 frases en browser.md:11,397 y browser.es.md:12,420; grep 0 residuales; viewer_http 2 passed y viewer_viewport 1 passed regeneran target/test-evidence/browser/viewer/",
+        "id": "B5-01",
+        "recommendation": "No re-auditar; cerrada en este arbol.",
+        "severity": "low",
+        "status": "resolved"
+      },
+      {
+        "blocking": false,
+        "evidence": "e662bac ancestro de HEAD via merge-base; ephemeral_gate_denies_schemes_tracks_origins_and_flags_c4 en lib 36 passed; fila login.test denied human_only_origin en matrix.json regenerado",
+        "id": "F-B4-01",
+        "recommendation": "No re-auditar; cierre preservado.",
+        "severity": "medium",
+        "status": "resolved"
+      }
+    ],
+    "necessary_unverified": [],
+    "report_path": "/home/cristhian/.local/state/excalibur-browser-owner/reports/b5-retry-meta.md",
+    "requirements": {
+      "complete": true,
+      "evidence": [
+        "R1 12.3 loopback/flags en lib36+policy6",
+        "R2 C2-C4 ephemeral_gate en lib36 + matrix denial",
+        "R3 12.6 15 denegaciones en lib36",
+        "R4 12.5 mundos/readiness en lib36",
+        "R5 9.1+9.5 block_matrix 1 passed Chrome156 matrix.json",
+        "R6 9.2 takeover/expiry en lib36 + webd_boundary 1 passed",
+        "R7 9.3+18.5 viewer_http 2 passed + viewer_viewport 1 passed small/large.png",
+        "R8 docs pareadas sin frases residuales + AGENTS:41 correcta"
+      ],
+      "missing": [],
+      "total": 8,
+      "verified": 8
+    },
+    "reviewed_commit": "4ad646e01f6173552c7a17f9694c3b289f7ee974",
+    "summary": "Approved B5 retry: docs-only 4ad646e fixes B5-01 (3 stale viewer phrases) with paired EN/ES served-viewer text; all 8 B5 requirements re-verified with real Chrome 156 where applicable and evidence regenerated in-tree; F-B4-01 closure preserved via e662bac ancestry. Out-of-scope future work (not verified): document_status live elevation, beyond-9.1 detectors, screencast streaming, F-B4-03/F-B4-04, full B0-B9/search NB-20-22/resources NB-17-18/B6, broker/harness wiring B9, manual 18.4 site walks.",
+    "verdict": "approved"
+  },
+  "model": "muse-spark-1.3-contributor",
+  "effort": "xhigh",
+  "session_id": "01a18dad-67ea-7de2-8641-68dfe0cfe27e"
+}
