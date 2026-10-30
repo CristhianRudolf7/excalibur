@@ -3,9 +3,13 @@
 `excalibur-cdp` implementa CDP asíncrono por tuberías nativas. `excalibur-browser`
 lanza y supervisa instancias de Chrome, verifica el sandbox de renderizadores y
 aplica la política de versiones, gestiona perfiles, sesiones y pestañas durables
-y ofrece esperas de carga, observación y blobs privados de evidencias.
-`excalibur-webd` ofrece diagnósticos de entorno y un servicio JSON-RPC Unix local. `excalibur-search` y `excalibur-web-adapter` siguen vacíos.
-El adaptador del arnés, las herramientas web del agente y el frontend visor no están implementados.
+y ofrece esperas de carga, observación, acciones de entrada, diálogos, descargas,
+subidas y relleno de credenciales. `excalibur-web-adapter` es la biblioteca de
+confianza del host que aplica a esos efectos la autorización del arnés, la
+autoridad de archivos, el control de archivos y `SecretExecutor`.
+`excalibur-webd` ofrece diagnósticos de entorno y un servicio JSON-RPC Unix local.
+`excalibur-search` sigue vacío. El registro de herramientas web del agente, la
+composición del host y el frontend visor no están implementados.
 
 Instala Rust estable con rustfmt y clippy, un compilador C/C++, `pkg-config`,
 cabeceras de desarrollo de OpenSSL y una compilación verificada de bubblewrap
@@ -312,8 +316,8 @@ WAYLAND_DISPLAY; una instancia que ya vive en otro modo devuelve
 disponer de intervención. La admisión de documentos del agente acepta solo los orígenes de
 lectura/escritura configurados; los de login son exclusivos de personas. La
 exclusión para entrada comprueba la URL real del frame y devuelve
-`denied(human_only_origin)` en un origen de login. Observación, envío de acciones,
-detección de login e intervención humana todavía no se exponen por RPC.
+`denied(human_only_origin)` en un origen de login. La detección de login y la
+intervención humana todavía no se exponen por RPC.
 
 Los bloqueos de origen conservan `blocked_reason` (`needs_login` o
 `document_origin`). La reconciliación lee el frame superior real, incluidas las
@@ -440,8 +444,9 @@ La biblioteca y el protocolo Unix ofrecen `observe.wait_ready`,
 `observe.snapshot`, `observe.subtree`, `observe.validate_ref`, `blob.read`,
 `devtools.console`, `devtools.network`, `devtools.performance`, `emulate.viewport`
 y `nav.go|back|forward|reload`. Son operaciones del backend compartido. El registro
-de herramientas del agente, las acciones de entrada, el envío al modelo visual
-y el visor de intervención son componentes separados.
+de herramientas del agente, el envío al modelo visual y el visor de intervención
+son componentes separados. Las acciones de entrada se describen en la sección
+siguiente.
 
 Cada operación de pestaña requiere `run_id`, `session_id`, `tab_id` y
 `deadline_ms`. Navegación y emulación requieren además `op_key` y usan el
@@ -548,3 +553,146 @@ comprueba peticiones lentas iniciales con `tab.new`, la espera automática de la
 primera instantánea, adjuntos tardíos de oyentes y entrega por blob de subárboles
 grandes.
 Las evidencias quedan en `target/test-evidence/browser/observation/`.
+
+## Acciones, diálogos, archivos y credenciales
+
+Las acciones usan dos llamadas del protocolo Unix. `act.prepare` (una consulta)
+acepta `request` con `action` (`click`, `type`, `select`, `hover`, `scroll`,
+`press`, `upload`, `drag` o `dialog`), `snapshot_id`, `ref`, `value`, `keys`,
+`target_ref`, `files` y `options` (`button`, `click_count`, `modifiers`,
+`key_events`, `html5`, `direction`, `amount`, `accept`, `prompt_text`). Valida la
+referencia y el origen del documento del marco del elemento y devuelve un
+`plan_id` válido durante 60 segundos junto con `action_class`, `effect`, `risk`,
+origen y nombre del elemento, calculados de forma determinista. `act.perform`
+recibe `plan_id` y `op_key`, usa el protocolo durable de operaciones y solo se
+acepta para la misma ejecución, sesión y pestaña. No se acepta JavaScript
+arbitrario, órdenes CDP ni rutas del host.
+
+Antes de la entrada, webd toma la exclusión de la pestaña, rechaza cualquier
+acción distinta de `dialog` mientras hay un `confirm`/`prompt` abierto
+(`dialog_open`), vuelve a validar la referencia (`stale_ref` sin efecto), vuelve
+a comprobar el origen de lectura/escritura del documento del marco del elemento
+(`denied(origin_not_writable)`) y recalcula la clase; si cambia, devuelve
+`authorization_changed`. La accionabilidad exige un elemento conectado, visible,
+habilitado (y editable para `type`), con la caja igual durante dos fotogramas de
+animación y que reciba la prueba de impacto en su centro. Los reintentos esperan
+0, 20, 100, 100 y 500 ms y alternan la alineación `center`, `end` y `start`. La
+prueba de impacto atraviesa raíces shadow del agente de usuario y del autor y
+los propietarios de marcos. Si falla, devuelve `not_actionable` con
+`covered_by`; nunca se fuerza la entrada. Solo entonces la operación pasa a
+`dispatched` en `web_ops`; si a partir de ahí se pierde la confirmación de CDP,
+se informa `uncertain` y no se repite nunca.
+
+`click` y `hover` envían eventos de ratón en el centro del elemento; `type`
+enfoca, selecciona todo e inserta el texto, por lo que repetirlo es idempotente,
+y `key_events: true` envía eventos de tecla (como máximo 2.048 caracteres).
+`select` elige una opción por valor o etiqueta en un mundo aislado y emite
+`input` y `change`. `press` acepta teclas con nombre, letras, dígitos y F1–F12
+con `Control`, `Alt`, `Meta` y `Shift`. `scroll` sin referencia envía un evento de
+rueda de `amount` pantallas en `direction`. `upload` asigna archivos preparados a
+un `input[type=file]`. `drag` mueve el ratón en cinco pasos hasta `target_ref`;
+con `html5: true` intercepta los datos del arrastre y reproduce `dragEnter`,
+`dragOver` y `drop`, y rechaza datos de archivos nativos. `dialog` acepta o
+descarta el diálogo actual, con `prompt_text` opcional.
+
+El resultado contiene `result` (`ok` o `dialog_open`), `navigated`, `url`,
+`new_tabs`, `popup_blocked`, `dialog`, `alerts`, `download`, `file_chooser`,
+`settled`, `wait`, `dom_changed`, `suggest_snapshot`, `action_class` y
+`elapsed_ms`. El asentamiento usa una ventana de 250 ms y una espera de carga de
+5 s. `dom_changed` y `suggest_snapshot` son conservadores y siempre valen true.
+Los resultados se redactan y se marcan como no confiables.
+
+Las clases son `observe` (hover, scroll), `input` (type, select),
+`navigate_link` (un enlace fuera de un formulario sin manejador de clic),
+`commit`, `upload`, `drag` y `credential`. `commit` cubre botones de formulario,
+Enter en un formulario o en un sitio en escucha, aceptar un diálogo en un perfil
+persistente y nombres accesibles con el léxico de compromiso (enviar, send,
+submit, publicar, post, comprar, buy, pagar, pay, confirmar, confirm, eliminar,
+delete, borrar, transferir, transfer, firmar, sign, reservar, book, suscribir,
+subscribe, aceptar, accept). En perfiles persistentes un clic sin clasificar es
+`commit`. El riesgo es bajo/medio en sesiones efímeras y medio/alto en
+persistentes; subidas y credenciales son siempre de riesgo alto. Los ajustes de
+clase por sitio no están implementados.
+
+Un `alert` abierto durante una acción se acepta y su mensaje redactado se
+devuelve en `alerts`. `beforeunload` solo se acepta en una navegación del agente
+o en una acción que navega. `confirm` y `prompt` quedan abiertos: la acción
+devuelve `dialog_open` con tipo y mensaje, porque la página queda suspendida
+hasta que se atiende el diálogo. Las páginas abiertas por la pestaña que actúa se
+registran con el mismo propietario y aparecen en `new_tabs`. En sesiones
+persistentes, una ventana emergente fuera de los orígenes de lectura/escritura se
+cierra y se informa en `popup_blocked`; los límites de pestañas también la
+cierran.
+
+Cada instancia y contexto arranca con las descargas denegadas. Una descarga
+iniciada por una acción se cancela y se informa como `download_blocked` con el
+nombre sugerido y el origen. El método `download` (con clave `op_key`) acepta
+`trigger: {snapshot_id, ref}` o `{url}` y `timeout_ms` de hasta 120 s. Serializa
+las descargas por contexto, permite una sola descarga desde los marcos de la
+pestaña en un directorio privado nuevo `quarantine/<sesión>/<uuid>/`, usa el GUID
+como nombre de archivo, rechaza orígenes fuera de la sesión y cancela y borra
+todo lo que supere 200 MiB. Al completar, calcula SHA-256, tamaño y tipo por
+bytes mágicos, guarda los bytes como blob autorizado para la ejecución, borra la
+copia de la cuarentena y restaura la política de denegación. El nombre sugerido
+se sanea y nunca se usa como ruta.
+
+`act.stage_upload` recibe fragmentos base64 de hasta 2 MiB (`file_name`,
+`staged_id` opcional, `offset`, `final`) y escribe
+`staging/<sesión>/<uuid>/<nombre saneado>` con modo `0600` en directorios
+privados, hasta 200 MiB por archivo y 128 archivos preparados. Los preparados
+pertenecen a la ejecución y a la sesión, se borran al cerrar la sesión y caducan
+a la hora. Chrome solo recibe estas rutas de preparación.
+
+`act.check_credential_target` y `act.fill_secret` implementan el relleno de
+credenciales por referencia. La sesión debe declarar la referencia `secret://`.
+El origen esperado debe ser HTTPS canónico sin `userinfo`. El origen de
+seguridad comprometido y la URL del marco superior y del marco del elemento deben
+coincidir exactamente con él; un iframe solo se acepta si el sitio incluye su
+origen exacto en `credential_frames`. El elemento debe ser un
+`input[type=password]` visible, habilitado y accionable en un origen de
+lectura/escritura. `act.fill_secret` repite todas las comprobaciones bajo la
+exclusión de la pestaña justo antes y después de enfocar, confirma el foco,
+inserta el valor y pone a cero el búfer de la petición y la cadena decodificada.
+El elemento rellenado se redacta en instantáneas posteriores. Las capturas de esa
+pestaña se retienen (`vision_suppressed: true`) durante 5 s y mientras siga el
+mismo documento. El método no se guarda en `web_ops`; el `SecretExecutor` del
+host aporta la marca durable de uso y la reconciliación de cierre seguro.
+
+`excalibur-web-adapter` ofrece `WebAdapter` sobre un `LocalBackend` en proceso o
+el `SocketBackend` Unix. `act` rechaza argumentos que contengan un secreto
+registrado, prepara el plan y lo autoriza como `Action::Browser` (acción externa
+`browser.<clase>` y riesgo según la clase) o como el ámbito de datos
+`browser.observe` mediante el registro durable de efectos del host, de modo que
+una aprobación o una clave repetida nunca envían dos veces. `credential` solo lee
+metadatos del baúl, exige un `WebsitePassword` con URL, comprueba el objetivo en
+webd sin el secreto y después llama a `SecretExecutor::execute`, que registra el
+uso y la auditoría antes de resolver el valor. `stage_path` resuelve la ruta con
+un descriptor de directorio de capacidades dentro del espacio de trabajo de la
+ejecución, rechaza rutas protegidas, nombres de credenciales y enlaces simbólicos
+que salen de la raíz, y exige autorización de lectura; `stage_blob` exige el
+ámbito de datos `blob:<sha256>`. No se prepara contenido que contenga un secreto
+registrado. `download` autoriza un efecto de navegador de riesgo alto, lee el
+blob en cuarentena en ventanas de 1 MiB y lo entrega al control de archivos del
+host: los ejecutables, los archivos demasiado grandes y los que contienen
+secretos quedan en cuarentena, se ejecuta un `FileScanner` opcional y los
+archivos admitidos pasan a ser blobs del host no confiables con registro de
+auditoría. Son puntos de entrada de biblioteca; no se registra ninguna
+herramienta del agente.
+
+Ejecuta `cargo test -p excalibur-browser --lib observation` y
+`cargo test -p excalibur-web-adapter --test actions -- --nocapture`. La segunda
+usa Chrome real con sandbox como usuario dedicado y un servidor HTTPS local
+sintético con una CA temporal, que requiere `openssl` y `certutil`
+(`libnss3-tools`). Comprueba cada acción sobre su control, una capa
+superpuesta que devuelve `not_actionable` sin clic, un botón en movimiento, la
+escritura idempotente, arrastre con ratón y HTML5, `alert`/`confirm`, ventanas
+emergentes efímeras y bloqueadas, denegación en un marco ajeno, aprobación de un
+`commit` antes del efecto con un único resultado repetido, clics desconocidos
+persistentes como `commit`, contenido exacto de la subida, fuentes de subida
+rechazadas que nunca llegan a webd, descargas sin armar, armadas y demasiado
+grandes, relleno y redacción de credenciales, rechazo en marco de otro origen,
+subdominio y HTTP sin resolver el secreto, una navegación entre comprobación y
+relleno, una caída simulada del host tras la marca de uso que no se reintenta y
+la ausencia del valor secreto en archivos de webd y del host, eventos, auditoría
+y salida de las pruebas.
+Las evidencias quedan en `target/test-evidence/browser/actions/`.

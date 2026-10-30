@@ -193,6 +193,7 @@ pub struct Vault {
     lock: PathBuf,
     master: SecretValue,
     redactor: Redactor,
+    resolved_uses: std::sync::atomic::AtomicU64,
 }
 impl std::fmt::Debug for Vault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -244,6 +245,7 @@ impl Vault {
             lock,
             master,
             redactor: Redactor::default(),
+            resolved_uses: std::sync::atomic::AtomicU64::new(0),
         };
         let envelope = vault.read()?;
         for record in envelope.entries.values() {
@@ -262,6 +264,15 @@ impl Vault {
     }
     pub fn redactor(&self) -> Redactor {
         self.redactor.clone()
+    }
+    /// Metadata lookup for origin checks before any secret is decrypted.
+    pub fn metadata(&self, reference: &SecretRef) -> Result<SecretMetadata, VaultError> {
+        let _guard = locked(&self.lock)?;
+        self.read()?
+            .entries
+            .get(reference.as_str())
+            .map(|r| r.metadata.clone())
+            .ok_or(VaultError::NotFound)
     }
     pub fn list(&self) -> Result<Vec<SecretMetadata>, VaultError> {
         let _guard = locked(&self.lock)?;
@@ -311,12 +322,19 @@ impl Vault {
         );
         self.persist(&envelope)
     }
+    /// Number of explicit with_secret uses; metadata reads do not increment this counter.
+    pub fn resolved_use_count(&self) -> u64 {
+        self.resolved_uses
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn with_secret<T>(
         &self,
         reference: &SecretRef,
         use_secret: impl FnOnce(&[u8]) -> T,
     ) -> Result<T, VaultError> {
         let value = {
+            self.resolved_uses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _guard = locked(&self.lock)?;
             let envelope = self.read()?;
             let record = envelope

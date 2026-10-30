@@ -74,6 +74,7 @@ pub struct Site {
     pub listen: bool,
     pub listen_probe: ListenProbe,
     pub wait: Option<crate::observation::WaitCriteria>,
+    pub credential_frames: Vec<String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -507,6 +508,12 @@ pub struct Manager {
 }
 impl Manager {
     pub async fn open(options: Options) -> Result<Arc<Self>> {
+        Self::open_with_redactor(options, excalibur_vault::Redactor::default()).await
+    }
+    pub async fn open_with_redactor(
+        options: Options,
+        redactor: excalibur_vault::Redactor,
+    ) -> Result<Arc<Self>> {
         options.validate()?;
         private_dir(&options.data_dir)?;
         let lock = fs::OpenOptions::new()
@@ -577,7 +584,7 @@ impl Manager {
                 .await
                 .unwrap_or(false);
         let manager = Arc::new_cyclic(|weak| Self {
-            observation: crate::observation::Observation::new(options.data_dir.clone()),
+            observation: crate::observation::Observation::new(options.data_dir.clone(), redactor),
             secret_service,
             weak: weak.clone(),
             db,
@@ -817,7 +824,7 @@ impl Manager {
             || request
                 .credentials
                 .iter()
-                .any(|r| !r.starts_with("secret_ref:") || r.len() > 512)
+                .any(|r| excalibur_vault::SecretRef::parse(r.clone()).is_err() || r.len() > 512)
         {
             return Err(Fault::new(
                 "invalid_params",
@@ -894,6 +901,14 @@ impl Manager {
             self.instance(&mut m, &key, &request.mode).await?;
             None
         };
+        let mut download_policy = json!({"behavior":"deny","eventsEnabled":true});
+        if let Some(c) = &context {
+            download_policy["browserContextId"] = json!(c)
+        }
+        m.instances[&key]
+            .client()
+            .send(Method::BrowserSetDownloadBehavior, download_policy, None)
+            .await?;
         let sid = id();
         let s = Session {
             id: sid.clone(),
@@ -1435,6 +1450,7 @@ impl Manager {
             }
         }
         let s = Self::owned(&m, run, sid)?.clone();
+        self.observation.cleanup_uploads(Some(sid));
         if m.sessions[sid].state == SessionState::Busy {
             m.sessions
                 .get_mut(sid)
@@ -1736,6 +1752,7 @@ impl Manager {
         ))
     }
     pub async fn tick(&self) -> Result<()> {
+        self.observation.cleanup_uploads(None);
         let instances = {
             let m = self.model.lock().await;
             m.instances
@@ -2432,7 +2449,7 @@ fn remove_stale_lock(dir: &Path) -> Result<()> {
 }
 
 impl Manager {
-    async fn observation_context(
+    pub(crate) async fn observation_context(
         &self,
         run: &str,
         sid: &str,
@@ -2545,6 +2562,7 @@ impl Manager {
             }
             "emulate.viewport" => self.observation.emulate(&ctx, &p).await,
             "nav.go" | "nav.reload" | "nav.back" | "nav.forward" => {
+                let _dialog_scope = self.observation.action_scope(&ctx, false, true);
                 let frames = self.observation.frames(&ctx).await?;
                 let _network = self.observation.initialize(&ctx, &frames).await?;
                 if method != "nav.go" {
@@ -2636,6 +2654,124 @@ fn required<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| Fault::new("invalid_params", key))
 }
 
+impl Manager {
+    pub(crate) async fn credential_frame_allowed(&self, s: &Session, origin: &str) -> bool {
+        self.site(&s.profile, s.site.as_deref())
+            .ok()
+            .flatten()
+            .is_some_and(|site| {
+                site.credential_frames.iter().any(|o| o == origin)
+                    && !site.login.iter().any(|o| o == origin)
+            })
+    }
+    pub(crate) async fn adopt_action_popups(
+        &self,
+        ctx: &crate::observation::Context,
+    ) -> Result<Value> {
+        let targets = ctx
+            .client
+            .send_with_timeout(
+                Method::TargetGetTargets,
+                json!({}),
+                None,
+                Duration::from_millis(500),
+            )
+            .await?;
+        let mut tabs = vec![];
+        let mut blocked = vec![];
+        for info in targets["targetInfos"].as_array().into_iter().flatten() {
+            if info["type"] != "page"
+                || info["openerId"] != ctx.tab.target_id.as_deref().unwrap_or("")
+            {
+                continue;
+            }
+            let Some(target) = info["targetId"].as_str() else {
+                continue;
+            };
+            {
+                let m = self.model.lock().await;
+                if m.tabs
+                    .values()
+                    .any(|t| t.target_id.as_deref() == Some(target))
+                {
+                    continue;
+                }
+            }
+            let url = info["url"].as_str().unwrap_or("");
+            if self.document_allowed(&ctx.session, url, false).is_err() {
+                ctx.client
+                    .send(Method::TargetCloseTarget, json!({"targetId":target}), None)
+                    .await?;
+                blocked.push(json!({"origin":origin(url),"reason":"origin_not_writable"}));
+                continue;
+            }
+            let instance = {
+                let m = self.model.lock().await;
+                m.instances
+                    .get(&ctx.session.instance_id)
+                    .cloned()
+                    .ok_or_else(|| Fault::new("session_recovering", "popup instance"))?
+            };
+            let cdp = match tokio::time::timeout(
+                Duration::from_millis(750),
+                instance.attach_page(target),
+            )
+            .await
+            {
+                Ok(Ok(sid)) => sid,
+                _ => {
+                    let _ = ctx
+                        .client
+                        .send(Method::TargetCloseTarget, json!({"targetId":target}), None)
+                        .await;
+                    blocked.push(json!({"reason":"popup_unresponsive"}));
+                    continue;
+                }
+            };
+            let mut m = self.model.lock().await;
+            let count = m
+                .tabs
+                .values()
+                .filter(|t| t.state != "closed" && t.target_id.is_some())
+                .count();
+            let own = m
+                .tabs
+                .values()
+                .filter(|t| {
+                    t.owner_run == ctx.session.owner_run
+                        && t.state != "closed"
+                        && t.target_id.is_some()
+                })
+                .count();
+            if count >= 12 || own >= 4 {
+                drop(m);
+                let _ = ctx
+                    .client
+                    .send(Method::TargetCloseTarget, json!({"targetId":target}), None)
+                    .await;
+                blocked.push(json!({"reason":"tab_limit"}));
+                continue;
+            }
+            let tab = Tab {
+                id: id(),
+                session_id: ctx.session.id.clone(),
+                target_id: Some(target.into()),
+                cdp_session: Some(cdp),
+                owner_run: ctx.session.owner_run.clone(),
+                label: Some("popup".into()),
+                url: url.into(),
+                title: info["title"].as_str().unwrap_or("").into(),
+                state: "ready".into(),
+                document_epoch: 1,
+                listen: false,
+            };
+            tabs.push(json!(tab));
+            m.tabs.insert(tab.id.clone(), tab);
+            self.db.save(&mut m).await?;
+        }
+        Ok(json!({"tabs":tabs,"blocked":blocked}))
+    }
+}
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;

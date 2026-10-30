@@ -105,6 +105,9 @@ impl CapabilityToken {
             Action::Network { domain } => domain_allowed(&self.network, domain),
             Action::UseSecret { reference } => self.secrets.contains(reference),
             Action::External { kind, .. } => self.external_actions.contains(kind),
+            Action::Browser { class, .. } => {
+                self.external_actions.contains(&format!("browser.{class}"))
+            }
             Action::Data { scope } => self.data_scopes.contains(scope),
             Action::SecuritySettings { .. } | Action::DisableSandbox | Action::ReadVault => false,
         }
@@ -126,15 +129,41 @@ pub fn domain_allowed(network: &Network, domain: &str) -> bool {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Action {
-    Read { path: PathBuf },
-    Write { path: PathBuf },
-    WriteExact { path: PathBuf, change: String },
-    Exec { command: String },
-    Network { domain: String },
-    UseSecret { reference: String },
-    External { kind: String, target: String },
-    Data { scope: String },
-    SecuritySettings { diff: String },
+    Read {
+        path: PathBuf,
+    },
+    Write {
+        path: PathBuf,
+    },
+    WriteExact {
+        path: PathBuf,
+        change: String,
+    },
+    Exec {
+        command: String,
+    },
+    Network {
+        domain: String,
+    },
+    UseSecret {
+        reference: String,
+    },
+    External {
+        kind: String,
+        target: String,
+    },
+    Browser {
+        class: String,
+        origin: String,
+        target: String,
+        persistent: bool,
+    },
+    Data {
+        scope: String,
+    },
+    SecuritySettings {
+        diff: String,
+    },
     DisableSandbox,
     ReadVault,
 }
@@ -147,6 +176,7 @@ impl Action {
             Self::Network { .. } => "net",
             Self::UseSecret { .. } => "secret",
             Self::External { kind, .. } => kind,
+            Self::Browser { class, .. } => class,
             Self::Data { .. } => "data",
             Self::SecuritySettings { .. } => "settings",
             Self::DisableSandbox => "disable_sandbox",
@@ -162,6 +192,7 @@ impl Action {
             Self::Network { domain } => domain.clone(),
             Self::UseSecret { reference } => reference.clone(),
             Self::External { target, .. } => target.clone(),
+            Self::Browser { origin, target, .. } => format!("{origin}|{target}"),
             Self::Data { scope } => scope.clone(),
             Self::SecuritySettings { diff } => diff.clone(),
             _ => String::new(),
@@ -250,6 +281,18 @@ pub fn classify(action: &Action) -> RiskReport {
         }
         Action::Read { path } => report.sensitive = taints(path),
         Action::Network { .. } | Action::UseSecret { .. } => report.risk = Risk::Medium,
+        Action::Browser {
+            class, persistent, ..
+        } => {
+            report.risk = match class.as_str() {
+                "observe" => Risk::Low,
+                "input" if !persistent => Risk::Low,
+                "input" | "navigate_link" if *persistent => Risk::Medium,
+                "navigate_link" => Risk::Low,
+                "commit" | "drag" if !persistent => Risk::Medium,
+                _ => Risk::High,
+            };
+        }
         Action::External { .. }
         | Action::SecuritySettings { .. }
         | Action::DisableSandbox

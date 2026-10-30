@@ -3,9 +3,12 @@
 `excalibur-cdp` implements asynchronous CDP over native pipes. `excalibur-browser`
 launches and supervises Chrome instances, verifies renderer sandbox state and
 applies version policy, manages durable profiles, sessions and tabs, and provides
-readiness checks, page observation and private evidence blobs.
-`excalibur-webd` provides environment diagnostics and a local Unix JSON-RPC service. `excalibur-search` and `excalibur-web-adapter` remain empty boundaries.
-The host adapter, agent browser tools and viewer frontend are not implemented.
+readiness checks, page observation, input actions, dialogs, downloads, uploads and
+credential filling. `excalibur-web-adapter` is the trusted host library that applies
+the harness authorization, file authority, file control and `SecretExecutor` to
+those effects. `excalibur-webd` provides environment diagnostics and a local Unix
+JSON-RPC service. `excalibur-search` remains an empty boundary. Agent browser tool
+registration, host composition and the viewer frontend are not implemented.
 
 Install a stable Rust toolchain with rustfmt and clippy, a C/C++ compiler,
 `pkg-config`, OpenSSL development headers and a verified bubblewrap build (at
@@ -297,8 +300,8 @@ an instance already in another mode returns `mode_unavailable`. Without a
 display, `headed` also returns that error until intervention support is available. Agent document admission accepts only
 configured read/write origins; login origins are human-only. The input lease
 checks the actual current frame URL under exclusion and returns
-`denied(human_only_origin)` for a login origin. Observation, action dispatch,
-login detection and human takeover are not yet exposed by RPC.
+`denied(human_only_origin)` for a login origin. Login detection and human
+takeover are not yet exposed by RPC.
 
 Document-origin blocks retain a `blocked_reason` (`needs_login` or
 `document_origin`). Reconciliation reads the actual top-level frame, including
@@ -416,8 +419,8 @@ The browser library and Unix protocol provide `observe.wait_ready`,
 `observe.snapshot`, `observe.subtree`, `observe.validate_ref`, `blob.read`,
 `devtools.console`, `devtools.network`, `devtools.performance`, `emulate.viewport`
 and `nav.go|back|forward|reload`. These are shared backend operations. Agent tool
-registration, input actions, model vision routing and the intervention viewer
-remain separate components.
+registration, model vision routing and the intervention viewer remain separate
+components. Input actions are described in the next section.
 
 Every tab operation requires `run_id`, `session_id`, `tab_id` and `deadline_ms`.
 Navigation and emulation also require `op_key` and use the durable operation
@@ -522,3 +525,135 @@ network header filtering, console bounds, metrics and mobile viewport size. It a
 checks initial slow requests through `tab.new`, automatic first-snapshot waits,
 late listener attachment and blob delivery for oversized subtrees.
 Evidence is written to `target/test-evidence/browser/observation/`.
+
+## Actions, dialogs, files and credentials
+
+Actions use two Unix protocol calls. `act.prepare` (a query) accepts `request` with
+`action` (`click`, `type`, `select`, `hover`, `scroll`, `press`, `upload`, `drag`
+or `dialog`), `snapshot_id`, `ref`, `value`, `keys`, `target_ref`, `files` and
+`options` (`button`, `click_count`, `modifiers`, `key_events`, `html5`,
+`direction`, `amount`, `accept`, `prompt_text`). It validates the reference and
+the element frame's document origin and returns a `plan_id` valid for 60 seconds
+together with the deterministic `action_class`, `effect`, `risk`, origin and
+element name. `act.perform` takes `plan_id` and `op_key`, uses the durable
+operation protocol and is accepted only for the same run, session and tab.
+No arbitrary JavaScript, CDP command or host path is accepted.
+
+Before input, webd takes the tab lease, rejects a non-`dialog` action while a
+`confirm`/`prompt` is open (`dialog_open`), revalidates the reference
+(`stale_ref` without effect), rechecks the read/write document origin of the
+element frame (`denied(origin_not_writable)`) and recomputes the class; a changed
+class returns `authorization_changed`. Actionability requires a connected,
+visible, enabled (and, for `type`, editable) element whose box is unchanged over
+two animation frames and that receives the hit test at its centre. Retries wait
+0, 20, 100, 100 and 500 ms, alternating `center`, `end` and `start` scroll
+alignment. Hit testing crosses user-agent and author shadow roots and frame
+owners. Failure returns `not_actionable` with `covered_by`; input is never forced.
+Only then does the operation move to `dispatched` in `web_ops`; a lost CDP
+receipt after that point is reported as `uncertain` and is never repeated.
+
+`click` and `hover` dispatch mouse events at the element centre; `type`
+focuses, selects all and inserts text, so repeating it is idempotent, and
+`key_events: true` sends key events instead (at most 2,048 characters). `select`
+chooses an option by value or label in an isolated world and emits `input` and
+`change`. `press` accepts named keys, letters, digits and F1–F12 with
+`Control`, `Alt`, `Meta` and `Shift`. `scroll` without a reference sends a wheel
+event of `amount` screens in `direction`. `upload` sets staged files on an
+`input[type=file]`. `drag` moves the mouse in five steps to `target_ref`; with
+`html5: true` it intercepts the drag data and replays `dragEnter`, `dragOver` and
+`drop`, refusing native file data. `dialog` accepts or dismisses the current
+dialog, optionally with `prompt_text`.
+
+The result contains `result` (`ok` or `dialog_open`), `navigated`, `url`,
+`new_tabs`, `popup_blocked`, `dialog`, `alerts`, `download`, `file_chooser`,
+`settled`, `wait`, `dom_changed`, `suggest_snapshot`, `action_class` and
+`elapsed_ms`. Settling uses a 250 ms window and a 5 s readiness wait.
+`dom_changed` and `suggest_snapshot` are conservative and always true. Results
+are redacted and marked untrusted.
+
+Classes are `observe` (hover, scroll), `input` (type, select), `navigate_link`
+(a link outside a form without a click handler), `commit`, `upload`, `drag` and
+`credential`. `commit` covers form buttons, Enter in a form or in a listening
+site, accepting a dialog in a persistent profile, and accessible names containing
+the commit lexicon (enviar, send, submit, publicar, post, comprar, buy, pagar, pay,
+confirmar, confirm, eliminar, delete, borrar, transferir, transfer, firmar, sign,
+reservar, book, suscribir, subscribe, aceptar, accept). In persistent profiles an
+unclassified click is `commit`. Risk is low/medium in ephemeral sessions and
+medium/high in persistent ones; uploads and credentials are always high. Per-site
+class overrides are not implemented.
+
+An `alert` opened during an action is accepted and its redacted message is
+returned in `alerts`. `beforeunload` is accepted only for agent navigation or a
+navigating action. `confirm` and `prompt` stay open: the action returns
+`dialog_open` with type and message, because the page is suspended until the
+dialog is handled. Pages opened by the acting tab are registered with the same
+owner and reported in `new_tabs`. In persistent sessions a popup outside the
+read/write origins is closed and reported in `popup_blocked`; tab limits also
+close the popup.
+
+Every instance and browser context starts with downloads denied. A download
+started by an action is cancelled and reported as `download_blocked` with the
+suggested name and origin. The `download` method (keyed by `op_key`) accepts
+`trigger: {snapshot_id, ref}` or `{url}` and `timeout_ms` up to 120 s. It
+serializes downloads per context, allows a single download from the tab's frames
+into a fresh private `quarantine/<session>/<uuid>/` directory, uses the GUID as
+the file name, rejects origins outside the session and cancels and deletes
+anything above 200 MiB. On completion it computes SHA-256, size and a content
+type from magic bytes, stores the bytes as a run-authorized blob, removes the
+quarantine copy and restores the deny policy. The suggested name is sanitized
+and never used as a path.
+
+`act.stage_upload` receives base64 chunks of at most 2 MiB (`file_name`,
+optional `staged_id`, `offset`, `final`) and writes
+`staging/<session>/<uuid>/<sanitized name>` with mode `0600` in private
+directories, up to 200 MiB per file and 128 staged files. Staged files belong to
+the run and session, are deleted when the session closes and expire after one
+hour. Chrome only receives these staged paths.
+
+`act.check_credential_target` and `act.fill_secret` implement reference-only
+credential filling. The session must declare the `secret://` reference. The
+expected origin must be canonical HTTPS without userinfo. The committed security
+origin and URL of the top frame and of the element's frame must equal it exactly;
+an iframe is accepted only if the site lists its exact origin in
+`credential_frames`. The element must be a visible, enabled, actionable
+`input[type=password]` on a read/write origin. `act.fill_secret` repeats every
+check under the tab lease immediately before and after focusing, confirms focus,
+inserts the value and zeroizes the request buffer and the decoded string. The
+filled element is redacted in later snapshots. Screenshots of that tab are
+withheld (`vision_suppressed: true`) for 5 s and while the same document remains.
+The method is not stored in `web_ops`; the host `SecretExecutor` provides the
+durable use mark and fail-closed reconciliation.
+
+`excalibur-web-adapter` provides `WebAdapter` over an in-process `LocalBackend` or
+the Unix `SocketBackend`. `act` rejects arguments containing a registered secret,
+prepares the plan, and authorizes it as `Action::Browser` (`browser.<class>`
+external action and class-based risk) or as the `browser.observe` data scope
+through the durable host-effect ledger, so an approval or a repeated key never
+dispatches twice. `credential` reads only vault metadata, requires a
+`WebsitePassword` with a URL, checks the target in webd without the secret and
+then calls `SecretExecutor::execute`, which records the use and audit before
+resolving the value. `stage_path` resolves the path through a capability
+directory handle inside the run workspace, rejects protected paths, credential
+names and symlinks leaving the root, and requires read authorization; `stage_blob`
+requires the `blob:<sha256>` data scope. Content containing a registered secret
+is not staged. `download` authorizes a high-risk browser effect, reads the
+quarantined blob in 1 MiB windows and passes it to host file control:
+executables, oversized files and secret-bearing content stay quarantined, an
+optional `FileScanner` runs, and admitted files become untrusted host blobs with
+an audit record. These are library entry points; no agent tool is registered.
+
+Run `cargo test -p excalibur-browser --lib observation` and
+`cargo test -p excalibur-web-adapter --test actions -- --nocapture`. The second
+uses real sandboxed Chrome as the dedicated user and a local synthetic HTTPS
+fixture with a temporary CA, which requires `openssl` and `certutil`
+(`libnss3-tools`). It checks each action on its control, an overlay
+returning `not_actionable` without a click, a moving button, idempotent typing,
+mouse and HTML5 drag, alert/confirm handling, ephemeral and blocked popups,
+foreign-frame denial, commit approval before effect with a single replayed
+result, unknown persistent clicks as `commit`, exact upload content, rejected
+upload sources that never reach webd, unarmed, armed and oversized downloads,
+credential fill and redaction, cross-origin frame, subdomain and HTTP refusal
+without resolution, a navigation between check and fill, a simulated host crash
+after the use mark that is not retried, and the absence of the secret value from
+webd and host files, events, audit and test output.
+Evidence is written to `target/test-evidence/browser/actions/`.

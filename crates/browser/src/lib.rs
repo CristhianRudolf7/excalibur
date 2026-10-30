@@ -380,6 +380,14 @@ impl Instance {
         }
         *inner.assessment.lock().unwrap() = assessment;
         wait_for_sandbox(&inner).await.map_err(Error::Sandbox)?;
+        // Default-context downloads stay denied before any target is created.
+        client
+            .send(
+                Method::BrowserSetDownloadBehavior,
+                json!({"behavior":"deny","eventsEnabled":true}),
+                None,
+            )
+            .await?;
         let event_rx = client.subscribe_lifecycle();
         client
             .send(
@@ -798,4 +806,9 @@ async fn wait_for_sandbox(inner: &Arc<Inner>) -> Result<Vec<process::Process>, S
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// Canonical HTTPS origin for credential metadata; userinfo is forbidden.
+pub fn credential_origin(url: &str) -> sessions::Result<String> {
+    observation::actions::exact_https(url)
 }

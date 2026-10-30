@@ -2,3 +2,24 @@
 name = "excalibur-web-adapter"
 version = "0.1.0"
 edition = "2024"
+[dependencies]
+excalibur-browser = { path = "../browser" }
+excalibur-security = { path = "../security" }
+excalibur-vault = { path = "../vault" }
+excalibur-store = { path = "../store" }
+excalibur-types = { path = "../types" }
+excalibur-sandbox = { path = "../sandbox" }
+cap-std = "3"
+serde_json = "1"
+tokio = { version="1", features=["net","io-util","time","rt","sync"] }
+base64 = "0.22"
+zeroize = "1"
+uuid = { version="1", features=["v4"] }
+[dev-dependencies]
+tempfile="3"
+excalibur-journal={path="../journal"}
+tokio={version="1",features=["macros","rt-multi-thread"]}
+libc="0.2"
+rustls={version="0.23",default-features=false,features=["ring","std","tls12"]}
+tokio-rustls={version="0.26",default-features=false,features=["ring","tls12"]}
+excalibur-cdp={path="../cdp"}

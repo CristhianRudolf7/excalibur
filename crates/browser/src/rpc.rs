@@ -63,7 +63,50 @@ impl Protocol {
             tokio::task::yield_now().await;
         }
     }
-    pub async fn request(self: &Arc<Self>, r: Request) -> Value {
+    pub async fn request(self: &Arc<Self>, mut r: Request) -> Value {
+        if r.method == "act.fill_secret" {
+            let raw = r
+                .params
+                .get_mut("value")
+                .map(Value::take)
+                .unwrap_or(Value::Null);
+            let result = async {
+                if r.jsonrpc != "2.0" {
+                    return Err(Fault::new("invalid_request", "JSON-RPC 2.0 required"));
+                }
+                let bytes = match raw {
+                    Value::String(value) => value.into_bytes(),
+                    _ => return Err(Fault::new("invalid_params", "sensitive value required")),
+                };
+                let value = excalibur_vault::SecretValue::new(bytes)
+                    .map_err(|_| Fault::new("invalid_params", "secret size"))?;
+                let p = &r.params;
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    self.manager.fill_secret(
+                        string(p, "run_id")?,
+                        string(p, "session_id")?,
+                        string(p, "tab_id")?,
+                        string(p, "snapshot_id")?,
+                        string(p, "ref")?,
+                        string(p, "secret_ref")?,
+                        string(p, "expected_origin")?,
+                        value,
+                    ),
+                )
+                .await
+                .map_err(|_| Fault::new("uncertain", "credential fill interrupted"))?
+            }
+            .await;
+            return match result {
+                Ok(v) => {
+                    json!({"jsonrpc":"2.0","id":r.id,"result":{"state":"completed","result":v}})
+                }
+                Err(e) => {
+                    json!({"jsonrpc":"2.0","id":r.id,"error":{"code":-32000,"message":e.kind,"data":{"kind":e.kind,"detail":e.detail}}})
+                }
+            };
+        }
         let id = r.id.clone();
         let result =
             if r.jsonrpc != "2.0" || !(r.id.is_string() || r.id.is_number() || r.id.is_null()) {
@@ -136,7 +179,9 @@ impl Protocol {
         }
         if matches!(
             r.method.as_str(),
-            "session.list"
+            "act.prepare"
+                | "act.check_credential_target"
+                | "session.list"
                 | "status.get"
                 | "events.list"
                 | "observe.wait_ready"
@@ -171,6 +216,9 @@ impl Protocol {
                 | "nav.reload"
                 | "nav.back"
                 | "nav.forward"
+                | "act.perform"
+                | "act.stage_upload"
+                | "download"
         ) {
             return Err(Fault::new("method_not_found", "method is not implemented"));
         }
@@ -254,14 +302,19 @@ impl Protocol {
             live.insert(key.clone(), Operation { result: rx.clone() });
             tokio::spawn(async move {
                 let k = task_key.clone();
+                // Input actions mark `dispatched` themselves, immediately before the
+                // first input event, so failed prechecks remain safely retryable.
+                let deferred = method == "act.perform";
                 let started = manager
                     .manager
                     .db
                     .call(move |c| {
-                        c.execute(
-                            "UPDATE web_ops SET state='dispatched',updated_at=?1 WHERE op_key=?2",
-                            params![now(), k],
-                        )?;
+                        if !deferred {
+                            c.execute(
+                                "UPDATE web_ops SET state='dispatched',updated_at=?1 WHERE op_key=?2",
+                                params![now(), k],
+                            )?;
+                        }
                         Ok(())
                     })
                     .await;
@@ -274,7 +327,10 @@ impl Protocol {
                     Ok(v) => json!({"ok":v}),
                     Err(e) => json!({"error":e}),
                 };
-                let state = if result.is_ok() {
+                let uncertain = result.as_ref().err().is_some_and(|e| e.kind == "uncertain");
+                let state = if uncertain {
+                    "dispatched"
+                } else if result.is_ok() {
                     "completed"
                 } else {
                     "failed"
@@ -323,6 +379,40 @@ impl Protocol {
         let sid = || string(p, "session_id");
         let tid = || string(p, "tab_id");
         match method {
+            "act.prepare" => {
+                let request = serde_json::from_value(p["request"].clone())
+                    .map_err(|e| Fault::new("invalid_params", e))?;
+                self.manager
+                    .prepare_action(run, sid()?, tid()?, request)
+                    .await
+            }
+            "act.perform" => {
+                self.manager
+                    .perform_action(
+                        run,
+                        sid()?,
+                        tid()?,
+                        string(p, "plan_id")?,
+                        string(p, "op_key")?,
+                    )
+                    .await
+            }
+            "act.stage_upload" => self.manager.stage_upload(run, sid()?, tid()?, p).await,
+            "download" => self.manager.download(run, sid()?, tid()?, p).await,
+            "act.check_credential_target" => {
+                self.manager
+                    .check_credential_target(
+                        run,
+                        sid()?,
+                        tid()?,
+                        string(p, "snapshot_id")?,
+                        string(p, "ref")?,
+                        string(p, "secret_ref")?,
+                        string(p, "expected_origin")?,
+                    )
+                    .await
+            }
+
             "observe.wait_ready"
             | "observe.snapshot"
             | "observe.subtree"
@@ -504,6 +594,6 @@ async fn connection_loop(
     let mut cursor = 0;
     let mut timer = tokio::time::interval(Duration::from_millis(250));
     loop {
-        tokio::select! {biased;_=stop.changed()=>return Ok(()),buffer=read.fill_buf()=>{let buffer=buffer?;if buffer.is_empty(){return Ok(())}let end=buffer.iter().position(|b|*b==b'\n');let take=end.map_or(buffer.len(),|n|n+1);if line.len()+take>MAX_MESSAGE{oversized=true;line.clear();}else if !oversized{line.extend_from_slice(&buffer[..take]);}read.consume(take);if end.is_none(){continue}let response=if oversized{oversized=false;json!({"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"message_too_large"}})}else {match serde_json::from_slice::<Request>(&line){Ok(request)=>protocol.request(request).await,Err(_)=>json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"invalid_json_or_request"}})}};line.clear();write(&mut write_half,response).await?;},_=timer.tick()=>{if let Ok(events)=protocol.manager.db.events(cursor).await{for event in events{let next=event["cursor"].as_u64().unwrap_or(cursor);write(&mut write_half,json!({"jsonrpc":"2.0","method":"event","params":event})).await?;cursor=next;}}}}
+        tokio::select! {biased;_=stop.changed()=>return Ok(()),buffer=read.fill_buf()=>{let buffer=buffer?;if buffer.is_empty(){return Ok(())}let end=buffer.iter().position(|b|*b==b'\n');let take=end.map_or(buffer.len(),|n|n+1);if line.len()+take>MAX_MESSAGE{oversized=true;line.clear();}else if !oversized{line.extend_from_slice(&buffer[..take]);}read.consume(take);if end.is_none(){continue}let response=if oversized{oversized=false;json!({"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"message_too_large"}})}else {match serde_json::from_slice::<Request>(&line){Ok(request)=>protocol.request(request).await,Err(_)=>json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"invalid_json_or_request"}})}};line.fill(0);line.clear();write(&mut write_half,response).await?;},_=timer.tick()=>{if let Ok(events)=protocol.manager.db.events(cursor).await{for event in events{let next=event["cursor"].as_u64().unwrap_or(cursor);write(&mut write_half,json!({"jsonrpc":"2.0","method":"event","params":event})).await?;cursor=next;}}}}
     }
 }

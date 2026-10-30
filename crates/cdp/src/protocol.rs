@@ -26,6 +26,7 @@ methods! {
     TargetDetachFromTarget => "Target.detachFromTarget",
     TargetSetAutoAttach => "Target.setAutoAttach",
     TargetSetDiscoverTargets => "Target.setDiscoverTargets",
+    TargetGetTargetInfo => "Target.getTargetInfo",
     TargetGetTargets => "Target.getTargets",
     PageEnable => "Page.enable",
     PageNavigate => "Page.navigate",

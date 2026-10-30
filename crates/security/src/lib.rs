@@ -1,5 +1,8 @@
 //! Deterministic authorization, durable approvals and append-only audit for host adapters.
 mod executor;
+mod file_control;
+mod host_effect;
+pub use file_control::{FileScanner, content_type};
 mod finalization;
 mod network;
 mod policy;

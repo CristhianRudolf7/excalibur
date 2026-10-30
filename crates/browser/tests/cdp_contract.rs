@@ -311,6 +311,7 @@ async fn contract(root: &Path) {
         let params = match method {
             Method::RuntimeReleaseObject => json!({"objectId":"nonexistent-object"}),
             Method::NetworkSetUserAgentOverride => json!({"userAgent":"Excalibur local contract"}),
+            Method::TargetGetTargetInfo => json!({"targetId":target}),
             Method::DOMGetFrameOwner => json!({"frameId":"nonexistent-frame"}),
             Method::AccessibilityGetPartialAXTree => {
                 json!({"nodeId":node(client,&sid,"#text").await})

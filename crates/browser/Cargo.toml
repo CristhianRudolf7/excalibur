@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+zeroize = "1"
 excalibur-cdp = { path = "../cdp" }
 excalibur-store = { path = "../store" }
 excalibur-vault = { path = "../vault" }

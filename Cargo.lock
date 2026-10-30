@@ -842,6 +842,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1196,6 +1197,26 @@ dependencies = [
 [[package]]
 name = "excalibur-web-adapter"
 version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "cap-std",
+ "excalibur-browser",
+ "excalibur-cdp",
+ "excalibur-journal",
+ "excalibur-sandbox",
+ "excalibur-security",
+ "excalibur-store",
+ "excalibur-types",
+ "excalibur-vault",
+ "libc",
+ "rustls",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "uuid",
+ "zeroize",
+]
 
 [[package]]
 name = "excalibur-webd"

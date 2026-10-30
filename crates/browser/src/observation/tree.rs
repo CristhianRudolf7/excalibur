@@ -733,6 +733,9 @@ impl Observation {
             })
             .collect::<Vec<_>>();
         for node in &mut nodes {
+            if node.key.as_ref().is_some_and(|key| self.secret_mask(key)) {
+                node.sensitive = true;
+            }
             if node
                 .value
                 .as_ref()
@@ -941,6 +944,7 @@ impl Observation {
         {
             missing.push("capture_budget".into());
         }
+        let vision_suppressed = self.vision_blocked(ctx, &frames[0].loader);
         let snapshot = Snapshot {
             snapshot_id: id.clone(),
             tab_id: ctx.tab.id.clone(),
@@ -952,7 +956,12 @@ impl Observation {
                 "loading"
             }
             .into(),
-            screenshot_ref,
+            screenshot_ref: if vision_suppressed {
+                None
+            } else {
+                screenshot_ref
+            },
+            vision_suppressed,
             dom_tree_ref,
             elements,
             text,
@@ -961,8 +970,9 @@ impl Observation {
             missing,
             wait: report,
             untrusted: true,
-            vision_recommended: options.screenshot
-                || (visual && nodes.iter().filter(|n| n.role != "generic").count() < 20),
+            vision_recommended: !vision_suppressed
+                && (options.screenshot
+                    || (visual && nodes.iter().filter(|n| n.role != "generic").count() < 20)),
             document_epoch: ctx.tab.document_epoch,
         };
         let invalidated = book.invalidation;

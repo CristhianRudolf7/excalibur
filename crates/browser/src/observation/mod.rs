@@ -1,5 +1,7 @@
 //! Read-only browser observation, readiness, reference validation and private blobs.
 mod access;
+pub mod actions;
+mod files;
 mod tree;
 mod wait;
 use crate::sessions::{Fault, Result, Session, Tab};
@@ -29,6 +31,7 @@ pub(crate) struct Frame {
     pub id: String,
     pub loader: String,
     pub url: String,
+    pub security_origin: String,
     pub session: String,
     pub target: String,
     pub parent: Option<String>,
@@ -76,6 +79,8 @@ pub struct Snapshot {
     pub wait: WaitResult,
     pub untrusted: bool,
     pub vision_recommended: bool,
+    #[serde(default)]
+    pub vision_suppressed: bool,
     pub document_epoch: u64,
 }
 #[derive(Clone)]
@@ -113,6 +118,9 @@ struct EventState {
     navigation_pending: bool,
     unobserved_sessions: HashMap<String, String>,
     last_network_activity: tokio::time::Instant,
+    active_actions: usize,
+    active_navigation: usize,
+    action_alerts: Vec<Value>,
 }
 struct TabObserver {
     target: String,
@@ -138,16 +146,18 @@ pub struct Observation {
     pub redactor: Redactor,
     generation: String,
     next_ref: std::sync::atomic::AtomicU64,
+    pub(crate) actions: actions::ActionState,
 }
 impl Observation {
-    pub(crate) fn new(root: PathBuf) -> Self {
+    pub(crate) fn new(root: PathBuf, redactor: Redactor) -> Self {
         Self {
             root,
             store: OnceCell::new(),
             tabs: Mutex::new(HashMap::new()),
-            redactor: Redactor::default(),
+            redactor,
             generation: uuid::Uuid::new_v4().to_string(),
             next_ref: std::sync::atomic::AtomicU64::new(1),
+            actions: Default::default(),
         }
     }
     async fn store(&self) -> Result<&excalibur_store::Database> {
@@ -263,11 +273,15 @@ impl Observation {
             navigation_pending: false,
             unobserved_sessions: Default::default(),
             last_network_activity: tokio::time::Instant::now(),
+            active_actions: 0,
+            active_navigation: 0,
+            action_alerts: vec![],
         }));
         let weak = Arc::downgrade(&state);
         let mut events = ctx.client.subscribe_observation();
         let mut console = ctx.client.subscribe_console();
         let redactor = self.redactor.clone();
+        let dialog_client = ctx.client.clone();
         let task = tokio::spawn(async move {
             loop {
                 let (received, is_console) = tokio::select! {biased;event=events.recv()=>(event,false),event=console.recv()=>(event,true)};
@@ -281,6 +295,24 @@ impl Observation {
                             .is_some_and(|id| s.sessions.contains(id))
                         {
                             continue;
+                        }
+                        if event.method == "Page.javascriptDialogOpening"
+                            && ((event.params["type"] == "alert" && s.active_actions > 0)
+                                || (event.params["type"] == "beforeunload"
+                                    && s.active_navigation > 0))
+                        {
+                            let client = dialog_client.clone();
+                            let sid = event.session_id.clone();
+                            tokio::spawn(async move {
+                                let _ = client
+                                    .send_with_timeout(
+                                        Method::PageHandleJavaScriptDialog,
+                                        json!({"accept":true}),
+                                        sid.as_deref(),
+                                        Duration::from_millis(500),
+                                    )
+                                    .await;
+                            });
                         }
                         event_record(&mut s, event, &redactor);
                     }
@@ -348,6 +380,7 @@ impl Observation {
             id: tab.target_id.clone().unwrap_or_default(),
             loader: String::new(),
             url: "about:blank".into(),
+            security_origin: String::new(),
             session: tab.cdp_session.clone().unwrap_or_default(),
             target: tab.target_id.clone().unwrap_or_default(),
             parent: None,
@@ -444,6 +477,7 @@ impl Observation {
                         id: id.into(),
                         loader: String::new(),
                         url: info["url"].as_str().unwrap_or("").into(),
+                        security_origin: String::new(),
                         session: session.into(),
                         target: id.into(),
                         parent: Some(parent.into()),
@@ -516,6 +550,10 @@ fn collect_frames(
         out.push(Frame {
             id: id.into(),
             url: tree["frame"]["url"].as_str().unwrap_or("").into(),
+            security_origin: tree["frame"]["securityOrigin"]
+                .as_str()
+                .unwrap_or("")
+                .into(),
             loader: tree["frame"]["loaderId"].as_str().unwrap_or("").into(),
             session: session.into(),
             target: target.into(),
@@ -546,7 +584,15 @@ fn event_record(s: &mut EventState, e: excalibur_cdp::Event, r: &Redactor) {
     let p = e.params;
     match e.method.as_str() {
         "Page.javascriptDialogOpening" => {
-            s.dialog = Some(json!({"kind":"dialog","type":p["type"],"confidence":"high"}))
+            if s.active_actions > 0 && p["type"] == "alert" {
+                if s.action_alerts.len() == 16 {
+                    s.action_alerts.remove(0);
+                }
+                s.action_alerts.push(json!({"type":"alert","message":r.redact_text(p["message"].as_str().unwrap_or("")),"untrusted":true}));
+            }
+            s.dialog = Some(
+                json!({"kind":"dialog","type":p["type"],"message":r.redact_text(p["message"].as_str().unwrap_or("")),"confidence":"high"}),
+            )
         }
         "Page.javascriptDialogClosed" => s.dialog = None,
         "Page.fileChooserOpened" => s.file_chooser = true,

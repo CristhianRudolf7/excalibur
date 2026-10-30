@@ -196,6 +196,7 @@ async fn contract(root: PathBuf) {
                     login: vec!["http://login.test".into()],
                     listen: true,
                     wait: None,
+                    credential_frames: vec![],
                     listen_probe: ListenProbe {
                         unread_selector: ".unread".into(),
                     },
@@ -1067,6 +1068,7 @@ async fn reconciliation_contract(root: PathBuf) {
                 login: vec!["http://login.test".into()],
                 listen: true,
                 wait: None,
+                credential_frames: vec![],
                 listen_probe: ListenProbe {
                     unread_selector: ".unread".into(),
                 },
@@ -1300,6 +1302,7 @@ async fn spin_contract(root: PathBuf) {
                 rw: vec!["http://chat.test".into()],
                 listen: true,
                 wait: None,
+                credential_frames: vec![],
                 listen_probe: ListenProbe {
                     unread_selector: ".unread".into(),
                 },
