@@ -10,7 +10,9 @@ fn marker(lane: u8) -> String {
 }
 
 fn marker_count(layer: &str) -> usize {
-    (0..=3).map(|lane| layer.matches(&marker(lane)).count()).sum()
+    (0..=3)
+        .map(|lane| layer.matches(&marker(lane)).count())
+        .sum()
 }
 
 async fn layer0(f: &Fixture, agent: &Agent) -> (String, usize) {
