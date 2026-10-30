@@ -7,3 +7,5 @@ El hook exclusivo del anfitrión `ToolRuntime::overrides_builtin` selecciona el 
 Las observaciones enmascaradas ya indican `get_tool_output` con un hash durable; no encaminan la recuperación del diario al historial de mensajes por ámbito. Se conserva esa indicación inequívoca.
 
 `cargo test -p excalibur-daemon --test memory_history` ejercita ambos dispatchers reales con modelo simulado y base local. Las pruebas de utilidades del motor comparan el alias con `history_search`. La verificación final está pendiente en este punto; no se declara completo el workspace ni H11.
+
+Después de esperar el cierre del maestro y los trabajadores, el daemon separa el anfitrión de memoria del orquestador. Esto libera su ciclo de referencias de autoridad/árbol de citas antes de cerrar el almacenamiento. La fixture de integración reabre la base tras cerrar el anfitrión con memoria.

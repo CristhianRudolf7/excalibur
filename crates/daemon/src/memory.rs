@@ -391,6 +391,14 @@ impl MemoryHost {
         });
         *maintenance = Some(task.abort_handle());
     }
+    /// Release the host attachment after worker/master shutdown. The runtime's
+    /// citation tree and authority otherwise keep each other's database alive.
+    pub fn detach(&self) {
+        self.orchestrator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(task) = self

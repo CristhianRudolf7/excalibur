@@ -114,5 +114,13 @@ fn memory_and_journal_history_have_distinct_schemas_and_dispatchers() {
         }}).await.unwrap();assert!(model.0.load(Ordering::SeqCst)>=3);
     });
     runtimes.block_on(host.close()).unwrap();
+    drop(db);
+    let reopened = Database::open(
+        dir.path().join("main.db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    runtimes.block_on(reopened.shutdown()).unwrap();
     runtimes.shutdown(std::time::Duration::from_secs(3));
 }

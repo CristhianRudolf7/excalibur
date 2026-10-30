@@ -7,3 +7,5 @@ A host-only `ToolRuntime::overrides_builtin` hook selects ownership before the f
 Masked observations already identify `get_tool_output` with a durable blob hash; they do not direct journal recovery to scoped message history. That unambiguous retrieval hint remains intact.
 
 `cargo test -p excalibur-daemon --test memory_history` exercises both actual dispatch paths with a mock model and local database. The engine utility tests compare the journal alias result with `history_search`. Final verification is pending at this source checkpoint; no full workspace or H11 completion is claimed.
+
+After the master and worker shutdown joins, the daemon detaches the memory host from the orchestrator. This releases their authority/citation-tree reference cycle before storage shutdown. The integration fixture reopens the database after closing the memory-enabled host.
