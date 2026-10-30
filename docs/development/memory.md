@@ -73,6 +73,8 @@ Snapshot `41b90ecc53bb8ea2d6666e51b645e30aae136ca8` (2026-10-30) passed the comp
 
 The independent review of that snapshot found five defects, addressed in its first correction: extraction now takes human authority and literal text from `master_user_sources` (role alone never grants user trust); bound calls distinguish shared reads from primary-scope writes; notebook version history filters fragment scopes in SQL, including deleted fragments; profile reverts obey provenance, explicit-request and trust rules; and consolidation refuses a timestamp winner below another assertion's trust. `audit_regressions` covers the library boundaries and `memory_host` exercises actual urgent notices through the master. Verification of this correction is pending until its checks finish; the earlier 45-test result applies to the earlier snapshot.
 
+On `7a66c5513bbd5d336275131f0e4397ee0229c56b`, all 50 memory tests and all 8 gateway backend tests passed. The host suite passed three cases but the urgent-notice fixture failed before exercising its scenario because its principal was missing; directed Clippy also rejected a complex curation tuple type. The following verification fix registers the synthetic principal and names that tuple type. Host and Clippy results remain pending for that follow-up; no earlier failure is counted as a pass.
+
 ## Pending connections and limits
 
 - The maintenance scope list is currently captured at host startup; automatically enrolling projects registered later remains pending. The noninteractive `exec` host does not yet enable long-term memory.

@@ -22,6 +22,8 @@ pub struct CurationResult {
     pub admission: Option<AdmissionResult>,
 }
 
+type EntityMergeRow = (String, String, String, Option<String>);
+
 #[allow(clippy::too_many_arguments)]
 fn log(
     c: &rusqlite::Connection,
@@ -278,7 +280,7 @@ impl MemoryStore {
         let changed = self
             .db
             .write(Priority::Normal, move |c| {
-                let row = |id: &str| -> rusqlite::Result<Option<(String, String, String, Option<String>)>> {
+                let row = |id: &str| -> rusqlite::Result<Option<EntityMergeRow>> {
                     c.query_row(
                         "SELECT COALESCE(scope_id,''),canonical_name,aliases,merged_into FROM entities WHERE id=?1 AND principal_id=?2",
                         rusqlite::params![id, principal],

@@ -73,6 +73,8 @@ El snapshot `41b90ecc53bb8ea2d6666e51b645e30aae136ca8` (2026-10-30) pasó la sui
 
 La revisión independiente de ese snapshot encontró cinco defectos, tratados en su primera corrección: la extracción toma autoridad humana y texto literal de `master_user_sources` (el rol nunca concede por sí solo confianza de usuario); las llamadas vinculadas distinguen lecturas compartidas de escrituras en el ámbito principal; el historial del bloc filtra ámbitos de fragmentos en SQL, incluso tras borrarlos; las reversiones de perfiles respetan procedencia, petición explícita y confianza; y la consolidación rechaza un ganador temporal con menor confianza que otra afirmación. `audit_regressions` cubre las fronteras de la biblioteca y `memory_host` prueba avisos urgentes reales del maestro. La verificación de esta corrección sigue pendiente hasta terminar sus comprobaciones; las 45 pruebas anteriores corresponden al snapshot anterior.
 
+En `7a66c5513bbd5d336275131f0e4397ee0229c56b` pasaron las 50 pruebas de memoria y las 8 del backend del gateway. La suite del anfitrión pasó tres casos, pero la fixture de aviso urgente falló antes del escenario por faltar su principal; Clippy dirigido también rechazó una tupla compleja de corrección de entidades. El ajuste de verificación siguiente registra el principal sintético y da nombre al tipo de tupla. Los resultados del anfitrión y Clippy siguen pendientes para ese ajuste; ningún fallo anterior se cuenta como aprobado.
+
 ## Conexiones pendientes y límites
 
 - La lista de ámbitos de mantenimiento se captura al iniciar el anfitrión; falta incorporar automáticamente los proyectos registrados después. El anfitrión no interactivo `exec` todavía no activa memoria a largo plazo.

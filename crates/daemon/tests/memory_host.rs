@@ -308,6 +308,7 @@ async fn actual_urgent_notices_never_become_user_preferences_during_review() {
     .await
     .unwrap();
     db.write(excalibur_store::Priority::Journal,|c| {
+        c.execute("INSERT OR IGNORE INTO principals(id,name) VALUES('owner','owner')",[])?;
         c.execute("INSERT INTO conversations(id,principal_id,active_scope) VALUES('chat','owner','general')",[])?; Ok(())
     }).await.unwrap();
     for id in ["generated-1", "generated-2"] {
