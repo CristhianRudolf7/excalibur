@@ -49,9 +49,10 @@ pub use measure::{
 };
 pub use sampling::{
     InstanceClass as SamplingInstanceClass, MemoryEvents, ProcEntry, ProcessType, Sample,
-    SampleLevel, classify_cmdline, current_process_working_set, desired_oom_score_adj,
-    enumerate_proc_root, oom_raise_allowed, parse_byte_counter, parse_memory_events,
-    parse_memory_stat_inactive_file, parse_psi_some_avg10, parse_smaps_pss,
-    parse_status_working_set, psi_triggers_eviction, working_set_a,
+    SampleLevel, cgroup_dir_from_self, cgroup_memory_high_writable, classify_cmdline,
+    current_process_working_set, desired_oom_score_adj, enumerate_proc_root, live_psi_some_avg10,
+    oom_raise_allowed, parse_byte_counter, parse_memory_events, parse_memory_stat_inactive_file,
+    parse_psi_some_avg10, parse_smaps_pss, parse_status_working_set, psi_triggers_eviction,
+    read_cgroup_events, read_cgroup_working_set, working_set_a,
 };
 pub use telemetry::BrowserResourceSample;

@@ -1,8 +1,13 @@
-//! Real-Chrome 9.5 block matrices (9.1) over local synthetic pages.
+//! Real-Chrome 9.5 block matrices (9.1 plus cookie-wall/geo extensions) over
+//! local synthetic pages.
 //!
 //! Every detector kind gets a dedicated synthetic page plus control pages
-//! without 9.1 markers. No external sites, accounts or paid APIs are used:
-//! all hostnames resolve through the local fixture proxy. Evidence lands in
+//! without 9.1 markers. Cookie-wall and geo-block variants extend the fixed
+//! 9.1 vocabulary with their own kinds; document-status elevation is wired to
+//! the live document HTTP status (403/429/451/503) so `site-denied` and
+//! `geo-block` elevate medium to high with a `document_status` signal.
+//! No external sites, accounts or paid APIs are used: all hostnames resolve
+//! through the local fixture proxy. Evidence lands in
 //! `target/test-evidence/browser/block_matrix/`.
 use excalibur_browser::{
     sessions::{Manager, Open, Options, Profile, Site},
@@ -176,6 +181,38 @@ fn route(host: &str, path: &str) -> (u16, Vec<(&'static str, &'static str)>, Str
                 "<h1>synthetic</h1><p>assets load from /cdn-cgi/challenge-platform/ without any visible challenge</p>",
             ),
         ),
+        (_, "/m/cookie-wall") => (
+            200,
+            ok,
+            shell(
+                "consent wall",
+                "<h1>synthetic</h1><div id='cookie-wall' style='display:block;width:400px;height:400px;position:fixed;inset:0;background:#fff'>We value your privacy. We use cookies to improve your experience. <button>Accept all cookies</button></div>",
+            ),
+        ),
+        (_, "/m/geo-block") => (
+            451,
+            ok,
+            shell(
+                "geo blocked",
+                "<h1>unavailable</h1><p>This content is not available in your country due to regional restrictions.</p>",
+            ),
+        ),
+        (_, "/m/control-cookie-banner") => (
+            200,
+            ok,
+            shell(
+                "control",
+                "<h1>synthetic</h1><footer><p>We use cookies for analytics. <a href='/m/control-plain'>Learn more</a></p></footer>",
+            ),
+        ),
+        (_, "/m/control-region-select") => (
+            200,
+            ok,
+            shell(
+                "control",
+                "<h1>synthetic</h1><p>Select your region to continue shopping.</p>",
+            ),
+        ),
         (_, "/m/control-plain") => (
             200,
             ok,
@@ -257,7 +294,10 @@ async fn contract(root: PathBuf) {
         .await
         .unwrap_or_else(|e| panic!("nav {url}: {e}"))
     }
-    // (url, expected kind or "unblocked", expected confidence-word or vendor note)
+    // (url, expected kind, expected confidence, vendor). `site-denied`
+    // carries block text without corroboration words, so medium would stay
+    // without the live document status: the 403 elevates it to high with a
+    // `document_status` signal (B5). `geo-block` proves the same path for 451.
     let matrix = [
         (
             "http://one.test/m/captcha-frame",
@@ -274,7 +314,7 @@ async fn contract(root: PathBuf) {
         (
             "http://one.test/m/site-denied",
             "blocked_by_site",
-            "medium",
+            "high",
             "one.test",
         ),
         (
@@ -296,6 +336,18 @@ async fn contract(root: PathBuf) {
             "medium",
             "one.test",
         ),
+        (
+            "http://one.test/m/cookie-wall",
+            "blocked_cookie_wall",
+            "medium",
+            "one.test",
+        ),
+        (
+            "http://one.test/m/geo-block",
+            "blocked_geo",
+            "high",
+            "one.test",
+        ),
     ];
     for (url, kind, confidence, vendor) in matrix {
         let wait = navigate(&m, sid, tid, url).await;
@@ -305,12 +357,41 @@ async fn contract(root: PathBuf) {
         assert_eq!(wait["blocked"]["vendor"], vendor, "{url}: {wait}");
         rows.push(json!({"page":url,"kind":wait["blocked"]["kind"],"vendor":wait["blocked"]["vendor"],"confidence":wait["blocked"]["confidence"],"signals":wait["blocked"]["signals"]}));
     }
+    // Live document-status elevation must be visible on the wire: the 403
+    // denied page and the 451 geo page carry `document_status` alongside
+    // their text signals, while the 200 cookie wall does not elevate.
+    for url in [
+        "http://one.test/m/site-denied",
+        "http://one.test/m/geo-block",
+    ] {
+        let row = rows.iter().find(|r| r["page"] == url).unwrap();
+        assert!(
+            row["signals"]
+                .as_array()
+                .is_some_and(|s| s.contains(&json!("document_status"))),
+            "{url}: live document status must elevate, got {row}"
+        );
+    }
+    let wall = rows
+        .iter()
+        .find(|r| r["page"] == "http://one.test/m/cookie-wall")
+        .unwrap();
+    assert!(
+        !wall["signals"]
+            .as_array()
+            .is_some_and(|s| s.contains(&json!("document_status"))),
+        "cookie wall must not carry document_status, got {wall}"
+    );
     // Control pages carry 9.1-adjacent markers but no block: an invisible
-    // reCAPTCHA badge, an injected challenge-platform path and plain text.
+    // reCAPTCHA badge, an injected challenge-platform path, plain text, a
+    // small analytics cookie banner without a wall, and a region selector
+    // without geo-block wording.
     for url in [
         "http://one.test/m/control-badge",
         "http://one.test/m/control-cdn",
         "http://one.test/m/control-plain",
+        "http://one.test/m/control-cookie-banner",
+        "http://one.test/m/control-region-select",
     ] {
         let wait = navigate(&m, sid, tid, url).await;
         assert!(wait["blocked"].is_null(), "{url}: unexpected block {wait}");

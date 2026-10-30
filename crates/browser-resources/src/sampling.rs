@@ -311,6 +311,66 @@ pub fn current_process_working_set() -> Option<u64> {
     parse_status_working_set(&status)
 }
 
+/// Resolve the caller cgroup directory from `/proc/self/cgroup` (cgroup v2
+/// `0::<relative>`). Returns `None` when the layout is unexpected so callers
+/// fail closed to the level-B `/proc` tree instead of guessing a path.
+#[must_use]
+pub fn cgroup_dir_from_self() -> Option<std::path::PathBuf> {
+    let content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relative = content.lines().find_map(|line| line.strip_prefix("0::"))?;
+    // Reject absolute escapes and `..` so a hostile `/proc` cannot steer the
+    // read outside `/sys/fs/cgroup`.
+    let relative = relative.strip_prefix('/').unwrap_or(relative);
+    if relative.is_empty() {
+        return None;
+    }
+    let mut joined = std::path::PathBuf::from("/sys/fs/cgroup");
+    for component in std::path::Path::new(relative).components() {
+        match component {
+            std::path::Component::Normal(part) => joined.push(part),
+            _ => return None,
+        }
+    }
+    Some(joined)
+}
+
+/// Read the live level-A working set (`memory.current - inactive_file`) from
+/// a cgroup directory. Returns `None` when the cgroup is shared, inaccessible
+/// or lacks the memory controller so callers fall back to level B.
+#[must_use]
+pub fn read_cgroup_working_set(dir: &std::path::Path) -> Option<u64> {
+    let current = parse_byte_counter(&std::fs::read_to_string(dir.join("memory.current")).ok()?)?;
+    let stat = std::fs::read_to_string(dir.join("memory.stat")).ok()?;
+    let inactive = parse_memory_stat_inactive_file(&stat)?;
+    Some(working_set_a(current, inactive))
+}
+
+/// Read the live `memory.events` counters from a cgroup directory.
+#[must_use]
+pub fn read_cgroup_events(dir: &std::path::Path) -> Option<MemoryEvents> {
+    let content = std::fs::read_to_string(dir.join("memory.events")).ok()?;
+    Some(parse_memory_events(&content))
+}
+
+/// True when the cgroup `memory.high` knob is writable without changing it.
+/// The B6 forcing test only writes when this probe succeeds; otherwise it
+/// fails closed with a clear message instead of throttling a shared scope.
+#[must_use]
+pub fn cgroup_memory_high_writable(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(dir.join("memory.high"))
+        .map(|meta| meta.permissions().mode() & 0o200 != 0)
+        .unwrap_or(false)
+}
+
+/// Read the live PSI `some avg10` pressure in percent, when the kernel
+/// exposes `/proc/pressure/memory`.
+#[must_use]
+pub fn live_psi_some_avg10() -> Option<f64> {
+    let content = std::fs::read_to_string("/proc/pressure/memory").ok()?;
+    parse_psi_some_avg10(&content)
+}
+
 /// Instance class selecting the OOM policy.
 ///
 /// Canonical [`crate::eviction::InstanceKind`] aliased here so sampling and

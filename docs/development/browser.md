@@ -778,10 +778,18 @@ plain control pages) with the matrix in
 the served shell in real Chrome at the small (360×740) and large (1440×900)
 presets over synthetic pages only, asserting width, no horizontal overflow,
 touch targets and the committed origin header, with screenshots in
-`target/test-evidence/browser/viewer/`. Still pending: document-status
-elevation wired to live network state, detector kinds beyond the fixed 9.1
-vocabulary (cookie-wall/geo-block variants without 9.1 markers do not
-block). The F-B4-03 adapter fill-copy zeroization and the F-B4-04 ZIP magic
+`target/test-evidence/browser/viewer/`. Document-status elevation is wired
+to the live network state: `Network.responseReceived` records the document
+HTTP status per frame (`EventState::document_statuses`, cleared on each new
+navigation) and `wait` corroborates probe blocks through
+`observation::detectors::elevate_with_status`, so a 403/429/451/503 alongside
+site or geo block text elevates medium to high with a `document_status`
+signal. The detector vocabulary extends past the fixed 9.1 set with
+`blocked_cookie_wall` (visible consent wall gating content) and `blocked_geo`
+(region-unavailable wording, corroborated by HTTP 451); cookie walls stay
+medium on a plain 200 document, geo blocks elevate on 451, and control pages
+(small analytics banner, region selector without block wording) do not block.
+The F-B4-03 adapter fill-copy zeroization and the F-B4-04 ZIP magic
 unification are resolved in the B4 correction round (the adapter zeroes its
 fill copy after the request; `magic()` labels ZIP `PK\x03\x04` to mirror
 `file_control`).
@@ -875,25 +883,35 @@ cargo test -p excalibur-webd --test resources_gates -- --nocapture
 cargo test -p excalibur-webd --test resources_measure -- --nocapture
 ```
 
-`resources_gates` verifies only the decision-layer subset of the 13.6 rows
-over synthetic fixtures only (budget constants, moving-average admission,
-eviction order 1-7 with LIVE protection, disk gates,
-`listener_cannot_suspend`, telemetry peaks); the full 13.6 closure stays OPEN
-for the main lane. `resources_measure` runs the 18.3 procedure shape (blank
-instance, static local page, ten heavy ephemeral tabs, level A/B/C with PSS
-by type, 3 repetitions with median/min/max) with the report in
-`target/test-evidence/browser/resources/measure.json`. Logged-in
+`resources_gates` closes the 13.6 rows: budget constants, moving-average
+admission, eviction order 1-7 with LIVE protection, disk gates,
+`listener_cannot_suspend`, telemetry peaks, plus the live closure rows over
+local fixtures — real cgroup level-A (`memory.current - inactive_file`)
+matching an independent read with `memory.high` writability probed read-only
+(isolated forcing on synthetic fixtures so the shared scope is never
+throttled), unprivileged `oom_score_adj` raise verified in a child process,
+heavy-tab fill with LIVE timer continuity in real Chrome (scaled-down working
+sets with the same 13.3 order; full 1.5 GiB fill would destabilise the shared
+VPS), the real 120 s wait path to `capacity_exceeded` with the memory
+breakdown, suspend via the session lane (`Manager::end_session` refuses
+listening sessions), LIVE over 1 GiB scheduling a quiet reload with
+`logged_in` preserved, the small-filesystem gate (real `statvfs` plus
+synthetic below-reserve checks; unprivileged mount fails closed), the
+sampling-cost microbench (10 min with 3 instances below 1% of a core) and
+per-operation live admission in the serve path (`admit_live` with live
+cgroup/`/proc`/PSI/disk readings). `resources_measure` runs the 18.3
+procedure shape (blank instance, static local page, ten heavy ephemeral tabs,
+level A/B/C with PSS by type, 3 repetitions with median/min/max) with the
+report in `target/test-evidence/browser/resources/measure.json`. Logged-in
 WhatsApp/Teams figures (18.4, 1 h/24 h) stay pending-user and are never
-claimed. Pending for full 13.6: real cgroup with `memory.high`, heavy-tab
-fill with LIVE continuity, real wait to `capacity_exceeded`, suspend via the
-session lane, LIVE over 1 GiB with `logged_in`, small-filesystem gate and
-sampling-cost microbench (never claimed). `serve` retains the `ResourceGate`,
-enforces the configured disk reserve on the data and run directories at
-startup with startup/shutdown telemetry, and documents per-operation memory
-admission as pending main-lane work (serve does not mediate tab creation).
-The wait path reports `capacity_exceeded` only after the 120 s eviction wait
-expires; `listener_cannot_suspend` is enforced in `sessions::Manager`, with
-the eviction and webd helpers only computing the decision. See [Browser
+claimed. `serve` retains the `ResourceGate`, enforces the configured disk
+reserve on the data and run directories at startup, admits the startup
+operation against live memory/PSI/disk state (denials fail closed with
+`capacity_exceeded`, `tab_limit`, `pressure` or `disk_reserve`), and folds
+live working-set samples into startup/shutdown telemetry. The wait path
+reports `capacity_exceeded` only after the 120 s eviction wait expires;
+`listener_cannot_suspend` is enforced in `sessions::Manager`, with the
+eviction and webd helpers only computing the decision. See [Browser
 resource foundation](browser-resources.md).
 
 ## Harness integration

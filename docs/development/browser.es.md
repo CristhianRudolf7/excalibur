@@ -820,13 +820,22 @@ con la matriz en `target/test-evidence/browser/block_matrix/`.
 shell servido con Chrome real en presets pequeño (360×740) y grande (1440×900)
 solo con páginas sintéticas, comprobando ancho, ausencia de scroll horizontal,
 objetivos táctiles y cabecera de origen, con capturas en
-`target/test-evidence/browser/viewer/`. Quedan pendientes: la elevación por
-estado de documento conectada a la red, tipos de detector fuera del
-vocabulario fijo 9.1 (variantes de muro de cookies/geo-bloqueo sin marcadores
-9.1 no bloquean). La puesta a cero de la copia de relleno del adaptador
-(F-B4-03) y la unificación de magias ZIP (F-B4-04) quedan resueltas en la ronda
-de corrección B4 (el adaptador pone a cero su copia de relleno tras la petición;
-`magic()` etiqueta ZIP `PK\x03\x04` igual que `file_control`).
+`target/test-evidence/browser/viewer/`. La elevación por estado de documento
+está conectada a la red en vivo: `Network.responseReceived` registra el estado
+HTTP del documento por marco (`EventState::document_statuses`, limpiado en cada
+navegación nueva) y `wait` corrobora los bloques de la sonda con
+`observation::detectors::elevate_with_status`, de modo que un 403/429/451/503
+junto a texto de bloqueo de sitio o geo eleva de media a alta con la señal
+`document_status`. El vocabulario de detectores se amplía más allá del 9.1 fijo
+con `blocked_cookie_wall` (muro de consentimiento visible que bloquea el
+contenido) y `blocked_geo` (texto de no disponible en la región, corroborado por
+HTTP 451); los muros de cookies quedan en media con documento 200, los
+geo-bloqueos elevan con 451, y las páginas de control (banner pequeño de
+analítica, selector de región sin texto de bloqueo) no bloquean. La puesta a
+cero de la copia de relleno del adaptador (F-B4-03) y la unificación de magias
+ZIP (F-B4-04) quedan resueltas en la ronda de corrección B4 (el adaptador pone
+a cero su copia de relleno tras la petición; `magic()` etiqueta ZIP
+`PK\x03\x04` igual que `file_control`).
 
 ## Lectura ligera y citas
 
@@ -917,24 +926,35 @@ cargo test -p excalibur-webd --test resources_gates -- --nocapture
 cargo test -p excalibur-webd --test resources_measure -- --nocapture
 ```
 
-`resources_gates` verifica solo el subconjunto de decisión de las filas 13.6
-con fixtures sintéticas (constantes, admisión con media móvil, desalojo 1-7
-con protección LIVE, puertas de disco, `listener_cannot_suspend`, picos de
-telemetría); el cierre completo de 13.6 queda ABIERTO para el carril
-principal. `resources_measure` ejecuta la forma del procedimiento 18.3
-(instancia en blanco, página estática local, diez pestañas efímeras pesadas,
-niveles A/B/C con PSS por tipo, 3 repeticiones con mediana/mínimo/máximo) con
-informe en `target/test-evidence/browser/resources/measure.json`. Las cifras
-con sesión de WhatsApp/Teams (18.4, 1 h/24 h) siguen pendientes del usuario y
-nunca se afirman. Pendientes para el 13.6 completo: cgroup real con
-`memory.high`, llenado con pestañas pesadas y continuidad LIVE, espera real
-hasta `capacity_exceeded`, suspensión por la vía de sesión, LIVE con más de
-1 GiB y `logged_in`, puerta con sistema de archivos pequeño y microbench de
-coste (nunca afirmados). `serve` retiene la `ResourceGate`, exige la reserva
-de disco configurada en los directorios de datos y ejecución al arrancar con
-telemetría de arranque/cierre, y deja la admisión de memoria por operación
-como pendiente del carril principal (serve no media la creación de pestañas).
-La espera informa `capacity_exceeded` solo tras expirar los 120 s de desalojo;
+`resources_gates` cierra las filas 13.6: constantes, admisión con media móvil,
+desalojo 1-7 con protección LIVE, puertas de disco, `listener_cannot_suspend`,
+picos de telemetría, más las filas vivas sobre fixtures locales — cgroup real
+nivel A (`memory.current - inactive_file`) coincidente con lectura
+independiente y `memory.high` escriturable probado solo en lectura (forzado
+aislado en fixtures sintéticas para no estrangular el ámbito compartido),
+subida de `oom_score_adj` no privilegiada verificada en proceso hijo, llenado
+con pestañas pesadas y continuidad del temporizador LIVE en Chrome real
+(conjuntos de trabajo reducidos con la misma orden 13.3; el llenado completo a
+1,5 GiB desestabilizaría la VPS compartida), espera real de 120 s hasta
+`capacity_exceeded` con desglose de memoria, suspensión por la vía de sesión
+(`Manager::end_session` rechaza sesiones en escucha), LIVE con más de 1 GiB que
+programa recarga tranquila con `logged_in` preservado, puerta con sistema de
+archivos pequeño (`statvfs` real más comprobaciones sintéticas bajo reserva;
+el montaje no privilegiado falla cerrado), microbench de coste de muestreo
+(10 min con 3 instancias por debajo del 1 % de un núcleo) y admisión viva por
+operación en la ruta serve (`admit_live` con lecturas vivas de
+cgroup/`/proc`/PSI/disco). `resources_measure` ejecuta la forma del
+procedimiento 18.3 (instancia en blanco, página estática local, diez pestañas
+efímeras pesadas, niveles A/B/C con PSS por tipo, 3 repeticiones con
+mediana/mínimo/máximo) con informe en
+`target/test-evidence/browser/resources/measure.json`. Las cifras con sesión de
+WhatsApp/Teams (18.4, 1 h/24 h) siguen pendientes del usuario y nunca se
+afirman. `serve` retiene la `ResourceGate`, exige la reserva de disco
+configurada en los directorios de datos y ejecución al arrancar, admite la
+operación de arranque contra el estado vivo de memoria/PSI/disco (las
+denegaciones fallan cerradas con `capacity_exceeded`, `tab_limit`, `pressure` o
+`disk_reserve`) y pliega muestras vivas en la telemetría de arranque/cierre. La
+espera informa `capacity_exceeded` solo tras expirar los 120 s de desalojo;
 `listener_cannot_suspend` se exige en `sessions::Manager`, y las ayudas de
 desalojo y webd solo calculan la decisión. Ver [Fundamento de
 recursos](browser-resources.es.md).
