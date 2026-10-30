@@ -105,7 +105,7 @@ cargo test -p excalibur-journal --test state_transitions
 cargo test -p excalibur-tools -- --nocapture
 ```
 
-Final run: 338 passing tests, zero failures; eleven ignored subprocess helpers are executed by their active parent tests. Tests use synthetic data and provider/capability simulators; filesystem/process effects are real inside temporary directories. No credentials, inference services, GPU, deployment or paid benchmark are needed. No real model quality or real remote keyed-service guarantee is claimed.
+Final run (recorded for the H4 noninteractive checkpoint fe93d5c on 2026-10-29; not rerun for later trees, see the current full-workspace status in the progress records): 338 passing tests, zero failures; eleven ignored subprocess helpers are executed by their active parent tests. Tests use synthetic data and provider/capability simulators; filesystem/process effects are real inside temporary directories. No credentials, inference services, GPU, deployment or paid benchmark are needed. No real model quality or real remote keyed-service guarantee is claimed.
 
 Built/run evidence applies to this Ubuntu x86-64 VPS, Rust/Cargo 1.99.1. Process killing is not a physical power-loss test. The current terminal sandbox integration was built and exercised on Linux only; Windows/macOS runtime and complete workspace compilation on those targets have not been verified. Shared task/evidence and context management contracts are described in [Verifiable work](verifiable-work.md) and [Context and cache](context-cache.md). Memory, the complete skill catalogue, general orchestration, agenda and supervisory continuous recovery remain separate capabilities.
 

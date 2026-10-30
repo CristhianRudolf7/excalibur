@@ -105,7 +105,7 @@ cargo test -p excalibur-journal --test state_transitions
 cargo test -p excalibur-tools -- --nocapture
 ```
 
-Ejecución final: 338 pruebas aprobadas, cero fallos; los once helpers de subproceso ignored son invocados por sus pruebas padre activas. Datos sintéticos y simuladores de proveedores/capacidades; efectos reales de archivos/procesos dentro de directorios temporales. No requiere credenciales, inferencia, GPU, despliegue ni benchmark pagado. No se afirma calidad de un modelo real ni garantía de un servicio externo real con clave.
+Ejecución final (registrado para el checkpoint no interactivo H4 fe93d5c del 2026-10-29; no se repitió para árboles posteriores, ver el estado actual del workspace completo en los registros de progreso): 338 pruebas aprobadas, cero fallos; los once helpers de subproceso ignored son invocados por sus pruebas padre activas. Datos sintéticos y simuladores de proveedores/capacidades; efectos reales de archivos/procesos dentro de directorios temporales. No requiere credenciales, inferencia, GPU, despliegue ni benchmark pagado. No se afirma calidad de un modelo real ni garantía de un servicio externo real con clave.
 
 La compilación/ejecución corresponde a esta VPS Ubuntu x86-64, Rust/Cargo 1.99.1. Matar procesos no prueba un corte eléctrico físico. La integración actual de terminal y sandbox solo se compiló y ejecutó en Linux; no se verificó la ejecución en Windows/macOS ni la compilación integral del workspace para esos targets. La planificación/evidencia compartida y la gestión de contexto tienen contratos en [Trabajo verificable](verifiable-work.es.md) y [Contexto y caché](context-cache.es.md). Memoria, catálogo completo de skills, orquestador general, agenda y supervisión continua conservan sus propios alcances.
 
