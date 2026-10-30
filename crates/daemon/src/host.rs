@@ -569,6 +569,9 @@ impl DaemonHost {
             .await
             .err()
             .map(|e| e.to_string());
+        if let Some(memory) = &self.memory {
+            memory.detach();
+        }
         // Storage failure must never skip process/resource cleanup.
         self.tools.shutdown().await;
         match self.orchestrator.active_agents().await {
