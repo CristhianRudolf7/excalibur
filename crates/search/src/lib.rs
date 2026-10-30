@@ -8,12 +8,14 @@
 //! with BM25, and the `web_search` ranking service with coverage and the
 //! insufficient flag.
 //!
-//! The on-disk backend is an explicit [`index::DiskIndex`] behind plain
-//! method boundaries; the production tantivy store plugs into the same
-//! document model and query flow in the main lane. Budgets, schemas and
-//! response shapes already follow the architecture so integration only
-//! adapts constructors, never query call sites.
+//! The on-disk backend is an explicit [`index::DiskIndex`] behind the
+//! [`backend::IndexBackend`] trait; the production tantivy store
+//! (`tantivy_index::TantivyIndex`, feature `tantivy`) implements the same
+//! document model and query flow. Budgets, schemas and response shapes
+//! already follow the architecture so integration only adapts constructors,
+//! never query call sites.
 
+pub mod backend;
 pub mod config;
 pub mod dedup;
 pub mod error;
@@ -21,10 +23,15 @@ pub mod frontier;
 pub mod index;
 pub mod ingest;
 pub mod normalize;
+pub mod pipeline;
 pub mod ranking;
 pub mod robots;
 pub mod search;
+#[cfg(feature = "tantivy")]
+pub mod tantivy_index;
+pub mod wire;
 
+pub use backend::IndexBackend;
 pub use config::{SearchConfig, SearchProfile};
 pub use error::{Result, SearchError};
 pub use frontier::{CrawlTask, FetchOutcome, Frontier, Priority, Source, UrlState};
@@ -34,11 +41,15 @@ pub use ingest::{
     parse_sitemap_locs_for_sitemap,
 };
 pub use normalize::{NormalizedUrl, normalize_url, registrable_domain};
+pub use pipeline::{Pipeline, PipelinePage, RunStats, bytes_per_doc, known_item_recall};
 pub use ranking::{
     RankedResult, fuse_rrf, has_recency_intent, prior_for_harmonic_rank, rank_candidates,
 };
 pub use robots::{RobotsFetch, RobotsRules, decide, parse_robots_directives};
 pub use search::{Coverage, SearchOptions, SearchResponse, SearchService};
+pub use wire::{
+    AllowAllGate, BudgetProvider, DenyAllGate, FetchGate, HostProxyWire, is_low_priority_source,
+};
 
 /// Lower-case ASCII folding tokenizer shared by the index and ranking.
 ///
