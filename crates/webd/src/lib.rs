@@ -3,14 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     ffi::CString,
     fs,
-    io::Read,
-    os::{
-        fd::AsRawFd,
-        unix::{fs::MetadataExt, process::CommandExt},
-    },
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, Instant},
 };
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
@@ -23,6 +17,9 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct WebConfig {
     pub os_user: String,
+    pub chrome_args: Vec<String>,
+    pub instance_class: excalibur_browser::Class,
+    pub version: excalibur_browser::version::VersionPolicy,
     pub chrome_binary: Option<PathBuf>,
     pub data_dir: PathBuf,
     pub run_dir: PathBuf,
@@ -33,6 +30,9 @@ impl Default for WebConfig {
     fn default() -> Self {
         Self {
             os_user: "excalibur-web".into(),
+            chrome_args: Vec::new(),
+            instance_class: Default::default(),
+            version: Default::default(),
             chrome_binary: None,
             data_dir: "/var/lib/excalibur-web".into(),
             run_dir: "/run/excalibur-web".into(),
@@ -45,6 +45,7 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
         let config: Self = toml::from_str(text).map_err(|e| e.to_string())?;
         let w = &config.web;
+        excalibur_browser::validate_args(&w.chrome_args).map_err(|e| e.to_string())?;
         if w.os_user.is_empty()
             || !w.data_dir.is_absolute()
             || !w.run_dir.is_absolute()
@@ -128,105 +129,7 @@ pub fn drop_privileges(user: &str) -> Result<Identity, String> {
         Ok(identity)
     }
 }
-#[derive(Debug, Serialize)]
-pub struct Chrome {
-    pub binary: PathBuf,
-    pub version: String,
-}
-pub fn detect_chrome(explicit: Option<&Path>) -> Result<Chrome, String> {
-    let candidates = match explicit {
-        Some(p) => vec![p.to_owned()],
-        None => vec![
-            "/usr/bin/google-chrome-stable".into(),
-            "/usr/bin/google-chrome".into(),
-            "/usr/bin/chromium".into(),
-            "/usr/bin/chromium-browser".into(),
-        ],
-    };
-    let binary = candidates
-        .into_iter()
-        .find(|p| p.is_file())
-        .ok_or("Chrome binary unavailable")?;
-    let (status, stdout) = probe_version(&binary)?;
-    let version = String::from_utf8(stdout)
-        .map_err(|_| "invalid Chrome version")?
-        .trim()
-        .to_owned();
-    if !status.success()
-        || !(version.starts_with("Google Chrome ") || version.starts_with("Chromium "))
-        || !version.split_whitespace().any(|part| {
-            part.split('.').count() == 4 && part.split('.').all(|n| n.parse::<u32>().is_ok())
-        })
-    {
-        return Err("unrecognized Chrome version".into());
-    }
-    Ok(Chrome { binary, version })
-}
-// Own only the probe's process group, including descendants holding stdout open.
-struct Probe(std::process::Child);
-impl Drop for Probe {
-    fn drop(&mut self) {
-        // SAFETY: process_group(0) created a separate group with this child's PID.
-        unsafe {
-            libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL);
-        }
-        let _ = self.0.wait();
-    }
-}
-fn probe_version(binary: &Path) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut probe = Probe(
-        Command::new(binary)
-            .arg("--version")
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| e.to_string())?,
-    );
-    let mut stdout = probe.0.stdout.take().ok_or("missing probe stdout")?;
-    // SAFETY: stdout owns a valid descriptor; preserve its existing flags.
-    unsafe {
-        let flags = libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL);
-        if flags < 0 || libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0
-        {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-    }
-    let mut output = Vec::new();
-    let mut eof = false;
-    loop {
-        if Instant::now() >= deadline {
-            return Err("Chrome version check timed out".into());
-        }
-        let mut buffer = [0; 1024];
-        if !eof {
-            match stdout.read(&mut buffer) {
-                Ok(0) => eof = true,
-                Ok(n) => {
-                    output.extend_from_slice(&buffer[..n]);
-                    if output.len() > 4096 {
-                        return Err("Chrome version output exceeds 4096 bytes".into());
-                    }
-                }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    ) => {}
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        if let Some(status) = probe.0.try_wait().map_err(|e| e.to_string())?
-            && eof
-        {
-            return Ok((status, output));
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
+pub use excalibur_browser::installation::{Chrome, detect_chrome};
 #[derive(Debug, Serialize)]
 pub struct DirectoryCheck {
     pub path: PathBuf,

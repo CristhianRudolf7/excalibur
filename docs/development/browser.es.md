@@ -1,9 +1,10 @@
 # Entorno del navegador
 
-El workspace reserva `excalibur-cdp`, `excalibur-browser`, `excalibur-search` y
-`excalibur-web-adapter` como bibliotecas vacías. `excalibur-webd` implementa
-únicamente comprobaciones del entorno Linux. No atiende peticiones ni lanza
-sesiones de navegador y no está registrado en las herramientas del host.
+`excalibur-cdp` implementa CDP asíncrono por tuberías nativas. `excalibur-browser`
+lanza y supervisa instancias de Chrome, verifica el sandbox de renderizadores y
+aplica la política de versiones. `excalibur-webd` ofrece diagnósticos puntuales de
+entorno e instancia. `excalibur-search` y `excalibur-web-adapter` siguen vacíos.
+No hay sesiones de aplicación, servidor RPC, herramientas web ni frontend visor.
 
 Instala Rust estable con rustfmt y clippy, un compilador C/C++, `pkg-config`,
 cabeceras de desarrollo de OpenSSL y una compilación verificada de bubblewrap
@@ -32,6 +33,8 @@ Proporciona un archivo dedicado y confiable (distinto de la configuración del h
 ```toml
 [web]
 os_user = "excalibur-web"
+instance_class = "ephemeral"
+chrome_args = []
 chrome_binary = "/usr/bin/google-chrome-stable" # opcional: busca rutas Linux conocidas
 data_dir = "/var/lib/excalibur-web"
 run_dir = "/run/excalibur-web"
@@ -61,12 +64,15 @@ observaciones de cgroup v2. El código de salida es cero solo si pasan las
 comprobaciones; los errores de argumentos, configuración e identidad también
 producen JSON con `ready = false`.
 
-`ready` significa que la preparación del entorno es satisfactoria.
-`sandbox_verified` permanece en false: no están implementados el lanzamiento del
-navegador ni la verificación del sandbox de renderizadores. Solo se invoca Chrome
-con `--version` en un grupo de procesos separado. El plazo total de cinco segundos
+`ready` en la comprobación previa significa que la preparación del entorno es
+satisfactoria. Esa comprobación mantiene `sandbox_verified` en false porque no
+lanza renderizadores. Su sonda de versión solo invoca Chrome con `--version` en
+un grupo de procesos separado. El plazo total de cinco segundos
 cubre el proceso y stdout, incluida la salida retenida por descendientes. Se mata
-el grupo al terminar o ante un error; la salida se limita a 4096 bytes. No se usan modelos remotos ni cuentas.
+el grupo al terminar o ante un error; la salida se limita a 4096 bytes. Los errores
+transitorios de ejecutable ocupado comparten el mismo plazo. La sonda también
+vacía el entorno heredado. No se usan modelos
+remotos ni cuentas.
 Se informa explícitamente si el cgroup está compartido o es inaccesible; en ese
 caso hará falta contabilidad por árbol de procesos al implementar los recursos.
 El cgroup es opcional y su disponibilidad no implica límites de memoria activos.
@@ -93,3 +99,113 @@ root rechazadas, arranque sin root,
 retirada irreversible de privilegios y evidencia real de identidad y capacidades
 en `/proc`. Los casos exclusivos de root se ejecutan si el lanzador de pruebas
 es root. No existe frontend que revisar.
+
+
+Ejecuta una comprobación real de instancia temporal después de la previa:
+
+```sh
+sudo target/debug/excalibur-webd --check-instance /ruta/absoluta/web.toml
+```
+
+Este diagnóstico retira privilegios antes de construir Tokio, prepara un perfil
+privado único, inicia un proxy loopback propio que rechaza toda conexión, lanza
+Chrome headless, obtiene `Browser.getVersion`, verifica el árbol de renderizadores
+y emite JSON antes de cerrar y borrar su perfil temporal. No expone endpoint RPC ni visor, y no
+navega a sitios externos. `sandbox_verified` solo es true con una inspección de
+renderizadores satisfactoria. `--preflight` conserva su significado de comprobación
+del entorno.
+
+La API compartida `Instance` exige un perfil existente del UID actual con modo
+0700, un binario absoluto de Chrome y un proxy loopback IPv4 explícito. Rechaza
+root, capacidades retenidas y perfiles que contengan `DevToolsActivePort`. Los
+descriptores 3 y 4 del hijo son extremos bloqueantes de tuberías nativas; el padre
+usa Tokio. Chrome tiene grupo de procesos propio y `PR_SET_PDEATHSIG(SIGKILL)`,
+con comprobación de la carrera de muerte del padre. Su entorno se vacía y solo
+recibe HOME privado, PATH/LANG controlados y los valores necesarios de pantalla o
+bus de sesión. El cierre y la liberación limpian el grupo y los manejadores de
+caídas observados, comprobando el instante de inicio del PID antes de señales
+individuales. La enumeración incluye manejadores con doble fork identificados
+por ejecutable y perfil privado, sin apropiarse de árboles de Chrome ajenos.
+
+Los flags seleccionan tubería, headless por defecto, aislamiento de sitios,
+extensiones y servicios de fondo desactivados, cachés de disco acotadas, proxy
+incluida loopback y desactivación de resolución DNS anticipada, QUIC y UDP de
+WebRTC fuera del proxy. Los flags de fondo para escucha se restringen a instancias
+persistentes en escucha. Los flags adicionales tienen lista estricta: se rechazan
+desactivación del sandbox, depuración TCP, evasión de certificados, automatización
+y sustitución de flags gestionados. El host solo puede seleccionar el almacén de
+Secret Service tras verificar ese servicio; en otro caso `basic` lleva un aviso
+explícito frente a lectores locales. El diagnóstico usa un perfil vacío y `basic`.
+No están implementadas la integración del broker ni la gestión de perfiles de
+aplicación; el argumento del proxy es una frontera del host confiable, no una
+afirmación de aislamiento completo de salida.
+
+La verificación exige `Seccomp: 2`, `NoNewPrivs: 1` y espacios de nombres de usuario
+y red distintos del navegador. El arranque exige al menos un renderizador
+verificado en cinco segundos. Los targets nuevos y OOPIF se adjuntan con sesiones
+planas y `waitForDebuggerOnStart`; solo se reanudan tras verificar sus procesos.
+Las identidades de proceso nuevas tienen hasta un segundo para terminar la
+inicialización del sandbox mientras sus targets siguen pausados. Un fallo después
+de que un renderizador haya pasado es inmediato. El monitor muestrea cada 50 ms,
+independiente de órdenes CDP y consultas de versión pendientes. Un fallo cierra la
+instancia con `sandbox_unavailable`; EOF o muerte del navegador genera
+`instance_crashed`, y las caídas de renderizadores generan eventos de target. El
+proceso principal del navegador permanece en los espacios de nombres del host;
+aquí no se añade un espacio de nombres de red exterior.
+
+CDP ofrece un catálogo de métodos escrito a mano, estructuras tipadas comunes de
+petición/respuesta y parámetros JSON genéricos. Maneja tramas NUL fragmentadas o
+concatenadas, peticiones concurrentes con números crecientes, errores de protocolo
+y eventos por sesión plana. Los plazos cubren espera de bloqueo/escritura/respuesta:
+diez segundos por defecto, quince para capturas y veinte para instantáneas DOM.
+La cancelación y el plazo liberan las entradas pendientes; no se reutilizan IDs.
+Cancelar una escritura parcial cierra el transporte. Los mensajes entrantes se
+limitan a 64 MiB; una trama excesiva de target se descarta hasta el delimitador,
+su sesión CDP se invalida y desconecta, y las demás continúan. Una trama excesiva
+sin identidad o del navegador, JSON inválido o EOF cierra la conexión.
+
+La versión se comprueba con la sonda compartida y acotada del binario instalado
+antes de que Chrome abra un perfil persistente, y con `Browser.getVersion` tras
+arrancar. Las opciones de política se configuran en el TOML dedicado:
+
+```toml
+[web.version]
+# stable_major se puede aportar desde metadatos de versión confiables.
+# installed_release_unix_secs es la publicación conocida, no el mtime del archivo.
+# La consulta pública es optativa; omite la clave para trabajar sin red:
+# stable_metadata_url = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json"
+```
+
+Frente a la versión estable aportada, cero o una mayor por detrás es normal, dos
+emiten aviso y tres o más bloquean instancias persistentes, manteniendo disponibles
+las efímeras. Una publicación conocida de más de 42 días también bloquea las
+persistentes. La antigüedad desconocida se informa como null; no se inventa desde
+la fecha de instalación. Sin metadatos de estable, la vigencia es explícitamente
+desconocida. La consulta pública optativa tiene límites de cinco segundos y 64 KiB,
+no sigue redirecciones y rechaza URLs con credenciales y admite fixtures HTTP locales. La
+política se refresca cada 24 horas y mediante `Instance::refresh_version`; avisos
+y bloqueos son eventos observables. Si falla la consulta, se emite aviso y se
+conserva el último dato aportado, sin afirmar que se haya refrescado. No hay
+actualizador ni descarga automática del binario.
+
+Verifica transporte, política y contrato con el navegador instalado:
+
+```sh
+cargo test -p excalibur-cdp -p excalibur-browser
+cargo test -p excalibur-browser --test cdp_contract -- --nocapture
+```
+
+El contrato corre como usuario dedicado sin privilegios, con perfil nuevo y proxy
+HTTP sintético local. Ejercita cada orden del catálogo contra Chrome instalado,
+incluidas las experimentales; registra errores explícitos de estado ausente para
+operaciones como cancelar una descarga inexistente. Comprueba OOPIF reales, las
+cuatro condiciones del sandbox, oyentes TCP del árbol y ausencia de
+`DevToolsActivePort`, una instantánea DOM real de 70 MiB aislada a una sesión, aviso,
+bloqueo y refresco de versión, un binario copiado sin sandbox utilizable, caídas de
+renderizador/navegador y SIGKILL del padre con dos instancias. Guarda resúmenes
+redactados de método/resultado y evidencia de procesos bajo
+`target/test-evidence/browser/cdp_contract/`. Los helpers de subproceso están
+marcados como ignorados para la invocación directa, pero los ejecutan sus pruebas
+padre. La falta de Chrome o confinamiento hace fallar la suite; solo
+`EXCALIBUR_BROWSER_TESTS=skip` explícito excluye Chrome real y debe constar en el
+informe. No se usan APIs de modelos, cuentas reales ni benchmarks pagados.

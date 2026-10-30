@@ -1,17 +1,49 @@
 use excalibur_webd::{Config, drop_privileges, preflight};
 fn run() -> Result<bool, String> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 2 || args[0] != "--preflight" {
-        return Err("usage: excalibur-webd --preflight <config.toml>".into());
+    if args.len() != 2 || (args[0] != "--preflight" && args[0] != "--check-instance") {
+        return Err("usage: excalibur-webd <--preflight|--check-instance> <config.toml>".into());
     }
     let config = Config::parse(&std::fs::read_to_string(&args[1]).map_err(|e| e.to_string())?)?;
     let identity = drop_privileges(&config.web.os_user)?;
     let report = preflight(&config.web, identity);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
-    );
-    Ok(report.ready)
+    if args[0] == "--preflight" || !report.ready {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+        return Ok(report.ready);
+    }
+    let binary = report.chrome.ok_or("Chrome unavailable")?.binary;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        // Until the network broker is integrated, this diagnostic owns a deny-all proxy.
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
+        let address = match proxy.local_addr().map_err(|e| e.to_string())? { std::net::SocketAddr::V4(v) => v, _ => return Err("IPv4 loopback required".into()) };
+        let deny = tokio::spawn(async move { while let Ok((stream, _)) = proxy.accept().await { drop(stream); } });
+        use std::os::unix::fs::DirBuilderExt;
+        let profile = config.web.data_dir.join(format!("instance-check-{}-{}", std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
+        std::fs::DirBuilder::new().mode(0o700).create(&profile).map_err(|e| e.to_string())?;
+        struct Profile(std::path::PathBuf);
+        impl Drop for Profile { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let profile = Profile(profile);
+        let result = excalibur_browser::Instance::launch(excalibur_browser::LaunchOptions {
+            binary,profile:profile.0.clone(),proxy:address,class:config.web.instance_class,headless:true,listening:false,secret_service:false,extra_args:config.web.chrome_args.clone(),version_policy:config.web.version.clone(),
+        }).await;
+        let result = match result {
+            Ok(instance) => {
+                let processes=instance.verify_sandbox().await.map_err(|e|e.to_string())?;
+                let evidence = serde_json::json!({"ready":true,"version":instance.version,"warnings":instance.warnings,"assessment":instance.assessment(),"processes":processes,"sandbox_verified":true,"network":"deny_all_diagnostic_proxy"});
+                instance.close().await.map_err(|e|e.to_string())?;
+                println!("{}",serde_json::to_string_pretty(&evidence).map_err(|e| e.to_string())?); Ok(true)
+            },
+            Err(error) => Err(error.to_string()),
+        };
+        deny.abort(); result
+    })
 }
 fn main() {
     match run() {

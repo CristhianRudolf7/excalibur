@@ -812,10 +812,26 @@ dependencies = [
 [[package]]
 name = "excalibur-browser"
 version = "0.1.0"
+dependencies = [
+ "excalibur-cdp",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
 
 [[package]]
 name = "excalibur-cdp"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+]
 
 [[package]]
 name = "excalibur-cli"
@@ -1164,10 +1180,12 @@ version = "0.1.0"
 name = "excalibur-webd"
 version = "0.1.0"
 dependencies = [
+ "excalibur-browser",
  "libc",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml",
 ]
 

@@ -38,7 +38,8 @@ fn chrome_probe_requires_executable_success_and_version() {
     ] {
         fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(detect_chrome(Some(&script)).is_ok(), valid);
+        let result = detect_chrome(Some(&script));
+        assert_eq!(result.is_ok(), valid, "{body}: {result:?}");
     }
     fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
     assert!(detect_chrome(Some(&script)).is_err());
@@ -284,4 +285,95 @@ fn chrome_probe_rejects_excessive_output_without_blocking() {
     fs::write(&script, "#!/bin/sh\nexec head -c 65536 /dev/zero\n").unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(detect_chrome(Some(&script)).unwrap_err().contains("4096"));
+}
+
+#[test]
+fn instance_diagnostic_rejects_unsafe_flags_before_opening_profiles() {
+    let directory = tempfile::tempdir().unwrap();
+    for flag in [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--single-process",
+        "--no-zygote",
+        "--disable-web-security",
+        "--disable-site-isolation-trials",
+        "--disable-features=site-per-process",
+        "--remote-allow-origins=*",
+        "--ignore-certificate-errors",
+        "--enable-unsafe-swiftshader",
+        "--remote-debugging-port=9222",
+        "--enable-automation",
+    ] {
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            config.path(),
+            format!(
+                "[web]\ndata_dir='{}'\nrun_dir='{}'\nchrome_args=[{flag:?}]\n",
+                directory.path().display(),
+                directory.path().display()
+            ),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_excalibur-webd"))
+            .arg("--check-instance")
+            .arg(config.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["ready"], false);
+        assert!(
+            report["error"]
+                .as_str()
+                .unwrap()
+                .contains("unapproved Chrome flag")
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn chrome_probe_retries_temporary_executable_busy_within_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("chrome");
+    fs::write(&script, "#!/bin/sh\necho 'Google Chrome 156.0.8078.73'\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let writer = fs::OpenOptions::new().write(true).open(&script).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(writer);
+    });
+    let result = detect_chrome(Some(&script));
+    release.join().unwrap();
+    assert_eq!(result.unwrap().version, "Google Chrome 156.0.8078.73");
+}
+
+#[test]
+fn version_probe_does_not_inherit_host_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    own_by_final_user(dir.path());
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let script = dir.path().join("chrome");
+    fs::write(&script,"#!/bin/sh\nif [ -n \"${EXCALIBUR_SYNTHETIC_ENV_MARKER:-}\" ]; then exit 1; fi\necho 'Google Chrome 156.0.8078.73'\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let config = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        config.path(),
+        format!(
+            "[web]\nos_user='nobody'\ndata_dir='{}'\nrun_dir='{}'\nchrome_binary='{}'\n",
+            dir.path().display(),
+            dir.path().display(),
+            script.display()
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_excalibur-webd"))
+        .arg("--preflight")
+        .arg(config.path())
+        .env("EXCALIBUR_SYNTHETIC_ENV_MARKER", "synthetic-fixture-only")
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output.status.success(), "{report}");
+    assert_eq!(report["chrome"]["version"], "Google Chrome 156.0.8078.73");
 }
