@@ -494,7 +494,7 @@ async fn legacy_pending_provenance_is_scoped_and_neutral_notice_replays_once() {
     let ids = db.write(Priority::Journal, move |c| {
         let hash:String=c.query_row("SELECT hash FROM project_observations WHERE project=?1 AND path='source.rs'",[&project],|r|r.get(0))?;
         let mut ids=Vec::new();
-        for (scope,state) in [(&project,"pending"),(&"another-project".to_owned(),"pending"),(&project,"processed")] {
+        for (scope,state) in [(project.as_str(),"pending"),("another-project","pending"),(project.as_str(),"processed")] {
             c.execute("INSERT INTO project_changes(project,path,previous_hash,current_hash,external,state) VALUES(?1,'source.rs','legacy',?2,0,?3)",excalibur_store::rusqlite::params![scope,hash,state])?;
             ids.push(c.last_insert_rowid());
         }
@@ -532,10 +532,11 @@ async fn legacy_pending_provenance_is_scoped_and_neutral_notice_replays_once() {
             (false, "processed".into())
         ]
     );
-    let observed = seen.0.lock().unwrap();
-    assert_eq!(observed.len(), 1);
-    assert_eq!(observed[0].0.origin, ChangeOrigin::Unattributed);
-    drop(observed);
+    {
+        let observed = seen.0.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].0.origin, ChangeOrigin::Unattributed);
+    }
     let entries = journal.entries(&run, 0, 100).await.unwrap();
     let notices = entries
         .iter()
