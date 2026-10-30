@@ -110,7 +110,9 @@ impl RoleConfig {
         if verifier == executor && other_family {
             advisories.push(RoleAdvisory {
                 role: Role::Verifier,
-                message: "verifier shares the executor family although another family is configured".into(),
+                message:
+                    "verifier shares the executor family although another family is configured"
+                        .into(),
             });
         }
         Ok(advisories)
@@ -312,14 +314,21 @@ pub struct ExpertAdvice {
     pub plan: Vec<String>,
 }
 fn clip(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
+    // Budget serialized JSON bytes, including escape expansion and quotes.
+    if serde_json::to_string(text).is_ok_and(|s| s.len() <= limit) {
         return text.into();
     }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
+    let mut end = text.len().min(limit.saturating_sub(32));
+    loop {
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let candidate = format!("{}[truncated]", &text[..end]);
+        if serde_json::to_string(&candidate).is_ok_and(|s| s.len() <= limit) {
+            return candidate;
+        }
+        end /= 2;
     }
-    format!("{}[truncated {} bytes]", &text[..end], text.len() - end)
 }
 impl ExpertBrief {
     /// Bounded, deterministic projection of the brief.
@@ -332,15 +341,17 @@ impl ExpertBrief {
             .rev()
             .map(|a| clip(a, 1024))
             .collect::<Vec<_>>();
-        let mut budget = MAX_BRIEF_BYTES.saturating_sub(8 * 1024);
+        let mut budget = MAX_BRIEF_BYTES.saturating_sub(12 * 1024);
         let mut fragments = Vec::new();
         for fragment in self.fragments.iter().take(8) {
             if budget < 256 {
                 break;
             }
             let content = clip(&fragment.content, budget.min(4096));
-            budget = budget.saturating_sub(content.len());
-            fragments.push(json!({"label":clip(&fragment.label,128),"content":content}));
+            let label = clip(&fragment.label, 128);
+            let fragment = json!({"label":label,"content":content});
+            budget = budget.saturating_sub(fragment.to_string().len() + 1);
+            fragments.push(fragment);
         }
         json!({
             "goal": clip(&self.goal, 1024),
@@ -348,7 +359,11 @@ impl ExpertBrief {
             "exact_error": clip(&self.exact_error, 2048),
             "attempts": attempts,
             "fragments": fragments,
-            "signals": self.signals,
+            "signals": self.signals.iter().take(4).map(|signal| match signal {
+                EscalationSignal::PersistentTestFailure { test, attempts } => EscalationSignal::PersistentTestFailure { test: clip(test, 128), attempts: *attempts },
+                EscalationSignal::RepeatedGateFailure { criterion, failures } => EscalationSignal::RepeatedGateFailure { criterion: clip(criterion, 128), failures: *failures },
+                other => other.clone(),
+            }).collect::<Vec<_>>(),
         })
     }
     pub fn request(&self) -> ModelRequest {

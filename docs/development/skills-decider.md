@@ -1,0 +1,19 @@
+# Skills and bounded decisions
+
+The shared `excalibur-skills` library validates Agent Skills front matter, reports invalid entries, resolves project/user/installed/builtin precedence, hashes resources and builds BM25 and optional host-provided vector indexes. Installed roots remain quarantined. Embedded skills cover the seven integrated groups; curated groups have definitions but are not shipped as audited content.
+
+`SkillSession` freezes a catalog for a run. The caller supplies its tokenizer; L1 fits the smaller of 2% of the window and 4,000 tokens. Relevant groups receive descriptions when they fit; other groups receive headers. Extremely small budgets may omit headers. Suggestions are lexical over the frozen snapshot, at most three, with per-model negative-outcome filtering. `SkillIndex::search` additionally supports hybrid vector retrieval through a bounded embedding adapter.
+
+Loading returns the frozen body as a tool result after a host callback resolves declared deferred tools. Loading never rewrites the catalog. Changed or unavailable entries cannot be newly loaded from a stale session. Active skills intersect `allowed-tools` with existing authority; callers must apply this intersection when executing tools. Deltas identify changes to loaded skills. `SkillWatcher` uses filesystem events and a 30-minute recovery scan; dropping it aborts its task.
+
+The `excalibur-decider` library provides typed probability answers, bounded fallback, explicit refusal, conservative uncalibrated thresholds and a SQLite labeled ledger. Calibration reports Brier/ECE/MCE and coverage from supplied local labels. Final correctness verdicts have no decision port. The model-role router binds roles and supports isolated expert consultation while keeping an executor binding stable.
+
+These libraries are not yet wired into the daemon's complete context and execution lifecycle. Automatic tool enforcement, skill context projection, all eight production decision ports, durable skill statistics, curated-skill audit/promotion and learning remain integration work. No provider quality or calibrated production accuracy is claimed. Tests use local deterministic doubles and never call paid APIs.
+
+Verification:
+
+```sh
+cargo test -p excalibur-skills --test catalog
+cargo test -p excalibur-decider --test contract
+cargo clippy -p excalibur-skills -p excalibur-decider --all-targets -- -D warnings
+```

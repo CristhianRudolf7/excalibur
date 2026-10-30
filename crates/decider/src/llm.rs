@@ -94,6 +94,18 @@ fn parse(request: &DecisionRequest, content: &str) -> Result<Vec<Answer>> {
             Question::Choice { choices, .. } => choices.iter().map(|c| c.value.clone()).collect(),
             Question::Score { levels, .. } => levels.iter().map(|l| l.label.clone()).collect(),
         };
+        let distribution = raw["distribution"]
+            .as_array()
+            .ok_or_else(|| bad(format!("{name} needs a distribution")))?;
+        let unique = distribution
+            .iter()
+            .filter_map(|p| p["value"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if distribution.len() != values.len() || unique.len() != values.len() {
+            return Err(bad(format!(
+                "{name} needs one probability per offered value"
+            )));
+        }
         let mut entries = Vec::new();
         for value in &values {
             let p = raw["distribution"]
@@ -104,8 +116,11 @@ fn parse(request: &DecisionRequest, content: &str) -> Result<Vec<Answer>> {
             entries.push((value.clone(), p));
         }
         if raw["distribution"].as_array().is_some_and(|d| {
-            d.iter()
-                .any(|e| !e["value"].as_str().is_some_and(|v| values.iter().any(|x| x == v)))
+            d.iter().any(|e| {
+                !e["value"]
+                    .as_str()
+                    .is_some_and(|v| values.iter().any(|x| x == v))
+            })
         }) {
             return Err(bad(format!("{name} contains a value that was not offered")));
         }

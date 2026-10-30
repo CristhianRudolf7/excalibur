@@ -124,7 +124,9 @@ pub fn calibrate(
         let (count, negatives) = sorted
             .iter()
             .filter(|s| s.probability <= t)
-            .fold((0usize, 0usize), |(c, n), s| (c + 1, n + usize::from(!s.outcome)));
+            .fold((0usize, 0usize), |(c, n), s| {
+                (c + 1, n + usize::from(!s.outcome))
+            });
         if count < min_support {
             continue;
         }
@@ -156,8 +158,7 @@ pub fn calibrate(
             (count > 0).then(|| hits as f64 / count as f64),
         )
     };
-    let (act_coverage, act_precision) =
-        region(&|p| tau_high.is_some_and(|h| p >= h), true);
+    let (act_coverage, act_precision) = region(&|p| tau_high.is_some_and(|h| p >= h), true);
     let (alternative_coverage, alternative_precision) =
         region(&|p| tau_low.is_some_and(|l| p <= l), false);
     Ok(CalibrationReport {

@@ -103,7 +103,9 @@ impl DecisionPort {
         {
             return Err(DeciderError::FinalVerdictForbidden);
         }
-        Err(DeciderError::Invalid(format!("unknown decision port {value}")))
+        Err(DeciderError::Invalid(format!(
+            "unknown decision port {value}"
+        )))
     }
 }
 
@@ -255,7 +257,9 @@ impl DecisionRequest {
                     let values = choices.iter().map(|c| &c.value).collect::<BTreeSet<_>>();
                     if !(2..=255).contains(&choices.len())
                         || values.len() != choices.len()
-                        || choices.iter().any(|c| c.value.is_empty() || c.value.len() > 256)
+                        || choices
+                            .iter()
+                            .any(|c| c.value.is_empty() || c.value.len() > 256)
                     {
                         return invalid("choice questions need 2..255 unique nonempty values");
                     }
@@ -264,7 +268,9 @@ impl DecisionRequest {
                     let labels = levels.iter().map(|l| &l.label).collect::<BTreeSet<_>>();
                     if !(2..=10).contains(&levels.len())
                         || labels.len() != levels.len()
-                        || levels.iter().any(|l| l.label.is_empty() || l.label.len() > 256)
+                        || levels
+                            .iter()
+                            .any(|l| l.label.is_empty() || l.label.len() > 256)
                     {
                         return invalid("score questions need 2..10 unique ordered levels");
                     }
@@ -350,11 +356,14 @@ impl Answer {
         }
         let sums = |values: Vec<f64>| {
             values.is_empty()
-                || (values.iter().all(|p| unit(*p)) && (values.iter().sum::<f64>() - 1.0).abs() <= 0.02)
+                || (values.iter().all(|p| unit(*p))
+                    && (values.iter().sum::<f64>() - 1.0).abs() <= 0.02)
         };
         match (self, question) {
             (Self::Refusal { .. }, _) => Ok(()),
-            (Self::Predicate { probability, .. }, Question::Predicate { .. }) if unit(*probability) => {
+            (Self::Predicate { probability, .. }, Question::Predicate { .. })
+                if unit(*probability) =>
+            {
                 Ok(())
             }
             (
@@ -370,7 +379,22 @@ impl Answer {
                 && probabilities
                     .iter()
                     .all(|p| choices.iter().any(|c| c.value == p.value))
-                && sums(probabilities.iter().map(|p| p.probability).collect()) =>
+                && sums(probabilities.iter().map(|p| p.probability).collect())
+                && (probabilities.is_empty()
+                    || (probabilities.len() == choices.len()
+                        && probabilities
+                            .iter()
+                            .map(|p| &p.value)
+                            .collect::<BTreeSet<_>>()
+                            .len()
+                            == choices.len()
+                        && probabilities
+                            .iter()
+                            .find(|p| &p.value == choice)
+                            .is_some_and(|p| (p.probability - confidence).abs() <= 1e-6)
+                        && probabilities
+                            .iter()
+                            .all(|p| p.probability <= confidence + 1e-6))) =>
             {
                 Ok(())
             }
@@ -387,14 +411,39 @@ impl Answer {
                 && *level < levels.len()
                 && score.is_finite()
                 && (0.0..=(levels.len() - 1) as f64 + 1e-9).contains(score)
-                && probabilities.iter().all(|p| {
-                    p.value < levels.len() && levels[p.value].label == p.label
-                })
-                && sums(probabilities.iter().map(|p| p.probability).collect()) =>
+                && probabilities
+                    .iter()
+                    .all(|p| p.value < levels.len() && levels[p.value].label == p.label)
+                && sums(probabilities.iter().map(|p| p.probability).collect())
+                && (probabilities.is_empty()
+                    || (probabilities.len() == levels.len()
+                        && probabilities
+                            .iter()
+                            .map(|p| p.value)
+                            .collect::<BTreeSet<_>>()
+                            .len()
+                            == levels.len()
+                        && probabilities
+                            .iter()
+                            .find(|p| p.value == *level)
+                            .is_some_and(|p| (p.probability - confidence).abs() <= 1e-6)
+                        && probabilities
+                            .iter()
+                            .all(|p| p.probability <= confidence + 1e-6)
+                        && (probabilities
+                            .iter()
+                            .map(|p| p.value as f64 * p.probability)
+                            .sum::<f64>()
+                            - score)
+                            .abs()
+                            <= 1e-6)) =>
             {
                 Ok(())
             }
-            _ => bad(format!("answer for {} has an invalid type or range", question.name())),
+            _ => bad(format!(
+                "answer for {} has an invalid type or range",
+                question.name()
+            )),
         }
     }
 }
@@ -638,7 +687,11 @@ impl DecisionService {
                             port: request.port,
                             question: answer.name().to_string(),
                             kind: answer_kind(&answer).into(),
-                            backend: if decision.fallback_questions.iter().any(|q| q == answer.name()) {
+                            backend: if decision
+                                .fallback_questions
+                                .iter()
+                                .any(|q| q == answer.name())
+                            {
                                 format!("{}:fallback", decision.backend)
                             } else {
                                 decision.backend.clone()
@@ -713,10 +766,14 @@ pub(crate) fn normalized(values: &[(String, f64)]) -> Option<(usize, f64, Vec<f6
         return None;
     }
     let distribution = values.iter().map(|(_, p)| p / total).collect::<Vec<_>>();
-    let (index, confidence) = distribution
-        .iter()
-        .copied()
-        .enumerate()
-        .fold((0, f64::MIN), |best, (i, p)| if p > best.1 { (i, p) } else { best });
+    let (index, confidence) =
+        distribution
+            .iter()
+            .copied()
+            .enumerate()
+            .fold(
+                (0, f64::MIN),
+                |best, (i, p)| if p > best.1 { (i, p) } else { best },
+            );
     Some((index, confidence, distribution))
 }

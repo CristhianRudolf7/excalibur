@@ -3,18 +3,16 @@
 //! The ledger stores only a hash of the decision input, never the input text,
 //! so user content does not leak into calibration data. Labels come from the
 //! harness itself: user corrections, task outcomes or explicit review.
-use crate::{CalibrationReport, DeciderError, DecisionPort, LabeledOutcome, Result, Thresholds, Verdict};
+use crate::{
+    CalibrationReport, DeciderError, DecisionPort, LabeledOutcome, Result, Thresholds, Verdict,
+};
 use excalibur_store::{
     Database, DatabaseKind, Priority, ReadLane, StorageConfig,
     rusqlite::{self, OptionalExtension},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeMap,
-    path::Path,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::{collections::BTreeMap, path::Path};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS decider_schema(version INTEGER PRIMARY KEY,checksum TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS decider_records(id TEXT PRIMARY KEY,port TEXT NOT NULL,question TEXT NOT NULL,kind TEXT NOT NULL,backend TEXT NOT NULL,probability REAL NOT NULL CHECK(probability>=0 AND probability<=1),verdict TEXT NOT NULL,selected TEXT,input_hash TEXT NOT NULL,created_ms INTEGER NOT NULL,label INTEGER CHECK(label IS NULL OR label IN (0,1)),label_source TEXT,labeled_ms INTEGER);
@@ -78,7 +76,6 @@ pub struct LedgerRecord {
 #[derive(Clone)]
 pub struct DecisionLedger {
     db: Database,
-    counter: std::sync::Arc<AtomicU64>,
 }
 impl DecisionLedger {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -111,27 +108,11 @@ impl DecisionLedger {
         })
         .await
         .map_err(ledger_error)?;
-        Ok(Self {
-            db,
-            counter: Default::default(),
-        })
+        Ok(Self { db })
     }
     pub(crate) async fn record(&self, record: NewRecord) -> Result<String> {
-        let sequence = self.counter.fetch_add(1, Ordering::Relaxed);
         let created = now_ms();
-        let id = format!(
-            "dec_{}",
-            &digest(
-                format!(
-                    "{}:{}:{}:{created}:{sequence}:{}",
-                    record.port.as_str(),
-                    record.question,
-                    record.input_hash,
-                    std::process::id()
-                )
-                .as_bytes()
-            )[..32]
-        );
+        let id = format!("dec_{}", excalibur_types::RunId::new().ulid());
         let row = id.clone();
         let verdict = serde_json::to_value(record.verdict)
             .ok()
@@ -275,7 +256,8 @@ impl DecisionLedger {
         let rows: Vec<(String, String, Option<f64>, Option<f64>)> = self
             .db
             .read(ReadLane::Background, |c| {
-                let mut q = c.prepare("SELECT port,question,tau_low,tau_high FROM decider_thresholds")?;
+                let mut q =
+                    c.prepare("SELECT port,question,tau_low,tau_high FROM decider_thresholds")?;
                 let rows = q
                     .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
