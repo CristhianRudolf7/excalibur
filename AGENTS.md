@@ -34,3 +34,5 @@
 
 - Skill/decider library verification: `cargo test -p excalibur-skills --test catalog` and `cargo test -p excalibur-decider --test contract` cover local manifest validation, precedence, catalog freezing, authority intersection, quarantine, labeled decisions and calibration. See [Skills and bounded decisions](docs/development/skills-decider.md) for integration limits.
 - Decider adapter verification: `cargo test -p excalibur-decider --test llm_contract` checks strict LLM response validation, retry/fallback through local mock gateways, per-answer attribution and calibration isolation by backend/model and question semantics.
+
+- Civil calendar verification: `cargo test -p excalibur-scheduler --test calendar` covers IANA gaps/folds, numeric five/six-field cron, leap years, scoped zone-change receipts, concurrent calendar ticks and additive migration of UTC timers. See [Durable timers and civil calendars](docs/development/scheduling.md); daemon dispatch remains pending.
