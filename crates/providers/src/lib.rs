@@ -34,6 +34,51 @@ pub enum KnownFailure {
     Overloaded,
 }
 
+/// Sanitized server retry hint. Only bounded visible-ASCII header values are
+/// kept; interpretation (delta-seconds or HTTP-date) belongs to the caller.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetryHint {
+    /// Raw `Retry-After` value (delta-seconds or HTTP-date).
+    pub retry_after: Option<String>,
+    /// Raw `retry-after-ms` value sent by some providers.
+    pub retry_after_ms: Option<String>,
+}
+impl RetryHint {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Option<Self> {
+        let value = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= 64
+                        && value.bytes().all(|b| (0x20..0x7f).contains(&b))
+                })
+                .map(String::from)
+        };
+        let hint = Self {
+            retry_after: value("retry-after"),
+            retry_after_ms: value("retry-after-ms"),
+        };
+        (hint.retry_after.is_some() || hint.retry_after_ms.is_some()).then_some(hint)
+    }
+}
+/// A provider failure plus the retry hint the server sent with it, if any.
+#[derive(Debug)]
+pub struct FailureDetail {
+    pub error: Error,
+    pub retry_after: Option<RetryHint>,
+}
+impl From<Error> for FailureDetail {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct OpenAiErrorEnvelope {
     error: OpenAiErrorFields,
@@ -477,6 +522,16 @@ impl ProviderClient {
         path: &str,
         body: Option<Value>,
     ) -> Result<reqwest::Response, Error> {
+        self.request_detailed(method, path, body)
+            .await
+            .map_err(|failure| failure.error)
+    }
+    async fn request_detailed(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<reqwest::Response, FailureDetail> {
         let url = if self.provider == Provider::Modal && path.is_empty() {
             self.base.clone()
         } else {
@@ -533,6 +588,7 @@ impl ProviderClient {
             request = request.json(&body);
         }
         let response = request.send().await.map_err(|_| Error::Transport)?;
+        let retry_after = RetryHint::from_headers(response.headers());
         if let (Some(requests), Some(tokens)) = (
             response
                 .headers()
@@ -550,10 +606,12 @@ impl ProviderClient {
             *self.rate_limits.lock().unwrap_or_else(|p| p.into_inner()) = Some((requests, tokens));
         }
         if !response.status().is_success() {
-            if self.provider == Provider::OpenAi {
-                return Err(openai_http_error(response).await);
-            }
-            return Err(Error::Http(response.status()));
+            let error = if self.provider == Provider::OpenAi {
+                openai_http_error(response).await
+            } else {
+                Error::Http(response.status())
+            };
+            return Err(FailureDetail { error, retry_after });
         }
         Ok(response)
     }
@@ -680,7 +738,18 @@ impl ProviderClient {
     }
     /// Send a provider-native request including tool definitions and tool-result history.
     /// The caller owns schema compatibility and replays the complete returned messages.
-    pub async fn native_chat(&self, model: &str, mut body: Value) -> Result<Value, Error> {
+    pub async fn native_chat(&self, model: &str, body: Value) -> Result<Value, Error> {
+        self.native_chat_detailed(model, body)
+            .await
+            .map_err(|failure| failure.error)
+    }
+    /// Same request as [`Self::native_chat`], additionally returning the
+    /// provider's sanitized retry hint on failure. No response body is kept.
+    pub async fn native_chat_detailed(
+        &self,
+        model: &str,
+        mut body: Value,
+    ) -> Result<Value, FailureDetail> {
         let path = self.native_chat_path(model, false)?;
         let object = body
             .as_object_mut()
@@ -689,7 +758,12 @@ impl ProviderClient {
             object.insert("model".into(), json!(model));
             object.insert("stream".into(), json!(false));
         }
-        self.send(Method::POST, &path, Some(body)).await
+        Ok(self
+            .request_detailed(Method::POST, &path, Some(body))
+            .await?
+            .json()
+            .await
+            .map_err(|_| Error::InvalidResponse)?)
     }
     /// Meta Responses supports server-managed or encrypted reasoning replay.
     pub async fn meta_response(&self, mut body: Value) -> Result<Value, Error> {
@@ -720,11 +794,18 @@ impl ProviderClient {
         })
     }
     /// Stream native SSE events; caller handles provider-specific deltas and tool-call assembly.
-    pub async fn stream_native_chat(
+    pub async fn stream_native_chat(&self, model: &str, body: Value) -> Result<SseStream, Error> {
+        self.stream_native_chat_detailed(model, body)
+            .await
+            .map_err(|failure| failure.error)
+    }
+    /// Same connection as [`Self::stream_native_chat`], additionally returning
+    /// the provider's sanitized retry hint when the stream cannot be opened.
+    pub async fn stream_native_chat_detailed(
         &self,
         model: &str,
         mut body: Value,
-    ) -> Result<SseStream, Error> {
+    ) -> Result<SseStream, FailureDetail> {
         let path = self.native_chat_path(model, true)?;
         let object = body
             .as_object_mut()
@@ -733,7 +814,9 @@ impl ProviderClient {
             object.insert("model".into(), json!(model));
             object.insert("stream".into(), json!(true));
         }
-        let response = self.request(Method::POST, &path, Some(body)).await?;
+        let response = self
+            .request_detailed(Method::POST, &path, Some(body))
+            .await?;
         Ok(SseStream {
             response,
             buffer: Vec::new(),

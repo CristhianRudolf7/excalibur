@@ -96,6 +96,8 @@ pub enum FailureClass {
     Unknown,
     AgentTimeout,
     HarnessError,
+    /// The provider's circuit breaker is open; no request was sent.
+    CircuitOpen,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelFailure {

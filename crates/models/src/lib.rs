@@ -4,12 +4,14 @@ mod cache;
 mod metrics;
 mod native;
 mod replay;
+pub mod resilience;
 pub mod routing;
 pub use cache::*;
 use excalibur_providers::ProviderClient;
 use excalibur_types::runtime::{BoxFuture, Message, ModelRequest, ModelResponse, ToolCall, Usage};
 pub use metrics::*;
 pub use replay::*;
+pub use resilience::{FailoverGateway, ProviderResilience, ResiliencePolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -246,8 +248,87 @@ pub struct OpenAiGateway {
     client: ProviderClient,
     config: GatewayConfig,
     pricing: Option<Arc<PriceTable>>,
+    resilience: Option<Arc<ProviderResilience>>,
+}
+/// A provider attempt that failed and was retried with the identical request.
+struct RetriedAttempt {
+    failure: ModelFailure,
+    duration_ms: u64,
 }
 impl OpenAiGateway {
+    /// Opt into shared retry/backoff and circuit-breaker state, normally
+    /// [`ProviderResilience::process`]. The request body, identity and wire
+    /// format are unchanged; only failed provider attempts are affected.
+    pub fn with_resilience(mut self, resilience: Arc<ProviderResilience>) -> Self {
+        self.resilience = Some(resilience);
+        self
+    }
+    pub fn resilience(&self) -> Option<&Arc<ProviderResilience>> {
+        self.resilience.as_ref()
+    }
+    async fn resilient<T, F, Fut>(
+        &self,
+        mut call: F,
+        retried: &mut Vec<RetriedAttempt>,
+    ) -> Result<T, ModelError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, excalibur_providers::FailureDetail>>,
+    {
+        let Some(resilience) = &self.resilience else {
+            return call().await.map_err(|detail| provider_error(detail.error));
+        };
+        let key = resilience.key(&format!("{:?}", self.client.provider()), &self.config.model);
+        let mut retry = 0_u32;
+        let mut last: Option<ModelError> = None;
+        loop {
+            let permit = match resilience.admit(&key) {
+                Ok(permit) => permit,
+                // CircuitOpen means nothing was sent by this loop. If an
+                // earlier attempt was sent, report that real failure instead.
+                Err(rejected) => return Err(last.unwrap_or(ModelError::ProviderFailure(rejected))),
+            };
+            let started = resilience.clock().monotonic();
+            match call().await {
+                Ok(value) => {
+                    permit.record(crate::resilience::Outcome::Success);
+                    return Ok(value);
+                }
+                Err(detail) => {
+                    let error = provider_error(detail.error);
+                    let failure = error.classification();
+                    permit.record(if crate::resilience::is_availability_failure(&failure) {
+                        crate::resilience::Outcome::Failure
+                    } else {
+                        crate::resilience::Outcome::Neutral
+                    });
+                    // Once this failure opened the breaker, waiting out a
+                    // backoff would only delay failover.
+                    if resilience.is_open(&key) {
+                        return Err(error);
+                    }
+                    let Some(delay) =
+                        resilience.retry_delay(&key, retry, &failure, detail.retry_after.as_ref())
+                    else {
+                        return Err(error);
+                    };
+                    last = Some(error);
+                    retried.push(RetriedAttempt {
+                        failure,
+                        duration_ms: resilience
+                            .clock()
+                            .monotonic()
+                            .saturating_sub(started)
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                    });
+                    resilience.clock().sleep(delay).await;
+                    retry += 1;
+                }
+            }
+        }
+    }
     pub fn new(client: ProviderClient, config: GatewayConfig) -> Result<Self, ModelError> {
         if config.model.trim().is_empty() || config.max_output_tokens == 0 {
             return Err(ModelError::Configuration(
@@ -270,6 +351,7 @@ impl OpenAiGateway {
             client,
             config,
             pricing: None,
+            resilience: None,
         })
     }
     /// The trusted host supplies the versioned tariff; no prices are downloaded.
@@ -442,6 +524,7 @@ impl OpenAiGateway {
         let mut total = Usage::default();
         metrics.usage = UsageBreakdown::zero();
         metrics.cost_microusd = self.pricing.as_ref().map(|_| 0);
+        let mut last_validation: Option<String> = None;
         for attempt in 0..=1_u8 {
             let attempt_started = std::time::Instant::now();
             let mut counted_wire = body.clone();
@@ -459,17 +542,86 @@ impl OpenAiGateway {
             }
             let input_bytes = counted_wire.to_string().len() as u64;
             metrics.provider_calls += 1;
+            let mut retried = Vec::new();
             let raw = if let Some(sink) = &sink {
-                self.stream_once(body.clone(), sink, attempt).await
-            } else {
-                self.client
-                    .native_chat(&self.config.model, body.clone())
+                self.stream_once(body.clone(), sink, attempt, &mut retried)
                     .await
-                    .map_err(provider_error)
-                    .and_then(|raw| native::response(self.client.provider(), raw))
+            } else {
+                self.resilient(
+                    || {
+                        self.client
+                            .native_chat_detailed(&self.config.model, body.clone())
+                    },
+                    &mut retried,
+                )
+                .await
+                .and_then(|raw| native::response(self.client.provider(), raw))
             };
+            // Each retried attempt resent the identical body and received no
+            // usable response. As for a final failure, its usage is unknown:
+            // it is charged with the same conservative input estimate, priced
+            // when a tariff exists, and the call's usage becomes unknown.
+            for retry in retried {
+                metrics.provider_calls += 1;
+                let unreported = UsageBreakdown {
+                    input_tokens: input_bytes.saturating_add(100),
+                    estimated: true,
+                    ..UsageBreakdown::zero()
+                };
+                // The tariff refuses estimated usage, so price the estimate as
+                // if reported: all estimated input at the ordinary input rate.
+                let priced_as = UsageBreakdown {
+                    estimated: false,
+                    ..unreported.clone()
+                };
+                let price = self.pricing.as_ref().and_then(|table| {
+                    table
+                        .price(
+                            &format!("{:?}", self.client.provider()),
+                            &self.config.model,
+                            &priced_as,
+                        )
+                        .ok()
+                        .flatten()
+                });
+                metrics.usage.add(&unreported);
+                metrics.usage_known = false;
+                metrics.cost_microusd = metrics
+                    .cost_microusd
+                    .zip(price)
+                    .map(|(a, b)| a.saturating_add(b));
+                total.input_tokens = total.input_tokens.saturating_add(unreported.input_tokens);
+                total.estimated = true;
+                total.cost_microusd = total.cost_microusd.saturating_add(price.unwrap_or(0));
+                metrics.attempts.push(ModelAttemptMetrics {
+                    index: attempt,
+                    duration_ms: retry.duration_ms,
+                    usage: unreported,
+                    cost_microusd: price,
+                    error: Some(retry.failure),
+                });
+            }
             let raw = match raw {
                 Ok(raw) => raw,
+                Err(error) if error.classification().class == FailureClass::CircuitOpen => {
+                    // The open breaker rejected this attempt before anything
+                    // was sent for it; earlier attempts keep their accounting.
+                    metrics.provider_calls -= 1;
+                    metrics.duration_ms = elapsed_ms(started);
+                    metrics.attempts.push(ModelAttemptMetrics {
+                        index: attempt,
+                        duration_ms: elapsed_ms(attempt_started),
+                        usage: UsageBreakdown::zero(),
+                        cost_microusd: Some(0),
+                        error: Some(error.classification()),
+                    });
+                    // CircuitOpen is reserved for calls that sent nothing.
+                    let error = match last_validation.take() {
+                        Some(reason) => ModelError::Validation(reason),
+                        None => error,
+                    };
+                    return Err(ModelCallError { error, metrics });
+                }
                 Err(error) => {
                     metrics.duration_ms = elapsed_ms(started);
                     metrics.cost_microusd = None;
@@ -568,6 +720,7 @@ impl OpenAiGateway {
                     });
                 }
                 Err(ModelError::Validation(reason)) if attempt == 0 => {
+                    last_validation = Some(reason.clone());
                     if let Some(sink) = &sink
                         && let Err(error) = emit(
                             sink,
@@ -666,7 +819,10 @@ impl OpenAiGateway {
         mut body: Value,
         sink: &StreamSink,
         attempt: u8,
+        retried: &mut Vec<RetriedAttempt>,
     ) -> Result<Value, ModelError> {
+        // Only opening the stream is retried: once a delta reached the sink
+        // a failure is reported, never silently restarted.
         if matches!(
             self.client.provider(),
             excalibur_providers::Provider::Anthropic
@@ -674,18 +830,26 @@ impl OpenAiGateway {
                 | excalibur_providers::Provider::Vertex
         ) {
             let stream = self
-                .client
-                .stream_native_chat(&self.config.model, body)
-                .await
-                .map_err(provider_error)?;
+                .resilient(
+                    || {
+                        self.client
+                            .stream_native_chat_detailed(&self.config.model, body.clone())
+                    },
+                    retried,
+                )
+                .await?;
             return native::stream(self.client.provider(), stream, sink, attempt).await;
         }
         body["stream_options"] = json!({"include_usage":true});
         let mut stream = self
-            .client
-            .stream_native_chat(&self.config.model, body)
-            .await
-            .map_err(provider_error)?;
+            .resilient(
+                || {
+                    self.client
+                        .stream_native_chat_detailed(&self.config.model, body.clone())
+                },
+                retried,
+            )
+            .await?;
         let mut content = String::new();
         let mut calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
         let mut finish = None;
@@ -811,8 +975,20 @@ impl ModelGateway for OpenAiGateway {
             .saturating_add(self.config.model.len() as u64)
             .saturating_add(1024);
         let output = u64::from(self.config.max_output_tokens);
+        // Each of the two validation attempts may also resend the request up
+        // to max_retries times; every resend is charged its input estimate.
+        let resent = self
+            .resilience
+            .as_ref()
+            .map(|r| u64::from(r.policy().retry.max_retries))
+            .unwrap_or(0)
+            .saturating_mul(2)
+            .saturating_mul(input);
         Some(ModelCallBound {
-            max_tokens: input.saturating_add(output).saturating_mul(2),
+            max_tokens: input
+                .saturating_add(output)
+                .saturating_mul(2)
+                .saturating_add(resent),
             // A token-only bound is useful before an unpriced call. This zero
             // is not an invoice value: cost_is_known remains false and observed
             // cost remains None; cost budgets cannot use an unpriced gateway.
@@ -824,7 +1000,10 @@ impl ModelGateway for OpenAiGateway {
                         .upper_bound(
                             &format!("{:?}", self.client.provider()),
                             &self.config.model,
-                            input.saturating_mul(3).saturating_add(output),
+                            input
+                                .saturating_mul(3)
+                                .saturating_add(output)
+                                .saturating_add(resent),
                             output.saturating_mul(2),
                         )
                         .unwrap_or(u64::MAX)

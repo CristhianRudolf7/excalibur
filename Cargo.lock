@@ -1198,6 +1198,7 @@ dependencies = [
  "excalibur-providers",
  "excalibur-store",
  "excalibur-types",
+ "httpdate",
  "jsonschema",
  "serde",
  "serde_json",
