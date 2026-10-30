@@ -137,7 +137,6 @@ fn host_notices_use_original_authority_without_worker_and_replay_across_reopen()
         binding
     });
     rt.block_on(host.close()).unwrap();
-    drop(host);
     drop(db);
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "host_notification_crash_helper"])
