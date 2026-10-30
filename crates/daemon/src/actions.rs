@@ -844,7 +844,26 @@ impl FastActions for DaemonActions {
                             "pause" => Control::Pause,
                             "resume" => Control::Resume,
                             "interrupt" => Control::Interrupt,
-                            "cancel" => Control::Cancel { confirmed: false },
+                            "cancel" => {
+                                if args["confirmed"] == true {
+                                    return Err(
+                                        "model arguments cannot confirm cancellation".into()
+                                    );
+                                }
+                                let agent = self
+                                    .orchestrator
+                                    .agent(&targets[0])
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                if agent.scope != scope {
+                                    return Err(
+                                        "cancellation target exceeds conversation authority".into(),
+                                    );
+                                }
+                                return Ok(
+                                    json!({"confirmation_required":true,"target":agent.id,"scope":agent.scope,"action":"cancel"}),
+                                );
+                            }
                             "redirect" => Control::Redirect {
                                 text: args["text"]
                                     .as_str()

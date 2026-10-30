@@ -179,7 +179,7 @@ impl Master {
                     if normal {return Ok(QuestionRoute::Continue);}unmatched=true;
                 }
             } else if analysis.command.is_none() {
-                let mut query=conn.prepare("SELECT q.id,q.scope_id,q.blocking FROM master_questions q WHERE q.conversation_id=?1 AND q.scope_id=?2 AND q.answer IS NULL AND EXISTS(SELECT 1 FROM master_events e WHERE e.conversation_id=q.conversation_id AND e.kind='question' AND json_extract(e.payload,'$.id')=q.id AND e.sequence<?3) ORDER BY q.created_at,q.id")?;
+                let mut query=conn.prepare("SELECT q.id,q.scope_id,q.blocking FROM master_questions q WHERE q.conversation_id=?1 AND q.scope_id=?2 AND q.answer IS NULL AND NOT EXISTS(SELECT 1 FROM master_cancel_confirmations x WHERE x.question_id=q.id) AND EXISTS(SELECT 1 FROM master_events e WHERE e.conversation_id=q.conversation_id AND e.kind='question' AND json_extract(e.payload,'$.id')=q.id AND e.sequence<?3) ORDER BY q.created_at,q.id")?;
                 candidates=query.query_map((&conversation,&scope,cursor),|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,bool>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
                 if !candidates.iter().any(|candidate|candidate.2) {return Ok(QuestionRoute::Continue);}
             } else {return Ok(QuestionRoute::Continue);}

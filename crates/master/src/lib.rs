@@ -562,10 +562,6 @@ impl Master {
                     None,
                 )
                 .await?;
-            if command.name == "cancel" && result["confirmation_required"] == true {
-                self.create_cancel_question(conversation, source, &result)
-                    .await?;
-            }
             self.respond(
                 conversation,
                 &templates::control(&command.name, &result),
@@ -1433,6 +1429,19 @@ conn.execute("UPDATE master_inbox SET state='done' WHERE message_id=?1 AND state
         {
             return Err(Error::Invalid("unsafe master action metadata".into()));
         }
+        // Cancellation request resolution has no control effect. It can safely
+        // be retried after an intent-only interruption; confirmation is separate.
+        let cancel_request =
+            name == "command:cancel" || (name == "subagent" && args["action"] == "cancel");
+        let source = if name == "command:cancel" {
+            key.strip_prefix("message:")
+        } else if cancel_request {
+            key.strip_prefix(&format!("master:{conversation}:"))
+                .and_then(|rest| rest.split_once(':'))
+                .map(|(source, _)| source)
+        } else {
+            None
+        };
         let conversation_owned = conversation.to_string();
         let name_owned = name.to_string();
         let arguments = self.inner.redactor.redact_json(&args).to_string();
@@ -1440,6 +1449,7 @@ conn.execute("UPDATE master_inbox SET state='done' WHERE message_id=?1 AND state
         let previous=self.inner.db.write(Priority::Interactive,move|conn| {
             if let Some((name,args,state,result))=conn.query_row("SELECT tool_name,arguments,state,result FROM master_action_receipts WHERE operation_key=?1",[&key_owned],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?))).optional()? {
                 if name!=name_owned || args!=arguments {return Err(excalibur_store::Error::Invalid("master action key reused"));}
+                if cancel_request && state=="intent" {return Ok(None);}
                 return Ok(Some(if state=="done" {serde_json::from_str(&result.unwrap_or_default()).unwrap_or(Value::Null)} else {json!({"error":"uncertain interrupted master action; inspect its durable operation key before resolving","operation_key":key_owned})}));
             }
             if name_owned.starts_with("command:") && let Some(source)=key_owned.strip_prefix("message:") {
@@ -1449,6 +1459,14 @@ conn.execute("UPDATE master_inbox SET state='done' WHERE message_id=?1 AND state
             conn.execute("INSERT INTO master_action_receipts(operation_key,conversation_id,tool_name,arguments,state) VALUES(?1,?2,?3,?4,'intent')",(&key_owned,&conversation_owned,&name_owned,&arguments))?;Ok(None)
         }).await?;
         if let Some(previous) = previous {
+            if cancel_request && previous["confirmation_required"] == true {
+                self.create_cancel_question(
+                    conversation,
+                    source.ok_or_else(|| Error::Invalid("cancellation needs a source".into()))?,
+                    &previous,
+                )
+                .await?;
+            }
             return Ok(self.inner.redactor.redact_json(&previous));
         }
         let action = async {
@@ -1499,6 +1517,14 @@ conn.execute("UPDATE master_inbox SET state='done' WHERE message_id=?1 AND state
         let mut result = self.inner.redactor.redact_json(&result);
         if result.to_string().len() > 64 * 1024 {
             result = json!({"error":"fast action output exceeded the bounded master result limit"});
+        }
+        if cancel_request && result["confirmation_required"] == true {
+            self.create_cancel_question(
+                conversation,
+                source.ok_or_else(|| Error::Invalid("cancellation needs a source".into()))?,
+                &result,
+            )
+            .await?;
         }
         let encoded = result.to_string();
         let key = key.to_string();

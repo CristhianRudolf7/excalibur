@@ -35,6 +35,9 @@ impl FastActions for Actions {
         _: &'a str,
     ) -> BoxFuture<'a, std::result::Result<Value, String>> {
         Box::pin(async move {
+            if std::env::var_os("EXCALIBUR_CANCEL_INTENT_CUT").is_some() {
+                std::process::exit(77);
+            }
             Ok(
                 json!({"confirmation_required":true,"target":target.unwrap_or("worker"),"scope":"general"}),
             )
@@ -103,12 +106,43 @@ async fn accepted_outbox_reopens_with_same_effect_key_and_completion_once() {
         .await
         .unwrap();
     let id = master.questions("origin").await.unwrap()[0].id.clone();
+    let key = format!("cancel-confirmation:{id}");
+    assert!(
+        !master
+            .authorizes_cancel("origin", "general", "worker", &key)
+            .await
+            .unwrap()
+    );
     master
         .receive(incoming("yes", "yes", Some(&id)))
         .await
         .unwrap();
     assert_eq!(actions.effects.lock().unwrap().len(), 1);
     assert_eq!(actions.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        master
+            .authorizes_cancel("origin", "general", "worker", &key)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !master
+            .authorizes_cancel("origin", "project:other", "worker", &key)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !master
+            .authorizes_cancel("origin", "general", "other", &key)
+            .await
+            .unwrap()
+    );
+    assert!(
+        master
+            .authorizes_cancel("other-conversation", "general", "worker", &key)
+            .await
+            .is_err()
+    );
     assert_eq!(
         master
             .events(0, 100)
@@ -232,5 +266,82 @@ async fn ambiguity_scope_mismatch_and_generated_answers_do_not_authorize() {
         .await
         .unwrap();
     assert_eq!(n, 1);
+    master.shutdown().await;
+}
+
+#[tokio::test]
+async fn independent_text_remains_available_while_cancellation_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(
+        dir.path().join("main.db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let actions = Arc::new(Actions::default());
+    let master = open(db.clone(), actions.clone(), "owner").await;
+    master
+        .receive(incoming("command", "/cancel worker", None))
+        .await
+        .unwrap();
+    let receipt = master
+        .receive(incoming("independent", "Review file Y independently", None))
+        .await
+        .unwrap();
+    let id = receipt.message_id;
+    let state: String = db
+        .read(ReadLane::Interactive, move |c| {
+            Ok(c.query_row(
+                "SELECT state FROM master_inbox WHERE message_id=?1",
+                [id],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_ne!(state, "consumed");
+    assert!(
+        master.questions("origin").await.unwrap()[0]
+            .answer
+            .is_none()
+    );
+    assert_eq!(actions.calls.load(Ordering::SeqCst), 0);
+    master.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "subprocess fixture"]
+async fn intent_interruption_child() {
+    let path = std::env::var("EXCALIBUR_CANCEL_INTENT_DB").unwrap();
+    let db = Database::open(path, DatabaseKind::Main, Default::default()).unwrap();
+    let master = open(db, Arc::new(Actions::default()), "owner").await;
+    master
+        .receive(incoming("command", "/cancel worker", None))
+        .await
+        .unwrap();
+    panic!("expected process interruption before request resolution returned");
+}
+
+#[tokio::test]
+async fn interrupted_pure_cancel_resolution_reopens_its_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.db");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "intent_interruption_child"])
+        .env("EXCALIBUR_CANCEL_INTENT_DB", &path)
+        .env("EXCALIBUR_CANCEL_INTENT_CUT", "1")
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(77));
+    let db = Database::open(path, DatabaseKind::Main, Default::default()).unwrap();
+    let actions = Arc::new(Actions::default());
+    let master = open(db, actions.clone(), "owner").await;
+    master.retry_pending().await.unwrap();
+    assert_eq!(master.questions("origin").await.unwrap().len(), 1);
+    master
+        .receive(incoming("affirm", "yes", None))
+        .await
+        .unwrap();
+    assert_eq!(actions.effects.lock().unwrap().len(), 1);
     master.shutdown().await;
 }
