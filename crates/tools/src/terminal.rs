@@ -1090,7 +1090,7 @@ impl TerminalManager {
                             Err(e) => {
                                 let mut output = observed.output.lock().unwrap();
                                 if output.termination_reason.is_none() {
-                                    self.output.lock().unwrap().error = Some(e.to_string());
+                                    output.error = Some(e.to_string());
                                 }
                                 break None;
                             }
