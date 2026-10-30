@@ -196,42 +196,125 @@ async fn call(
     }
     Ok(v["result"]["value"].clone())
 }
+const COMMIT_LEXICON: &[&str] = &[
+    "enviar",
+    "send",
+    "submit",
+    "publicar",
+    "post",
+    "comprar",
+    "buy",
+    "pagar",
+    "pay",
+    "confirmar",
+    "confirm",
+    "eliminar",
+    "delete",
+    "borrar",
+    "transferir",
+    "transfer",
+    "firmar",
+    "sign",
+    "reservar",
+    "book",
+    "suscribir",
+    "subscribe",
+    "aceptar",
+    "accept",
+];
+
+fn has_commit_lexicon(name_lower: &str) -> bool {
+    COMMIT_LEXICON.iter().any(|w| {
+        name_lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|s| s == *w)
+    })
+}
+
+/// Host of a site URL or bare host, lower-cased without port or userinfo.
+fn site_host(site: &str) -> String {
+    let without_scheme = site.trim().rsplit("://").next().unwrap_or(site);
+    let authority = without_scheme.split('/').next().unwrap_or("");
+    let hostport = authority.split('@').next_back().unwrap_or(authority);
+    hostport
+        .split(':')
+        .next()
+        .unwrap_or(hostport)
+        .to_ascii_lowercase()
+}
+
+fn is_whatsapp_site(site: &str) -> bool {
+    let host = site_host(site);
+    host == "web.whatsapp.com" || host.ends_with(".web.whatsapp.com")
+}
+
+/// Site-scoped action-class refinement consulted by [`classify`] (arch 8.3:
+/// "cada sitio puede afinar en su configuracion").
+///
+/// The table is intentionally narrow: WhatsApp refines the Enter composer to
+/// `commit` and non-form chat-surface clicks without commit lexicon to
+/// `navigate_link`. Every other site keeps the conservative default
+/// (unknown click in a persistent profile stays `commit`). Form controls and
+/// lexicon hits never downgrade: they return `None` so the base table keeps
+/// them as `commit`.
+fn site_override_class(site: &str, r: &ActionRequest, m: &Value) -> Option<&'static str> {
+    if !is_whatsapp_site(site) {
+        return None;
+    }
+    if r.action == "press"
+        && r.keys
+            .as_deref()
+            .unwrap_or("")
+            .split('+')
+            .any(|k| k == "Enter")
+    {
+        return Some("commit");
+    }
+    if r.action == "click" {
+        let tag = m["tag"].as_str().unwrap_or("");
+        if matches!(tag, "button" | "input") {
+            return None;
+        }
+        if m["form"] == true {
+            return None;
+        }
+        let name = m["name"].as_str().unwrap_or("").to_lowercase();
+        if has_commit_lexicon(&name) {
+            return None;
+        }
+        return Some("navigate_link");
+    }
+    None
+}
+
 fn classify(
     r: &ActionRequest,
     m: &Value,
     persistent: bool,
     listen: bool,
+    site: &str,
 ) -> (&'static str, &'static str, &'static str) {
+    if let Some(overridden) = site_override_class(site, r, m) {
+        let effect = match overridden {
+            "observe" => "pure",
+            "input" => "idempotent",
+            _ => "non_idempotent",
+        };
+        let risk = if overridden == "observe" {
+            "low"
+        } else if matches!(overridden, "upload" | "credential")
+            || (persistent && matches!(overridden, "commit" | "drag"))
+        {
+            "high"
+        } else if persistent || matches!(overridden, "commit" | "drag") {
+            "medium"
+        } else {
+            "low"
+        };
+        return (overridden, effect, risk);
+    }
     let name = m["name"].as_str().unwrap_or("").to_lowercase();
-    let words = [
-        "enviar",
-        "send",
-        "submit",
-        "publicar",
-        "post",
-        "comprar",
-        "buy",
-        "pagar",
-        "pay",
-        "confirmar",
-        "confirm",
-        "eliminar",
-        "delete",
-        "borrar",
-        "transferir",
-        "transfer",
-        "firmar",
-        "sign",
-        "reservar",
-        "book",
-        "suscribir",
-        "subscribe",
-        "aceptar",
-        "accept",
-    ];
-    let commit = words
-        .iter()
-        .any(|w| name.split(|c: char| !c.is_alphanumeric()).any(|s| s == *w))
+    let commit = has_commit_lexicon(&name)
         || (r.action == "click"
             && m["form"] == true
             && matches!(m["tag"].as_str(), Some("button" | "input")))
@@ -381,6 +464,7 @@ impl Manager {
             &metadata,
             ctx.session.profile != "ephemeral",
             ctx.session.listen,
+            &ctx.tab.url,
         );
         let plan_id = uuid::Uuid::new_v4().to_string();
         let expires = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -479,6 +563,7 @@ impl Manager {
             &meta,
             ctx.session.profile != "ephemeral",
             ctx.session.listen,
+            &ctx.tab.url,
         );
         if class != plan.class {
             return Err(Fault::new("authorization_changed", "action class changed"));
@@ -1228,59 +1313,133 @@ mod tests {
         let lexicon = json!({"tag":"div","name":"Confirmar pedido"});
         let unknown = json!({"tag":"div","name":"?"});
         assert_eq!(
-            classify(&request("hover"), &json!({}), true, false),
+            classify(&request("hover"), &json!({}), true, false, ""),
             ("observe", "pure", "low")
         );
         assert_eq!(
-            classify(&request("type"), &json!({}), false, false),
+            classify(&request("type"), &json!({}), false, false, ""),
             ("input", "idempotent", "low")
         );
         assert_eq!(
-            classify(&request("select"), &json!({}), true, false),
+            classify(&request("select"), &json!({}), true, false, ""),
             ("input", "idempotent", "medium")
         );
         assert_eq!(
-            classify(&request("click"), &link, false, false),
+            classify(&request("click"), &link, false, false, ""),
             ("navigate_link", "non_idempotent", "low")
         );
         assert_eq!(
-            classify(&request("click"), &link, true, false),
+            classify(&request("click"), &link, true, false, ""),
             ("navigate_link", "non_idempotent", "medium")
         );
         assert_eq!(
-            classify(&request("click"), &submit, false, false).0,
+            classify(&request("click"), &submit, false, false, "").0,
             "commit"
         );
         assert_eq!(
-            classify(&request("click"), &lexicon, true, false),
+            classify(&request("click"), &lexicon, true, false, ""),
             ("commit", "non_idempotent", "high")
         );
         assert_eq!(
-            classify(&request("click"), &unknown, true, false).0,
+            classify(&request("click"), &unknown, true, false, "").0,
             "commit"
         );
         assert_eq!(
-            classify(&request("click"), &unknown, false, false).0,
+            classify(&request("click"), &unknown, false, false, "").0,
             "navigate_link"
         );
         assert_eq!(
-            classify(&request("upload"), &json!({}), false, false).2,
+            classify(&request("upload"), &json!({}), false, false, "").2,
             "high"
         );
         assert_eq!(
-            classify(&request("drag"), &json!({}), false, false),
+            classify(&request("drag"), &json!({}), false, false, ""),
             ("drag", "non_idempotent", "medium")
         );
         let mut enter = request("press");
         enter.keys = Some("Enter".into());
-        assert_eq!(classify(&enter, &json!({}), true, true).0, "commit");
+        assert_eq!(classify(&enter, &json!({}), true, true, "").0, "commit");
         let mut accept = request("dialog");
         accept.options.accept = Some(true);
-        assert_eq!(classify(&accept, &json!({}), true, false).0, "commit");
+        assert_eq!(classify(&accept, &json!({}), true, false, "").0, "commit");
         assert_eq!(
-            classify(&accept, &json!({}), false, false).1,
+            classify(&accept, &json!({}), false, false, "").1,
             "non_idempotent"
         );
+    }
+    #[test]
+    fn per_site_overrides_refine_whatsapp_without_relaxing_default() {
+        let chat = json!({"tag":"div","name":"Chat with Ana"});
+        let composer = json!({"tag":"div","name":"Type a message"});
+        // Generic site keeps the conservative unknown->commit default.
+        assert_eq!(
+            classify(&request("click"), &chat, true, false, "https://example.com").0,
+            "commit"
+        );
+        // WhatsApp chat-surface click refines to navigation.
+        assert_eq!(
+            classify(
+                &request("click"),
+                &chat,
+                true,
+                false,
+                "https://web.whatsapp.com"
+            )
+            .0,
+            "navigate_link"
+        );
+        assert_eq!(
+            classify(
+                &request("click"),
+                &chat,
+                true,
+                false,
+                "https://web.whatsapp.com/chat"
+            )
+            .0,
+            "navigate_link"
+        );
+        // WhatsApp composer Enter stays commit even without form or listen.
+        let mut enter = request("press");
+        enter.keys = Some("Enter".into());
+        assert_eq!(
+            classify(&enter, &composer, true, false, "https://web.whatsapp.com").0,
+            "commit"
+        );
+        // Form controls and lexicon hits never downgrade on WhatsApp.
+        let submit = json!({"tag":"button","form":true,"name":"Save"});
+        assert_eq!(
+            classify(
+                &request("click"),
+                &submit,
+                true,
+                false,
+                "https://web.whatsapp.com"
+            )
+            .0,
+            "commit"
+        );
+        let lexicon = json!({"tag":"div","name":"Enviar"});
+        assert_eq!(
+            classify(
+                &request("click"),
+                &lexicon,
+                true,
+                false,
+                "https://web.whatsapp.com"
+            )
+            .0,
+            "commit"
+        );
+    }
+    #[test]
+    fn site_hosts_parse_bare_hosts_and_urls() {
+        assert_eq!(site_host("web.whatsapp.com"), "web.whatsapp.com");
+        assert_eq!(
+            site_host("https://web.whatsapp.com:443/chat"),
+            "web.whatsapp.com"
+        );
+        assert_eq!(site_host("https://example.com/a"), "example.com");
     }
     #[test]
     fn requests_and_keys_are_bounded() {

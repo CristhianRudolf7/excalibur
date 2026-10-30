@@ -582,7 +582,11 @@ confirmar, confirm, eliminar, delete, borrar, transferir, transfer, firmar, sign
 reservar, book, suscribir, subscribe, aceptar, accept). In persistent profiles an
 unclassified click is `commit`. Risk is low/medium in ephemeral sessions and
 medium/high in persistent ones; uploads and credentials are always high. Per-site
-class overrides are not implemented.
+class overrides are a site-scoped table consulted by `classify` (arch 8.3):
+WhatsApp refines composer Enter to `commit` and non-form chat-surface clicks
+without commit lexicon to `navigate_link`; form controls and lexicon hits never
+downgrade. Every other site keeps the conservative unknown-to-`commit` default
+in persistent profiles.
 
 An `alert` opened during an action is accepted and its redacted message is
 returned in `alerts`. `beforeunload` is accepted only for agent navigation or a
@@ -869,16 +873,26 @@ cargo test -p excalibur-webd --test resources_gates -- --nocapture
 cargo test -p excalibur-webd --test resources_measure -- --nocapture
 ```
 
-`resources_gates` verifies the 13.6 rows over synthetic fixtures only;
-`resources_measure` runs the 18.3 procedure shape (blank instance, static
-local page, ten heavy ephemeral tabs, level A/B/C with PSS by type, 3
-repetitions with median/min/max) with the report in
+`resources_gates` verifies only the decision-layer subset of the 13.6 rows
+over synthetic fixtures only (budget constants, moving-average admission,
+eviction order 1-7 with LIVE protection, disk gates,
+`listener_cannot_suspend`, telemetry peaks); the full 13.6 closure stays OPEN
+for the main lane. `resources_measure` runs the 18.3 procedure shape (blank
+instance, static local page, ten heavy ephemeral tabs, level A/B/C with PSS
+by type, 3 repetitions with median/min/max) with the report in
 `target/test-evidence/browser/resources/measure.json`. Logged-in
 WhatsApp/Teams figures (18.4, 1 h/24 h) stay pending-user and are never
-claimed. Pending: cgroup scope management, real Chrome supervision, broker
-pressure signals, CDP GC/pressure/cache calls, profile walks with
-`Storage.getUsageAndQuota` and VPS measurement runs. See [Browser resource
-foundation](browser-resources.md).
+claimed. Pending for full 13.6: real cgroup with `memory.high`, heavy-tab
+fill with LIVE continuity, real wait to `capacity_exceeded`, suspend via the
+session lane, LIVE over 1 GiB with `logged_in`, small-filesystem gate and
+sampling-cost microbench (never claimed). `serve` retains the `ResourceGate`,
+enforces the configured disk reserve on the data and run directories at
+startup with startup/shutdown telemetry, and documents per-operation memory
+admission as pending main-lane work (serve does not mediate tab creation).
+The wait path reports `capacity_exceeded` only after the 120 s eviction wait
+expires; `listener_cannot_suspend` is enforced in `sessions::Manager`, with
+the eviction and webd helpers only computing the decision. See [Browser
+resource foundation](browser-resources.md).
 
 ## Harness integration
 

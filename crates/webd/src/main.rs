@@ -78,20 +78,31 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
         rpc::{Protocol, Server},
         sessions::{Manager, Options},
     };
-    // B6 resource wiring (13.2-13.5): hold the shared-core gate for the
-    // service lifetime and refuse to grow when the free disk would breach
-    // the configured 5 GiB reserve. Decisions stay in
-    // `excalibur-browser-resources`; webd only enforces them.
-    let resources = excalibur_webd::resources::ResourceGate::new();
-    let free_disk = excalibur_webd::disk_available(&config.web.data_dir).unwrap_or(0);
-    if !excalibur_webd::resources::growth_allowed_with_reserve(
-        free_disk,
-        0,
-        config.web.disk_reserve_bytes,
-    ) {
+    // B6 resource wiring (13.2-13.5): retain the shared-core gate for the
+    // service lifetime and refuse disk growth when the free disk would breach
+    // the configured reserve. Decisions stay in
+    // `excalibur-browser-resources`; webd enforces the disk gates it owns.
+    // Per-operation memory admission and eviction remain pending main-lane
+    // work: `serve` does not mediate tab creation via RPC, so it cannot
+    // enforce those decisions here without fake wiring.
+    let resource_gate = excalibur_webd::resources::ResourceGate::new();
+    let free_data = excalibur_webd::disk_available(&config.web.data_dir).unwrap_or(0);
+    if !resource_gate.disk_growth_allowed(free_data, 0) {
         return Err("disk_reserve: free disk below configured reserve".into());
     }
-    let _resource_gate = resources;
+    // The Unix socket in `run_dir` is the other path `serve` grows itself.
+    let free_run = excalibur_webd::disk_available(&config.web.run_dir).unwrap_or(0);
+    if !resource_gate.disk_growth_allowed(free_run, 0) {
+        return Err("disk_reserve: run directory below configured reserve".into());
+    }
+    // Startup telemetry through the retained gate (no browser working set
+    // yet; peaks start at zero and grow with `note_sample` in future lanes).
+    eprintln!(
+        "resource_gate startup budgets soft_global={} reserve={} telemetry={}",
+        resource_gate.memory_budgets().soft_global_bytes,
+        resource_gate.disk_budgets().reserve_bytes,
+        resource_gate.telemetry_json()
+    );
     // Egress broker (12.3): HostProxy with pinned DNS, no private/loopback
     // answers and only web ports. The loopback listener below verifies the
     // peer UID so only the web user can reach the broker through Chrome's
@@ -175,6 +186,12 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
     monitor.abort();
     let _ = monitor.await;
     protocol.drain().await;
+    // Retained gate stays alive for the whole service lifetime; report its
+    // (still startup) telemetry at shutdown so the wiring is observable.
+    eprintln!(
+        "resource_gate shutdown telemetry={}",
+        resource_gate.telemetry_json()
+    );
     let closed = manager.shutdown().await;
     forward.abort();
     viewer_server.abort();

@@ -12,7 +12,7 @@ use excalibur_browser_resources::admission::{
 };
 use excalibur_browser_resources::budgets::{DiskBudgets, MemoryBudgets, SearchProfile};
 use excalibur_browser_resources::disk::{
-    LowDiskAction, WebdDataUsage, disk_admission_allowed, low_disk_action, search_start_allowed,
+    LowDiskAction, WebdDataUsage, low_disk_action, search_start_allowed,
 };
 use excalibur_browser_resources::error::{ResourceError, Result};
 use excalibur_browser_resources::eviction::{EvictionStep, TabInfo, suspend_session};
@@ -64,14 +64,18 @@ impl ResourceGate {
     /// Decide admission for `origin` using the moving-average estimate.
     ///
     /// The soft budget always comes from the wired [`MemoryBudgets`]; callers
-    /// supply the remaining live readings. Over-budget outcomes return a
-    /// 120 s wait so eviction (13.3 steps 1-6) can free room before the
-    /// caller reports `capacity_exceeded`.
+    /// supply the remaining live readings (no budget field to ignore).
+    /// Over-budget outcomes return a 120 s wait so eviction (13.3 steps 1-6)
+    /// can free room before the caller reports `capacity_exceeded` (see
+    /// [`denial_code`]).
     #[must_use]
     pub fn admit(&self, origin: &str, readings: AdmissionReadings) -> AdmissionDecision {
-        let request = AdmissionRequest::with_estimator(origin, &self.estimator, readings);
-        let mut request = request;
-        request.soft_budget_bytes = self.memory.soft_global_bytes;
+        let request = AdmissionRequest::with_estimator(
+            origin,
+            &self.estimator,
+            readings,
+            self.memory.soft_global_bytes,
+        );
         decide(&request)
     }
 
@@ -95,17 +99,26 @@ impl ResourceGate {
         excalibur_browser_resources::eviction::plan_eviction(tabs)
     }
 
-    /// Enforce suspension protection: listening sessions refuse without
-    /// explicit user approval (`listener_cannot_suspend`).
+    /// Decision helper for suspension protection: listening sessions refuse
+    /// without explicit user approval (`listener_cannot_suspend`).
+    ///
+    /// Enforcing layer: `sessions::Manager` enforces this at the lifecycle
+    /// boundary; `eviction::suspend_session` and this helper only compute the
+    /// decision so webd wiring and tests share the rule without duplicating it.
     pub fn suspend_session(is_listening: bool, user_approved: bool) -> Result<()> {
         suspend_session(is_listening, user_approved)
     }
 
     /// True when a disk-growing operation keeps the configured reserve.
+    ///
+    /// The enforcing layer is the webd service (`serve` startup and any
+    /// future per-operation gates): only the configured
+    /// [`DiskBudgets::reserve_bytes`] (default 5 GiB from the shared core) is
+    /// checked here. The core helper [`disk_admission_allowed`] encodes the
+    /// same constant and is not checked twice.
     #[must_use]
     pub fn disk_growth_allowed(&self, free_bytes: u64, growth_bytes: u64) -> bool {
         free_bytes.saturating_sub(growth_bytes) >= self.disk.reserve_bytes
-            && disk_admission_allowed(free_bytes, growth_bytes)
     }
 
     /// True when the search backend may start under `profile`.
@@ -181,6 +194,12 @@ pub fn capacity_exceeded_message(
 }
 
 /// Map an admission denial to its wire code.
+///
+/// A `WaitWithTimeout` maps to `capacity_exceeded`: the caller waits up to
+/// 120 s for eviction (13.3 steps 1-6) and reports `capacity_exceeded` with
+/// the memory breakdown only when the wait expires. Immediate denials map to
+/// `tab_limit`, `pressure`, `disk_reserve`, or `capacity_exceeded` for
+/// `OverBudget` with no evictable room.
 #[must_use]
 pub fn denial_code(decision: &AdmissionDecision) -> &'static str {
     match decision {

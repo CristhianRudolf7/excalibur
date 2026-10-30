@@ -615,7 +615,12 @@ delete, borrar, transferir, transfer, firmar, sign, reservar, book, suscribir,
 subscribe, aceptar, accept). En perfiles persistentes un clic sin clasificar es
 `commit`. El riesgo es bajo/medio en sesiones efímeras y medio/alto en
 persistentes; subidas y credenciales son siempre de riesgo alto. Los ajustes de
-clase por sitio no están implementados.
+clase por sitio son una tabla por sitio que consulta `classify` (arq. 8.3):
+WhatsApp afina Enter en el compositor a `commit` y los clics fuera de
+formulario en la superficie de chats sin léxico de compromiso a
+`navigate_link`; los controles de formulario y los aciertos de léxico nunca se
+degradan. El resto de sitios mantiene el valor conservador (clic desconocido
+en persistente sigue siendo `commit`).
 
 Un `alert` abierto durante una acción se acepta y su mensaje redactado se
 devuelve en `alerts`. `beforeunload` solo se acepta en una navegación del agente
@@ -911,16 +916,27 @@ cargo test -p excalibur-webd --test resources_gates -- --nocapture
 cargo test -p excalibur-webd --test resources_measure -- --nocapture
 ```
 
-`resources_gates` verifica las filas 13.6 solo con fixtures sintéticas;
-`resources_measure` ejecuta la forma del procedimiento 18.3 (instancia en
-blanco, página estática local, diez pestañas efímeras pesadas, niveles A/B/C
-con PSS por tipo, 3 repeticiones con mediana/mínimo/máximo) con informe en
-`target/test-evidence/browser/resources/measure.json`. Las cifras con sesión
-de WhatsApp/Teams (18.4, 1 h/24 h) siguen pendientes del usuario y nunca se
-afirman. Pendientes: gestión del scope del cgroup, supervisión real de
-Chrome, señales del intermediario, llamadas CDP de GC/presión/caché,
-recorridos de perfiles con `Storage.getUsageAndQuota` y mediciones VPS. Ver
-[Fundamento de recursos](browser-resources.es.md).
+`resources_gates` verifica solo el subconjunto de decisión de las filas 13.6
+con fixtures sintéticas (constantes, admisión con media móvil, desalojo 1-7
+con protección LIVE, puertas de disco, `listener_cannot_suspend`, picos de
+telemetría); el cierre completo de 13.6 queda ABIERTO para el carril
+principal. `resources_measure` ejecuta la forma del procedimiento 18.3
+(instancia en blanco, página estática local, diez pestañas efímeras pesadas,
+niveles A/B/C con PSS por tipo, 3 repeticiones con mediana/mínimo/máximo) con
+informe en `target/test-evidence/browser/resources/measure.json`. Las cifras
+con sesión de WhatsApp/Teams (18.4, 1 h/24 h) siguen pendientes del usuario y
+nunca se afirman. Pendientes para el 13.6 completo: cgroup real con
+`memory.high`, llenado con pestañas pesadas y continuidad LIVE, espera real
+hasta `capacity_exceeded`, suspensión por la vía de sesión, LIVE con más de
+1 GiB y `logged_in`, puerta con sistema de archivos pequeño y microbench de
+coste (nunca afirmados). `serve` retiene la `ResourceGate`, exige la reserva
+de disco configurada en los directorios de datos y ejecución al arrancar con
+telemetría de arranque/cierre, y deja la admisión de memoria por operación
+como pendiente del carril principal (serve no media la creación de pestañas).
+La espera informa `capacity_exceeded` solo tras expirar los 120 s de desalojo;
+`listener_cannot_suspend` se exige en `sessions::Manager`, y las ayudas de
+desalojo y webd solo calculan la decisión. Ver [Fundamento de
+recursos](browser-resources.es.md).
 
 ## Integración con el arnés
 

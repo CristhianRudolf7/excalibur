@@ -26,7 +26,6 @@ fn readings(
 ) -> AdmissionReadings {
     AdmissionReadings {
         working_set_bytes,
-        soft_budget_bytes: SOFT_GLOBAL_BYTES,
         psi_some_avg10_pct,
         execution_tabs,
         global_tabs,

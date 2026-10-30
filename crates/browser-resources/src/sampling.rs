@@ -312,13 +312,12 @@ pub fn current_process_working_set() -> Option<u64> {
 }
 
 /// Instance class selecting the OOM policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstanceClass {
-    /// Persistent instance hosting listening sessions.
-    Persistent,
-    /// Ephemeral instance for agent browsing.
-    Ephemeral,
-}
+///
+/// Canonical [`crate::eviction::InstanceKind`] aliased here so sampling and
+/// eviction share one enum; `InstanceClass` remains as a compatibility name.
+/// The enforcing layer for OOM policy is the webd service wiring, which reads
+/// these values when it adjusts scores; sampling only computes them.
+pub use crate::eviction::InstanceKind as InstanceClass;
 
 /// Desired `oom_score_adj` for a process class.
 ///

@@ -235,8 +235,13 @@ pub fn classify_by_age(is_live: bool, secs_since_activity: u64) -> TabClass {
     }
 }
 
-/// Suspend a session: close its tabs and keep URLs for reopening. Listening
-/// sessions refuse with `listener_cannot_suspend` unless the user approved.
+/// Decision helper for session suspension: close its tabs and keep URLs for
+/// reopening. Listening sessions refuse with `listener_cannot_suspend`
+/// unless the user approved.
+///
+/// Enforcing layer: `sessions::Manager` enforces this at the lifecycle
+/// boundary; this helper only computes the decision so the webd gate and
+/// tests share the rule.
 pub fn suspend_session(is_listening: bool, user_approved: bool) -> Result<()> {
     if is_listening && !user_approved {
         return Err(ResourceError::ListenerCannotSuspend);

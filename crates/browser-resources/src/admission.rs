@@ -98,14 +98,15 @@ pub struct AdmissionRequest<'a> {
 
 /// Runtime readings for one admission check, wired by webd.
 ///
-/// Bundling keeps constructor and gate signatures under the argument limit
-/// while every threshold stays in the shared core.
+/// The soft budget is intentionally not part of these readings: it always
+/// comes from the enforcing [`crate::budgets::MemoryBudgets`] so callers
+/// cannot pass a silently-ignored value. Bundling keeps constructor and gate
+/// signatures under the argument limit while every threshold stays in the
+/// shared core.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AdmissionReadings {
     /// Current global working set in bytes.
     pub working_set_bytes: u64,
-    /// Soft global budget in bytes.
-    pub soft_budget_bytes: u64,
     /// Current PSI `some avg10` in percent, when measured.
     pub psi_some_avg10_pct: Option<f64>,
     /// Tabs already open in this execution.
@@ -120,19 +121,22 @@ pub struct AdmissionReadings {
 
 impl<'a> AdmissionRequest<'a> {
     /// Build a request for a runtime `origin`, filling the estimate from
-    /// `estimator`. This keeps per-origin moving-average logic in the shared
-    /// core so webd wiring never hard-codes footprint defaults.
+    /// `estimator` and the soft budget from the caller (the enforcing gate).
+    /// This keeps per-origin moving-average logic in the shared core so webd
+    /// wiring never hard-codes footprint defaults, without accepting a
+    /// budget field that would be overwritten.
     #[must_use]
     pub fn with_estimator(
         origin: &'a str,
         estimator: &OriginEstimator,
         readings: AdmissionReadings,
+        soft_budget_bytes: u64,
     ) -> Self {
         Self {
             origin,
             estimated_bytes: estimator.estimate(origin),
             working_set_bytes: readings.working_set_bytes,
-            soft_budget_bytes: readings.soft_budget_bytes,
+            soft_budget_bytes,
             psi_some_avg10_pct: readings.psi_some_avg10_pct,
             execution_tabs: readings.execution_tabs,
             global_tabs: readings.global_tabs,
