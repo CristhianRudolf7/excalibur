@@ -1189,6 +1189,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "excalibur-scheduler"
+version = "0.1.0"
+dependencies = [
+ "excalibur-store",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "excalibur-security"
 version = "0.1.0"
 dependencies = [

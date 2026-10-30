@@ -1,4 +1,5 @@
 //! Durable interactive intake and the bounded, fast-tool-only conversational master.
+mod cancellation;
 mod context_request;
 mod fast_tools;
 pub use fast_tools::MasterFastTools;
@@ -83,6 +84,16 @@ pub trait FastActions: Send + Sync {
         target: Option<&'a str>,
         key: &'a str,
     ) -> BoxFuture<'a, std::result::Result<Value, String>>;
+    /// Host-only confirmation port. Model tools must never forward `confirmed` here.
+    fn confirm_cancel<'a>(
+        &'a self,
+        _conversation: &'a str,
+        _scope: &'a str,
+        _target: &'a str,
+        _key: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<Value, String>> {
+        Box::pin(async { Err("confirmed cancellation is unsupported".into()) })
+    }
     fn invoke<'a>(
         &'a self,
         _conversation: &'a str,
@@ -253,6 +264,7 @@ impl Master {
         })
         .await?;
         provenance::migrate(&db).await?;
+        cancellation::migrate(&db).await?;
         let outage: bool = db
             .read(ReadLane::Interactive, |conn| {
                 Ok(conn.query_row(
@@ -368,7 +380,8 @@ impl Master {
             let current_scope:String=conn.query_row("SELECT COALESCE(active_scope,'general') FROM conversations WHERE id=?1",[&entry.conversation],|r|r.get(0))?;
             if entry.scope.as_ref().is_some_and(|value|value!=&current_scope) {return Err(excalibur_store::Error::Invalid("change conversation scope explicitly before writing"));}
             let pending:u32=conn.query_row("SELECT COUNT(*) FROM master_inbox WHERE conversation_id=?1 AND state IN ('pending','unavailable','processing','context_blocked','routing')",[&entry.conversation],|r|r.get(0))?;
-            if pending>=max_pending && serde_json::from_str::<Preanalysis>(&analysis_json).ok().and_then(|a|a.command).is_none() {return Err(excalibur_store::Error::Invalid("conversation inbox capacity exceeded"));}
+            let cancellation_reply:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM master_cancel_confirmations x JOIN master_questions q ON q.id=x.question_id WHERE x.conversation_id=?1 AND x.principal_id=?2 AND x.scope_id=?3 AND ((x.state='pending' AND q.answer IS NULL) OR x.question_id=?4))",(&entry.conversation,&principal,&current_scope,&entry.reply_to),|r|r.get(0))?;
+            if pending>=max_pending && !(cancellation_reply && cancellation::decision(&entry.text).is_some() && entry.attachments.is_empty()) && serde_json::from_str::<Preanalysis>(&analysis_json).ok().and_then(|a|a.command).is_none() {return Err(excalibur_store::Error::Invalid("conversation inbox capacity exceeded"));}
             let linked_reply=if let Some(reply)=&entry.reply_to {conn.query_row("SELECT id FROM messages WHERE id=?1 AND conversation_id=?2",(reply,&entry.conversation),|row|row.get::<_,String>(0)).optional()?}else{None};
             conn.execute("INSERT INTO messages(id,conversation_id,role,text,attachments,language,reply_to,user_timezone,principal_id,scope_id) VALUES(?1,?2,'user',?3,?4,'und',?5,?6,?7,?8)",(&id,&entry.conversation,&entry.text,serde_json::to_string(&entry.attachments).unwrap(),&linked_reply,&entry.timezone,&principal,&current_scope))?;
             let event=json!({"message_id":id,"scope":current_scope});
@@ -378,6 +391,12 @@ impl Master {
             conn.execute("INSERT INTO master_client_receipts(client_id,client_msg_id,message_id,fingerprint,cursor) VALUES(?1,?2,?3,?4,?5)",(&entry.client_id,&entry.client_msg_id,&id,&fingerprint,cursor))?;
             Ok(Receipt{message_id:id,cursor,duplicate:false})
         }).await?;
+        if self
+            .route_cancel_source(&incoming.conversation, &receipt.message_id)
+            .await?
+        {
+            return Ok(receipt);
+        }
         match self
             .route_question_source(&incoming.conversation, &receipt.message_id)
             .await?
@@ -611,6 +630,7 @@ impl Master {
         );
     }
     pub async fn retry_pending(&self) -> Result<()> {
+        self.drain_cancel_confirmations().await?;
         let conversations=self.inner.db.read(ReadLane::Interactive,|conn|{let mut q=conn.prepare("SELECT i.conversation_id FROM master_inbox i JOIN messages m ON m.id=i.message_id JOIN conversations c ON c.id=i.conversation_id WHERE i.state IN ('pending','processing','unavailable','routing') AND m.scope_id=COALESCE(c.active_scope,'general') GROUP BY i.conversation_id ORDER BY MIN(i.created_seq) LIMIT 1024")?;Ok(q.query_map([],|r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?)}).await?;
         for conversation in &conversations {
             self.route_recovered_questions(conversation).await?;
@@ -1362,6 +1382,19 @@ conn.execute("UPDATE master_inbox SET state='done' WHERE message_id=?1 AND state
         {
             return Err(Error::Invalid("unsafe master action metadata".into()));
         }
+        // Cancellation request resolution has no control effect. It can safely
+        // be retried after an intent-only interruption; confirmation is separate.
+        let cancel_request =
+            name == "command:cancel" || (name == "subagent" && args["action"] == "cancel");
+        let source = if name == "command:cancel" {
+            key.strip_prefix("message:")
+        } else if cancel_request {
+            key.strip_prefix(&format!("master:{conversation}:"))
+                .and_then(|rest| rest.split_once(':'))
+                .map(|(source, _)| source)
+        } else {
+            None
+        };
         let conversation_owned = conversation.to_string();
         let name_owned = name.to_string();
         let arguments = self.inner.redactor.redact_json(&args).to_string();
@@ -1369,6 +1402,7 @@ conn.execute("UPDATE master_inbox SET state='done' WHERE message_id=?1 AND state
         let previous=self.inner.db.write(Priority::Interactive,move|conn| {
             if let Some((name,args,state,result))=conn.query_row("SELECT tool_name,arguments,state,result FROM master_action_receipts WHERE operation_key=?1",[&key_owned],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?))).optional()? {
                 if name!=name_owned || args!=arguments {return Err(excalibur_store::Error::Invalid("master action key reused"));}
+                if cancel_request && state=="intent" {return Ok(None);}
                 return Ok(Some(if state=="done" {serde_json::from_str(&result.unwrap_or_default()).unwrap_or(Value::Null)} else {json!({"error":"uncertain interrupted master action; inspect its durable operation key before resolving","operation_key":key_owned})}));
             }
             if name_owned.starts_with("command:") && let Some(source)=key_owned.strip_prefix("message:") {
@@ -1377,7 +1411,27 @@ conn.execute("UPDATE master_inbox SET state='done' WHERE message_id=?1 AND state
             }
             conn.execute("INSERT INTO master_action_receipts(operation_key,conversation_id,tool_name,arguments,state) VALUES(?1,?2,?3,?4,'intent')",(&key_owned,&conversation_owned,&name_owned,&arguments))?;Ok(None)
         }).await?;
-        if let Some(previous) = previous {
+        if let Some(mut previous) = previous {
+            if cancel_request
+                && previous["confirmation_required"] == true
+                && !self
+                    .create_cancel_question(
+                        conversation,
+                        source
+                            .ok_or_else(|| Error::Invalid("cancellation needs a source".into()))?,
+                        key,
+                        &previous,
+                    )
+                    .await?
+            {
+                previous = cancellation::question_limit_result();
+                let encoded = previous.to_string();
+                let key = key.to_owned();
+                self.inner.db.write(Priority::Interactive, move |conn| {
+                    conn.execute("UPDATE master_action_receipts SET state='done',result=?2 WHERE operation_key=?1", (&key, &encoded))?;
+                    Ok(())
+                }).await?;
+            }
             return Ok(self.inner.redactor.redact_json(&previous));
         }
         let action = async {
@@ -1428,6 +1482,19 @@ conn.execute("UPDATE master_inbox SET state='done' WHERE message_id=?1 AND state
         let mut result = self.inner.redactor.redact_json(&result);
         if result.to_string().len() > 64 * 1024 {
             result = json!({"error":"fast action output exceeded the bounded master result limit"});
+        }
+        if cancel_request
+            && result["confirmation_required"] == true
+            && !self
+                .create_cancel_question(
+                    conversation,
+                    source.ok_or_else(|| Error::Invalid("cancellation needs a source".into()))?,
+                    key,
+                    &result,
+                )
+                .await?
+        {
+            result = cancellation::question_limit_result();
         }
         let encoded = result.to_string();
         let key = key.to_string();

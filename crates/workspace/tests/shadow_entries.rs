@@ -336,7 +336,7 @@ async fn oversized_paths_degrade_to_warnings_instead_of_failing_the_snapshot() {
     db.shutdown().await.unwrap();
 }
 #[tokio::test]
-async fn old_per_run_snapshots_are_pruned_while_recent_steps_survive() {
+async fn active_run_history_survives_object_collection_without_a_snapshot_count_cap() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
     std::fs::create_dir(&root).unwrap();
@@ -379,7 +379,133 @@ async fn old_per_run_snapshots_are_pruned_while_recent_steps_survive() {
         assert!(!snapshot.tree.is_empty());
     }
     let kept = workspace.shadow().list_snapshots("prune").await.unwrap();
-    assert_eq!(kept.len(), 32);
+    assert_eq!(kept.len(), 35);
+    assert!(kept.iter().any(|s| s.step == 0));
     assert!(kept.iter().any(|s| s.step == 34));
+    let repository = std::fs::read_dir(temp.path().join("data/shadow"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("objects.git");
+    // Simulate an old unpinned receipt from before this correction. Force the
+    // production threshold using unique objects, after aging the legacy files.
+    let remove = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repository)
+        .args([
+            "update-ref",
+            "-d",
+            &format!("refs/excalibur/trees/{}", kept[0].tree),
+        ])
+        .status()
+        .unwrap();
+    assert!(remove.success());
+    for directory in std::fs::read_dir(repository.join("objects")).unwrap() {
+        let directory = directory.unwrap();
+        if directory.file_name().len() != 2 || !directory.file_type().unwrap().is_dir() {
+            continue;
+        }
+        for object in std::fs::read_dir(directory.path()).unwrap() {
+            let file = std::fs::File::open(object.unwrap().path()).unwrap();
+            file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+                .unwrap();
+        }
+    }
+    let bulk = (0..1005)
+        .map(|i| {
+            (
+                PathBuf::from(format!("bulk-{i}")),
+                format!("object-{i}").into_bytes(),
+            )
+        })
+        .collect();
+    workspace
+        .shadow()
+        .snapshot_files("run", 1, "before", bulk)
+        .await
+        .unwrap();
+    // A paused or other run's oldest receipt must survive the real GC branch.
+    assert!(repository.parent().unwrap().join("last-shadow-gc").exists());
+    let left = workspace.shadow();
+    let right = workspace.shadow();
+    let (left, right) = tokio::join!(
+        left.snapshot_files(
+            "run",
+            2,
+            "before",
+            BTreeMap::from([(PathBuf::from("race.txt"), b"left".to_vec())])
+        ),
+        right.snapshot_files(
+            "run",
+            2,
+            "before",
+            BTreeMap::from([(PathBuf::from("race.txt"), b"right".to_vec())])
+        )
+    );
+    let left = left.unwrap().0;
+    let right = right.unwrap().0;
+    assert_eq!(left.id, right.id);
+    assert_eq!(left.tree, right.tree);
+    let output = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repository)
+        .args(["gc", "--prune=now"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let restored = workspace
+        .shadow()
+        .plan_between_entries(
+            &kept[0].id,
+            &kept[34].id,
+            BTreeMap::from([(
+                PathBuf::from("file.txt"),
+                Some(SnapshotEntry::file(b"revision 34\n".to_vec(), false)),
+            )]),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored.files[0].post, Some(b"revision 0\n".to_vec()));
+    assert!(
+        !workspace
+            .shadow()
+            .diff(&kept[0].id, &kept[34].id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let winner = workspace
+        .shadow()
+        .plan_between_entries(
+            &left.id,
+            &kept[34].id,
+            BTreeMap::from([
+                (
+                    PathBuf::from("file.txt"),
+                    Some(SnapshotEntry::file(b"revision 34\n".to_vec(), false)),
+                ),
+                (PathBuf::from("race.txt"), None),
+            ]),
+            false,
+        )
+        .await
+        .unwrap();
+    let content = winner
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("race.txt"))
+        .unwrap()
+        .post
+        .as_ref()
+        .unwrap();
+    assert!(content == b"left" || content == b"right");
     db.shutdown().await.unwrap();
 }

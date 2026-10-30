@@ -28,6 +28,12 @@ pub(super) fn control(command: &str, value: &Value) -> String {
             "Choose the intended agent or task by its identifier; no target was selected automatically. {choices}"
         );
     }
+    if value.get("confirmation_required").and_then(Value::as_bool) == Some(true) {
+        return format!(
+            "Cancellation needs your confirmation for {}. No work has been cancelled.",
+            safe(value.get("target"))
+        );
+    }
     if value
         .get("error")
         .and_then(Value::as_str)
@@ -127,12 +133,19 @@ pub(super) fn notice(content: &Value) -> String {
         body.get("name")
             .or_else(|| body.get("agent"))
             .or_else(|| body.get("agent_id"))
-            .or_else(|| body.get("task")),
+            .or_else(|| body.get("task"))
+            .or_else(|| content.get("name"))
+            .or_else(|| content.get("agent_id")),
     );
     let detail = safe(
         body.get("text")
             .or_else(|| body.get("message"))
             .or_else(|| body.get("summary"))
+            .or_else(|| {
+                body.get("final_text")
+                    .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+            })
+            .or_else(|| body.get("reason").filter(|v| !v.is_null()))
             .or_else(|| {
                 if inner.is_none() {
                     content.get("content")
@@ -146,4 +159,28 @@ pub(super) fn notice(content: &Value) -> String {
         .map(|value| format!(" [conversation {}]", safe(Some(value))))
         .unwrap_or_default();
     format!("{name} — {kind}: {detail}{origin}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn cancellation_waiting_for_confirmation_is_never_reported_as_performed() {
+        let text = control(
+            "cancel",
+            &json!({"confirmation_required":true,"target":"worker-7"}),
+        );
+        assert!(text.contains("needs your confirmation"));
+        assert!(text.contains("worker-7"));
+        assert!(text.contains("No work has been cancelled"));
+    }
+    #[test]
+    fn stop_notice_uses_reason_when_there_is_no_final_deliverable() {
+        let text = notice(
+            &json!({"name":"Build worker","content":json!({"state":"blocked","reason":"compiler failed","final_text":null}).to_string()}),
+        );
+        assert!(text.contains("Build worker"));
+        assert!(text.contains("compiler failed"));
+    }
 }
