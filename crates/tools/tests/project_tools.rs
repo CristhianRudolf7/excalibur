@@ -371,3 +371,140 @@ async fn command_shadow_restores_selected_files_and_preserves_user_git_index_and
     tools.terminals().shutdown().await;
     db.shutdown().await.unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shadow_snapshots_cover_exec_io_only_steps_and_cancelled_transitions() {
+    let (dir, db, _tools) = fixture().await;
+    let root = dir.path().join("project");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    std::fs::write(root.join("base.txt"), "base\n").unwrap();
+    excalibur_tools::terminal::prepare_project_boundary(&root).unwrap();
+    let tools = LocalTools::new(
+        db.clone(),
+        root.clone(),
+        ToolPolicy {
+            write: Access::Allow,
+            exec: Access::Allow,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    // A run that never touches exec records no filesystem snapshots.
+    tools.begin_step("quiet", 0).await.unwrap();
+    tools.end_step("quiet", 0).await.unwrap();
+    let listed = invoke(
+        &tools,
+        "snapshots",
+        "workspace_snapshot",
+        json!({"action":"list"}),
+    )
+    .await;
+    assert!(listed.success, "{listed:?}");
+    assert!(
+        listed.output["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["run_id"] != "quiet"),
+        "{listed:?}"
+    );
+    // Step 0 starts a session that only writes once it receives stdin.
+    tools.begin_step("run", 0).await.unwrap();
+    let started = invoke(
+        &tools,
+        "spawn",
+        "exec",
+        json!({"cmd":"sh -c 'read line; printf \"%s\" \"$line\" > late.txt; sleep 30'","yield_ms":1000}),
+    )
+    .await;
+    assert!(started.success, "{started:?}");
+    let session = started.output["session_id"].as_str().unwrap().to_owned();
+    tools.end_step("run", 0).await.unwrap();
+    // Step 1 only drives the live session through exec_io; the background
+    // write lands while the step is open.
+    tools.begin_step("run", 1).await.unwrap();
+    let written = invoke(
+        &tools,
+        "write",
+        "exec_io",
+        json!({"action":"write","session_id":session,"text":"late\n"}),
+    )
+    .await;
+    assert!(written.success, "{written:?}");
+    for _ in 0..100 {
+        if root.join("late.txt").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        root.join("late.txt").exists(),
+        "background write never landed"
+    );
+    tools.end_step("run", 1).await.unwrap();
+    // A step that ends through cancellation (no end_step) still closes its
+    // filesystem state on the lifecycle transition.
+    tools.execution_state("run", "running", None).await.unwrap();
+    tools.begin_step("run", 2).await.unwrap();
+    tools
+        .execution_state("run", "cancelled", Some("synthetic"))
+        .await
+        .unwrap();
+    let listed = invoke(
+        &tools,
+        "snapshots",
+        "workspace_snapshot",
+        json!({"action":"list"}),
+    )
+    .await;
+    assert!(listed.success, "{listed:?}");
+    let snapshots = listed.output["snapshots"].as_array().unwrap();
+    let phase_id = |step: u64, phase: &str| {
+        snapshots
+            .iter()
+            .find(|s| s["run_id"] == "run" && s["step"] == step && s["phase"] == phase)
+            .unwrap_or_else(|| panic!("missing snapshot step={step} phase={phase}: {listed:?}"))
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let before_one = phase_id(1, "before");
+    let after_one = phase_id(1, "after");
+    phase_id(0, "before");
+    phase_id(0, "after");
+    phase_id(2, "after");
+    // The exec_io-only step observed the background write: before lacks the
+    // file while after records it.
+    let diff = invoke(
+        &tools,
+        "diff",
+        "workspace_snapshot",
+        json!({"action":"diff","before":before_one,"after":after_one}),
+    )
+    .await;
+    assert!(diff.success, "{diff:?}");
+    assert!(
+        diff.output["diff"].as_str().unwrap().contains("late.txt"),
+        "{diff:?}"
+    );
+    tools.terminals().shutdown().await;
+    db.shutdown().await.unwrap();
+}

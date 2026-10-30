@@ -112,6 +112,10 @@ impl Shadow {
         .await?;
         let result = async {
             let mut total = 0usize;
+            // Stage every blob first, then update the index in a single
+            // process: one git invocation per snapshot instead of one per
+            // file, with identical resulting objects.
+            let mut staged: Vec<(String, String, String)> = Vec::new();
             for (path, entry) in files {
                 if entry.kind == EntryKind::Symlink && entry.executable {
                     return Err(Error::Invalid(
@@ -150,20 +154,21 @@ impl Shadow {
                     .await?;
                 let oid =
                     String::from_utf8(oid).map_err(|_| Error::Invalid("invalid shadow object"))?;
+                let name = path
+                    .to_str()
+                    .ok_or(Error::Invalid("snapshot path must be UTF-8"))?
+                    .to_owned();
+                staged.push((mode.to_owned(), oid.trim().to_owned(), name));
+            }
+            if !staged.is_empty() {
+                let mut info = Vec::new();
+                for (mode, oid, name) in &staged {
+                    info.extend_from_slice(format!("{mode} {oid} 0\t{name}\n").as_bytes());
+                }
                 self.git(
-                    vec![
-                        "update-index".into(),
-                        "--add".into(),
-                        "--cacheinfo".into(),
-                        format!(
-                            "{mode},{},{}",
-                            oid.trim(),
-                            path.to_str()
-                                .ok_or(Error::Invalid("snapshot path must be UTF-8"))?
-                        ),
-                    ],
+                    vec!["update-index".into(), "--add".into(), "--index-info".into()],
                     Some(&index),
-                    None,
+                    Some(info),
                 )
                 .await?;
             }
@@ -204,9 +209,8 @@ impl Shadow {
                     Ok(())
                 })
                 .await?;
-            self.lookup(&id)
-                .await?
-                .ok_or(Error::Invalid("snapshot receipt missing"))
+            let found = self.lookup(&id).await?;
+            found.ok_or(Error::Invalid("snapshot receipt missing"))
         }
         .await;
         let _ = std::fs::remove_file(index);

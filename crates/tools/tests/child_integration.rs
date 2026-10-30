@@ -197,6 +197,26 @@ impl Fixture {
         assert!(git_text(&self.root, &["remote"]).is_empty());
     }
 }
+async fn queue_id(tools: &LocalTools, child: &str) -> String {
+    let listed = invoke(
+        tools,
+        "parent",
+        "parent-list",
+        "integration_queue",
+        json!({"action":"list"}),
+    )
+    .await;
+    assert!(listed.success, "{listed:?}");
+    listed.output["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["child"] == child)
+        .unwrap_or_else(|| panic!("no queue entry for {child}"))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
 fn call(id: &str, name: &str, args: Value) -> ToolCall {
     ToolCall {
         id: id.into(),
@@ -480,6 +500,190 @@ async fn child_binding_rejects_foreign_work_queue_mutation_identity_injection_an
             .is_empty()
     );
     assert_eq!(f.checks.0.load(Ordering::SeqCst), 0);
+    f.assert_user_branch_untouched();
+    f.db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn conflict_resolution_retry_rebases_checks_and_integrates() {
+    let f = Fixture::new().await;
+    let a = f.create_child("a").await;
+    let b = f.create_child("b").await;
+    std::fs::write(a.path.join("base.txt"), "child a line\n").unwrap();
+    std::fs::write(b.path.join("base.txt"), "child b line\n").unwrap();
+    for owner in ["a", "b"] {
+        let run = format!("run-{owner}");
+        let checkpoint = f
+            .tools
+            .prepare(
+                &run,
+                call(
+                    "checkpoint",
+                    "integration_queue",
+                    json!({"action":"checkpoint","message":format!("Synthetic change {owner}")}),
+                ),
+            )
+            .await
+            .unwrap();
+        let committed = f.tools.execute(&run, "checkpoint", &checkpoint).await;
+        assert!(committed.success, "{committed:?}");
+        let queued = invoke(
+            &f.tools,
+            &run,
+            "enqueue",
+            "integration_queue",
+            json!({"action":"enqueue","intent":format!("Synthetic intent {owner}")}),
+        )
+        .await;
+        assert!(queued.success, "{queued:?}");
+    }
+    // The first child advances the integration branch.
+    let first = invoke(
+        &f.tools,
+        "parent",
+        "process-0",
+        "integration_queue",
+        json!({"action":"process"}),
+    )
+    .await;
+    assert!(first.success, "{first:?}");
+    assert_eq!(first.output["report"]["state"], "integrated");
+    // The second child now conflicts when rebased onto the advanced tip.
+    let conflicted = invoke(
+        &f.tools,
+        "parent",
+        "process-1",
+        "integration_queue",
+        json!({"action":"process"}),
+    )
+    .await;
+    assert!(conflicted.success, "{conflicted:?}");
+    assert_eq!(conflicted.output["report"]["state"], "conflicted");
+    // The parent resolves the conflict inside the child worktree and stages it.
+    std::fs::write(b.path.join("base.txt"), "resolved line\n").unwrap();
+    git_text(&b.path, &["add", "base.txt"]);
+    let id = queue_id(&f.tools, "b").await;
+    let retry = invoke(
+        &f.tools,
+        "parent",
+        "retry-b",
+        "integration_queue",
+        json!({"action":"retry","id":id.clone()}),
+    )
+    .await;
+    assert!(retry.success, "{retry:?}");
+    // Without new state the same entry cannot retry twice.
+    let again = invoke(
+        &f.tools,
+        "parent",
+        "retry-b-again",
+        "integration_queue",
+        json!({"action":"retry","id":id}),
+    )
+    .await;
+    assert!(!again.success, "{again:?}");
+    // The re-queued checkpoint rebases onto the advanced tip, passes the
+    // impacted checks, and advances the integration branch.
+    let done = invoke(
+        &f.tools,
+        "parent",
+        "process-2",
+        "integration_queue",
+        json!({"action":"process"}),
+    )
+    .await;
+    assert!(done.success, "{done:?}");
+    assert_eq!(done.output["report"]["state"], "integrated");
+    assert_eq!(
+        std::fs::read_to_string(b.integration_path.join("base.txt")).unwrap(),
+        "resolved line\n"
+    );
+    assert_eq!(f.checks.0.load(Ordering::SeqCst), 2);
+    f.assert_user_branch_untouched();
+    f.db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_checks_retry_with_new_checkpoint_integrates() {
+    let f = Fixture::new().await;
+    let c = f.create_child("c").await;
+    // Trailing whitespace fails the `git diff --check` impacted check.
+    std::fs::write(c.path.join("c.txt"), "synthetic c  \n").unwrap();
+    let checkpoint = f
+        .tools
+        .prepare(
+            "run-c",
+            call(
+                "checkpoint",
+                "integration_queue",
+                json!({"action":"checkpoint","message":"Synthetic change c"}),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        f.tools
+            .execute("run-c", "checkpoint", &checkpoint)
+            .await
+            .success
+    );
+    let queued = invoke(
+        &f.tools,
+        "run-c",
+        "enqueue",
+        "integration_queue",
+        json!({"action":"enqueue","intent":"Synthetic intent c"}),
+    )
+    .await;
+    assert!(queued.success, "{queued:?}");
+    let returned = invoke(
+        &f.tools,
+        "parent",
+        "process-0",
+        "integration_queue",
+        json!({"action":"process"}),
+    )
+    .await;
+    assert!(returned.success, "{returned:?}");
+    assert_eq!(returned.output["report"]["state"], "returned");
+    // The child fixes the file and records a new checkpoint.
+    std::fs::write(c.path.join("c.txt"), "synthetic c\n").unwrap();
+    let checkpoint = f
+        .tools
+        .prepare(
+            "run-c",
+            call(
+                "checkpoint-2",
+                "integration_queue",
+                json!({"action":"checkpoint","message":"Synthetic fix c"}),
+            ),
+        )
+        .await
+        .unwrap();
+    let fixed = f.tools.execute("run-c", "checkpoint-2", &checkpoint).await;
+    assert!(fixed.success, "{fixed:?}");
+    // Retry adopts the new checkpoint instead of returning it as changed.
+    let id = queue_id(&f.tools, "c").await;
+    let retry = invoke(
+        &f.tools,
+        "parent",
+        "retry-c",
+        "integration_queue",
+        json!({"action":"retry","id":id}),
+    )
+    .await;
+    assert!(retry.success, "{retry:?}");
+    let done = invoke(
+        &f.tools,
+        "parent",
+        "process-1",
+        "integration_queue",
+        json!({"action":"process"}),
+    )
+    .await;
+    assert!(done.success, "{done:?}");
+    assert_eq!(done.output["report"]["state"], "integrated");
+    assert!(c.integration_path.join("c.txt").is_file());
     f.assert_user_branch_untouched();
     f.db.shutdown().await.unwrap();
 }

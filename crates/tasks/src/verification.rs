@@ -151,8 +151,43 @@ pub struct CheckRunner {
     excluded_paths: Vec<PathBuf>,
     calls: Arc<AtomicU64>,
     tool_budget: Option<u64>,
+    attempt_grace: Duration,
 }
+/// Timeout-without-evidence error: the attempt ran past its own deadline with
+/// live timers but nothing completed. It expires the attempt and fails fast;
+/// only pre-timer wedges are retried (see below).
+const TIMEOUT_NO_EVIDENCE: &str = "declared check timed out; outcome remains uncertain";
+/// Pre-timer wedge error: the attempt never confirmed an outcome and its
+/// timers never fired (post-INSERT stall) or never existed (a setup stall
+/// before the attempt row). Execution provably never started, so `run_keyed`
+/// retries exactly once with a fresh key on this error only.
+const OUTER_BOUND_MESSAGE: &str =
+    "declared check timed out before its attempt timers confirmed an outcome";
 impl CheckRunner {
+    /// Mark an admitted attempt terminal when its outcome can never be
+    /// confirmed (deadline, interruption, wait budget). The row keeps no
+    /// evidence, so a later attempt still goes through reconcile instead of
+    /// repeating implicitly; completion gates no longer mistake it for
+    /// in-flight work and report the real check error instead.
+    ///
+    /// The marking is best-effort and never blocks the failing check: under
+    /// synthetic clocks it must not add a cross-thread round trip to the
+    /// failure path, so callers detach it instead of awaiting it.
+    pub(crate) fn expire_attempt(store: &TaskStore, operation_key: &str) {
+        let db = store.db.clone();
+        let op = operation_key.to_owned();
+        tokio::spawn(async move {
+            let _ = db
+                .write(Priority::Journal, move |c| {
+                    c.execute(
+                        "UPDATE task_check_attempts SET state='expired' WHERE operation_key=?1 AND state='intent'",
+                        [op],
+                    )?;
+                    Ok(())
+                })
+                .await;
+        });
+    }
     pub fn new(runtime: Arc<dyn ToolRuntime>, workspace: PathBuf) -> Self {
         Self {
             runtime,
@@ -161,6 +196,7 @@ impl CheckRunner {
             excluded_paths: vec![],
             calls: Arc::new(AtomicU64::new(0)),
             tool_budget: None,
+            attempt_grace: Duration::from_secs(60),
         }
     }
     pub fn with_projection(mut self, path: PathBuf) -> Self {
@@ -173,6 +209,13 @@ impl CheckRunner {
     }
     pub fn with_tool_budget(mut self, limit: u64) -> Self {
         self.tool_budget = Some(limit);
+        self
+    }
+    /// Grace for attempt bounds: past its own deadline after INSERT, and end
+    /// to end for the pre-timer setup stages in `run_keyed`. Either bound
+    /// expires the attempt; `run_keyed` then retries once with a fresh key.
+    pub fn with_attempt_grace(mut self, grace: Duration) -> Self {
+        self.attempt_grace = grace;
         self
     }
     pub fn tool_calls(&self) -> u64 {
@@ -210,7 +253,66 @@ impl CheckRunner {
         run: &'a str,
         operation_key: &'a str,
     ) -> BoxFuture<'a, Result<EvidenceRecord>> {
-        Box::pin(self.run_keyed_inner(store, task_id, check_id, run, operation_key))
+        Box::pin(async move {
+            // Attempt 1, bounded end to end. The setup stages (admission,
+            // baseline snapshot, preparation, attempt INSERT) run before any
+            // timer exists, so a stall there would otherwise park forever
+            // with no row to expire and no deadline to fire.
+            let first_row = format!("{run}:{operation_key}");
+            let first = match tokio::time::timeout_at(
+                tokio::time::Instant::now() + self.attempt_grace,
+                self.run_keyed_inner(store, task_id, check_id, run, operation_key),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    Self::expire_attempt(store, &first_row);
+                    Err(fail(OUTER_BOUND_MESSAGE))
+                }
+            };
+            match first {
+                ok @ Ok(_) => ok,
+                Err(first_err) => {
+                    // Only a pre-timer wedge (an admitted check with no
+                    // confirmed outcome whose timers never fired, or never
+                    // existed) is retried once with a fresh operation key:
+                    // execution provably never started, so the retry is
+                    // explicit, never an implicit repeat. Inner deadline
+                    // timeouts already interrupted their execution, so they
+                    // expire and fail fast instead of dispatching again.
+                    // Genuine check failures arrive as evidence, not errors,
+                    // and deterministic errors fail fast below.
+                    if first_err.to_string() != OUTER_BOUND_MESSAGE {
+                        return Err(first_err);
+                    }
+                    Self::expire_attempt(store, &first_row);
+                    let retry_key = format!("{operation_key}#retry");
+                    let retry_row = format!("{run}:{retry_key}");
+                    // The retry re-runs the same setup stages, so it gets the
+                    // same end-to-end bound rather than running unbounded.
+                    match tokio::time::timeout_at(
+                        tokio::time::Instant::now() + self.attempt_grace,
+                        self.run_keyed_inner(store, task_id, check_id, run, &retry_key),
+                    )
+                    .await
+                    {
+                        Ok(outcome) => outcome.map_err(|second| {
+                            fail(format!(
+                                "declared check retry failed: {second} (first attempt: {first_err})"
+                            ))
+                        }),
+                        Err(_) => {
+                            Self::expire_attempt(store, &retry_row);
+                            Err(fail(format!(
+                                "declared check retry failed: {} (first attempt: {first_err})",
+                                OUTER_BOUND_MESSAGE
+                            )))
+                        }
+                    }
+                }
+            }
+        })
     }
     async fn run_keyed_inner(
         &self,
@@ -368,103 +470,114 @@ impl CheckRunner {
         };
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout);
         drop(admission_lease);
-        let mut result = if recovery {
-            match self.runtime.reconcile(run, &key, &prepared).await {
-                Reconcile::Done(result) => result,
-                Reconcile::Retry
-                    if prepared.effect != excalibur_types::runtime::Effect::NonIdempotent =>
-                {
-                    Box::pin(self.invoke_monitored(store, run, &key, &prepared, deadline)).await?
+        // The end-to-end setup bound lives in `run_keyed`: the stages above
+        // run before this deadline exists, so a stall there is bounded and
+        // retried there with a fresh key instead of parking here forever.
+        let attempt = async {
+            let mut result = if recovery {
+                match self.runtime.reconcile(run, &key, &prepared).await {
+                    Reconcile::Done(result) => result,
+                    Reconcile::Retry
+                        if prepared.effect != excalibur_types::runtime::Effect::NonIdempotent =>
+                    {
+                        Box::pin(self.invoke_monitored(store, run, &key, &prepared, deadline))
+                            .await?
+                    }
+                    Reconcile::Retry | Reconcile::Uncertain(_) => {
+                        Self::expire_attempt(store, &key);
+                        return Err(fail(
+                            "check outcome is uncertain after interruption; explicit new attempt required, command was not repeated",
+                        ));
+                    }
                 }
-                Reconcile::Retry | Reconcile::Uncertain(_) => {
+            } else {
+                Box::pin(self.invoke_monitored(store, run, &key, &prepared, deadline)).await?
+            };
+            let mut tool_calls = 1u64;
+            while result.output["exited"] == false && result.output["session_id"].is_string() {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    Self::expire_attempt(store, &key);
                     return Err(fail(
-                        "check outcome is uncertain after interruption; explicit new attempt required, command was not repeated",
+                        "declared check timed out; its receipt remains uncertain",
                     ));
                 }
+                let wait=ToolCall{id:new_id("check-wait"),name:"exec_io".into(),arguments:json!({"action":"wait_for","session_id":result.output["session_id"],"timeout_ms":remaining.as_millis().min(300000)as u64}).to_string()};
+                let wait = self.runtime.prepare(run, wait).await.map_err(fail)?;
+                result = self
+                    .invoke_monitored(
+                        store,
+                        run,
+                        &format!("{key}:wait:{tool_calls}"),
+                        &wait,
+                        deadline,
+                    )
+                    .await?;
+                tool_calls += 1;
+                if tool_calls > 32 {
+                    Self::expire_attempt(store, &key);
+                    return Err(fail("declared check exceeded bounded session waits"));
+                }
             }
-        } else {
-            Box::pin(self.invoke_monitored(store, run, &key, &prepared, deadline)).await?
-        };
-        let mut tool_calls = 1u64;
-        while result.output["exited"] == false && result.output["session_id"].is_string() {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(fail(
-                    "declared check timed out; its receipt remains uncertain",
-                ));
-            }
-            let wait=ToolCall{id:new_id("check-wait"),name:"exec_io".into(),arguments:json!({"action":"wait_for","session_id":result.output["session_id"],"timeout_ms":remaining.as_millis().min(300000)as u64}).to_string()};
-            let wait = self.runtime.prepare(run, wait).await.map_err(fail)?;
-            result = self
-                .invoke_monitored(
-                    store,
-                    run,
-                    &format!("{key}:wait:{tool_calls}"),
-                    &wait,
-                    deadline,
+            let _publication_lease = store.mutation_lock.write().await;
+            let (passed, explanation) = self.evaluate(store, &check.definition, &result).await?;
+            let current_revision = store.criterion_revision(&criterion.id).await?;
+            let id = check.id.clone();
+            let current_version = store
+                .db
+                .read(ReadLane::Interactive, move |c| {
+                    Ok(
+                        c.query_row("SELECT version FROM checks WHERE id=?1", [id], |r| {
+                            r.get::<_, u64>(0)
+                        })?,
+                    )
+                })
+                .await?;
+            let fresh = snapshot.fresh(current_revision).await?
+                && producer["check_version"].as_u64() == Some(current_version);
+            let result_value = self
+                .runtime
+                .sanitize_durable(&serde_json::to_value(&result)?)
+                .map_err(fail)?;
+            let evidence = store
+                .store_evidence(
+                    EvidenceRecord {
+                        id: new_id("evidence"),
+                        task_id: task_id.into(),
+                        criterion_id: criterion.id,
+                        check_id: check_id.into(),
+                        run_id: run.into(),
+                        result: if !fresh {
+                            EvidenceResult::Error
+                        } else if passed {
+                            EvidenceResult::Pass
+                        } else {
+                            EvidenceResult::Fail
+                        },
+                        kind: EvidenceKind::Execution,
+                        output_blob: None,
+                        recorded_at: excalibur_store::unix_seconds().max(0) as u64,
+                        snapshot,
+                        tool_call_id: Some(prepared.call.id),
+                        trusted: true,
+                        stale: !fresh,
+                        explanation: if fresh {
+                            explanation
+                        } else {
+                            "affected files changed while check was running".into()
+                        },
+                        producer_snapshot: producer,
+                        tool_calls: self.tool_calls().saturating_sub(calls_at_start).max(1),
+                    },
+                    result_value,
                 )
                 .await?;
-            tool_calls += 1;
-            if tool_calls > 32 {
-                return Err(fail("declared check exceeded bounded session waits"));
-            }
-        }
-        let _publication_lease = store.mutation_lock.write().await;
-        let (passed, explanation) = self.evaluate(store, &check.definition, &result).await?;
-        let current_revision = store.criterion_revision(&criterion.id).await?;
-        let id = check.id.clone();
-        let current_version = store
-            .db
-            .read(ReadLane::Interactive, move |c| {
-                Ok(
-                    c.query_row("SELECT version FROM checks WHERE id=?1", [id], |r| {
-                        r.get::<_, u64>(0)
-                    })?,
-                )
-            })
-            .await?;
-        let fresh = snapshot.fresh(current_revision).await?
-            && producer["check_version"].as_u64() == Some(current_version);
-        let result_value = self
-            .runtime
-            .sanitize_durable(&serde_json::to_value(&result)?)
-            .map_err(fail)?;
-        let evidence = store
-            .store_evidence(
-                EvidenceRecord {
-                    id: new_id("evidence"),
-                    task_id: task_id.into(),
-                    criterion_id: criterion.id,
-                    check_id: check_id.into(),
-                    run_id: run.into(),
-                    result: if !fresh {
-                        EvidenceResult::Error
-                    } else if passed {
-                        EvidenceResult::Pass
-                    } else {
-                        EvidenceResult::Fail
-                    },
-                    kind: EvidenceKind::Execution,
-                    output_blob: None,
-                    recorded_at: excalibur_store::unix_seconds().max(0) as u64,
-                    snapshot,
-                    tool_call_id: Some(prepared.call.id),
-                    trusted: true,
-                    stale: !fresh,
-                    explanation: if fresh {
-                        explanation
-                    } else {
-                        "affected files changed while check was running".into()
-                    },
-                    producer_snapshot: producer,
-                    tool_calls: self.tool_calls().saturating_sub(calls_at_start).max(1),
-                },
-                result_value,
-            )
-            .await?;
-        let (op, id) = (key, evidence.id.clone());
-        store.db.write(Priority::Journal,move|c|{c.execute("UPDATE task_check_attempts SET evidence_id=?1,state='completed' WHERE operation_key=?2",rusqlite::params![id,op])?;Ok(())}).await?;
-        drop(_publication_lease);
+            let (op, id) = (key.clone(), evidence.id.clone());
+            store.db.write(Priority::Journal,move|c|{c.execute("UPDATE task_check_attempts SET evidence_id=?1,state='completed' WHERE operation_key=?2",rusqlite::params![id,op])?;Ok(())}).await?;
+            drop(_publication_lease);
+            Ok(evidence)
+        };
+        let evidence = attempt.await?;
         if evidence.result == EvidenceResult::Fail {
             let id = check_id.to_owned();
             let task = task_id.to_owned();
@@ -522,6 +635,7 @@ impl CheckRunner {
         match outcome {
             Ok(result) => Ok(result),
             Err(control) => {
+                Self::expire_attempt(store, key);
                 self.runtime
                     .interrupt_execution(run, control.unwrap_or(false), Some(prepared))
                     .await
@@ -529,7 +643,7 @@ impl CheckRunner {
                 Err(fail(if control.is_some() {
                     "check interrupted by run control; outcome remains uncertain"
                 } else {
-                    "declared check timed out; outcome remains uncertain"
+                    TIMEOUT_NO_EVIDENCE
                 }))
             }
         }
@@ -618,6 +732,28 @@ impl CheckRunner {
             }
             CheckDefinition::Inspection => Err(fail("inspection cannot execute")),
         }
+    }
+}
+
+impl TaskStore {
+    /// Mark evidence-less intent attempts of a finished verifier run as expired.
+    /// A verifier run that is being superseded or that already returned can no
+    /// longer confirm its in-flight attempts; without this their rows keep the
+    /// completion gate blocked even after a later round checks everything again.
+    /// Attempt keys are unique per verifier run, so expiring them cannot clash
+    /// with a retry, which always uses a fresh run identity.
+    pub async fn expire_abandoned_attempts(&self, run: &str) -> Result<()> {
+        let run = run.to_owned();
+        self.db
+            .write(Priority::Journal, move |c| {
+                c.execute(
+                    "UPDATE task_check_attempts SET state='expired' WHERE run_id=?1 AND state='intent' AND evidence_id IS NULL",
+                    [run],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 }
 
@@ -1253,6 +1389,13 @@ impl TaskCompletionGate {
                 false,
             )
         }
+        // Every check this assessment drives has settled by now: the final-check
+        // loop above awaits each attempt, and no other driver runs checks for
+        // this run after finalization starts. An intent row left behind can only
+        // belong to a dropped future, so mark it expired instead of blocking the
+        // gate on an intention nobody will resolve. The evidence-based entries
+        // below still report the check itself as unproven.
+        self.store.expire_abandoned_attempts(run).await?;
         let owner = run.to_owned();
         let pending=self.store.db.read(ReadLane::Interactive,move|c|{let mut q=c.prepare("WITH RECURSIVE tree(id) AS(SELECT ?1 UNION SELECT l.run_id FROM task_run_links l JOIN tree t ON l.parent_run_id=t.id) SELECT a.check_id FROM task_check_attempts a JOIN tree t ON t.id=a.run_id WHERE a.state='intent'")?;Ok(q.query_map([owner],|r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?)}).await?;
         for id in pending {

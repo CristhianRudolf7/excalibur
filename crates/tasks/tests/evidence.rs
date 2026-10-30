@@ -1272,6 +1272,15 @@ impl ToolRuntime for PendingCheck {
 #[tokio::test(start_paused = true)]
 async fn declared_timeout_interrupts_a_hung_adapter_deterministically_and_preserves_uncertain_intent()
  {
+    // SQLite answers on a dedicated OS thread. Keep Tokio runnable while the
+    // check reaches its adapter, so paused-time auto-advance cannot fire the
+    // 250 ms deadline during setup I/O and finish the task before `started`
+    // fires; without this the `notified()` wait below would park forever.
+    let keep_awake = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
     let f = fixture(
         "test",
         Some(json!({"kind":"command","command":"synthetic pending adapter","timeout_ms":250})),
@@ -1297,6 +1306,7 @@ async fn declared_timeout_interrupts_a_hung_adapter_deterministically_and_preser
     assert!(error.to_string().contains("timed out"));
     assert_eq!(runtime.interrupted.load(Ordering::SeqCst), 1);
     assert!(f.store.task_evidence("task").await.unwrap().is_empty());
+    keep_awake.abort();
 }
 #[cfg(target_os = "linux")]
 #[tokio::test]

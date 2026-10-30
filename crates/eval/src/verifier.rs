@@ -49,7 +49,7 @@ impl IndependentVerifier for GatewayVerifier {
                     .await
                     .map_err(|e| e.to_string())?;
                 let owner = allocation.child_run.clone();
-                let uncertain=self.store.database().read(excalibur_store::ReadLane::Interactive,move|c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM task_check_attempts WHERE run_id=?1 AND state='intent' AND evidence_id IS NULL)",[owner],|r|r.get::<_,bool>(0))?)).await.map_err(|e|e.to_string())?;
+                let uncertain=self.store.database().read(excalibur_store::ReadLane::Interactive,move|c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM task_check_attempts WHERE run_id=?1 AND state IN ('intent','expired') AND evidence_id IS NULL)",[owner],|r|r.get::<_,bool>(0))?)).await.map_err(|e|e.to_string())?;
                 if uncertain {
                     return Err("interrupted independent check has uncertain effects; host reconciliation is required before another attempt".into());
                 }
@@ -235,6 +235,12 @@ impl IndependentVerifier for GatewayVerifier {
             }.await;
             local.terminals().shutdown().await;
             if result.is_err() {
+                // This verifier run is over; its evidence-less attempts would
+                // otherwise block the gate even when a retry checks everything.
+                self.store
+                    .expire_abandoned_attempts(&verifier_run)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 record_unknown_call(&journal, &verifier_run).await?;
                 let parent = journal
                     .state(&input.root_run_id)

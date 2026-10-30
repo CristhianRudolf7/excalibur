@@ -758,16 +758,70 @@ impl GitWorkspace {
                 return Err(Error::Git(error));
             }
         }
-        self.workspace
+        // Only a committed checkpoint integrates: uncommitted resolution edits
+        // must be checkpointed before the retry, mirroring enqueue.
+        if !self
+            .git(&tree.path, &["status", "--porcelain"])
+            .await?
+            .is_empty()
+        {
+            return Err(Error::Invalid("checkpoint child changes before retry"));
+        }
+        let resolved = self
+            .git(&tree.path, &["rev-parse", "HEAD"])
+            .await?
+            .trim()
+            .to_owned();
+        // Adopt the post-resolution checkpoint atomically: compare-and-swap on
+        // the terminal state, refresh the source the queue guard compares
+        // against, and clear transient rebase state so process_next rebases,
+        // checks, and advances the resolved checkpoint instead of returning it.
+        let (retry_id, task_id, child_id, source) =
+            (id.clone(), task.clone(), child.clone(), resolved.clone());
+        let changed = self
+            .workspace
             .db
             .write(Priority::Journal, move |c| {
-                c.execute(
-                    "UPDATE workspace_integrations SET state='queued' WHERE id=?1",
-                    [id],
+                if c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspace_integrations WHERE task_id=?1 AND child=?2 AND source_oid=?3 AND id<>?4)",
+                    params![task_id, child_id, source, retry_id],
+                    |r| r.get::<_, bool>(0),
+                )? {
+                    return Err(excalibur_store::Error::Invalid(
+                        "resolved checkpoint is already queued; process the existing entry",
+                    ));
+                }
+                let text: String = c.query_row(
+                    "SELECT report FROM workspace_integrations WHERE id=?1",
+                    params![retry_id],
+                    |r| r.get(0),
                 )?;
-                Ok(())
+                let mut report: IntegrationReport =
+                    serde_json::from_str(&text).map_err(|_| {
+                        excalibur_store::Error::Invalid("integration report is corrupt")
+                    })?;
+                report.state = "queued".into();
+                report.detail = "re-queued at resolved checkpoint".into();
+                report.target_before = None;
+                report.rebased_oid = None;
+                report.files.clear();
+                report.child_diff.clear();
+                report.integration_diff.clear();
+                report.tests = None;
+                let text = serde_json::to_string(&report).map_err(|_| {
+                    excalibur_store::Error::Invalid("integration report is corrupt")
+                })?;
+                Ok(c.execute(
+                    "UPDATE workspace_integrations SET state='queued',source_oid=?2,target_before=NULL,rebased_oid=NULL,report=?3 WHERE id=?1 AND state IN ('returned','conflicted')",
+                    params![retry_id, source, text],
+                )?)
             })
             .await?;
+        if changed == 0 {
+            return Err(Error::Invalid(
+                "integration entry changed concurrently; list the queue before retrying",
+            ));
+        }
         Ok(())
     }
     async fn save(&self, report: &IntegrationReport) -> Result<()> {

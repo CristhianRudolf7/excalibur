@@ -244,7 +244,43 @@ impl LocalTools {
         }
         Ok(files)
     }
+    pub(crate) fn mark_exec_run(&self, run: &str) {
+        if let Ok(mut runs) = self.exec_runs.lock() {
+            runs.insert(run.into());
+        }
+    }
+    /// A run "uses exec" once it attempted an exec call or still owns terminal
+    /// sessions. Steps of such runs record filesystem state at their
+    /// boundaries even when the step itself only drives background sessions
+    /// through exec_io.
+    pub(crate) fn uses_exec(&self, run: &str) -> bool {
+        if self
+            .exec_runs
+            .lock()
+            .map(|runs| runs.contains(run))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        !self.terminal.live_status(run).is_empty()
+    }
+    pub(crate) async fn has_shadow_snapshot(
+        &self,
+        run: &str,
+        step: u64,
+        phase: &str,
+    ) -> Result<bool, String> {
+        Ok(self
+            .workspace
+            .shadow()
+            .list_snapshots(run)
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|s| s.step == step && s.phase == phase))
+    }
     pub(crate) async fn start_shadow_command(&self, run: &str) -> Result<(), String> {
+        self.mark_exec_run(run);
         let step = self
             .steps
             .lock()
@@ -252,6 +288,25 @@ impl LocalTools {
             .get(run)
             .copied()
             .unwrap_or(0);
+        // The per-step entry is idempotent; check before walking the tree so a
+        // repeated exec in the same step does not re-read every file.
+        if self.has_shadow_snapshot(run, step, "before").await? {
+            return Ok(());
+        }
+        self.workspace
+            .shadow()
+            .snapshot_entries(run, step, "before", self.authorized_snapshot_entries()?)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub(crate) async fn begin_shadow_step(&self, run: &str, step: u64) -> Result<(), String> {
+        if !self.uses_exec(run) {
+            return Ok(());
+        }
+        if self.has_shadow_snapshot(run, step, "before").await? {
+            return Ok(());
+        }
         self.workspace
             .shadow()
             .snapshot_entries(run, step, "before", self.authorized_snapshot_entries()?)
@@ -260,21 +315,17 @@ impl LocalTools {
         Ok(())
     }
     pub(crate) async fn finish_shadow_step(&self, run: &str, step: u64) -> Result<(), String> {
-        if self
-            .workspace
-            .shadow()
-            .list_snapshots(run)
-            .await
-            .map_err(|e| e.to_string())?
-            .iter()
-            .any(|s| s.step == step && s.phase == "before")
-        {
-            self.workspace
-                .shadow()
-                .snapshot_entries(run, step, "after", self.authorized_snapshot_entries()?)
-                .await
-                .map_err(|e| e.to_string())?;
+        if self.has_shadow_snapshot(run, step, "after").await? {
+            return Ok(());
         }
+        if !self.uses_exec(run) && !self.has_shadow_snapshot(run, step, "before").await? {
+            return Ok(());
+        }
+        self.workspace
+            .shadow()
+            .snapshot_entries(run, step, "after", self.authorized_snapshot_entries()?)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
     pub(crate) async fn prepare_domain(

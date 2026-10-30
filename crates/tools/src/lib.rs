@@ -85,6 +85,7 @@ pub struct LocalTools {
     workspace: excalibur_workspace::Workspace,
     active_runs: Arc<Mutex<HashSet<String>>>,
     steps: Arc<Mutex<HashMap<String, u64>>>,
+    exec_runs: Arc<Mutex<HashSet<String>>>,
     parents: Arc<Mutex<HashMap<String, project::ParentAuthority>>>,
     child_authorities: Arc<Mutex<HashMap<String, project::ChildAuthority>>>,
     intelligence: Option<Arc<intelligence::ProjectIntelligence>>,
@@ -206,6 +207,7 @@ impl LocalTools {
             intelligence: None,
             active_runs: Arc::new(Mutex::new(HashSet::new())),
             steps: Arc::new(Mutex::new(HashMap::new())),
+            exec_runs: Arc::new(Mutex::new(HashSet::new())),
             db,
             root,
             directory: Arc::new(directory),
@@ -1090,15 +1092,31 @@ impl ToolRuntime for LocalTools {
         Box::pin(async move {
             let active = matches!(state, "running" | "verifying")
                 || state == "waiting" && matches!(reason, Some("tool" | "subagents"));
-            {
+            let was_active = {
                 let mut runs = self
                     .active_runs
                     .lock()
                     .map_err(|_| "run state lock poisoned")?;
+                let was_active = runs.contains(run);
                 if active {
                     runs.insert(run.into());
                 } else {
                     runs.remove(run);
+                }
+                was_active && !active
+            };
+            // A run leaving active execution (pause, cancel, approval wait,
+            // block) ends its current step outside the normal step boundary.
+            // Record the closing filesystem state so the step stays restorable.
+            if was_active {
+                let step = self
+                    .steps
+                    .lock()
+                    .map_err(|_| "step state lock poisoned")?
+                    .get(run)
+                    .copied();
+                if let Some(step) = step {
+                    self.finish_shadow_step(run, step).await?;
                 }
             }
             self.workspace
@@ -1114,7 +1132,7 @@ impl ToolRuntime for LocalTools {
                 .lock()
                 .map_err(|_| "step state lock poisoned")?
                 .insert(run.into(), step);
-            Ok(())
+            self.begin_shadow_step(run, step).await
         })
     }
     fn end_step<'a>(&'a self, run: &'a str, step: u64) -> BoxFuture<'a, Result<(), String>> {
