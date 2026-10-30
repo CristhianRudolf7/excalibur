@@ -435,12 +435,12 @@ async fn shared_exec_changes_retain_unverified_provenance() {
     assert!(
         changes
             .iter()
-            .any(|(c, _)| c.path == PathBuf::from("agent.txt"))
+            .any(|(c, _)| c.path == Path::new("agent.txt"))
     );
     assert!(
         changes
             .iter()
-            .any(|(c, _)| c.path == PathBuf::from("human.txt"))
+            .any(|(c, _)| c.path == Path::new("human.txt"))
     );
     tools.end_step(&run, 0).await.unwrap();
     // An ABA edit returns to content captured by the closing exec snapshot.
