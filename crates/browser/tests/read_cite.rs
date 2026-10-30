@@ -292,7 +292,10 @@ async fn http_first_with_cache_hits() {
     let normalized = read::normalize_url(&url).unwrap();
     assert!(cache.get(&normalized, 1_000).is_none());
 
-    let (status, final_url, body) = read::fetch_http(&url).await.expect("local fetch");
+    let policy = read::FetchPolicy::test_loopback();
+    let (status, final_url, body) = read::fetch_http_with_policy(&url, &policy)
+        .await
+        .expect("local fetch");
     assert_eq!(status, 200);
     assert!(body.contains("Harbor Guide"));
     assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -338,4 +341,295 @@ async fn http_first_with_cache_hits() {
         500,
     );
     assert!(expiring.get(&normalized, 500 + 11).is_none());
+}
+
+#[test]
+fn inline_limit_floors_char_boundary_for_non_ascii() {
+    // Byte INLINE_LIMIT lands inside a multibyte character: ASCII filler up to
+    // INLINE_LIMIT - 1, then U+00E9 (2 bytes) straddling the cut.
+    let mut markdown = "a".repeat(read::INLINE_LIMIT - 1);
+    markdown.push('\u{e9}');
+    markdown.push_str(&"b".repeat(1024));
+    assert!(markdown.len() > read::INLINE_LIMIT);
+    assert!(!markdown.is_char_boundary(read::INLINE_LIMIT));
+    let out = read::build_read(
+        "https://example.com/nonascii",
+        "https://example.com/nonascii",
+        "Tildes",
+        &markdown,
+        &[],
+        200,
+        Render::Http,
+        "2026-10-30T00:00:00Z",
+    );
+    assert!(out.truncated);
+    assert!(out.markdown.len() <= read::INLINE_LIMIT);
+    assert!(out.markdown.len() == read::floor_char_boundary(&markdown, read::INLINE_LIMIT));
+    assert!(out.full_len == markdown.len());
+    // Emoji (4-byte) straddling case as well.
+    let mut emoji = "x".repeat(read::INLINE_LIMIT - 2);
+    emoji.push('\u{1f30a}');
+    emoji.push_str(&"y".repeat(512));
+    assert!(!emoji.is_char_boundary(read::INLINE_LIMIT));
+    let out2 = read::build_read(
+        "https://example.com/emoji",
+        "https://example.com/emoji",
+        "Olas",
+        &emoji,
+        &[],
+        200,
+        Render::Http,
+        "2026-10-30T00:00:00Z",
+    );
+    assert!(out2.truncated);
+    assert!(out2.markdown.len() <= read::INLINE_LIMIT);
+}
+
+#[test]
+fn loopback_private_and_metadata_hosts_are_refused() {
+    let secure = read::FetchPolicy::secure();
+    // Secure default refuses loopback without touching the network.
+    assert_eq!(
+        read::check_fetch_url("http://127.0.0.1/article", &secure).unwrap_err(),
+        "loopback_forbidden"
+    );
+    assert_eq!(
+        read::check_fetch_url("http://localhost/article", &secure).unwrap_err(),
+        "loopback_forbidden"
+    );
+    // Private ranges and the cloud metadata IP stay refused.
+    for url in [
+        "http://10.0.0.5/",
+        "http://192.168.1.10/",
+        "http://172.16.4.2/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://100.64.0.1/",
+        "http://[::1]/",
+        "http://[fc00::1]/",
+        "http://example.local/",
+    ] {
+        assert!(
+            read::check_fetch_url(url, &secure).is_err(),
+            "expected refusal for {url}"
+        );
+    }
+    // Decimal-integer loopback obfuscation is canonicalized and refused.
+    assert_eq!(
+        read::check_fetch_url("http://2130706433/", &secure).unwrap_err(),
+        "loopback_forbidden"
+    );
+    // Downgrade detection is pure string logic.
+    assert!(read::is_downgrade(
+        "https://example.com/a",
+        "http://example.com/a"
+    ));
+    assert!(!read::is_downgrade(
+        "http://example.com/a",
+        "http://example.com/a"
+    ));
+    assert!(!read::is_downgrade(
+        "https://example.com/a",
+        "https://example.com/a"
+    ));
+    // Test policy admits loopback fixtures but still refuses other privates.
+    let fixture = read::FetchPolicy::test_loopback();
+    assert!(read::check_fetch_url("http://127.0.0.1:9/article", &fixture).is_ok());
+    assert!(read::check_fetch_url("http://10.0.0.5/", &fixture).is_err());
+    assert!(read::check_fetch_url("http://169.254.169.254/", &fixture).is_err());
+    assert!(read::host_is_blocked("127.0.0.1"));
+    assert!(!read::host_is_blocked("example.com"));
+    // Cookie isolation flag is on for both policies (no jar by construction).
+    assert!(read::cookie_isolation_active(&secure));
+    assert!(read::cookie_isolation_active(&fixture));
+}
+
+#[test]
+fn robots_and_index_hooks() {
+    let policy = read::FetchPolicy::secure();
+    let robots = "User-agent: *\nDisallow: /private\nAllow: /private/open\n";
+    assert!(!read::robots_allows(
+        robots,
+        "ExcaliburReader",
+        "/private/secret"
+    ));
+    assert!(read::robots_allows(
+        robots,
+        "ExcaliburReader",
+        "/private/open/file"
+    ));
+    assert!(read::robots_allows(robots, "ExcaliburReader", "/public"));
+    assert!(read::should_enqueue_index(true, &policy));
+    assert!(!read::should_enqueue_index(false, &policy));
+    let noindex_html = "<html><head><meta name=\"robots\" content=\"noindex, nofollow\"></head><body><p>x</p></body></html>";
+    let (noindex, nofollow) = extract::robots_meta_directives(noindex_html);
+    assert!(noindex && nofollow);
+    assert!(extract::has_robots_noindex(noindex_html));
+    let plain = "<html><head><title>T</title></head><body><p>x</p></body></html>";
+    assert!(!extract::has_robots_noindex(plain));
+}
+
+#[test]
+fn normalized_cite_returns_exact_covering_span() {
+    let doc = extract::extract_document(&static_html());
+    let (start, end, frag) = cite::locate(
+        &doc.markdown,
+        &doc.fragments,
+        "  FIRST   paragraph\nabout TIDES ",
+    )
+    .expect("normalized match");
+    assert!(doc.markdown.is_char_boundary(start));
+    assert!(doc.markdown.is_char_boundary(end));
+    assert!(start < end && end <= doc.markdown.len());
+    let covered = &doc.markdown[start..end];
+    assert_eq!(cite::normalize(covered), "first paragraph about tides");
+    // The covered slice is the raw words with original spacing preserved.
+    assert!(covered.starts_with("First"));
+    assert!(covered.ends_with("tides"));
+    assert!(!frag.is_empty());
+    let quote = "Second paragraph about night signals and fog horns.";
+    let citation = cite::cite(
+        "https://example.com/harbor",
+        &doc.title,
+        "2026-10-30T00:00:00Z",
+        &cite::content_hash(&doc.markdown),
+        &doc.markdown,
+        &doc.fragments,
+        "  SECOND paragraph about NIGHT   signals and fog HORNS. ",
+    )
+    .expect("citation");
+    let raw = &doc.markdown[citation.start..citation.end];
+    assert_eq!(cite::normalize(raw), cite::normalize(quote));
+}
+
+fn serve_streaming(total_bytes: usize) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/big",
+        listener.local_addr().unwrap().port()
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(4) {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {total_bytes}\r\nConnection: close\r\n\r\n"
+            );
+            if std::io::Write::write_all(&mut stream, header.as_bytes()).is_err() {
+                continue;
+            }
+            // Stream filler without ever holding the full body in memory.
+            let chunk = vec![b'x'; 65536];
+            let mut sent = 0usize;
+            while sent < total_bytes {
+                let n = (total_bytes - sent).min(chunk.len());
+                if std::io::Write::write_all(&mut stream, &chunk[..n]).is_err() {
+                    break;
+                }
+                sent += n;
+            }
+        }
+    });
+    url
+}
+
+fn serve_redirect_to(target: String) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/start",
+        listener.local_addr().unwrap().port()
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(4) {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+        }
+    });
+    url
+}
+
+fn serve_cookie_observer(seen: Arc<std::sync::Mutex<Vec<Option<String>>>>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/page",
+        listener.local_addr().unwrap().port()
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(8) {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let cookie = req
+                .lines()
+                .find_map(|l| l.strip_prefix("Cookie:").map(|v| v.trim().to_owned()));
+            seen.lock().unwrap().push(cookie);
+            let body = "<html><body><p>hi</p></body></html>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: session=abc; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn large_body_aborts_past_cap_without_buffering_all() {
+    // 50 MiB matrix row: the client must abort past 10 MiB (chunked counter)
+    // instead of buffering the whole body first.
+    let url = serve_streaming(50 * 1024 * 1024);
+    let policy = read::FetchPolicy::test_loopback();
+    let err = read::fetch_http_with_policy(&url, &policy)
+        .await
+        .unwrap_err();
+    assert_eq!(err, "body_too_large");
+}
+
+#[tokio::test]
+async fn redirect_to_private_ip_is_refused_before_fetch() {
+    // Local server redirects to a private literal; the guard refuses before
+    // any connection to the private host is attempted.
+    let target = "http://10.0.0.5/private".to_owned();
+    let url = serve_redirect_to(target);
+    let policy = read::FetchPolicy::test_loopback();
+    let err = read::fetch_http_with_policy(&url, &policy)
+        .await
+        .unwrap_err();
+    assert_eq!(err, "private_host_forbidden");
+}
+
+#[tokio::test]
+async fn secure_default_refuses_loopback_fixture() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let (url, _server) = serve_once(static_html(), counter.clone());
+    let err = read::fetch_http(&url).await.unwrap_err();
+    assert_eq!(err, "loopback_forbidden");
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cookies_are_never_stored_or_replayed() {
+    let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let url = serve_cookie_observer(seen.clone());
+    let policy = read::FetchPolicy::test_loopback();
+    for _ in 0..2 {
+        let (status, _, _) = read::fetch_http_with_policy(&url, &policy)
+            .await
+            .expect("cookie fixture fetch");
+        assert_eq!(status, 200);
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen.iter().all(|c| c.is_none()),
+        "no Cookie header may be sent"
+    );
 }

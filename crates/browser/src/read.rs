@@ -175,10 +175,23 @@ pub struct LightRead {
     pub untrusted: bool,
 }
 
+/// Floor `limit` to the nearest preceding UTF-8 char boundary in `s`.
+///
+/// Slicing Markdown at a raw byte index panics when the index lands inside a
+/// multibyte character (non-ASCII documents over [`INLINE_LIMIT`]). This
+/// helper backs the inline truncation so the 50 KiB cut never panics.
+pub fn floor_char_boundary(s: &str, limit: usize) -> usize {
+    let mut end = limit.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// Build a [`LightRead`] from extracted Markdown (caller already waited).
 ///
 /// `markdown` must be the full normalized document; only the first
-/// [`INLINE_LIMIT`] bytes travel inline.
+/// [`INLINE_LIMIT`] bytes travel inline (floored to a char boundary).
 #[allow(clippy::too_many_arguments)]
 pub fn build_read(
     url: &str,
@@ -194,7 +207,8 @@ pub fn build_read(
     let source_id = cite::source_id(&content_hash);
     let truncated = markdown.len() > INLINE_LIMIT;
     let inline = if truncated {
-        markdown[..INLINE_LIMIT].to_owned()
+        let end = floor_char_boundary(markdown, INLINE_LIMIT);
+        markdown[..end].to_owned()
     } else {
         markdown.to_owned()
     };
@@ -378,42 +392,402 @@ impl ReadCache {
     }
 }
 
+/// Maximum redirects followed manually (architecture 14.4 matrix).
+pub const MAX_REDIRECTS: usize = 5;
+/// User-agent advertised by light reads.
+pub const USER_AGENT: &str = "ExcaliburReader/b7";
+/// Cloud metadata endpoint that must never be fetched (SSRF guard).
+pub const METADATA_IP: &str = "169.254.169.254";
+
+/// Fetch policy for light reads.
+///
+/// `allow_loopback` exists only for local synthetic fixtures exercised with
+/// `FetchPolicy::test_loopback`; the secure default denies loopback, private
+/// ranges and the metadata IP. `isolate_cookies` records the intent that no
+/// cookie jar is used (the reqwest client is built without one); production
+/// persistence decisions stay broker-owned. `respect_robots` and
+/// `enqueue_index` expose the robots/index hooks the broker (B9 lane) drives:
+/// the browser crate evaluates supplied `robots.txt` bodies and page `<meta
+/// name=robots>` markers, while `robots.txt` retrieval, DNS-bound egress and
+/// actual queue insertion remain broker-owned (pending B9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FetchPolicy {
+    pub allow_loopback: bool,
+    pub isolate_cookies: bool,
+    pub respect_robots: bool,
+    pub enqueue_index: bool,
+}
+
+impl Default for FetchPolicy {
+    fn default() -> Self {
+        Self {
+            allow_loopback: false,
+            isolate_cookies: true,
+            respect_robots: true,
+            enqueue_index: true,
+        }
+    }
+}
+
+impl FetchPolicy {
+    /// Secure default: no loopback, isolated cookies, robots respected.
+    pub fn secure() -> Self {
+        Self::default()
+    }
+
+    /// Local synthetic fixtures only: loopback admitted, everything else kept.
+    pub fn test_loopback() -> Self {
+        Self {
+            allow_loopback: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// True when the client built for `policy` carries no cookie jar.
+///
+/// The reqwest dependency is compiled without the `cookies` feature, so no
+/// `Cookie` header is ever stored or replayed; this helper records the flag
+/// for the 14.4 matrix (`isolate_cookies`) and keeps the invariant explicit.
+pub fn cookie_isolation_active(policy: &FetchPolicy) -> bool {
+    policy.isolate_cookies
+}
+
+/// Error for `host` when it must not be fetched under `policy`.
+///
+/// Returns `loopback_forbidden` for loopback/localhost and
+/// `private_host_forbidden` for other non-public literals (private ranges,
+/// link-local incl. the metadata IP, reserved/multicast/documentation and
+/// sensitive single-label suffixes). Public DNS names return `None` here:
+/// binding a resolved address to this decision requires broker egress and is
+/// pending the B9 lane.
+fn host_block_error(host: &str) -> Option<&'static str> {
+    let mut lower = host.trim().trim_end_matches('.').to_lowercase();
+    // `Url::host_str` may retain IPv6 brackets; strip them for the literal.
+    if lower.starts_with('[') && lower.ends_with(']') && lower.len() >= 2 {
+        lower = lower[1..lower.len() - 1].to_owned();
+    }
+    if lower.is_empty() {
+        return Some("unsupported_url");
+    }
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return Some("loopback_forbidden");
+    }
+    if lower == "metadata.google.internal"
+        || lower.ends_with(".metadata.google.internal")
+        || lower == "instance-data"
+    {
+        return Some("private_host_forbidden");
+    }
+    if lower == METADATA_IP {
+        return Some("private_host_forbidden");
+    }
+    for suffix in [".local", ".internal", ".lan", ".home", ".corp", ".intranet"] {
+        if lower.ends_with(suffix) {
+            return Some("private_host_forbidden");
+        }
+    }
+    // Decimal-integer IPv4 (`http://2130706433/` == 127.0.0.1): canonicalize
+    // before the literal check so obfuscated loopback cannot bypass it.
+    if !lower.is_empty()
+        && lower.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(n) = lower.parse::<u32>()
+    {
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(n));
+        return ip_block_error(ip);
+    }
+    if let Some(hex) = lower
+        .strip_prefix("0x")
+        .or_else(|| lower.strip_prefix("0X"))
+        && let Ok(n) = u32::from_str_radix(hex, 16)
+    {
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(n));
+        return ip_block_error(ip);
+    }
+    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+        return ip_block_error(ip);
+    }
+    None
+}
+
+fn ip_block_error(ip: std::net::IpAddr) -> Option<&'static str> {
+    let blocked = match ip {
+        std::net::IpAddr::V4(v) => {
+            let o = v.octets();
+            v.is_loopback()
+                || v.is_private()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_broadcast()
+                || v.is_multicast()
+                || v.is_documentation()
+                || o == [169, 254, 169, 254]
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || o[0] >= 240
+                || o[0] == 0
+        }
+        std::net::IpAddr::V6(v) => {
+            if let Some(mapped) = v.to_ipv4_mapped() {
+                return ip_block_error(std::net::IpAddr::V4(mapped));
+            }
+            let s = v.segments();
+            v.is_loopback()
+                || v.is_unspecified()
+                || v.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+        }
+    };
+    if !blocked {
+        return None;
+    }
+    if ip.is_loopback() {
+        return Some("loopback_forbidden");
+    }
+    Some("private_host_forbidden")
+}
+
+/// True when `host` must not be fetched under the secure default.
+pub fn host_is_blocked(host: &str) -> bool {
+    host_block_error(host).is_some()
+}
+
+/// Validate `url` for fetching under `policy`.
+///
+/// Runs [`normalize_url`] (scheme/userinfo/length) plus the loopback,
+/// private-range, metadata-IP and sensitive-suffix guard. With
+/// `allow_loopback` only 127.0.0.0/8, ::1 and `localhost` are admitted; every
+/// other non-public literal stays refused.
+pub fn check_fetch_url(url: &str, policy: &FetchPolicy) -> Result<reqwest::Url, String> {
+    let normalized = normalize_url(url)?;
+    let parsed: reqwest::Url = normalized
+        .parse()
+        .map_err(|_| "unsupported_url".to_string())?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "unsupported_url".to_string())?;
+    if let Some(reason) = host_block_error(host) {
+        if policy.allow_loopback && reason == "loopback_forbidden" {
+            return Ok(parsed);
+        }
+        return Err(reason.into());
+    }
+    Ok(parsed)
+}
+
+/// True when following `next` from `current` would downgrade HTTPS to HTTP.
+pub fn is_downgrade(current: &str, next: &str) -> bool {
+    current.starts_with("https://") && next.starts_with("http://")
+}
+
+/// Minimal `robots.txt` allow check for one path (RFC 9309 subset).
+///
+/// Selects the group matching `user_agent` (exact, case-insensitive) or `*`,
+/// then applies the longest matching `Allow`/`Disallow` rule; ties prefer
+/// `Allow`. Empty/disallow-free bodies allow everything. This mirrors the
+/// production `excalibur_search::robots` decision for single-page reads so
+/// the browser crate can enforce a supplied body without a new dependency;
+/// `robots.txt` retrieval and caching stay broker-owned (pending B9).
+pub fn robots_allows(robots_txt: &str, user_agent: &str, path: &str) -> bool {
+    let ua = user_agent.to_lowercase();
+    type RobotsGroup = (Vec<String>, Vec<(String, bool)>);
+    let mut groups: Vec<RobotsGroup> = Vec::new();
+    let mut agents: Vec<String> = Vec::new();
+    let mut rules: Vec<(String, bool)> = Vec::new();
+    let mut in_group = false;
+    for raw in robots_txt.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let key = k.trim().to_lowercase();
+        let val = v.trim();
+        if key == "user-agent" {
+            if in_group && !rules.is_empty() {
+                groups.push((agents.clone(), rules.clone()));
+                agents.clear();
+                rules.clear();
+            }
+            agents.push(val.to_lowercase());
+            in_group = true;
+        } else if key == "disallow" {
+            if val.is_empty() {
+                continue;
+            }
+            rules.push((val.to_owned(), false));
+        } else if key == "allow" {
+            if val.is_empty() {
+                continue;
+            }
+            rules.push((val.to_owned(), true));
+        }
+    }
+    if in_group && !agents.is_empty() {
+        groups.push((agents, rules));
+    }
+    let mut selected: Option<&Vec<(String, bool)>> = None;
+    for (agents, rules) in &groups {
+        if agents.iter().any(|a| a == &ua) {
+            selected = Some(rules);
+            break;
+        }
+    }
+    if selected.is_none() {
+        for (agents, rules) in &groups {
+            if agents.iter().any(|a| a == "*") {
+                selected = Some(rules);
+                break;
+            }
+        }
+    }
+    let Some(rules) = selected else {
+        return true;
+    };
+    let mut best: Option<(usize, bool)> = None;
+    for (pattern, allow) in rules {
+        if pattern.is_empty() {
+            continue;
+        }
+        if path.starts_with(pattern.as_str()) {
+            let len = pattern.len();
+            match best {
+                Some((best_len, best_allow)) => {
+                    if len > best_len || (len == best_len && *allow && !best_allow) {
+                        best = Some((len, *allow));
+                    }
+                }
+                None => best = Some((len, *allow)),
+            }
+        }
+    }
+    best.map(|(_, allow)| allow).unwrap_or(true)
+}
+
+/// Index-enqueue intent for a page already known to be robots-checked.
+///
+/// Returns false when the policy disables enqueue, or — with
+/// `respect_robots` — when `robots_allow` is false. Actual queue insertion is
+/// broker-owned (pending B9); this hook keeps the read path honest about the
+/// 14.4 `robots.txt`/index row.
+pub fn should_enqueue_index(robots_allow: bool, policy: &FetchPolicy) -> bool {
+    if !policy.enqueue_index {
+        return false;
+    }
+    if policy.respect_robots && !robots_allow {
+        return false;
+    }
+    true
+}
+
 /// Fetch an HTTP(S) URL with explicit timeouts and a 10 MiB body cap.
 ///
-/// Returns `(status, final_url, text_body)`. Redirects are limited to five
-/// and every hop is re-validated by [`normalize_url`] semantics through
-/// reqwest's `http(s)`-only handling plus a downgrade check below.
+/// Returns `(status, final_url, text_body)`. Redirects are followed manually
+/// (at most [`MAX_REDIRECTS`]) so every hop is re-validated by
+/// [`check_fetch_url`] semantics plus an HTTPS-downgrade refusal. Bodies are
+/// consumed in chunks with a running counter: past [`MAX_BODY_BYTES`] the
+/// read aborts with `body_too_large` before the full body is buffered.
+/// Cookies are never stored or replayed (no cookie jar); `robots.txt`
+/// retrieval and broker egress stay pending the B9 lane.
 pub async fn fetch_http(url: &str) -> Result<(u16, String, String), String> {
-    normalize_url(url)?;
+    fetch_http_with_policy(url, &FetchPolicy::secure()).await
+}
+
+/// Fetch under an explicit [`FetchPolicy`].
+///
+/// `FetchPolicy::test_loopback` admits loopback fixtures for local synthetic
+/// tests; every other guard (private ranges, metadata IP, downgrade,
+/// chunked cap, cookie isolation) still applies.
+pub async fn fetch_http_with_policy(
+    url: &str,
+    policy: &FetchPolicy,
+) -> Result<(u16, String, String), String> {
+    let first = check_fetch_url(url, policy)?;
+    let _ = cookie_isolation_active(policy);
     let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent("ExcaliburReader/b7")
+        .user_agent(USER_AGENT)
         .build()
         .map_err(|e| e.to_string())?;
-    let response = client.get(url).send().await.map_err(|e| e.to_string())?;
-    let status = response.status().as_u16();
-    let final_url = response.url().to_string();
-    // Refuse HTTPS -> HTTP downgrades on redirect.
-    if url.starts_with("https://") && final_url.starts_with("http://") {
-        return Err("redirect_downgrade".into());
+    let mut current = first.to_string();
+    let mut hops = 0usize;
+    loop {
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        let final_now = response.url().to_string();
+        check_fetch_url(&final_now, policy)?;
+        if is_downgrade(&current, &final_now) || is_downgrade(url, &final_now) {
+            return Err("redirect_downgrade".into());
+        }
+        if status.is_redirection() {
+            if hops >= MAX_REDIRECTS {
+                return Err("too_many_redirects".into());
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| "redirect_no_location".to_string())?
+                .to_owned();
+            let base: reqwest::Url = current.parse().map_err(|_| "unsupported_url".to_string())?;
+            let next = base
+                .join(&location)
+                .map_err(|_| "unsupported_url".to_string())?;
+            let next_str = next.to_string();
+            check_fetch_url(&next_str, policy)?;
+            if is_downgrade(&current, &next_str) || is_downgrade(url, &next_str) {
+                return Err("redirect_downgrade".into());
+            }
+            current = next_str;
+            hops += 1;
+            continue;
+        }
+        let status_u16 = status.as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        if !supported_type(&content_type) {
+            return Err(format!("unsupported_type:{content_type}"));
+        }
+        let text = read_capped_body(response).await?;
+        return Ok((status_u16, final_now, text));
     }
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
-    if !supported_type(&content_type) {
-        return Err(format!("unsupported_type:{content_type}"));
+}
+
+/// Consume `response` in chunks, aborting past [`MAX_BODY_BYTES`].
+///
+/// The running counter prevents a hostile server from forcing the full body
+/// into memory before the cap is enforced (14.2 step 3).
+async fn read_capped_body(response: reqwest::Response) -> Result<String, String> {
+    let mut total: usize = 0;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut response = response;
+    loop {
+        let chunk = response.chunk().await.map_err(|e| e.to_string())?;
+        let Some(bytes) = chunk else {
+            break;
+        };
+        total = total.saturating_add(bytes.len());
+        if total > MAX_BODY_BYTES {
+            return Err("body_too_large".into());
+        }
+        buf.extend_from_slice(&bytes);
     }
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() > MAX_BODY_BYTES {
-        return Err("body_too_large".into());
-    }
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    Ok((status, final_url, text))
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn supported_type(content_type: &str) -> bool {
