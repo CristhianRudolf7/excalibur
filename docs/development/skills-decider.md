@@ -8,7 +8,7 @@ Loading returns the frozen body as a tool result after a host callback resolves 
 
 The `excalibur-decider` library provides typed probability answers, bounded fallback, explicit refusal, conservative uncalibrated thresholds and a SQLite labeled ledger. Calibration reports Brier/ECE/MCE and coverage from supplied local labels. Final correctness verdicts have no decision port. The model-role router binds roles and supports isolated expert consultation while keeping an executor binding stable.
 
-These libraries are not yet wired into the daemon's complete context and execution lifecycle. Automatic tool enforcement, skill context projection, all eight production decision ports, durable skill statistics, curated-skill audit/promotion and learning remain integration work. No provider quality or calibrated production accuracy is claimed. Tests use local deterministic doubles and never call paid APIs.
+The daemon now binds durable worker skill sessions to the actual run and authorized project. The shared runtime supplies frozen L1 catalogs, at most three L3 suggestions, native search/load tools, associated deferred schemas, change deltas and execution restrictions. See [Worker skill sessions](skills-host.md). Master conversation sessions, all eight production decision ports, durable aggregate skill statistics, curated-skill audit/promotion and learning remain integration work. No provider quality or calibrated production accuracy is claimed. Tests use local deterministic doubles and never call paid APIs.
 
 Verification:
 

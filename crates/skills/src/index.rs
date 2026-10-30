@@ -177,7 +177,7 @@ impl GroupEvidence {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct IndexSnapshot {
     pub revision: u64,
     pub hash: String,
@@ -511,6 +511,15 @@ impl SkillIndex {
 
     /// Rescan every root. Entries whose content hash changed are revalidated
     /// and reindexed (lexical and vector); unchanged vectors are reused.
+    /// File scanning is blocking; hosts and watchers use this bridge rather than
+    /// executing filesystem traversal on an interactive async thread.
+    pub async fn refresh_background(self: &Arc<Self>) -> Result<RefreshReport, String> {
+        let index = self.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || handle.block_on(index.refresh()))
+            .await
+            .map_err(|e| e.to_string())
+    }
     pub async fn refresh(&self) -> RefreshReport {
         let _serial = self.refresh_lock.lock().await;
         let previous = self.snapshot();

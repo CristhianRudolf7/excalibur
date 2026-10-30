@@ -5,9 +5,12 @@ edition = "2024"
 
 [dependencies]
 cap-std = "3.4.6"
+excalibur-store = { path = "../store" }
+excalibur-context = { path = "../context" }
 excalibur-types = { path = "../types" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+jsonschema = { version = "0.60", default-features = false }
 serde_yaml_ng = "=0.10.0"
 sha2 = "0.10"
 thiserror = "2"

@@ -3,5 +3,6 @@ pub mod builtin;
 pub mod format;
 pub mod groups;
 pub mod index;
+pub mod runtime;
 pub mod session;
 pub mod watcher;

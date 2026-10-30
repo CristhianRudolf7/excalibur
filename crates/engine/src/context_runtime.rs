@@ -355,7 +355,21 @@ impl Engine {
         s: &mut Snapshot,
         input: excalibur_context::ContextInput,
     ) -> Result<excalibur_context::CompiledContext> {
+        let additions = self
+            .tools
+            .session_context(run)
+            .await
+            .map_err(|_| Error::Invalid("run session context unavailable"))?;
+        let additions_value = serde_json::to_value(&additions)?;
+        if self.sanitize(&additions_value)? != additions_value {
+            return Err(Error::Invalid("unsafe run session context"));
+        }
         let mut initial_context = s.spec.context.clone();
+        initial_context.layers[1].push_str(&additions.identity);
+        initial_context
+            .suggested_skills
+            .extend(additions.suggested_skills);
+        initial_context.suggested_skills.truncate(3);
         if s.context_session.is_none()
             && let Some(mut definitions) = self
                 .tools
@@ -409,6 +423,19 @@ impl Engine {
             session
                 .append(&format!("activity:{index}"), message.clone(), reference)
                 .map_err(|_| Error::Invalid("context history identity conflict"))?;
+        }
+        for (id, text) in additions.updates {
+            session
+                .append(
+                    &id,
+                    Message::text("user", text),
+                    HistoryReference {
+                        run_id: run.into(),
+                        to_sequence: s.last_sequence,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|_| Error::Invalid("run session delta rejected"))?;
         }
         let unarchived = session
             .unarchived_observations()

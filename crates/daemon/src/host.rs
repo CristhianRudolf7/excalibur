@@ -14,6 +14,7 @@ use excalibur_vault::Redactor;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 struct Authority {
+    skills: Arc<crate::skills::SkillsHost>,
     memory: Option<Arc<crate::memory::MemoryHost>>,
     security: Security,
     tools: Arc<WorkerTools>,
@@ -89,6 +90,7 @@ impl RunAuthority for Authority {
             if let Some(memory) = &self.memory {
                 memory.bind_agent(&effective, parent).await?;
             }
+            self.skills.bind_agent(&effective).await?;
             Ok(())
         })
     }
@@ -147,6 +149,7 @@ pub struct MasterToolOptions {
     pub scopes: BTreeSet<String>,
 }
 pub struct HostOptions {
+    pub skills: crate::skills::SkillsOptions,
     pub root: PathBuf,
     pub cgroup_root: Option<PathBuf>,
     pub project_services:
@@ -168,6 +171,7 @@ pub struct HostOptions {
 impl HostOptions {
     pub fn project(root: PathBuf) -> Self {
         Self {
+            skills: Default::default(),
             root: root.clone(),
             cgroup_root: None,
             project_services: Default::default(),
@@ -196,6 +200,7 @@ impl HostOptions {
     }
 }
 pub struct DaemonHost {
+    pub skills: Arc<crate::skills::SkillsHost>,
     pub master: Master,
     pub orchestrator: Orchestrator,
     pub gateway: Gateway,
@@ -347,6 +352,14 @@ impl DaemonHost {
             catalog,
             excalibur_tools::deferred::CallerRole::Worker,
         )?);
+        let skills = crate::skills::SkillsHost::open(
+            db.clone(),
+            deferred,
+            &options.projects,
+            options.skills.clone(),
+            model.as_ref(),
+        )
+        .await?;
         let journal = excalibur_journal::Journal::new(db.clone())
             .await
             .map_err(|e| e.to_string())?;
@@ -386,9 +399,13 @@ impl DaemonHost {
             tasks.clone(),
         ));
         let engine = Arc::new(
-            Engine::new(journal, lanes.gateway(Lane::User, model.clone()), deferred)
-                .with_completion_gate(gate.clone())
-                .with_durable_sink(projection.clone()),
+            Engine::new(
+                journal,
+                lanes.gateway(Lane::User, model.clone()),
+                skills.runtime.clone(),
+            )
+            .with_completion_gate(gate.clone())
+            .with_durable_sink(projection.clone()),
         );
         projection.attach(&engine);
         let orchestrator = Orchestrator::open(db.clone(), engine, options.limits.clone())
@@ -397,6 +414,7 @@ impl DaemonHost {
             .with_runtime(work.clone())
             .with_tasks(tasks.clone())
             .with_authority(Arc::new(Authority {
+                skills: skills.clone(),
                 memory: memory.clone(),
                 security: security.clone(),
                 tools: workers.clone(),
@@ -518,6 +536,7 @@ impl DaemonHost {
             AccessPolicy::new(token, options.origins, 16 * 1024 * 1024).map_err(|e| e.message)?;
         let gateway = Gateway::new(Arc::new(backend), db.clone(), policy);
         Ok(Self {
+            skills,
             master,
             orchestrator,
             gateway,
@@ -537,6 +556,7 @@ impl DaemonHost {
         self.actions.recover_task_directives().await
     }
     pub async fn close(self) -> Result<(), String> {
+        self.skills.stop();
         if let Some(memory) = &self.memory {
             memory.stop();
         }
