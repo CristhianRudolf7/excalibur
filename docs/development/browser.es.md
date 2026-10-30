@@ -823,9 +823,10 @@ objetivos táctiles y cabecera de origen, con capturas en
 `target/test-evidence/browser/viewer/`. Quedan pendientes: la elevación por
 estado de documento conectada a la red, tipos de detector fuera del
 vocabulario fijo 9.1 (variantes de muro de cookies/geo-bloqueo sin marcadores
-9.1 no bloquean), la puesta a cero de la copia de relleno del adaptador
-(F-B4-03) y la unificación de magias ZIP (F-B4-04), ambas fuera del conjunto de
-ficheros B5.
+9.1 no bloquean). La puesta a cero de la copia de relleno del adaptador
+(F-B4-03) y la unificación de magias ZIP (F-B4-04) quedan resueltas en la ronda
+de corrección B4 (el adaptador pone a cero su copia de relleno tras la petición;
+`magic()` etiqueta ZIP `PK\x03\x04` igual que `file_control`).
 
 ## Lectura ligera y citas
 

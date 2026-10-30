@@ -781,8 +781,10 @@ touch targets and the committed origin header, with screenshots in
 `target/test-evidence/browser/viewer/`. Still pending: document-status
 elevation wired to live network state, detector kinds beyond the fixed 9.1
 vocabulary (cookie-wall/geo-block variants without 9.1 markers do not
-block), the F-B4-03 adapter fill-copy zeroization and the F-B4-04 ZIP magic
-unification, both outside the allowed B5 file set.
+block). The F-B4-03 adapter fill-copy zeroization and the F-B4-04 ZIP magic
+unification are resolved in the B4 correction round (the adapter zeroes its
+fill copy after the request; `magic()` labels ZIP `PK\x03\x04` to mirror
+`file_control`).
 
 ## Light reading and citations
 
