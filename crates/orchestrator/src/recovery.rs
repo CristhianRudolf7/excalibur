@@ -48,8 +48,14 @@ pub(crate) struct ResumeAssessment {
 }
 impl ResumeAssessment {
     /// Reasons that forbid an automatic resume; empty means eligible.
-    pub(crate) fn blockers(&self, host: Autonomy) -> Vec<&'static str> {
+    /// `downtime_seconds` is the interruption length; 17.3 forbids automatic
+    /// resume after six hours or more.
+    pub(crate) fn blockers(&self, host: Autonomy, downtime_seconds: i64) -> Vec<&'static str> {
         [
+            (
+                downtime_seconds >= MAX_DOWNTIME,
+                "interruption lasted six hours or more",
+            ),
             (
                 host < Autonomy::Autonomous,
                 "host autonomy is below autonomous",
@@ -160,6 +166,12 @@ impl RecoveryLedger {
             let quarantined=c.prepare("SELECT run_id FROM daemon_quarantine WHERE released_at IS NULL ORDER BY run_id")?.query_map([],|r|r.get(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
             let decisions=c.prepare("SELECT run_id,decision,reason FROM daemon_recovery_decisions WHERE boot_id=?1 ORDER BY run_id LIMIT 100")?.query_map([&boot_id],|r|Ok(RecoveryDecision{run_id:r.get(0)?,decision:r.get(1)?,reason:r.get(2)?}))?.collect::<std::result::Result<Vec<_>,_>>()?;
             Ok(RecoveryStatus{boot_id,recovering,safe_mode:safe_until>at,safe_until,recent_crashes,downtime_seconds,quarantined,decisions})
+        }).await?)
+    }
+    /// Start time and measured downtime of the current daemon boot, if any.
+    pub(crate) async fn current_boot(&self) -> Result<Option<(i64, i64)>> {
+        Ok(self.db.read(ReadLane::Interactive, |c| {
+            Ok(c.query_row("SELECT b.started_at,b.downtime_seconds FROM daemon_recovery_state s JOIN daemon_boots b ON b.id=s.boot_id WHERE s.id=1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
         }).await?)
     }
     pub async fn heartbeat(&self, at: i64) -> Result<()> {
@@ -359,8 +371,9 @@ impl Orchestrator {
             let assessment = self.assess_resume(run, &state).await?;
             let pending_effect = assessment.pending_effect;
             let pending_approval = assessment.pending_approval;
-            let eligible =
-                assessment.blockers(autonomy).is_empty() && boot.downtime_seconds < MAX_DOWNTIME;
+            let eligible = assessment
+                .blockers(autonomy, boot.downtime_seconds)
+                .is_empty();
             let (decision, reason, resume) = if quarantined && !preserved {
                 ("blocked", "possible crash cause: quarantined", false)
             } else if preserved {

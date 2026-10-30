@@ -61,7 +61,10 @@ impl Orchestrator {
     /// Reap finished tasks and admit ready work without occupying a worker for waiting parents.
     pub async fn tick(&self) -> Result<Vec<String>> {
         self.reap().await?;
-        self.watchdog_runs(now()).await?;
+        // A watchdog storage failure must not stop control servicing or admission.
+        if let Err(error) = self.watchdog_runs(now()).await {
+            eprintln!("run watchdog pass failed: {error}");
+        }
         for a in self.active_agents().await? {
             if a.run_id.is_some() {
                 self.deliver_mailbox(&a.id).await?;
@@ -247,7 +250,10 @@ impl Orchestrator {
         for (id, handle) in finished {
             let a = self.agent(&id).await?;
             let run = a.run_id.as_ref().ok_or_else(|| invalid("run missing"))?;
-            match handle.await {
+            let outcome = handle.await;
+            let watchdog_abort = matches!(&outcome, Err(e) if e.is_cancelled())
+                && self.watchdog_aborted(run).await?;
+            match outcome {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
                     self.inner
@@ -255,9 +261,10 @@ impl Orchestrator {
                         .fail(run, &format!("execution error: {e}"))
                         .await?;
                 }
-                // Only the stall watchdog aborts a live driver, after its
-                // durable pause/block CAS; cancellation is not a run failure.
-                Err(e) if e.is_cancelled() => {}
+                // A driver aborted by the stall watchdog, after its durable
+                // pause/block CAS and abort receipt, is not a run failure.
+                // Any other cancellation still fails the run.
+                Err(_) if watchdog_abort => {}
                 Err(e) => {
                     self.inner
                         .engine

@@ -30,8 +30,10 @@ enum Reply {
 struct Script {
     replies: Mutex<VecDeque<Reply>>,
     model_entered: AtomicBool,
-    hang_prepare_once: AtomicBool,
-    prepare_entered: AtomicBool,
+    /// Number of upcoming `prepare` calls that hang until `release`.
+    hang_prepares: Mutex<usize>,
+    release: tokio::sync::Notify,
+    prepares: AtomicUsize,
     executions: AtomicUsize,
     execute_entered: AtomicBool,
 }
@@ -99,10 +101,17 @@ impl ToolRuntime for Tools {
         call: ToolCall,
     ) -> BoxFuture<'a, std::result::Result<PreparedTool, String>> {
         Box::pin(async move {
-            self.0.prepare_entered.store(true, Ordering::SeqCst);
-            if self.0.hang_prepare_once.swap(false, Ordering::SeqCst) {
-                // Outside any control select: only an abort can stop this driver.
-                std::future::pending::<()>().await;
+            let hang = {
+                let mut remaining = self.0.hang_prepares.lock().unwrap();
+                let hang = *remaining > 0;
+                *remaining = remaining.saturating_sub(1);
+                hang
+            };
+            self.0.prepares.fetch_add(1, Ordering::SeqCst);
+            if hang {
+                // Outside any control select: only an abort or an explicit
+                // test release can stop this driver.
+                self.0.release.notified().await;
             }
             let effect = if call.name == "write" {
                 Effect::NonIdempotent
@@ -160,7 +169,12 @@ struct Fixture {
     master: Agent,
     script: Arc<Script>,
 }
-async fn open(dir: tempfile::TempDir, script: Arc<Script>) -> Fixture {
+async fn open(
+    dir: tempfile::TempDir,
+    script: Arc<Script>,
+    boot_at: i64,
+    autonomy: Autonomy,
+) -> Fixture {
     let db = Database::open(
         dir.path().join("main.db"),
         DatabaseKind::Main,
@@ -188,14 +202,8 @@ async fn open(dir: tempfile::TempDir, script: Arc<Script>) -> Fixture {
         .rebind_master_at_startup("Excalibur", support::token())
         .await
         .unwrap();
-    let boot = host
-        .recovery()
-        .begin(excalibur_store::unix_seconds())
-        .await
-        .unwrap();
-    host.recover_startup(&boot, Autonomy::Autonomous)
-        .await
-        .unwrap();
+    let boot = host.recovery().begin(boot_at).await.unwrap();
+    host.recover_startup(&boot, autonomy).await.unwrap();
     Fixture {
         dir,
         db,
@@ -209,7 +217,13 @@ async fn fixture(replies: Vec<Reply>) -> Fixture {
         replies: Mutex::new(replies.into()),
         ..Default::default()
     });
-    open(tempfile::tempdir().unwrap(), script).await
+    open(
+        tempfile::tempdir().unwrap(),
+        script,
+        excalibur_store::unix_seconds(),
+        Autonomy::Autonomous,
+    )
+    .await
 }
 async fn authorize(f: &Fixture, run: &str) {
     Security::new(f.db.clone(), support::token(), Redactor::default())
@@ -375,7 +389,13 @@ async fn hung_model_is_interrupted_at_the_boundary_paused_and_alerted_once_acros
     drop(host);
     db.shutdown().await.unwrap();
     drop(db);
-    let f = open(dir, Arc::new(Script::default())).await;
+    let f = open(
+        dir,
+        Arc::new(Script::default()),
+        excalibur_store::unix_seconds(),
+        Autonomy::Autonomous,
+    )
+    .await;
     f.host.watchdog_runs(at + 3000).await.unwrap();
     assert_eq!(alerts(&f.host, &run).await.len(), 1);
     assert_eq!(f.host.watchdog_incidents(None).await.unwrap().len(), 1);
@@ -392,10 +412,10 @@ async fn hung_model_is_interrupted_at_the_boundary_paused_and_alerted_once_acros
 #[tokio::test]
 async fn non_cooperative_driver_is_aborted_reconciled_and_resumed_once_to_completion() {
     let f = fixture(vec![Reply::Call("probe"), Reply::Done]).await;
-    f.script.hang_prepare_once.store(true, Ordering::SeqCst);
+    *f.script.hang_prepares.lock().unwrap() = 1;
     let (agent, run) = spawn(&f, "hung-prepare").await;
     assert_eq!(f.host.tick().await.unwrap(), vec![agent.clone()]);
-    until(|| f.script.prepare_entered.load(Ordering::SeqCst)).await;
+    until(|| f.script.prepares.load(Ordering::SeqCst) >= 1).await;
     let at = base(&f.db, &run).await;
     assert_eq!(
         f.host.watchdog_runs(at + 600).await.unwrap(),
@@ -562,6 +582,156 @@ async fn watchdog_schema_is_additive_and_tampering_fails_closed() {
         Orchestrator::open(f.db.clone(), engine, Limits::default())
             .await
             .is_err()
+    );
+    f.host.shutdown().await.unwrap();
+    f.db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_run_is_resumed_automatically_at_most_once() {
+    let f = fixture(vec![Reply::Call("probe"), Reply::Done]).await;
+    *f.script.hang_prepares.lock().unwrap() = 2;
+    let (agent, run) = spawn(&f, "twice-stalled").await;
+    assert_eq!(f.host.tick().await.unwrap(), vec![agent.clone()]);
+    until(|| f.script.prepares.load(Ordering::SeqCst) >= 1).await;
+    let at = base(&f.db, &run).await;
+    assert_eq!(
+        f.host.watchdog_runs(at + 600).await.unwrap(),
+        vec![agent.clone()]
+    );
+    let first = settle(&f.host, &run, at + 606).await;
+    assert_eq!(first.decision.as_deref(), Some("resumed"));
+    // The redispatched driver hangs in the same place again.
+    for _ in 0..1000 {
+        if !f.host.tick().await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    until(|| f.script.prepares.load(Ordering::SeqCst) >= 2).await;
+    let again = base(&f.db, &run).await;
+    assert_eq!(
+        f.host.watchdog_runs(again + 600).await.unwrap(),
+        vec![agent.clone()]
+    );
+    let second = settle(&f.host, &run, again + 606).await;
+    assert_ne!(second.sequence, first.sequence);
+    assert!(second.aborted);
+    assert_eq!(second.decision.as_deref(), Some("paused"));
+    assert!(
+        second
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("an earlier watchdog incident already resumed this run")
+    );
+    let state = f.host.engine().load(&run).await.unwrap();
+    assert_eq!(state.status, Status::Paused);
+    assert_eq!(state.reason.as_deref(), Some(WATCHDOG_PAUSE_REASON));
+    assert_eq!(alerts(&f.host, &run).await.len(), 2);
+    f.host.shutdown().await.unwrap();
+    f.db.shutdown().await.unwrap();
+}
+
+/// The process stops after the durable interruption and before settlement;
+/// settlement in the next process applies the 17.3 downtime and autonomy rules.
+async fn restart_before_settlement(downtime: i64, autonomy: Autonomy) -> (String, Status) {
+    let f = fixture(vec![Reply::Call("probe"), Reply::Done]).await;
+    *f.script.hang_prepares.lock().unwrap() = 1;
+    let (agent, run) = spawn(&f, "restart").await;
+    assert_eq!(f.host.tick().await.unwrap(), vec![agent.clone()]);
+    until(|| f.script.prepares.load(Ordering::SeqCst) >= 1).await;
+    let at = base(&f.db, &run).await;
+    assert_eq!(
+        f.host.watchdog_runs(at + 600).await.unwrap(),
+        vec![agent.clone()]
+    );
+    // Let the observed driver stop on its own, without another watchdog pass.
+    f.script.release.notify_one();
+    for _ in 0..1000 {
+        if f.host.reap().await.unwrap() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pending = f.host.watchdog_incidents(Some(&run)).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].decision.is_none() && !pending[0].aborted);
+    f.host.shutdown().await.unwrap();
+    let Fixture { dir, db, host, .. } = f;
+    drop(host);
+    db.shutdown().await.unwrap();
+    drop(db);
+    let boot_at = excalibur_store::unix_seconds() + downtime;
+    let f = open(dir, Arc::new(Script::default()), boot_at, autonomy).await;
+    // Startup preserved the watchdog-owned pause for the watchdog to settle.
+    assert_eq!(
+        f.host.engine().load(&run).await.unwrap().reason.as_deref(),
+        Some(WATCHDOG_PAUSE_REASON)
+    );
+    let incident = settle(&f.host, &run, boot_at + 1).await;
+    assert_eq!(alerts(&f.host, &run).await.len(), 1);
+    let status = f.host.engine().load(&run).await.unwrap().status;
+    f.host.shutdown().await.unwrap();
+    f.db.shutdown().await.unwrap();
+    (
+        format!(
+            "{}: {}",
+            incident.decision.unwrap(),
+            incident.reason.unwrap_or_default()
+        ),
+        status,
+    )
+}
+
+#[tokio::test]
+async fn settlement_after_restart_applies_downtime_and_autonomy_rules() {
+    let (decision, status) = restart_before_settlement(60, Autonomy::Autonomous).await;
+    assert!(decision.starts_with("resumed"), "{decision}");
+    assert_eq!(status, Status::Ready);
+    let (decision, status) = restart_before_settlement(7 * 3600, Autonomy::Autonomous).await;
+    assert!(decision.starts_with("paused"), "{decision}");
+    assert!(
+        decision.contains("interruption lasted six hours or more"),
+        "{decision}"
+    );
+    assert_eq!(status, Status::Paused);
+    let (decision, status) = restart_before_settlement(60, Autonomy::Supervised).await;
+    assert!(decision.starts_with("paused"), "{decision}");
+    assert!(
+        decision.contains("host autonomy is below autonomous"),
+        "{decision}"
+    );
+    assert_eq!(status, Status::Paused);
+}
+
+#[tokio::test]
+async fn an_intent_without_a_confirmed_interruption_is_closed_without_alert() {
+    let f = fixture(vec![]).await;
+    let (agent, run) = spawn(&f, "not-applied").await;
+    let sequence = f.host.engine().load(&run).await.unwrap().last_sequence;
+    // Durable state after a loss between the host intent row and the CAS.
+    let (r, a) = (run.clone(), agent.clone());
+    f.db.write(Priority::Journal, move |c| {
+        c.execute(
+            "INSERT INTO orchestration_run_watchdog(run_id,sequence,agent_id,observed_at) VALUES(?1,?2,?3,0)",
+            excalibur_store::rusqlite::params![r, sequence, a],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    f.host
+        .watchdog_runs(excalibur_store::unix_seconds())
+        .await
+        .unwrap();
+    let incident = &f.host.watchdog_incidents(Some(&run)).await.unwrap()[0];
+    assert_eq!(incident.decision.as_deref(), Some("not_applied"));
+    assert!(incident.notified && incident.action.is_none());
+    assert!(alerts(&f.host, &run).await.is_empty());
+    assert_ne!(
+        f.host.engine().load(&run).await.unwrap().reason.as_deref(),
+        Some(WATCHDOG_PAUSE_REASON)
     );
     f.host.shutdown().await.unwrap();
     f.db.shutdown().await.unwrap();

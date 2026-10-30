@@ -1708,7 +1708,9 @@ impl Engine {
                 .await?;
         }
         if initial.status == Status::Running {
-            self.journal.heartbeat(run).await?;
+            // Liveness is advisory: a failed renewal only makes the watchdog
+            // conservative, it never fails the driver.
+            let _ = self.journal.heartbeat(run).await;
             if initial.confirmed_model_failure.is_some()
                 && initial.request.is_some()
                 && initial.response.is_none()
@@ -1774,7 +1776,9 @@ impl Engine {
                 .map_err(|_| Error::Invalid("tool lifecycle update failed"))?;
             // Each step renews the liveness heartbeat used by the host stall
             // watchdog. It is a projection write, not a replayed journal fact.
-            self.journal.heartbeat(run).await?;
+            // Liveness is advisory: a failed renewal only makes the watchdog
+            // conservative, it never fails the driver.
+            let _ = self.journal.heartbeat(run).await;
             self.tools
                 .begin_step(run, s.step)
                 .await

@@ -123,6 +123,8 @@ struct Inner {
     /// Serializes stall-watchdog passes of this process; durable CAS and keyed
     /// rows make passes from different processes idempotent.
     watchdog: AsyncMutex<()>,
+    /// Driver task observed at each watchdog detection; only it may be aborted.
+    watchdog_targets: Mutex<BTreeMap<String, tokio::task::Id>>,
 }
 fn digest(v: &[u8]) -> String {
     format!("{:x}", Sha256::digest(v))
@@ -237,6 +239,7 @@ impl Orchestrator {
                 tasks: Mutex::new(None),
                 host_autonomy: Mutex::new(None),
                 watchdog: AsyncMutex::new(()),
+                watchdog_targets: Mutex::new(BTreeMap::new()),
             }),
         })
     }
