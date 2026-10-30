@@ -1,5 +1,6 @@
 //! Linux environment preparation. No browser, listener or profile is started here.
 pub mod loopback;
+pub mod ops;
 pub mod read;
 pub mod resources;
 pub mod viewer;

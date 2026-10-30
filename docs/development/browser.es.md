@@ -969,15 +969,27 @@ composición del host (cadena
 `crates/eval/src/runner.rs`) solo ocurre con el arnés habilitado
 explícitamente vía `EXCALIBUR_WEB_HARNESS=1` con `EXCALIBUR_WEB_SOCKET`
 apuntando al socket de webd y el flag de red del host permitiendo
-herramientas web; la ruta por defecto no cambia. Un RPC
-`op.cancel` dedicado para operaciones ya despachadas sigue pendiente en
-webd, así que su cancelación depende del paro del sondeo más la limpieza
-efímera. La intervención sigue siendo un envoltorio fino: `takeover_start`
+herramientas web; la ruta por defecto no cambia. El RPC dedicado
+`op.cancel` para operaciones ya despachadas queda cerrado en el lado
+cliente y en el de decisión: `WebHarness::cancel_operation` envía
+`op.cancel` con el `run_id` propietario (mejor esfuerzo dentro de
+`interrupt_execution` para herramientas no `Pure` con `op_key`, manteniendo
+el paro del sondeo más la limpieza efímera como alternativa), y
+`excalibur-webd::ops` valida los parámetros con los límites de la frontera
+y clasifica el estado guardado (`received` a `cancelled`, `dispatched` con
+trabajador vivo a petición cooperativa de cancelación, `dispatched` sin él
+a `uncertain` sin reenvío, estados terminales devueltos tal cual sin
+cambios). Persistir la marca `cancelled` e interrumpir el trabajador de
+despacho vivo ocurre en el `Protocol` del crate navegador, trabajo
+pendiente de la vía principal fuera de este carril; hasta entonces el arnés
+tolera `method_not_found` y conserva la alternativa. La intervención sigue
+siendo un envoltorio fino: `takeover_start`
 llama al RPC existente `takeover.start` y `viewer_issue` al existente
 `viewer.issue` con las mismas comprobaciones de propiedad; no se añade
-autorización nueva. Conectar el comando `excalibur browser takeover
-<sesión>` en el binario CLI sigue pendiente (el CLI hoy solo implementa
-`exec`).
+autorización nueva. El comando `excalibur browser takeover <sesión>` ya
+está conectado en el binario CLI en los mismos términos (`--tab` además
+emite un código de visor de un solo uso); la dirección del visor la sigue
+imprimiendo `excalibur-webd --serve` para reenviarla por SSH (arq. 17).
 
 ```sh
 cargo test -p excalibur-web-adapter
@@ -995,6 +1007,16 @@ reconciliación tras caída a `Done` sin reenvío, reinicio de webd que vuelve
 cancelación que cierra sesiones efímeras y conserva persistentes,
 recuperación de `search_tools` con `browser_snapshot`/`browser_act` entre
 los cinco primeros con hash de catálogo estable, denegaciones `eval` y
-conflicto por clave reutilizada. Las filas con caídas del demonio real y
-los recorridos manuales 18.4 con sitios reales siguen pendientes del
-usuario y nunca se afirman.
+conflicto por clave reutilizada. Las filas de `op.cancel` cubren
+cancelar un commit `received` a `cancelled` sin despacho, pedir la
+cancelación del trabajador para un commit `dispatched` con reconciliación
+`Uncertain` y sin reenvío, y rechazar claves desconocidas y propietarios
+ajenos; `op.get` además exige la propiedad de la operación. Dos filas de
+la pila durable usan el `Protocol` real sobre un `Manager` real y SQLite
+`webd.db` en un directorio temporal (frontera RPC real, comprobaciones de
+propiedad y reapertura tras reinicio; sin lanzar Chrome ni proceso
+demonio): validación de operación desconocida y parámetros, más reapertura
+del mismo estado durable tras reiniciar el gestor. Un SIGKILL durante un
+efecto despachado real con Chrome vivo, y los recorridos manuales 18.4 con
+sitios reales (incluidas las cifras de sesión de 1 h/24 h de WhatsApp y
+Teams), siguen pendientes del usuario y nunca se afirman.

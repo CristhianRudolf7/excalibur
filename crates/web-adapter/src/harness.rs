@@ -597,6 +597,23 @@ impl WebHarness {
             .await
     }
 
+    /// Request server-side cancellation of an in-flight dispatched operation
+    /// (arch 16.5, 16.10; NB-13).
+    ///
+    /// Thin wrapper over the `op.cancel` RPC: the owner check stays with
+    /// webd (`run_id` must own `op_key`) and no new authorization is
+    /// introduced. A server without `op.cancel` answers `method_not_found`;
+    /// callers keep the existing client-side polling stop plus ephemeral
+    /// cleanup fallback in that case.
+    pub async fn cancel_operation(&self, run: &str, op_key: &str) -> Result<Value, String> {
+        self.backend
+            .request(
+                "op.cancel",
+                json!({"run_id": run, "op_key": op_key, "deadline_ms": 5_000}),
+            )
+            .await
+    }
+
     async fn probe_url(&self, run: &str, session: &str, tab: &str, target: &str) -> bool {
         let listed = self
             .backend
@@ -891,6 +908,18 @@ impl ToolRuntime for WebHarness {
             let class = cancellation_class(&tool.call.name);
             if matches!(class, CancellationClass::Immediate) {
                 return Ok(true);
+            }
+            // Best-effort server-side cancellation for in-flight dispatched
+            // work (commit and keyed classes carry an `op_key`). A server
+            // without `op.cancel` answers `method_not_found`; the polling
+            // stop plus ephemeral cleanup below stays the fallback either
+            // way, and the error is never surfaced as a cancellation
+            // failure.
+            if let Some(op_key) = tool.data.get("op_key").and_then(Value::as_str)
+                && !op_key.is_empty()
+                && !matches!(tool.effect, Effect::Pure)
+            {
+                let _ = self.cancel_operation(run, op_key).await;
             }
             let mut closed = false;
             if cancelled {

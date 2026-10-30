@@ -15,6 +15,6 @@ excalibur-security = { path = "../security" }
 excalibur-telemetry = { path = "../telemetry" }
 excalibur-vault = { path = "../vault" }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "time"] }
 [dev-dependencies]
 tempfile = "3"
