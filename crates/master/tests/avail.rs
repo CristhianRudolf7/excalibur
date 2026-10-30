@@ -851,3 +851,64 @@ async fn secret_tool_identifiers_are_rejected_before_any_durable_action_or_trans
     master.shutdown().await;
     database.shutdown().await.unwrap();
 }
+#[tokio::test]
+async fn compound_control_retains_its_literal_remainder_in_the_conversational_request() {
+    struct Decider;
+    impl IntakeDecider for Decider {
+        fn classify<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a Preanalysis,
+        ) -> BoxFuture<'a, std::result::Result<Classification, String>> {
+            Box::pin(async {
+                Ok(Classification {
+                    kind: IntakeKind::Pause,
+                    confidence: 0.99,
+                    target: Some("agt_lena".into()),
+                    scopes: vec![],
+                    literal_instructions: vec![],
+                    requires_clarification: false,
+                })
+            })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let database = db(&dir);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let actions = Arc::new(Actions::default());
+    let master = Master::open(
+        database.clone(),
+        MasterConfig::default(),
+        Arc::new(Controlled(tx)),
+        None,
+        actions.clone(),
+        Redactor::default(),
+    )
+    .await
+    .unwrap();
+    master
+        .set_lexicon(vec![LexiconEntry {
+            alias: "Lena".into(),
+            id: "agt_lena".into(),
+            kind: "agent".into(),
+        }])
+        .unwrap();
+    master.set_decider(Some(Arc::new(Decider)));
+    let literal = "Pause Lena and change R4 to require backend checks";
+    master
+        .receive(incoming("compound", "first", literal))
+        .await
+        .unwrap();
+    let (request, answer) = next(&mut rx).await;
+    assert!(serde_json::to_string(&request).unwrap().contains(literal));
+    assert_eq!(actions.0.load(Ordering::SeqCst), 1);
+    master
+        .receive(incoming("compound", "first", literal))
+        .await
+        .unwrap();
+    assert_eq!(actions.0.load(Ordering::SeqCst), 1);
+    answer.send(Ok(response("Both clauses retained"))).unwrap();
+    wait_reply(&master, "compound", "Both clauses retained").await;
+    master.shutdown().await;
+    database.shutdown().await.unwrap();
+}

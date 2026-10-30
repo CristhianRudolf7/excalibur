@@ -556,7 +556,12 @@ impl LspManager {
         out
     }
     pub async fn reap_idle(&self, now: Instant) -> usize {
-        reap(&self.inner, now).await
+        reap(&self.inner, now, false).await
+    }
+    /// Memory pressure can release idle servers immediately, never a server
+    /// with an in-flight request. Normal age-based reaping remains unchanged.
+    pub async fn unload_idle(&self) -> usize {
+        reap(&self.inner, Instant::now(), true).await
     }
     pub async fn shutdown_all(&self) {
         let slots = self
@@ -582,7 +587,7 @@ impl LspManager {
         tokio::spawn(async move {
             loop {
                 let Some(inner) = weak.upgrade() else { break };
-                reap(&inner, Instant::now()).await;
+                reap(&inner, Instant::now(), false).await;
                 let idle = inner
                     .idle
                     .min(Duration::from_secs(30))
@@ -593,7 +598,7 @@ impl LspManager {
         });
     }
 }
-async fn reap(inner: &ManagerInner, now: Instant) -> usize {
+async fn reap(inner: &ManagerInner, now: Instant, force: bool) -> usize {
     let slots = inner
         .slots
         .lock()
@@ -606,7 +611,9 @@ async fn reap(inner: &ManagerInner, now: Instant) -> usize {
         let mut session = slot.session.lock().await;
         if session.as_ref().is_some_and(|session| {
             session.in_flight.load(Ordering::SeqCst) == 0
-                && now.saturating_duration_since(*session.last_used.lock().unwrap()) >= inner.idle
+                && (force
+                    || now.saturating_duration_since(*session.last_used.lock().unwrap())
+                        >= inner.idle)
         }) {
             let old = session.take().unwrap();
             drop(session);

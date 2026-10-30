@@ -5,6 +5,7 @@ mod gate;
 mod messaging;
 mod notifications;
 mod profiles;
+mod progress;
 mod projects;
 pub use profiles::CustomProfile;
 mod scheduling;
@@ -51,6 +52,9 @@ pub trait RunAuthority: Send + Sync {
         Ok(value.clone())
     }
     fn bind<'a>(&'a self, agent: &'a Agent) -> BoxFuture<'a, std::result::Result<(), String>>;
+    fn admission_capacity(&self) -> AdmissionCapacity {
+        AdmissionCapacity::default()
+    }
     fn live_status(&self, _run: &str) -> Vec<Value> {
         Vec::new()
     }
@@ -87,7 +91,8 @@ struct Inner {
         >,
     >,
     wake: Notify,
-    last_scope: Mutex<Option<String>>,
+    fair_service: Mutex<BTreeMap<(u8, String), u64>>,
+    incarnation: String,
     runtime: Mutex<Option<tokio::runtime::Handle>>,
     tasks: Mutex<Option<excalibur_tasks::TaskStore>>,
 }
@@ -106,6 +111,12 @@ impl Orchestrator {
             || limits.children_per_parent == 0
             || limits.ram_bytes == 0
             || limits.estimated_run_bytes == 0
+            || limits.process_limit == 0
+            || limits.provider_concurrency == 0
+            || limits
+                .project_weights
+                .values()
+                .any(|weight| *weight == 0 || *weight > 100)
         {
             return Err(invalid("positive resource limits required"));
         }
@@ -134,6 +145,26 @@ impl Orchestrator {
                 "INSERT OR IGNORE INTO orchestration_schema VALUES(1,?1)",
                 [hash],
             )?;
+            let next = include_str!("schema2.sql");
+            let next_hash = digest(next.as_bytes());
+            let known: Option<String> = c
+                .query_row(
+                    "SELECT checksum FROM orchestration_schema WHERE version=2",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if known.as_ref().is_some_and(|hash| hash != &next_hash) {
+                return Err(excalibur_store::Error::Invalid(
+                    "orchestration schema checksum mismatch",
+                ));
+            }
+            c.execute_batch(next)?;
+            if known.is_none(){c.execute("INSERT OR IGNORE INTO orchestration_admissions SELECT a.id,a.created FROM orchestration_agents a JOIN runs r ON r.id=a.run_id WHERE r.state IN ('running','verifying','recovering','waiting','paused') OR EXISTS(SELECT 1 FROM journal j WHERE j.run_id=a.run_id AND j.kind='model_request')",[])?;}
+            c.execute(
+                "INSERT OR IGNORE INTO orchestration_schema VALUES(2,?1)",
+                [next_hash],
+            )?;
             Ok(())
         })
         .await?;
@@ -146,7 +177,8 @@ impl Orchestrator {
                 authority: Mutex::new(None),
                 running: AsyncMutex::new(BTreeMap::new()),
                 wake: Notify::new(),
-                last_scope: Mutex::new(None),
+                fair_service: Mutex::new(BTreeMap::new()),
+                incarnation: AgentId::new().to_string(),
                 runtime: Mutex::new(None),
                 tasks: Mutex::new(None),
             }),
@@ -435,24 +467,6 @@ impl Orchestrator {
         {
             return Err(invalid("parent cannot delegate in current state"));
         }
-        if parent.depth == 1 {
-            let mut active = 0;
-            for a in self
-                .list_agents()
-                .await?
-                .into_iter()
-                .filter(|a| a.parent_id.as_deref() == Some(&parent.id))
-            {
-                if let Some(run) = a.run_id
-                    && !terminal(&self.inner.engine.load(&run).await?.status)
-                {
-                    active += 1;
-                }
-            }
-            if active >= self.inner.limits.children_per_parent {
-                return Err(invalid("active child fanout limit reached"));
-            }
-        }
         // Preserve mandatory instructions, without inheriting parent's private reasoning/history.
         if let Some(run) = &parent.run_id {
             let instructions = self
@@ -648,7 +662,17 @@ impl Orchestrator {
                     );
                 }
             }
-            out.tools=state.calls.iter().filter(|(_,call)|call.result.is_none()).filter_map(|(index,call)|call.prepared.as_ref().map(|p|json!({"index":index,"name":p.call.name,"arguments":p.call.arguments,"resources":p.resources}))).collect();
+            let query_run = run.clone();
+            let tool_times=self.inner.db.read(ReadLane::Interactive,move|c| {
+                let mut q=c.prepare("SELECT sequence,created_at FROM journal WHERE run_id=?1 AND kind='tool_intent' AND state='confirmed' ORDER BY sequence")?;
+                Ok(q.query_map([query_run],|r|Ok((r.get::<_,u64>(0)?,r.get::<_,i64>(1)?)))?.collect::<std::result::Result<BTreeMap<_,_>,_>>()?)
+            }).await?;
+            out.tools=state.calls.iter().filter(|(_,call)|call.result.is_none()).filter_map(|(index,call)|call.prepared.as_ref().map(|p| {
+                let sequence=events.iter().rev().find(|event|event.kind=="tool_intent"&&event.payload["index"].as_u64()==Some(*index as u64)).map(|event|event.sequence);
+                let started=sequence.and_then(|sequence|tool_times.get(&sequence).copied()).unwrap_or(state.started_at);
+                let mut summary=p.call.arguments.chars().take(512).collect::<String>();if summary.len()<p.call.arguments.len(){summary.push('…');}
+                json!({"index":index,"name":p.call.name,"arguments_summary":summary,"elapsed_seconds":now().saturating_sub(started),"resources":p.resources})
+            })).collect();
             if let Some(host) = self.authority() {
                 out.tools.extend(host.live_status(run));
             }
@@ -663,8 +687,13 @@ impl Orchestrator {
                 .as_ref()
                 .and_then(|v| v["created"].as_i64())
                 .unwrap_or(state.started_at);
+            let progress_id = agent.id.clone();
+            let progress=self.inner.db.read(ReadLane::Interactive,move|c|Ok(c.query_row("SELECT step,observed_at FROM orchestration_plan_progress WHERE agent_id=?1",[progress_id],|r|Ok((r.get::<_,u64>(0)?,r.get::<_,i64>(1)?))).optional()?)).await?;
+            let baseline_step =
+                progress.map_or(last_report_step, |(step, _)| step.max(last_report_step));
+            let baseline_at = progress.map_or(last_report_at, |(_, at)| at.max(last_report_at));
             out.report_reminder =
-                state.step.saturating_sub(last_report_step) >= 15 || now() - last_report_at >= 600;
+                state.step.saturating_sub(baseline_step) >= 15 || now() - baseline_at >= 600;
             if state.status == Status::Ready {
                 let active = self
                     .inner

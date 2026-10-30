@@ -21,6 +21,10 @@ struct Authority {
     planning: Arc<ScopedPlanning>,
     autonomy: Autonomy,
     full_acknowledged: bool,
+    lanes: crate::LaneScheduler,
+    model: Arc<dyn ModelGateway>,
+    process_limit: usize,
+    fallback: Option<Arc<dyn ModelGateway>>,
 }
 impl RunAuthority for Authority {
     fn sanitize_durable(&self, value: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -28,6 +32,7 @@ impl RunAuthority for Authority {
     }
     fn bind<'a>(&'a self, agent: &'a Agent) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            crate::project_scope::validate_agent(&self.db, agent).await?;
             let run = agent.run_id.as_ref().ok_or("worker has no run")?;
             let parent_agent = if let Some(parent) = &agent.parent_id {
                 let parent = parent.clone();
@@ -82,6 +87,31 @@ impl RunAuthority for Authority {
             self.planning.bind_agent(&effective, workspace).await
         })
     }
+    fn admission_capacity(&self) -> excalibur_orchestrator::AdmissionCapacity {
+        let (provider_limit, provider_active) = self.lanes.worker_capacity();
+        excalibur_orchestrator::AdmissionCapacity {
+            process_limit: self.process_limit,
+            processes_active: self.tools.active_processes(),
+            provider_limit,
+            provider_active,
+        }
+    }
+    fn unload_idle(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.tools.unload_idle().await?;
+            self.model
+                .unload_idle()
+                .await
+                .map_err(|_| "idle inference release failed")?;
+            if let Some(model) = &self.fallback {
+                model
+                    .unload_idle()
+                    .await
+                    .map_err(|_| "idle fallback release failed")?;
+            }
+            Ok(())
+        })
+    }
     fn live_status(&self, run: &str) -> Vec<serde_json::Value> {
         self.tools.live_status(run)
     }
@@ -101,6 +131,9 @@ pub struct MasterToolOptions {
 }
 pub struct HostOptions {
     pub root: PathBuf,
+    pub cgroup_root: Option<PathBuf>,
+    pub project_services:
+        std::collections::BTreeMap<String, Arc<excalibur_tools::intelligence::ProjectIntelligence>>,
     pub projects: Vec<Project>,
     pub origins: BTreeSet<String>,
     pub limits: Limits,
@@ -117,6 +150,8 @@ impl HostOptions {
     pub fn project(root: PathBuf) -> Self {
         Self {
             root: root.clone(),
+            cgroup_root: None,
+            project_services: Default::default(),
             projects: vec![Project {
                 id: "default".into(),
                 name: "Default project".into(),
@@ -206,7 +241,9 @@ impl DaemonHost {
                 options.projects.clone(),
                 options.git.clone(),
             )
-            .await?,
+            .await?
+            .with_cgroup_root(options.cgroup_root.clone())?
+            .with_project_services(options.project_services.clone())?,
         );
         let managed = workers.managed_worktree_roots();
         let mut roots = vec![Root {
@@ -301,7 +338,7 @@ impl DaemonHost {
                 .with_durable_sink(projection.clone()),
         );
         projection.attach(&engine);
-        let orchestrator = Orchestrator::open(db.clone(), engine, options.limits)
+        let orchestrator = Orchestrator::open(db.clone(), engine, options.limits.clone())
             .await
             .map_err(|e| e.to_string())?
             .with_runtime(work.clone())
@@ -314,6 +351,10 @@ impl DaemonHost {
                 planning: planning.clone(),
                 autonomy: options.autonomy,
                 full_acknowledged: options.full_acknowledged,
+                lanes: lanes.clone(),
+                model: model.clone(),
+                process_limit: options.limits.process_limit,
+                fallback: fallback.clone(),
             }));
         gate.attach(&orchestrator).map_err(|e| e.to_string())?;
         coordination
@@ -419,31 +460,44 @@ impl DaemonHost {
         self.gateway.close_connections();
         self.master.shutdown().await;
         self.actions.detach();
-        self.orchestrator
+        let mut failure = self
+            .orchestrator
             .shutdown()
             .await
-            .map_err(|e| e.to_string())?;
+            .err()
+            .map(|e| e.to_string());
+        // Storage failure must never skip process/resource cleanup.
         self.tools.shutdown().await;
-        for agent in self
-            .orchestrator
-            .active_agents()
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            if let Some(run) = agent.run_id {
-                let snapshot = self
-                    .orchestrator
-                    .engine()
-                    .load(&run)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                self.telemetry
-                    .finalize(&run, &snapshot)
-                    .await
-                    .map_err(|e| e.to_string())?;
+        match self.orchestrator.active_agents().await {
+            Ok(agents) => {
+                for agent in agents {
+                    if let Some(run) = agent.run_id {
+                        match self.orchestrator.engine().load(&run).await {
+                            Ok(snapshot) => {
+                                if let Err(error) = self.telemetry.finalize(&run, &snapshot).await {
+                                    failure.get_or_insert_with(|| error.to_string());
+                                }
+                            }
+                            Err(error) => {
+                                failure.get_or_insert_with(|| error.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                failure.get_or_insert_with(|| error.to_string());
             }
         }
-        self.telemetry.shutdown().await.map_err(|e| e.to_string())?;
-        self.db.shutdown().await.map_err(|e| e.to_string())
+        if let Err(error) = self.telemetry.shutdown().await {
+            failure.get_or_insert_with(|| error.to_string());
+        }
+        if let Err(error) = self.db.shutdown().await {
+            failure.get_or_insert_with(|| error.to_string());
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }

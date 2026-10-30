@@ -493,6 +493,20 @@ fn apply_one(
     if data.get("metadata").is_some_and(|v| !v.is_object()) {
         return Err(fail("metadata must be an object"));
     }
+    if let Some(resolve_codes) = data
+        .as_object_mut()
+        .and_then(|fields| fields.remove("resolve_request_card_codes"))
+    {
+        if !policy.trusted_host || !create || entity != "task" || resolve_codes != json!(true) {
+            return Err(fail(
+                "request-card code resolution requires trusted task creation",
+            ));
+        }
+        let card = data
+            .get_mut("request_card")
+            .ok_or_else(|| fail("missing referenced request card"))?;
+        resolve_host_request_card(c, scope, principal, card)?;
+    }
     let mut old = if create {
         json!({})
     } else {
@@ -1329,4 +1343,50 @@ fn reserved_metadata(value: &Value) -> bool {
         Value::Array(values) => values.iter().any(reserved_metadata),
         _ => false,
     }
+}
+
+/// Resolve only explicitly requested host-owned card references in the writer's
+/// transaction, after requirement/criterion creation and before task publication.
+fn resolve_host_request_card(
+    c: &Connection,
+    scope: &str,
+    principal: Option<&str>,
+    card: &mut Value,
+) -> Result<()> {
+    let mut requirement_codes = BTreeMap::new();
+    let requirements = card
+        .get_mut("requirements")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| fail("request card requirements must be references"))?;
+    for entry in requirements {
+        let id = text(entry, "id")?.to_string();
+        id.parse::<excalibur_types::RequirementId>()
+            .map_err(|_| fail("request card requires typed requirement IDs"))?;
+        let requirement = load(c, "requirement", scope, &id, principal)?;
+        let code = text(&requirement, "code")?.to_string();
+        entry["code"] = json!(code);
+        requirement_codes.insert(id, code);
+    }
+    let criteria = card
+        .get_mut("criteria")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| fail("request card criteria must be references"))?;
+    for entry in criteria {
+        let id = text(entry, "id")?.to_string();
+        id.parse::<excalibur_types::CriterionId>()
+            .map_err(|_| fail("request card requires typed criterion IDs"))?;
+        let criterion = load(c, "criterion", scope, &id, principal)?;
+        let requirement = text(&criterion, "requirement_id")?;
+        let requirement_code = requirement_codes
+            .get(requirement)
+            .ok_or_else(|| fail("criterion is not linked to a card requirement"))?;
+        if entry.get("requirement_id").and_then(Value::as_str) != Some(requirement) {
+            return Err(fail(
+                "request card criterion requirement differs from stored reference",
+            ));
+        }
+        entry["code"] = criterion["code"].clone();
+        entry["requirement"] = json!(requirement_code);
+    }
+    Ok(())
 }

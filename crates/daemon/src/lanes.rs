@@ -23,7 +23,7 @@ pub struct LaneLimits {
 impl Default for LaneLimits {
     fn default() -> Self {
         Self {
-            concurrency: 8,
+            concurrency: 9,
             requests_per_minute: 1000,
             tokens_per_minute: 1_000_000,
         }
@@ -129,6 +129,13 @@ impl LaneScheduler {
             .unwrap_or_else(|p| p.into_inner())
             .user_active = active;
         self.0.wake.notify_waiters();
+    }
+    pub fn worker_capacity(&self) -> (usize, usize) {
+        let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            self.0.limits.concurrency.saturating_sub(1),
+            state.background_active,
+        )
     }
     pub fn waiting(&self) -> [usize; 4] {
         let s = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -331,6 +338,10 @@ impl PriorityGateway {
     }
 }
 impl ModelGateway for PriorityGateway {
+    fn unload_idle(&self) -> BoxFuture<'_, Result<usize, ModelError>> {
+        self.delegate.unload_idle()
+    }
+
     fn rate_limits(&self) -> Option<(u64, u64)> {
         self.delegate.rate_limits()
     }

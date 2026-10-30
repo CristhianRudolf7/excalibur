@@ -786,3 +786,16 @@ async fn readonly_lsp_process_cannot_read_hidden_or_unaccounted_hardlink_aliases
     );
     f.manager.shutdown_all().await;
 }
+
+#[tokio::test]
+async fn memory_pressure_releases_a_real_idle_server_without_waiting_for_its_age() {
+    let f = Fixture::new("pull").await;
+    f.metrics().await;
+    assert!(f.manager.states().await[0].running);
+    assert_eq!(f.manager.reap_idle(Instant::now()).await, 0);
+    assert_eq!(f.manager.unload_idle().await, 1);
+    assert!(!f.manager.states().await[0].running);
+    f.metrics().await;
+    assert_eq!(f.spawner.starts.load(Ordering::SeqCst), 2);
+    f.manager.shutdown_all().await;
+}

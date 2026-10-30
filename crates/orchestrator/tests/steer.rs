@@ -260,6 +260,10 @@ async fn directive_deadline_escalates_at_120_seconds_or_two_completed_steps() {
         )
         .await
         .unwrap();
+    f.host
+        .deliver_mailbox_at(&p.id, message.created)
+        .await
+        .unwrap();
     assert!(
         f.host
             .enforce_directive_deadlines(message.created + 119)
@@ -300,6 +304,10 @@ async fn directive_deadline_escalates_at_120_seconds_or_two_completed_steps() {
             json!({"literal":"Step correction"}),
             "normal",
         )
+        .await
+        .unwrap();
+    f.host
+        .deliver_mailbox_at(&q.id, message.created)
         .await
         .unwrap();
     for step in 0..2 {
@@ -388,6 +396,10 @@ async fn long_after_completion_tool_defers_deadline_until_confirmed_result() {
         )
         .await
         .unwrap();
+    f.host
+        .deliver_mailbox_at(&p.id, message.created)
+        .await
+        .unwrap();
     assert!(
         f.host
             .enforce_directive_deadlines(message.created + 121)
@@ -398,9 +410,23 @@ async fn long_after_completion_tool_defers_deadline_until_confirmed_result() {
     assert_eq!(f.host.status(&p.id).await.unwrap().state, "running");
     assert_eq!(f.host.mailbox(&p.id).await.unwrap()[0].priority, "normal");
     f.host.engine().journal().append(run,"tool_result","fixture-result",json!({"index":0,"name":"fixture_atomic","result":ToolResult::ok(json!({"synthetic":true}))})).await.unwrap();
-    assert_eq!(
+    assert!(
         f.host
             .enforce_directive_deadlines(message.created + 121)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        f.host
+            .enforce_directive_deadlines(message.created + 240)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        f.host
+            .enforce_directive_deadlines(message.created + 241)
             .await
             .unwrap(),
         vec![p.id]

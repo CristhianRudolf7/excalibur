@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS orchestration_directive_clocks(message_id TEXT PRIMARY KEY REFERENCES orchestration_messages(id),running_seconds INTEGER NOT NULL DEFAULT 0,last_at INTEGER NOT NULL,active INTEGER NOT NULL,epoch TEXT NOT NULL,start_step INTEGER);
+CREATE TABLE IF NOT EXISTS orchestration_question_deadlines(message_id TEXT PRIMARY KEY REFERENCES orchestration_messages(id),agent_id TEXT NOT NULL REFERENCES orchestration_agents(id),blocking INTEGER NOT NULL,default_value TEXT,created INTEGER NOT NULL,next_reminder INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'open');
+CREATE TABLE IF NOT EXISTS orchestration_question_inputs(message_id TEXT PRIMARY KEY REFERENCES orchestration_messages(id),body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS orchestration_admissions(agent_id TEXT PRIMARY KEY REFERENCES orchestration_agents(id),admitted_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS orchestration_plan_progress(agent_id TEXT PRIMARY KEY REFERENCES orchestration_agents(id),fingerprint TEXT NOT NULL,step INTEGER NOT NULL,observed_at INTEGER NOT NULL);

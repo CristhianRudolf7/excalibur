@@ -100,7 +100,8 @@ fn lower_background_priority() {
     #[cfg(target_os = "linux")]
     // SAFETY: zero targets the calling thread; no pointers are passed.
     unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+        let current = libc::getpriority(libc::PRIO_PROCESS, 0);
+        libc::setpriority(libc::PRIO_PROCESS, 0, current.max(10));
         libc::syscall(libc::SYS_ioprio_set, 1, 0, (2 << 13) | 7);
     }
     #[cfg(target_os = "macos")]

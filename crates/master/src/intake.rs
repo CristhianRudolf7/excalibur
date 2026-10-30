@@ -44,12 +44,22 @@ pub struct TemporalReference {
 pub struct Lexicon {
     matcher: Option<AhoCorasick>,
     entries: Vec<(String, Vec<LexiconEntry>)>,
+    pub(crate) fingerprint: String,
 }
 impl Lexicon {
+    pub(crate) fn fingerprint(entries: &[LexiconEntry]) -> String {
+        use sha2::Digest;
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(entries).unwrap_or_default())
+        )
+    }
+
     pub fn new(entries: Vec<LexiconEntry>) -> Result<Self> {
         if entries.len() > 100_000 {
             return Err(Error::Invalid("lexicon too large".into()));
         }
+        let fingerprint = Self::fingerprint(&entries);
         let mut grouped: BTreeMap<String, Vec<LexiconEntry>> = BTreeMap::new();
         for entry in entries {
             if entry.alias.is_empty() || entry.alias.len() > 256 || entry.id.is_empty() {
@@ -69,7 +79,11 @@ impl Lexicon {
                     .map_err(|e| Error::Invalid(e.to_string()))?,
             )
         };
-        Ok(Self { matcher, entries })
+        Ok(Self {
+            matcher,
+            entries,
+            fingerprint,
+        })
     }
     pub fn analyze(&self, text: &str, timezone: &str) -> Result<Preanalysis> {
         self.analyze_at(text, timezone, Utc::now().timestamp())
@@ -90,6 +104,9 @@ impl Lexicon {
                 name,
                 "status" | "pause" | "resume" | "cancel" | "stop" | "approve" | "deny" | "project"
             ) {
+                let target = split_remainder(target)
+                    .map(|(head, _)| head)
+                    .unwrap_or(target);
                 result.command = Some(ExplicitCommand {
                     name: name.into(),
                     target: (!target.is_empty()).then(|| target.into()),
@@ -108,7 +125,11 @@ impl Lexicon {
             {
                 result.paths.push(value.into());
             }
-            if value.starts_with("run_")
+            if (value.len() == 26
+                && format!("agt_{value}")
+                    .parse::<excalibur_types::AgentId>()
+                    .is_ok())
+                || value.starts_with("run_")
                 || value.starts_with("agt_")
                 || value.starts_with("tsk_")
                 || value.starts_with("prj_")
@@ -163,6 +184,12 @@ impl Lexicon {
             if let Some(days) = days {
                 let mut clock = None;
                 for token in words.iter().skip(index + 1).take(5) {
+                    let token = token.trim_matches(|c: char| {
+                        matches!(c, ',' | ';' | '.' | '!' | '?' | '(' | ')')
+                    });
+                    if !token.chars().all(|c| c.is_ascii_digit() || c == ':') {
+                        continue;
+                    }
                     let parts = token
                         .trim_matches(|c: char| !c.is_ascii_digit() && c != ':')
                         .split(':')
@@ -281,4 +308,36 @@ impl Classification {
             })
             && self.target.as_ref().is_none_or(|id| id.len() <= 256)
     }
+}
+
+pub(crate) fn split_remainder(text: &str) -> Option<(&str, &str)> {
+    for separator in [" and ", " y "] {
+        if let Some((head, tail)) = text.split_once(separator) {
+            let verb = tail.split_whitespace().next().unwrap_or("").to_lowercase();
+            if [
+                "change",
+                "cambia",
+                "cambiar",
+                "update",
+                "actualiza",
+                "add",
+                "añade",
+                "write",
+                "escribe",
+                "make",
+                "haz",
+                "create",
+                "crea",
+                "fix",
+                "corrige",
+                "require",
+                "exige",
+            ]
+            .contains(&verb.as_str())
+            {
+                return Some((head, tail));
+            }
+        }
+    }
+    None
 }

@@ -9,6 +9,10 @@ impl Orchestrator {
         if policy.quiet_start_minute.is_some_and(|m| m >= 1440)
             || policy.quiet_end_minute.is_some_and(|m| m >= 1440)
             || policy.utc_offset_minutes.unsigned_abs() > 1440
+            || policy
+                .timezone
+                .as_ref()
+                .is_some_and(|zone| zone.parse::<chrono_tz::Tz>().is_err())
         {
             return Err(invalid("invalid quiet hours"));
         }
@@ -81,12 +85,18 @@ impl Orchestrator {
                     if let Ok(candidate)=serde_json::from_value::<NotificationPolicy>(merged)
                         && candidate.quiet_start_minute.is_none_or(|minute|minute<1440)
                         && candidate.quiet_end_minute.is_none_or(|minute|minute<1440)
-                        && candidate.utc_offset_minutes.unsigned_abs()<=1440 {policy=candidate;}
+                        && candidate.utc_offset_minutes.unsigned_abs()<=1440
+                        && candidate.timezone.as_ref().is_none_or(|zone|zone.parse::<chrono_tz::Tz>().is_ok()) {policy=candidate;}
                 }
                 let progress=policy.progress.unwrap_or_else(||task.as_ref().is_some_and(|(level,_)|level.as_deref()==Some("N3")));
                 if n.class=="informational"&&!progress{continue;}
-                if n.class=="normal"&&at<n.created+5{continue;}
-                let minute=(at.div_euclid(60)+i64::from(policy.utc_offset_minutes)).rem_euclid(1440)as u16;
+                if n.class=="normal"&&at<(n.created.div_euclid(5)+1)*5{continue;}
+                let minute=if let Some(zone)=&policy.timezone {
+                    use chrono::Timelike;
+                    let zone=zone.parse::<chrono_tz::Tz>().map_err(|_|excalibur_store::Error::Invalid("invalid notification timezone"))?;
+                    let local=chrono::DateTime::from_timestamp(at,0).ok_or(excalibur_store::Error::Invalid("notification timestamp out of range"))?.with_timezone(&zone);
+                    (local.hour()*60+local.minute())as u16
+                }else{(at.div_euclid(60)+i64::from(policy.utc_offset_minutes)).rem_euclid(1440)as u16};
                 let quiet=match(policy.quiet_start_minute,policy.quiet_end_minute){(Some(start),Some(end))if start<end=>minute>=start&&minute<end,(Some(start),Some(end))=>minute>=start||minute<end,_=>false};
                 if quiet&&(n.class!="urgent"||!policy.urgent_during_quiet){continue;}
                 let origin:Option<(String,bool)>=c.query_row("SELECT channel,connected FROM orchestration_activity WHERE conversation=?1",[&n.conversation],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;

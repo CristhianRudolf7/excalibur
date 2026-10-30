@@ -565,6 +565,9 @@ impl Snapshot {
                     .model_calls
                     .saturating_add(p["model_calls"].as_u64().unwrap_or(0));
             }
+            // The following agent answer carries the assumption into model
+            // history; this receipt retains its durable evidence independently.
+            "assumption_recorded" => {}
             "checkpoint" | "wake_event" | "context_observation_archived" => {}
             _ => return Err(Error::Invalid("unknown durable event")),
         }
@@ -1173,6 +1176,16 @@ impl Engine {
     /// journal revision after acquiring the run boundary. User control wins races.
     pub async fn resume_if_reason(&self, run: &str, expected_reason: &str) -> Result<bool> {
         let _guard = self.journal.lock_run(run).await;
+        self.resume_if_revision(run, expected_reason).await
+    }
+    /// Resumes only the `approval required` pause after a decision commits. The
+    /// driver sets that pause itself at a tool-admission boundary with no effect
+    /// in flight, so this exact reason/revision CAS does not wait for live
+    /// inference or the old driver's boundary. A newer user pause always wins.
+    pub async fn resume_after_approval(&self, run: &str) -> Result<bool> {
+        self.resume_if_revision(run, "approval required").await
+    }
+    async fn resume_if_revision(&self, run: &str, expected_reason: &str) -> Result<bool> {
         let state = self.load(run).await?;
         if state.status != Status::Paused || state.reason.as_deref() != Some(expected_reason) {
             return Ok(false);
@@ -1441,6 +1454,15 @@ impl Engine {
         if self.tools.pending_approval(run).await {
             self.transition(run, state, Status::Paused, Some("approval required".into()))
                 .await?;
+            // A decision can commit between the pending read and the pause CAS.
+            // Close that lost-wakeup window without waiting on this driver's
+            // own run lock. Rejected/expired decisions never resume execution.
+            if !self.tools.pending_approval(run).await
+                && self.tools.approval_blocked(run).await.is_none()
+            {
+                self.resume_after_approval(run).await?;
+                *state = self.load(run).await?;
+            }
             return Ok(true);
         }
         Ok(false)

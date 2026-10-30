@@ -10,7 +10,7 @@ use excalibur_types::runtime::BoxFuture;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -628,10 +628,10 @@ impl SharedBackend {
                     }
                     // Tool admission produces a system pause rather than the
                     // host's structured waiting state. This method re-reads the
-                    // reason under the run guard and uses a revision CAS, so a
-                    // newer user pause is never resumed by this response.
+                    // reason using a revision CAS without waiting for live
+                    // inference; a newer user pause is never resumed.
                     engine
-                        .resume_if_reason(&run, "approval required")
+                        .resume_after_approval(&run)
                         .await
                         .map_err(|_| RpcError::internal())?;
                 }
@@ -720,31 +720,33 @@ impl SharedBackend {
         let edited = if only_agent {
             self.orchestrator.database().read(ReadLane::Interactive,move|c|{
             let present:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='file_versions' AND type='table')",[],|r|r.get(0))?;
-            if !present{return Ok(BTreeSet::new());}let mut q=c.prepare("SELECT DISTINCT path FROM file_versions WHERE path LIKE ?1 ESCAPE '\\' ORDER BY path LIMIT 10001")?;
+            if !present{return Ok(BTreeSet::new());}let mut q=c.prepare("SELECT DISTINCT ?2 || CASE instr(substr(path,length(?2)+1),'/') WHEN 0 THEN substr(path,length(?2)+1) ELSE substr(path,length(?2)+1,instr(substr(path,length(?2)+1),'/')-1) END FROM file_versions WHERE path LIKE ?1 ESCAPE '\\' ORDER BY 1")?;
             let pattern=format!("{}/%",root_text.replace('\\',"\\\\").replace('%',"\\%").replace('_',"\\_"));
-            Ok(q.query_map([pattern],|r|r.get::<_,String>(0))?.collect::<std::result::Result<BTreeSet<_>,_>>()?)
+            Ok(q.query_map([pattern,format!("{root_text}/")],|r|r.get::<_,String>(0))?.collect::<std::result::Result<BTreeSet<_>,_>>()?)
         }).await.map_err(|_|RpcError::internal())?
         } else {
             BTreeSet::new()
         };
-        if edited.len() > 10_000 {
-            return Err(RpcError::invalid(
-                "too many edited paths; select a narrower directory",
-            ));
-        }
         tokio::task::spawn_blocking(move||{
-            let mut entries=Vec::new();
-            let mut matcher=ignore::gitignore::GitignoreBuilder::new(&root);
-            let mut ancestor=PathBuf::new();
-            let mut ignore_paths=vec![PathBuf::from(".gitignore"),PathBuf::from(".git/info/exclude")];
+            // Keep only the next page and one lookahead, irrespective of directory size.
+            let mut entries = BTreeMap::new();
+            let mut matchers = Vec::new();
+            let mut ancestor = PathBuf::new();
+            // Repository excludes are lowest precedence; nested .gitignore files
+            // are anchored at their own directory and override ancestor rules.
+            let mut ignore_paths=vec![PathBuf::from(".git/info/exclude"), PathBuf::from(".gitignore")];
             for component in relative.components(){if let Component::Normal(part)=component{ancestor.push(part);ignore_paths.push(ancestor.join(".gitignore"));}}
             for ignore_path in ignore_paths {
                 if let Ok(metadata)=project_dir.metadata(&ignore_path) {
                     if metadata.len()>1024*1024{return Err(RpcError::invalid("ignore file exceeds size limit"));}
-                    if let Ok(content)=project_dir.read_to_string(&ignore_path){for line in content.lines(){matcher.add_line(Some(root.join(&ignore_path)),line).map_err(|_|RpcError::invalid("invalid ignore pattern"))?;}}
+                    if let Ok(content)=project_dir.read_to_string(&ignore_path){
+                        let base = if ignore_path == Path::new(".git/info/exclude") { root.clone() } else { root.join(ignore_path.parent().unwrap_or(Path::new(""))) };
+                        let mut builder=ignore::gitignore::GitignoreBuilder::new(base);
+                        for line in content.lines(){builder.add_line(Some(root.join(&ignore_path)),line).map_err(|_|RpcError::invalid("invalid ignore pattern"))?;}
+                        matchers.push(builder.build().map_err(|_|RpcError::invalid("invalid ignore rules"))?);
+                    }
                 }
             }
-            let matcher=matcher.build().map_err(|_|RpcError::invalid("invalid ignore rules"))?;
             for item in directory.entries().map_err(|_|RpcError::invalid("directory listing failed"))? {
                 let entry=item.map_err(|_|RpcError::invalid("directory listing failed"))?;
                 let Some(name)=entry.file_name().to_str().map(str::to_owned) else {continue;};
@@ -753,15 +755,23 @@ impl SharedBackend {
                 let metadata=directory.symlink_metadata(&name).map_err(|_|RpcError::invalid("entry unavailable"))?;
                 let is_directory=metadata.is_dir();
                 let absolute_path=root.join(&path);
-                if matcher.matched_path_or_any_parents(&absolute_path,is_directory).is_ignore(){continue;}
+                let mut ignored=false;
+                for matcher in &matchers {
+                    let matched=matcher.matched_path_or_any_parents(&absolute_path,is_directory);
+                    if matched.is_ignore(){ignored=true;}else if matched.is_whitelist(){ignored=false;}
+                }
+                if ignored {continue;}
+                // Protective mountpoints are host metadata, not generated project
+                // files. Preserve nonempty CI/config directories as user content.
+                if is_directory && matches!(name.as_str(), ".agents"|".codex"|".github"|".gitlab"|".circleci"|".config")
+                    && directory.open_dir(&name).ok().and_then(|d|d.entries().ok()).is_some_and(|mut items|items.next().is_none()) {continue;}
                 let absolute=absolute_path.to_string_lossy().to_string();
                 if only_agent && !edited.contains(&absolute) && !(is_directory&&edited.iter().any(|p|Path::new(p).starts_with(&absolute_path))) {continue;}
                 if after.as_ref().is_some_and(|after|name<=*after){continue;}
-                entries.push(json!({"name":name,"path":path,"kind":if is_directory{"directory"}else if metadata.file_type().is_symlink(){"symlink"}else{"file"},"collapsed":is_directory,"agent_modified":edited.contains(&absolute),"size":metadata.len()}));
-                if entries.len()>10_000{return Err(RpcError::invalid("directory too large; select a narrower directory"));}
+                entries.insert(name.clone(),json!({"name":name,"path":path,"kind":if is_directory{"directory"}else if metadata.file_type().is_symlink(){"symlink"}else{"file"},"collapsed":is_directory,"agent_modified":edited.contains(&absolute),"size":metadata.len()}));
+                if entries.len()>max+1{entries.pop_last();}
             }
-            entries.sort_by(|a,b|a["name"].as_str().cmp(&b["name"].as_str()));
-            let has_more=entries.len()>max;entries.truncate(max);let next=has_more.then(||entries.last().unwrap()["name"].clone());Ok(json!({"entries":entries,"next":next,"has_more":has_more}))
+            let has_more=entries.len()>max;let mut entries=entries.into_values().collect::<Vec<_>>();entries.truncate(max);let next=has_more.then(||entries.last().unwrap()["name"].clone());Ok(json!({"entries":entries,"next":next,"has_more":has_more}))
         }).await.map_err(|_|RpcError::internal())?
     }
 }
