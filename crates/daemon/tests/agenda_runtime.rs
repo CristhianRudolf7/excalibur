@@ -90,6 +90,16 @@ async fn wait_for(host: &DaemonHost, count: usize) -> Vec<Notification> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+/// Wait until the supervised runtime has no queued wake, then report passes.
+async fn settled(runtime: &AgendaRuntime) -> u64 {
+    loop {
+        let before = runtime.passes();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        if runtime.passes() == before {
+            return before;
+        }
+    }
+}
 fn with_text<'a>(all: &'a [Notification], id: &str) -> Vec<&'a Notification> {
     let text = format!("reminder {id}");
     all.iter().filter(|n| n.content == text).collect()
@@ -166,6 +176,34 @@ fn startup_policy_min_wake_mutations_safe_mode_and_shutdown() {
             .await
             .unwrap();
         wait_for(&host, 3).await;
+
+        // Complete and delete also wake the runtime (no clock movement; the
+        // next durable deadline is far away on the manual clock).
+        for (key, operation) in [
+            (
+                "done-later",
+                Operation::Complete {
+                    id: "later".into(),
+                    generation: 1,
+                },
+            ),
+            ("c-spare", create("spare", Timing::At(base + 100_000))),
+            (
+                "d-spare",
+                Operation::Delete {
+                    id: "spare".into(),
+                    generation: 1,
+                },
+            ),
+        ] {
+            let before = settled(&runtime).await;
+            agenda.apply(key.into(), operation).await.unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while runtime.passes() == before {
+                assert!(tokio::time::Instant::now() < deadline, "{key} did not wake");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
 
         // Snooze moves to a new generation; dispatch still uses the creator binding.
         let later = accepted(&host, "snoozer").await;
@@ -248,16 +286,47 @@ fn startup_policy_min_wake_mutations_safe_mode_and_shutdown() {
             assert!(tokio::time::Instant::now() < deadline, "fire not recorded");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // A second interval elapses while still safe: recorded, then coalesced.
+        clock.set(base + 300);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !reminders
+            .pending(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.fire.scheduled_at == base + 300)
+        {
+            assert!(tokio::time::Instant::now() < deadline, "fire not recorded");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // The runtime itself does not attempt admission while blocked; this
+        // does not rely on the notification writer's own readiness check.
+        let blocked = runtime.step().await.unwrap();
+        assert!(blocked.blocked && blocked.catch_up);
+        assert_eq!((blocked.attempted, blocked.queued), (0, 0));
+        assert_eq!(reminders.pending(10).await.unwrap().len(), 1, "coalesced");
+        assert!(
+            reminders
+                .dead_letters(10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|d| d.reason == "superseded")
+        );
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(notices(&host).await.len(), 4, "safe mode admits nothing");
         host.orchestrator
             .recovery()
-            .exit_safe_mode("manual-exit", base + 100)
+            .exit_safe_mode("manual-exit", base + 300)
             .await
             .unwrap();
         clock.advance(excalibur_daemon::agenda::BLOCKED_RECHECK_SECONDS);
         let all = wait_for(&host, 5).await;
-        assert_eq!(with_text(&all, "every").len(), 2);
+        let every = with_text(&all, "every");
+        assert_eq!(every.len(), 2, "safe-mode backlog admitted once");
+        assert!(every.iter().any(|n| n.created == base + 300));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(notices(&host).await.len(), 5, "no burst after safe mode");
         assert!(reminders.pending(10).await.unwrap().is_empty());
 
         // Shutdown cancels the wait and returns cleanly without a panic signal.
@@ -310,6 +379,15 @@ fn restart_and_concurrent_runtimes_deduplicate_and_forged_namespaces_stay_inert(
             .await
             .unwrap();
         assert_eq!((step.recorded, step.queued), (1, 1));
+        // Reproduce the crash window: the notice committed, the scheduler
+        // acknowledgement was lost before the process died.
+        let reset = db
+            .write(Priority::Journal, |c| {
+                Ok(c.execute("UPDATE scheduler_fires SET delivered=0", [])?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(reset, 1);
         binding
     });
     rt.block_on(host.close()).unwrap();
@@ -318,13 +396,29 @@ fn restart_and_concurrent_runtimes_deduplicate_and_forged_namespaces_stay_inert(
     let db = Database::open(&path, DatabaseKind::Main, Default::default()).unwrap();
     let host = open_host(&rt, &db, &root);
     rt.block_on(async {
-        // Restart at the same instant: catch-up again, but fire IDs dedupe.
-        let clock = ManualClock::new(base);
+        // Restart later: the runtime replays the existing notice by key and
+        // completes the lost acknowledgement without a second notice.
+        let clock = ManualClock::new(base + 50);
         let restarted = AgendaRuntime::new(host.orchestrator.clone(), clock.clone());
         let step = restarted.step().await.unwrap();
         assert!(step.catch_up);
-        assert_eq!((step.recorded, step.queued), (0, 0));
-        assert_eq!(notices(&host).await.len(), 1);
+        assert_eq!((step.recorded, step.attempted, step.queued), (0, 1, 1));
+        assert_eq!(notices(&host).await.len(), 1, "replayed, not duplicated");
+        let reminders = Reminders::open(
+            db.clone(),
+            binding.scope.clone(),
+            binding.principal.clone(),
+            binding.conversation.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(reminders.pending(10).await.unwrap().is_empty(), "ack done");
+        assert_eq!(
+            restarted.step().await.unwrap().attempted,
+            0,
+            "no further attempt once acknowledged"
+        );
 
         // A namespace whose metadata does not derive to its sealed scope is
         // never opened, ticked or admitted, even with a valid binding body.

@@ -215,6 +215,15 @@ impl Orchestrator {
             .read(ReadLane::Interactive, move |c| host_authority(c, &id))
             .await?)
     }
+    /// Apply the same deterministic content rules as host notice admission, so
+    /// a host can reject text up front instead of storing a notice that can
+    /// never be queued (for example, a secret literal refused by the redactor).
+    pub fn validate_host_notice_text(&self, text: &str) -> Result<()> {
+        if text.len() > 60 * 1024 || serde_json::to_string(text)?.len() > 60 * 1024 {
+            return Err(invalid("invalid host notice or unapproved route"));
+        }
+        self.validate_durable(&json!({"content":text}))
+    }
     /// Exact-key replay returns the insertion snapshot, including its original
     /// timestamp and acknowledgement. Notification and authority commit together.
     pub async fn notify_host(

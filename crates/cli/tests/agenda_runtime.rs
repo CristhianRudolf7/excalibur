@@ -190,11 +190,35 @@ fn seed(project: &Path, data: &Path, base: i64) {
             .await
             .unwrap();
         agenda
-            .apply("c-soon".into(), create("soon", Timing::At(base + 10)))
+            .apply("c-soon".into(), create("soon", Timing::At(base + 20)))
             .await
             .unwrap();
     });
     rt.block_on(host.close()).unwrap();
+}
+
+/// Run a statement against the daemon database while no daemon is running.
+fn offline_db<T: Send + 'static>(
+    data: &Path,
+    job: impl FnOnce(&excalibur_store::rusqlite::Connection) -> excalibur_store::Result<T>
+    + Send
+    + 'static,
+) -> T {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let db = Database::open(
+            data.join("excalibur.db"),
+            DatabaseKind::Main,
+            Default::default(),
+        )
+        .unwrap();
+        let value = db
+            .write(excalibur_store::Priority::Journal, job)
+            .await
+            .unwrap();
+        db.shutdown().await.unwrap();
+        value
+    })
 }
 
 #[test]
@@ -206,43 +230,64 @@ fn foreground_daemon_runs_agenda_with_missed_policy_min_wake_and_restart_dedupe(
     let base = excalibur_store::unix_seconds();
     seed(&project, &data, base);
     let (mut daemon, address) = start(&project, &data, &temp.path().join("boot-0.log"));
+    // Startup admits the missed fire while the future reminder still waits.
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut early_check = false;
-    let all = loop {
+    loop {
         let before = excalibur_store::unix_seconds();
         let all = notices(address);
-        if !with_text(&all, "hourly").is_empty() && before < base + 10 {
+        if !with_text(&all, "hourly").is_empty() {
+            assert!(
+                before < base + 20,
+                "startup admission too slow for this check"
+            );
             assert!(
                 with_text(&all, "soon").is_empty(),
                 "future reminder admitted before its time"
             );
-            early_check = true;
+            let hourly = with_text(&all, "hourly");
+            assert_eq!(hourly.len(), 1, "run_once_now admits one missed fire");
+            assert_eq!(hourly[0]["created"], base - 10_000 + 2 * 3600);
+            break;
         }
-        if all.len() >= 2 {
-            break all;
-        }
-        assert!(Instant::now() < deadline, "agenda notices not admitted");
+        assert!(Instant::now() < deadline, "missed fire not admitted");
         std::thread::sleep(Duration::from_millis(100));
-    };
-    assert!(
-        early_check,
-        "missed fire must be admitted at startup, before the next timer"
-    );
-    let hourly = with_text(&all, "hourly");
-    assert_eq!(hourly.len(), 1, "run_once_now admits one missed fire");
-    assert_eq!(hourly[0]["created"], base - 10_000 + 2 * 3600);
-    assert_eq!(with_text(&all, "soon")[0]["created"], base + 10);
-    assert!(excalibur_store::unix_seconds() >= base + 10);
+    }
 
-    // SIGKILL and restart: startup catch-up runs again but fire IDs dedupe.
+    // SIGKILL while the future reminder is still pending, then reproduce a
+    // crash between the notice commit and the scheduler acknowledgement.
     daemon.0.kill().unwrap();
     daemon.0.wait().unwrap();
+    let reset = offline_db(&data, |c| {
+        Ok(c.execute(
+            "UPDATE scheduler_fires SET delivered=0 WHERE delivered=1",
+            [],
+        )?)
+    });
+    assert_eq!(reset, 1, "the admitted hourly fire");
+
     let (mut daemon, address) = start(&project, &data, &temp.path().join("boot-1.log"));
     assert_eq!(
         result(address, "daemon.recovery.status", json!({}))["recent_crashes"],
         1
     );
-    std::thread::sleep(Duration::from_secs(3));
+    // The restarted daemon sleeps until the future reminder and admits it.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let all = loop {
+        let all = notices(address);
+        if !with_text(&all, "soon").is_empty() {
+            break all;
+        }
+        assert!(Instant::now() < deadline, "future reminder not admitted");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(excalibur_store::unix_seconds() >= base + 20);
+    assert_eq!(with_text(&all, "soon")[0]["created"], base + 20);
+    assert_eq!(
+        with_text(&all, "hourly").len(),
+        1,
+        "replayed by key, not duplicated"
+    );
+    std::thread::sleep(Duration::from_secs(2));
     assert_eq!(notices(address).len(), 2, "no duplicate after restart");
     result(address, "daemon.stop", json!({}));
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -254,4 +299,13 @@ fn foreground_daemon_runs_agenda_with_missed_policy_min_wake_and_restart_dedupe(
         assert!(Instant::now() < deadline, "daemon did not stop");
         std::thread::sleep(Duration::from_millis(30));
     }
+    // Every fire, including the one whose acknowledgement was lost, is acked.
+    let unacknowledged = offline_db(&data, |c| {
+        Ok(c.query_row(
+            "SELECT count(*) FROM scheduler_fires WHERE delivered=0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?)
+    });
+    assert_eq!(unacknowledged, 0);
 }
