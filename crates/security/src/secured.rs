@@ -33,6 +33,34 @@ impl SecuredTools {
     pub fn security(&self) -> &Security {
         &self.security
     }
+    fn confined_reads(
+        &self,
+        run: &str,
+        workspace: &Path,
+    ) -> std::result::Result<Vec<Action>, String> {
+        let Some(proof) = self.delegate.filesystem_confinement(run) else {
+            return Ok(vec![Action::Read {
+                path: workspace.to_path_buf(),
+            }]);
+        };
+        if proof.workspace != workspace
+            || proof.snapshot_owner != run
+            || proof.read_roots.is_empty()
+            || proof
+                .read_roots
+                .iter()
+                .any(|root| !root.starts_with(workspace))
+        {
+            return Err("invalid host filesystem confinement attestation".into());
+        }
+        // Every attested root is still evaluated by the ordinary current token
+        // and permission logic. No workspace-wide capability is manufactured.
+        Ok(proof
+            .read_roots
+            .into_iter()
+            .map(|path| Action::Read { path })
+            .collect())
+    }
     async fn actions(
         &self,
         run: &str,
@@ -109,11 +137,7 @@ impl SecuredTools {
                 {
                     return Err("search is unavailable across host-protected vault subtrees; use explicit authorized file reads".into());
                 }
-                // The generic delegate may traverse every descendant; requiring a
-                // workspace root prevents search widening a narrower file capability.
-                vec![Action::Read {
-                    path: config.workspace,
-                }]
+                self.confined_reads(run, &config.workspace)?
             }
             "file_history" => vec![Action::Read {
                 path: entry_parent(required("path")?)?,
@@ -156,7 +180,8 @@ impl SecuredTools {
                     })
                     .collect::<std::result::Result<Vec<_>, String>>()?
             }
-            "code_graph" | "lsp" | "workspace_snapshot" => vec![Action::Read {
+            "workspace_snapshot" => self.confined_reads(run, &config.workspace)?,
+            "code_graph" | "lsp" => vec![Action::Read {
                 path: config.workspace,
             }],
             "exec" => {

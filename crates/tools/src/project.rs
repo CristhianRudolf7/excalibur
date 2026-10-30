@@ -195,6 +195,7 @@ impl LocalTools {
         selected: Option<&BTreeSet<PathBuf>>,
     ) -> Result<BTreeMap<PathBuf, Vec<u8>>, String> {
         let protected = self.policy.protected_paths.clone();
+        let scope = self.path_scope.clone();
         let mut files = BTreeMap::new();
         let mut authority = crate::file_authority::ReadAuthority::excluding_credential_names();
         for entry in ignore::WalkBuilder::new(&self.root)
@@ -210,6 +211,11 @@ impl LocalTools {
                         Some(".git" | "target" | "node_modules")
                     )
                 }) && !protected.iter().any(|p| entry.path().starts_with(p))
+                    && scope.as_ref().is_none_or(|s| {
+                        s.roots.iter().any(|root| {
+                            entry.path().starts_with(root) || root.starts_with(entry.path())
+                        })
+                    })
             })
             .build()
         {
@@ -393,12 +399,7 @@ impl LocalTools {
         if call.name == "workspace_snapshot"
             && matches!(args["action"].as_str(), Some("diff" | "restore"))
         {
-            let snapshots = self
-                .workspace
-                .shadow()
-                .list_snapshots(run)
-                .await
-                .map_err(|e| e.to_string())?;
+            let snapshots = self.scoped_snapshots(run).await?;
             for field in if args["action"] == "diff" {
                 vec!["before", "after"]
             } else {
@@ -557,9 +558,7 @@ impl LocalTools {
             "revert_edit" => self.perform_edits(run, key, tool).await,
             "workspace_snapshot" => match args["action"].as_str() {
                 Some("restore") => self.perform_edits(run, key, tool).await,
-                Some("list") => Ok(
-                    json!({"snapshots":self.workspace.shadow().list_snapshots(run).await.map_err(|e|e.to_string())?}),
-                ),
+                Some("list") => Ok(json!({"snapshots":self.scoped_snapshots(run).await?})),
                 Some("diff") => Ok(
                     json!({"diff":self.workspace.shadow().diff(required_str(args,"before")?,required_str(args,"after")?).await.map_err(|e|e.to_string())?}),
                 ),
@@ -761,6 +760,36 @@ impl LocalTools {
         );
         self.db.read(excalibur_store::ReadLane::Interactive,move|c|{use excalibur_store::rusqlite::OptionalExtension;let old:Option<(String,String)>=c.query_row("SELECT call_hash,result FROM project_tool_receipts WHERE run_id=?1 AND operation_key=?2",[run,key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;match old{Some((expected,result)) if expected==digest=>Ok(Some(serde_json::from_str::<Value>(&result).map_err(|_|excalibur_store::Error::Invalid("project receipt invalid"))?)),Some(_)=>Err(excalibur_store::Error::Invalid("project operation key reused")),None=>Ok(None)}}).await.map_err(|e|e.to_string())
     }
+    async fn scoped_snapshots(
+        &self,
+        run: &str,
+    ) -> Result<Vec<excalibur_workspace::Snapshot>, String> {
+        let snapshots = self
+            .workspace
+            .shadow()
+            .list_snapshots(run)
+            .await
+            .map_err(|e| e.to_string())?;
+        if self.path_scope.is_none() {
+            return Ok(snapshots);
+        }
+        let mut allowed = Vec::new();
+        for snapshot in snapshots {
+            let paths = self
+                .workspace
+                .shadow()
+                .snapshot_paths(&snapshot.id)
+                .await
+                .map_err(|e| e.to_string())?;
+            if paths.iter().all(|path| {
+                self.scope_allows(&self.root.join(path))
+                    && self.check_write_path(&path.to_string_lossy()).is_ok()
+            }) {
+                allowed.push(snapshot);
+            }
+        }
+        Ok(allowed)
+    }
     pub(crate) async fn execute_project_operation(
         &self,
         run: &str,
@@ -911,7 +940,28 @@ impl LocalTools {
         if root != tree.path {
             return Err("registered worktree moved".into());
         }
+        let mapped_scope = self.scope_roots().map(|paths| {
+            paths
+                .iter()
+                .filter_map(|p| {
+                    p.strip_prefix(&self.root)
+                        .ok()
+                        .map(|relative| root.join(relative))
+                })
+                .collect::<Vec<_>>()
+        });
+        let mapped_protected = self
+            .policy
+            .protected_paths
+            .iter()
+            .filter_map(|p| {
+                p.strip_prefix(&self.root)
+                    .ok()
+                    .map(|relative| root.join(relative))
+            })
+            .collect::<Vec<_>>();
         let mut reader = self.clone();
+        reader.path_scope = None;
         reader.root = root.clone();
         reader.directory = Arc::new(directory);
         reader.intelligence = None;
@@ -921,6 +971,10 @@ impl LocalTools {
             .policy
             .protected_paths
             .retain(|p| !root.starts_with(p));
+        reader.policy.protected_paths.extend(mapped_protected);
+        if let Some(roots) = mapped_scope {
+            reader = reader.restrict_scope_roots(roots)?;
+        }
         Ok(WorktreeCheckpointReader(reader))
     }
     async fn checkpoint_child(

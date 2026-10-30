@@ -51,7 +51,17 @@ impl ReadAuthority {
         protected: &[PathBuf],
         file: &File,
     ) -> Result<(), String> {
-        let _ = self.deny_credential_names;
+        self.check_scoped(directory, root, protected, None, file)
+    }
+    pub fn check_scoped(
+        &mut self,
+        directory: &Dir,
+        root: &Path,
+        protected: &[PathBuf],
+        scope: Option<&[PathBuf]>,
+        file: &File,
+    ) -> Result<(), String> {
+        let _ = (self.deny_credential_names, scope);
         #[cfg(unix)]
         {
             use cap_std::fs::MetadataExt;
@@ -68,6 +78,7 @@ impl ReadAuthority {
                     root,
                     protected,
                     self.deny_credential_names,
+                    scope,
                 )?);
             }
             self.inventory.as_ref().unwrap().check(&metadata)
@@ -128,13 +139,20 @@ mod unix {
             root: &Path,
             protected: &[PathBuf],
             deny_credential_names: bool,
+            scope: Option<&[PathBuf]>,
         ) -> Result<Self, String> {
             let mut pending = vec![PathBuf::new()];
             let (mut entries, mut directories) = (0, 0);
             let mut inodes: BTreeMap<(u64, u64), Inode> = BTreeMap::new();
             while let Some(relative) = pending.pop() {
                 let full = root.join(&relative);
-                if protected.iter().any(|path| full.starts_with(path)) {
+                if protected.iter().any(|path| full.starts_with(path))
+                    || scope.is_some_and(|roots| {
+                        !roots
+                            .iter()
+                            .any(|p| full.starts_with(p) || p.starts_with(&full))
+                    })
+                {
                     continue;
                 }
                 directories += 1;
@@ -166,7 +184,12 @@ mod unix {
                     let metadata = dir.symlink_metadata(&name).map_err(|e| e.to_string())?;
                     if metadata.is_dir() {
                         pending.push(path);
-                    } else if metadata.is_file() && metadata.nlink() > 1 {
+                    } else if metadata.is_file()
+                        && metadata.nlink() > 1
+                        && scope.is_none_or(|roots| {
+                            roots.iter().any(|p| root.join(&path).starts_with(p))
+                        })
+                    {
                         let inode = inodes
                             .entry((metadata.dev(), metadata.ino()))
                             .or_insert_with(|| Inode {

@@ -294,6 +294,7 @@ pub struct ProviderClient {
     credential: Secret,
     client_id: Option<Secret>,
     http: Client,
+    rate_limits: std::sync::Arc<std::sync::Mutex<Option<(u64, u64)>>>,
 }
 impl fmt::Debug for ProviderClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -304,6 +305,11 @@ impl fmt::Debug for ProviderClient {
     }
 }
 impl ProviderClient {
+    /// Verified numeric request/token ceilings only; no credential or raw header is retained.
+    pub fn rate_limits(&self) -> Option<(u64, u64)> {
+        *self.rate_limits.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Stable non-secret transport identity for pinning durable model requests.
     /// Endpoint construction rejects credentials, query strings and fragments.
     /// Provider identity without credentials or endpoint details.
@@ -462,6 +468,7 @@ impl ProviderClient {
             credential,
             client_id: None,
             http,
+            rate_limits: Default::default(),
         })
     }
     async fn request(
@@ -526,6 +533,22 @@ impl ProviderClient {
             request = request.json(&body);
         }
         let response = request.send().await.map_err(|_| Error::Transport)?;
+        if let (Some(requests), Some(tokens)) = (
+            response
+                .headers()
+                .get("x-ratelimit-limit-requests")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0),
+            response
+                .headers()
+                .get("x-ratelimit-limit-tokens")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0),
+        ) {
+            *self.rate_limits.lock().unwrap_or_else(|p| p.into_inner()) = Some((requests, tokens));
+        }
         if !response.status().is_success() {
             if self.provider == Provider::OpenAi {
                 return Err(openai_http_error(response).await);

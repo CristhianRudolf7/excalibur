@@ -21,6 +21,23 @@ pub struct GatewayVerifier {
     pub protected: Vec<PathBuf>,
     pub redactor: Redactor,
 }
+/// Host-supplied, authoritatively bound workspace tools; the verifier still
+/// applies its own independent read-only security and declared-check ceiling.
+pub struct BoundGatewayVerifier {
+    pub verifier: GatewayVerifier,
+    pub tools: Arc<LocalTools>,
+}
+impl IndependentVerifier for BoundGatewayVerifier {
+    fn prepare<'a>(&'a self, run: &'a str) -> BoxFuture<'a, Result<(), String>> {
+        self.verifier.prepare(run)
+    }
+    fn verify<'a>(
+        &'a self,
+        input: &'a VerificationInput,
+    ) -> BoxFuture<'a, Result<VerificationVerdict, String>> {
+        self.verifier.verify_bound(input, Some(self.tools.clone()))
+    }
+}
 impl IndependentVerifier for GatewayVerifier {
     fn prepare<'a>(&'a self, root_run: &'a str) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
@@ -84,6 +101,15 @@ impl IndependentVerifier for GatewayVerifier {
         &'a self,
         input: &'a VerificationInput,
     ) -> BoxFuture<'a, Result<VerificationVerdict, String>> {
+        self.verify_bound(input, None)
+    }
+}
+impl GatewayVerifier {
+    pub fn verify_bound<'a>(
+        &'a self,
+        input: &'a VerificationInput,
+        provided: Option<Arc<LocalTools>>,
+    ) -> BoxFuture<'a, Result<VerificationVerdict, String>> {
         Box::pin(async move {
             let journal = excalibur_journal::Journal::new(self.store.database().clone())
                 .await
@@ -95,22 +121,26 @@ impl IndependentVerifier for GatewayVerifier {
             if sandbox.profile != excalibur_sandbox::SandboxProfile::Eval {
                 sandbox.profile = excalibur_sandbox::SandboxProfile::ReadOnly;
             }
-            let local = Arc::new(
-                LocalTools::new(
-                    self.store.database().clone(),
-                    self.workspace.clone(),
-                    ToolPolicy {
-                        sandbox: Some(sandbox.clone()),
-                        protected_paths: self.protected.clone(),
-                        redactor: self.redactor.clone(),
-                        read: Access::Allow,
-                        write: Access::Deny,
-                        exec: Access::Allow,
-                        ..Default::default()
-                    },
+            let local = if let Some(local) = provided {
+                local
+            } else {
+                Arc::new(
+                    LocalTools::new(
+                        self.store.database().clone(),
+                        self.workspace.clone(),
+                        ToolPolicy {
+                            sandbox: Some(sandbox.clone()),
+                            protected_paths: self.protected.clone(),
+                            redactor: self.redactor.clone(),
+                            read: Access::Allow,
+                            write: Access::Deny,
+                            exec: Access::Allow,
+                            ..Default::default()
+                        },
+                    )
+                    .await?,
                 )
-                .await?,
-            );
+            };
             let token = CapabilityToken {
                 roots: vec![Root {
                     path: self.workspace.clone(),
@@ -316,8 +346,7 @@ impl IndependentVerifier for GatewayVerifier {
             result
         })
     }
-}
-impl GatewayVerifier {
+
     async fn verify_with_tools(
         &self,
         input: &VerificationInput,

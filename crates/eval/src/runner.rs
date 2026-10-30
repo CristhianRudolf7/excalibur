@@ -129,8 +129,14 @@ pub fn exit_code(status: &Status) -> i32 {
         | Status::Recovering => 1,
     }
 }
-struct Projection(Arc<Telemetry>, excalibur_tasks::TaskStore);
-impl DurableSink for Projection {
+/// Shared durable event projection for embedded and daemon hosts.
+pub struct ExecutionProjection(Arc<Telemetry>, excalibur_tasks::TaskStore);
+impl ExecutionProjection {
+    pub fn new(telemetry: Arc<Telemetry>, tasks: excalibur_tasks::TaskStore) -> Self {
+        Self(telemetry, tasks)
+    }
+}
+impl DurableSink for ExecutionProjection {
     fn record<'a>(
         &'a self,
         run: &'a str,
@@ -631,7 +637,10 @@ impl Execution {
         let engine = Engine::new(journal, model, tools)
             .with_context_policy(options.context_policy.clone())
             .with_completion_gate(Arc::new(gate))
-            .with_durable_sink(Arc::new(Projection(telemetry.clone(), task_store.clone())));
+            .with_durable_sink(Arc::new(ExecutionProjection::new(
+                telemetry.clone(),
+                task_store.clone(),
+            )));
         let mut context = ContextInput::new(
             "You are Excalibur, the execution coordinator for one isolated task. Never ask questions or request permission. Use conservative assumptions. Missing mandatory data blocks the task: call status with action=block and a reason instead of asking. Rejected operations are tool results: find an authorized alternative. Never read verifier tests or benchmark solutions; never change security or use undeclared services.",
             options.request.clone(),

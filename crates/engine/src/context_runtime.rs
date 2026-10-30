@@ -355,11 +355,23 @@ impl Engine {
         s: &mut Snapshot,
         input: excalibur_context::ContextInput,
     ) -> Result<excalibur_context::CompiledContext> {
+        let mut initial_context = s.spec.context.clone();
+        if s.context_session.is_none()
+            && let Some(mut definitions) = self
+                .tools
+                .run_definitions(run)
+                .await
+                .map_err(|_| Error::Invalid("per-run role tool catalog unavailable"))?
+        {
+            definitions.extend(super::builtin_definitions());
+            definitions.sort_by(|a, b| a.name.cmp(&b.name));
+            initial_context.tools = definitions;
+        }
         let mut session = match s.context_session.clone() {
             Some(session) => session,
             None => Box::new(
                 ContextSession::new(
-                    s.spec.context.clone(),
+                    initial_context,
                     s.context_policy
                         .clone()
                         .unwrap_or(self.effective_context_policy()?),

@@ -1,0 +1,33 @@
+[package]
+name = "excalibur-gateway"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+excalibur-telemetry = { path = "../telemetry" }
+axum = { version = "0.8", features = ["ws"] }
+excalibur-types = { path = "../types" }
+excalibur-engine = { path = "../engine" }
+excalibur-store = { path = "../store" }
+excalibur-master = { path = "../master" }
+excalibur-orchestrator = { path = "../orchestrator" }
+excalibur-security = { path = "../security" }
+excalibur-tasks = { path = "../tasks" }
+tokio = { version = "1", features = ["sync", "time", "net", "rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+ignore = "0.4"
+cap-std = "3"
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = "0.28"
+excalibur-journal = { path = "../journal" }
+excalibur-models = { path = "../models" }
+excalibur-vault = { path = "../vault" }
+excalibur-context = { path = "../context" }

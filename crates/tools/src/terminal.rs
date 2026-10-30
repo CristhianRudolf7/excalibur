@@ -738,6 +738,36 @@ impl TerminalManager {
             .collect::<Vec<_>>();
         self.terminate_sessions(&sessions).await;
     }
+    /// Resource pressure stops one owned process group, selected by actual RSS.
+    /// Unknown native accounting is an error, never a synthetic memory sample.
+    pub async fn terminate_largest(&self, run: &str) -> Result<Option<String>, String> {
+        let sessions = self
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .filter(|s| s.owner == run && !s.output.lock().unwrap().exited)
+            .cloned()
+            .collect::<Vec<_>>();
+        if sessions.is_empty() {
+            return Ok(None);
+        }
+        let groups = sessions.iter().map(|s| s.pid).collect::<Vec<_>>();
+        let rss = tokio::task::spawn_blocking(move || process_group_rss(&groups))
+            .await
+            .map_err(|_| "resource accounting panicked")??;
+        let session = sessions
+            .into_iter()
+            .max_by_key(|s| rss.get(&s.pid).copied().unwrap_or(0))
+            .ok_or("no managed process")?;
+        self.close(&session).await;
+        self.inner.state.lock().unwrap().notices.push_back(
+            json!({"run":run,"session_id":session.id,"reason":"terminated_for_memory_pressure"}),
+        );
+        Ok(Some(session.id.clone()))
+    }
     async fn close(&self, session: &Arc<Session>) {
         self.terminate_sessions(std::slice::from_ref(session)).await;
     }
@@ -1465,6 +1495,12 @@ fn launch(
             }
             #[cfg(target_os = "linux")]
             {
+                // Background tool processes must not compete at the interactive
+                // daemon's scheduler priority. cgroup delegation remains host-owned.
+                if libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::syscall(libc::SYS_ioprio_set, 1, 0, (2 << 13) | 7);
                 if let Some(fd) = cgroup_fd {
                     let bytes = b"0";
                     if libc::write(fd, bytes.as_ptr().cast(), 1) != 1 {
@@ -1952,4 +1988,77 @@ fn detect_environment() -> Value {
         }
     }
     json!({"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"shells":shells,"default_shell":default,"tools":tools})
+}
+
+fn process_group_rss(groups: &[u32]) -> Result<BTreeMap<u32, u64>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut processes = Vec::new();
+        for entry in fs::read_dir("/proc").map_err(|_| "native process accounting unavailable")? {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some((_, tail)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            let Some(parent) = tail
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
+                continue;
+            };
+            let bytes = status
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("VmRSS:")
+                        .and_then(|v| v.split_whitespace().next())
+                        .and_then(|v| v.parse::<u64>().ok())
+                })
+                .unwrap_or(0)
+                .saturating_mul(1024);
+            processes.push((pid, parent, bytes));
+        }
+        let mut totals = BTreeMap::new();
+        for root in groups {
+            let mut descendants = std::collections::BTreeSet::from([*root]);
+            loop {
+                let before = descendants.len();
+                for (pid, parent, _) in &processes {
+                    if descendants.contains(parent) {
+                        descendants.insert(*pid);
+                    }
+                }
+                if descendants.len() == before {
+                    break;
+                }
+            }
+            totals.insert(
+                *root,
+                processes
+                    .iter()
+                    .filter(|(pid, _, _)| descendants.contains(pid))
+                    .fold(0u64, |sum, (_, _, bytes)| sum.saturating_add(*bytes)),
+            );
+        }
+        Ok(totals)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = groups;
+        Err("native process-tree RSS accounting unavailable".into())
+    }
 }

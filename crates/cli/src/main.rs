@@ -1,9 +1,17 @@
 use excalibur_cli::{HELP, model, parse};
 use excalibur_eval::Execution;
 use std::io::{self, Write};
-#[tokio::main]
-async fn main() {
-    let code = execute().await;
+fn main() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|a| a == "daemon") {
+        let code = excalibur_daemon::command::run(&args[1..]);
+        std::process::exit(code);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime initialization");
+    let code = runtime.block_on(execute());
     std::process::exit(code);
 }
 async fn execute() -> i32 {

@@ -25,3 +25,5 @@ Los contratos compartidos de tareas, planificación y evidencia se describen en 
 La compilación de contexto, las sesiones durables y la caché de proveedores se describen en [Contexto y caché](../development/context-cache.es.md).
 
 Las herramientas de proyecto y el aislamiento de edición se implementan en bibliotecas compartidas; consulta [Herramientas de proyecto y concurrencia de edición](../development/project-tools.es.md).
+
+El daemon, la puerta autenticada, los turnos conversacionales y los árboles de agentes: [contrato](../development/daemon.es.md).

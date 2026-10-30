@@ -239,7 +239,20 @@ impl FinalizationGuard for ReadyFinalizationGuard {
 }
 /// Preparation may persist preimages, but must not perform the requested external effect.
 /// Execution is called only after a confirmed durable intention; recovery never guesses.
+/// Trusted host runtime evidence; never deserialized from a model tool call.
+#[derive(Clone, Debug)]
+pub struct FilesystemConfinement {
+    pub workspace: std::path::PathBuf,
+    pub read_roots: Vec<std::path::PathBuf>,
+    pub snapshot_owner: String,
+}
 pub trait ToolRuntime: Send + Sync {
+    /// A positively confined filesystem and run-owned snapshot namespace.
+    /// Generic runtimes deliberately provide no attestation.
+    fn filesystem_confinement(&self, _run: &str) -> Option<FilesystemConfinement> {
+        None
+    }
+
     /// Authoritative lifecycle update. Adapters release leases on human waits and terminal states.
     fn execution_state<'a>(
         &'a self,
@@ -359,6 +372,14 @@ pub trait ToolRuntime: Send + Sync {
     }
     fn live_status(&self, _run: &str) -> Vec<serde_json::Value> {
         Vec::new()
+    }
+    /// Optional immutable per-run role catalog, fixed before the first context
+    /// session is compiled. Execution authorization remains independently required.
+    fn run_definitions<'a>(
+        &'a self,
+        _run: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Vec<ToolDefinition>>, String>> {
+        Box::pin(async { Ok(None) })
     }
     fn definitions(&self) -> Vec<ToolDefinition>;
     /// Return canonical resource keys without preparing content-dependent work.

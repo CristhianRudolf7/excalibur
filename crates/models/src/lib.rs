@@ -64,6 +64,9 @@ pub type StreamSink = Arc<dyn Fn(StreamDelta) + Send + Sync>;
 /// Stream deltas are provisional UI data. Only the returned complete response may
 /// enter the durable execution protocol; callbacks must never execute tool fragments.
 pub trait ModelGateway: Send + Sync {
+    fn rate_limits(&self) -> Option<(u64, u64)> {
+        None
+    }
     fn native_deferred_tools(&self) -> bool {
         false
     }
@@ -766,6 +769,9 @@ impl OpenAiGateway {
     }
 }
 impl ModelGateway for OpenAiGateway {
+    fn rate_limits(&self) -> Option<(u64, u64)> {
+        self.client.rate_limits()
+    }
     fn native_deferred_tools(&self) -> bool {
         self.config.native_tools
             && self.client.provider() == excalibur_providers::Provider::Anthropic

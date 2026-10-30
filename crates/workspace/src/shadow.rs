@@ -381,6 +381,11 @@ impl Shadow {
         }
         Ok(files)
     }
+    /// Entry names only; lets a capability-aware host validate a historical
+    /// capture without opening or diffing any stored file content.
+    pub async fn snapshot_paths(&self, snapshot: &str) -> Result<Vec<PathBuf>> {
+        Ok(self.tree(snapshot).await?.into_keys().collect())
+    }
     pub async fn changed_files(&self, before: &str, after: &str) -> Result<Vec<PathBuf>> {
         let (a, b) = (self.tree(before).await?, self.tree(after).await?);
         Ok(a.keys()

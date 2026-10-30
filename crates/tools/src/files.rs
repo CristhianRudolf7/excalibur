@@ -121,6 +121,9 @@ impl LocalTools {
         {
             return Err("security policy: protected host path is inaccessible".into());
         }
+        if !self.scope_traverses(&resolved) {
+            return Err("path exceeds explicit task roots".into());
+        }
         let relative = resolved
             .strip_prefix(&self.root)
             .map_err(|_| "outside root")?;
@@ -140,11 +143,12 @@ impl LocalTools {
         path: &str,
         authority: &mut crate::file_authority::ReadAuthority,
     ) -> Result<(), String> {
-        let file = self.directory.open(path).map_err(|e| e.to_string())?;
-        authority.check(
+        let file = self.scoped_open(path).map_err(|e| e.to_string())?;
+        authority.check_scoped(
             &self.directory,
             &self.root,
             &self.policy.protected_paths,
+            self.scope_roots(),
             &file,
         )
     }
@@ -153,12 +157,13 @@ impl LocalTools {
         path: &str,
         authority: &mut crate::file_authority::ReadAuthority,
     ) -> Result<Option<Vec<u8>>, String> {
-        match self.directory.open(path) {
+        match self.scoped_open(path) {
             Ok(mut file) => {
-                authority.check(
+                authority.check_scoped(
                     &self.directory,
                     &self.root,
                     &self.policy.protected_paths,
+                    self.scope_roots(),
                     &file,
                 )?;
                 let mut out = Vec::new();
@@ -169,10 +174,11 @@ impl LocalTools {
                 if out.len() as u64 > MAX_FILE_BYTES {
                     return Err("file exceeds 64 MiB limit".into());
                 }
-                authority.check(
+                authority.check_scoped(
                     &self.directory,
                     &self.root,
                     &self.policy.protected_paths,
+                    self.scope_roots(),
                     &file,
                 )?;
                 Ok(Some(out))
@@ -432,6 +438,9 @@ impl LocalTools {
         })
     }
     pub(crate) fn check_write_path(&self, path: &str) -> Result<(), String> {
+        if !self.scope_allows(&self.root.join(path)) {
+            return Err("write exceeds explicit task roots".into());
+        }
         let components = std::path::Path::new(path)
             .components()
             .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
@@ -465,15 +474,16 @@ impl LocalTools {
         if normalized != path {
             return Err("path changed after preparation".into());
         }
-        let relative = Path::new(path);
+        let (directory, scoped) = self.scoped_directory(path)?;
+        let relative = scoped.as_path();
         let parent = relative.parent().unwrap_or(Path::new(""));
-        self.directory
+        directory
             .create_dir_all(parent)
             .map_err(|e| e.to_string())?;
         let dir = if parent.as_os_str().is_empty() {
-            self.directory.try_clone()
+            directory.try_clone()
         } else {
-            self.directory.open_dir(parent)
+            directory.open_dir(parent)
         }
         .map_err(|e| e.to_string())?;
         let name = relative.file_name().ok_or("filename missing")?;

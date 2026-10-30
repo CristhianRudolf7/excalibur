@@ -6,7 +6,7 @@ Excalibur será un agente de inteligencia artificial personal capaz de conversar
 
 ## Estado
 
-El repositorio contiene documentación y bibliotecas Rust compartidas de proveedores, almacenamiento, motor durable mínimo, tareas/planificación y evidencias durables, contexto/caché, seguridad, baúl, sandbox Linux, telemetría y evaluación. El agente personal completo, la CLI interactiva, la interfaz web y la tienda siguen previstos. Consulta la [cobertura y los límites de proveedores](docs/architecture/provider-implementation.es.md).
+El repositorio contiene documentación y bibliotecas Rust compartidas de proveedores, almacenamiento, motor durable mínimo, tareas/planificación y evidencias durables, contexto/caché, seguridad, baúl, sandbox Linux, telemetría y evaluación. El daemon, la puerta autenticada, el maestro y los subagentes se describen en [Daemon, maestro y subagentes](docs/development/daemon.es.md). El agente personal completo, el chat interactivo de CLI, la interfaz web y la tienda siguen previstos. Consulta la [cobertura y los límites de proveedores](docs/architecture/provider-implementation.es.md).
 
 Consulta [Base y almacenamiento](docs/development/storage.es.md) para la implementación y sus comprobaciones. Revisa [Motor durable mínimo](docs/development/durable-engine.es.md) para el ciclo embebido, recuperación de efectos, contexto, pasarela y herramientas locales.
 

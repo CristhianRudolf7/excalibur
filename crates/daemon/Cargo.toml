@@ -1,0 +1,35 @@
+[package]
+name = "excalibur-daemon"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+excalibur-telemetry = { path = "../telemetry" }
+excalibur-eval = { path = "../eval" }
+excalibur-workspace = { path = "../workspace" }
+excalibur-tasks = { path = "../tasks" }
+excalibur-engine = { path = "../engine" }
+excalibur-models = { path = "../models" }
+excalibur-types = { path = "../types" }
+excalibur-store = { path = "../store" }
+excalibur-config = { path = "../config" }
+excalibur-journal = { path = "../journal" }
+excalibur-master = { path = "../master" }
+excalibur-orchestrator = { path = "../orchestrator" }
+excalibur-gateway = { path = "../gateway" }
+excalibur-tools = { path = "../tools" }
+excalibur-security = { path = "../security" }
+excalibur-vault = { path = "../vault" }
+excalibur-context = { path = "../context" }
+excalibur-providers = { path = "../providers" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+futures = "0.3"
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

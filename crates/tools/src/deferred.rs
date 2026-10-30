@@ -754,6 +754,27 @@ fn call_schema() -> Value {
     json!({"$schema":SCHEMA_URI,"type":"object","properties":{"name":{"type":"string","pattern":"^[a-z_][a-z0-9_]{0,63}$"},"args":{"type":"object"},"arguments":{"type":"object"}},"required":["name"],"oneOf":[{"required":["args"],"not":{"required":["arguments"]}},{"required":["arguments"],"not":{"required":["args"]}}],"additionalProperties":false})
 }
 impl ToolRuntime for DeferredTools {
+    fn run_definitions<'a>(
+        &'a self,
+        run: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Vec<ToolDefinition>>, String>> {
+        Box::pin(async move {
+            let Some(mut definitions) = self.delegate.run_definitions(run).await? else {
+                return Ok(None);
+            };
+            let names = self.catalog.names();
+            definitions.retain(|definition| {
+                !names.contains(&definition.name)
+                    && !matches!(definition.name.as_str(), "search_tools" | "call_tool")
+            });
+            definitions.extend(self.definitions().into_iter().filter(|definition| {
+                matches!(definition.name.as_str(), "search_tools" | "call_tool")
+            }));
+            definitions.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(Some(definitions))
+        })
+    }
+
     fn deferred_definitions<'a>(
         &'a self,
         run: &'a str,

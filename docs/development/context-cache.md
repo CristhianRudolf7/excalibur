@@ -22,7 +22,7 @@ Compaction derives the literal original request, active instructions, requiremen
 
 An optional extractor gateway, configured through `Engine::with_context_extractor`, returns a strict incremental summary of only the discarded segment. The engine requires the extractor role and a usage bound, journals admission and completion, honors control/timeout, accounts usage and uses a structured fallback on absence, provider failure, invalid output or interruption. Previous findings are merged rather than rewritten; missing open IDs are repaired mechanically. A pending extractor request reserves its upper bound and prevents distributing that share to children before reconciliation. An interrupted receipt is conservatively accounted and is not blindly redispatched. Summaries and quoted observations remain untrusted data and cannot replace structured state or literal instructions.
 
-Conversation mode retains a 12K recent window and updates its summary only after 24K activity or an expired-TTL session boundary. Omitted segments remain searchable. This is a shared host-facing mode; it does not implement a master/channel service or a general subagent scheduler.
+Conversation mode retains a 12K recent window and updates its summary only after 24K activity or an expired-TTL session boundary. Omitted segments remain searchable. This shared host-facing mode is available to the [daemon and conversational master](daemon.md); context compilation remains independent of client channels and agent scheduling.
 
 ## Tokenizers, provider caches and verification
 

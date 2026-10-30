@@ -22,7 +22,7 @@ La compactación deriva del backend petición original literal, instrucciones ac
 
 El extractor opcional, configurado mediante `Engine::with_context_extractor`, devuelve un resumen incremental estricto de solo el tramo descartado. El motor exige rol extractor y consumo acotado, registra admisión y finalización, respeta control/timeout, contabiliza uso y utiliza el estado estructurado si falta el extractor o hay fallo del proveedor, salida inválida o interrupción. Fusiona hallazgos sin reescribirlos y repara mecánicamente los ID abiertos ausentes. El máximo de una solicitud de extractor pendiente queda reservado y no permite repartirlo a hijos antes de reconciliarlo. Un recibo interrumpido se contabiliza conservadoramente y no se reenvía a ciegas. Resúmenes y observaciones citadas siguen siendo datos no confiables y no sustituyen estado ni instrucciones literales.
 
-El modo conversación retiene 12K recientes y actualiza el resumen al superar 24K o al cruzar un límite de sesión por TTL vencido. Lo omitido sigue consultable. Es un modo compartido para el host; no implementa un servicio maestro/canales ni un planificador general de subagentes.
+El modo conversación retiene 12K recientes y actualiza el resumen al superar 24K o al cruzar un límite de sesión por TTL vencido. Lo omitido sigue consultable. Este modo compartido está disponible para el [daemon y el maestro conversacional](daemon.es.md); la compilación del contexto sigue siendo independiente de canales y planificación de agentes.
 
 ## Tokenizadores, caché y comprobaciones
 

@@ -25,3 +25,5 @@ The shared task/planning and evidence contracts are described in [Verifiable wor
 Context compilation, durable sessions and provider caches are described in [Context and cache](../development/context-cache.md).
 
 Project-domain tools and editing isolation are implemented in the shared libraries; see [Project tools and editing concurrency](../development/project-tools.md).
+
+Daemon hosting, authenticated client transport, conversational turns and agent trees: [contract](../development/daemon.md).

@@ -7,13 +7,14 @@ mod files;
 pub mod intelligence;
 pub mod monitor;
 mod patch;
+mod path_scope;
 pub mod project;
 mod redaction;
 pub mod terminal;
 use excalibur_store::{Database, Priority};
 use excalibur_types::runtime::{
-    BoxFuture, Effect, PreparedTool, Reconcile, Resource, ToolCall, ToolDefinition, ToolResult,
-    ToolRuntime, ToolScheduling,
+    BoxFuture, Effect, FilesystemConfinement, PreparedTool, Reconcile, Resource, ToolCall,
+    ToolDefinition, ToolResult, ToolRuntime, ToolScheduling,
 };
 use files::{FileEdit, hash, required_str};
 use serde_json::{Value, json};
@@ -80,6 +81,7 @@ pub struct LocalTools {
     db: Database,
     root: PathBuf,
     directory: Arc<cap_std::fs::Dir>,
+    path_scope: Option<Arc<path_scope::PathScope>>,
     policy: ToolPolicy,
     terminal: Arc<terminal::TerminalManager>,
     workspace: excalibur_workspace::Workspace,
@@ -96,7 +98,50 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS tool_readset(run_id TEXT NOT NU
 // Additive upgrade: absence conflicts need counters even without a prior readset row.
 const SCHEMA_2: &str = "CREATE TABLE IF NOT EXISTS tool_conflicts(run_id TEXT NOT NULL,path TEXT NOT NULL,mismatches INTEGER NOT NULL DEFAULT 0 CHECK(mismatches>=0),PRIMARY KEY(run_id,path)); INSERT OR IGNORE INTO tool_conflicts(run_id,path,mismatches) SELECT run_id,path,mismatches FROM tool_readset WHERE mismatches>0;";
 impl LocalTools {
-    pub async fn new(db: Database, root: PathBuf, mut policy: ToolPolicy) -> Result<Self, String> {
+    pub async fn new(db: Database, root: PathBuf, policy: ToolPolicy) -> Result<Self, String> {
+        Self::new_inner(db, root, policy, false).await
+    }
+    /// Trusted host adaptation for one durable, registered child worktree.
+    /// Only automatic enclosing data-directory hides are narrowed; explicit
+    /// host denials and all database/blob paths remain protected.
+    pub async fn for_registered_worktree(
+        db: Database,
+        source: excalibur_workspace::Workspace,
+        task: &str,
+        owner: &str,
+        mut policy: ToolPolicy,
+    ) -> Result<Self, String> {
+        if db.path() != source.database_path() {
+            return Err("worktree and tools must share principal storage".into());
+        }
+        let tree = source
+            .git()
+            .worktree(task, owner)
+            .await
+            .map_err(|e| e.to_string())?;
+        let base = source
+            .managed_worktree_root()
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        let root = tree.path.canonicalize().map_err(|e| e.to_string())?;
+        if root != tree.path || root == base || !root.starts_with(&base) || root == source.root() {
+            return Err("registered worktree escaped its canonical host base".into());
+        }
+        if let Some(sandbox) = &mut policy.sandbox {
+            sandbox.workspace = root.clone();
+            sandbox.read_roots = vec![root.clone()];
+            if !sandbox.write_roots.is_empty() {
+                sandbox.write_roots = vec![root.clone()];
+            }
+        }
+        Self::new_inner(db, root, policy, true).await
+    }
+    async fn new_inner(
+        db: Database,
+        root: PathBuf,
+        mut policy: ToolPolicy,
+        registered_worktree: bool,
+    ) -> Result<Self, String> {
         if policy.output_budget_bytes < 256 || policy.output_budget_bytes > 1024 * 1024 {
             return Err("output budget must be 256..=1048576 bytes".into());
         }
@@ -107,6 +152,7 @@ impl LocalTools {
         {
             return Err("protected paths must be canonical absolute paths".into());
         }
+        let explicit_protected = policy.protected_paths.clone();
         let (root, directory) = files::open_root(root)?;
         let data_parent = db.path().parent().ok_or("database parent missing")?;
         if data_parent.starts_with(&root) && data_parent != root {
@@ -127,6 +173,16 @@ impl LocalTools {
                 data_parent.join("tool-spool"),
                 data_parent.join("workspaces"),
             ]);
+        }
+        if registered_worktree {
+            let automatic_workspaces = data_parent.join("workspaces");
+            // Removing an automatic ancestor permits only the selected cap-dir
+            // root, not any sibling worktree or database directory.
+            if root.starts_with(&automatic_workspaces) {
+                policy
+                    .protected_paths
+                    .retain(|p| p != &automatic_workspaces || explicit_protected.contains(p));
+            }
         }
         policy.protected_paths.push(db.blobs().root().to_path_buf());
         policy.protected_paths.sort();
@@ -159,9 +215,11 @@ impl LocalTools {
             );
         }
         sandbox.hidden_paths.extend(policy.protected_paths.clone());
-        sandbox
-            .hidden_paths
-            .push(db.path().parent().unwrap().to_path_buf());
+        if !registered_worktree {
+            sandbox
+                .hidden_paths
+                .push(db.path().parent().unwrap().to_path_buf());
+        }
         sandbox.hidden_paths.extend([
             db.path().to_path_buf(),
             db.path().with_file_name(format!(
@@ -215,6 +273,7 @@ impl LocalTools {
             db,
             root,
             directory: Arc::new(directory),
+            path_scope: None,
             policy,
             terminal: Arc::new(terminal),
         })
@@ -682,8 +741,16 @@ impl LocalTools {
             None
         };
         let protected = self.policy.protected_paths.clone();
+        let scope = self.path_scope.clone();
         let files = ignore::WalkBuilder::new(&self.root)
-            .filter_entry(move |entry| !protected.iter().any(|p| entry.path().starts_with(p)))
+            .filter_entry(move |entry| {
+                !protected.iter().any(|p| entry.path().starts_with(p))
+                    && scope.as_ref().is_none_or(|s| {
+                        s.roots.iter().any(|root| {
+                            entry.path().starts_with(root) || root.starts_with(entry.path())
+                        })
+                    })
+            })
             .hidden(false)
             .git_ignore(true)
             .git_exclude(true)
@@ -1130,6 +1197,14 @@ pub fn head_tail(text: &str, budget: usize) -> String {
     format!("{}{}{}", &text[..end], marker, &text[start..])
 }
 impl ToolRuntime for LocalTools {
+    fn filesystem_confinement(&self, run: &str) -> Option<FilesystemConfinement> {
+        self.scope_roots().map(|roots| FilesystemConfinement {
+            workspace: self.root.clone(),
+            read_roots: roots.to_vec(),
+            snapshot_owner: run.into(),
+        })
+    }
+
     fn live_status(&self, run: &str) -> Vec<Value> {
         self.terminal.live_status(run)
     }
@@ -1214,10 +1289,15 @@ impl ToolRuntime for LocalTools {
     fn interrupt_execution<'a>(
         &'a self,
         run: &'a str,
-        _cancelled: bool,
+        cancelled: bool,
         tool: Option<&'a PreparedTool>,
     ) -> BoxFuture<'a, Result<bool, String>> {
         Box::pin(async move {
+            // A declared background session outlives a pause between effects.
+            // Cancellation still tears down every managed process of the run.
+            if !cancelled && tool.is_none() {
+                return Ok(false);
+            }
             if tool.is_some_and(|t| !matches!(t.call.name.as_str(), "exec" | "exec_io")) {
                 return Ok(false);
             }

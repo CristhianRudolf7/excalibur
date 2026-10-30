@@ -41,6 +41,9 @@ impl LocalTools {
         {
             return Err("security policy: protected or outside host path".into());
         }
+        if !self.scope_allows(&entry) {
+            return Err("entry exceeds explicit task roots".into());
+        }
         entry
             .strip_prefix(&self.root)
             .map_err(|_| "outside root")?
@@ -58,15 +61,15 @@ impl LocalTools {
         authority: &mut crate::file_authority::ReadAuthority,
     ) -> Result<Option<SnapshotEntry>, String> {
         let path = self.resolve_entry(path)?;
-        let meta = match self.directory.symlink_metadata(&path) {
+        let (directory, scoped) = self.scoped_directory(&path)?;
+        let meta = match directory.symlink_metadata(&scoped) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.to_string()),
         };
         if meta.file_type().is_symlink() {
-            let target = self
-                .directory
-                .read_link_contents(&path)
+            let target = directory
+                .read_link_contents(&scoped)
                 .map_err(|e| e.to_string())?;
             #[cfg(unix)]
             let bytes = {
@@ -94,14 +97,14 @@ impl LocalTools {
             use cap_std::fs::OpenOptionsExt;
             opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY);
         }
-        let mut file = self
-            .directory
-            .open_with(&path, &opts)
+        let mut file = directory
+            .open_with(&scoped, &opts)
             .map_err(|e| e.to_string())?;
-        authority.check(
+        authority.check_scoped(
             &self.directory,
             &self.root,
             &self.policy.protected_paths,
+            self.scope_roots(),
             &file,
         )?;
         let opened = file.metadata().map_err(|e| e.to_string())?;
@@ -123,10 +126,11 @@ impl LocalTools {
         if bytes.len() as u64 > MAX_FILE_BYTES {
             return Err("file exceeds 64 MiB limit".into());
         }
-        authority.check(
+        authority.check_scoped(
             &self.directory,
             &self.root,
             &self.policy.protected_paths,
+            self.scope_roots(),
             &file,
         )?;
         Ok(Some(SnapshotEntry::file(bytes, executable)))
@@ -135,6 +139,7 @@ impl LocalTools {
     /// protected hard-link aliases are filtered before any content publication.
     pub fn authorized_snapshot_entries(&self) -> Result<BTreeMap<PathBuf, SnapshotEntry>, String> {
         let protected = self.policy.protected_paths.clone();
+        let scope = self.path_scope.clone();
         let mut out = BTreeMap::new();
         let mut total = 0usize;
         let mut authority = crate::file_authority::ReadAuthority::excluding_credential_names();
@@ -151,6 +156,11 @@ impl LocalTools {
                         Some(".git" | "target" | "node_modules")
                     )
                 }) && !protected.iter().any(|p| e.path().starts_with(p))
+                    && scope.as_ref().is_none_or(|s| {
+                        s.roots
+                            .iter()
+                            .any(|root| e.path().starts_with(root) || root.starts_with(e.path()))
+                    })
             })
             .build()
         {
@@ -357,15 +367,16 @@ impl LocalTools {
         if !entry_matches(edit, &current, false) {
             return Err("entry precondition changed immediately before atomic replacement".into());
         }
-        let relative = Path::new(&edit.path);
+        let (directory, scoped) = self.scoped_directory(&edit.path)?;
+        let relative = scoped.as_path();
         let parent = relative.parent().unwrap_or(Path::new(""));
-        self.directory
+        directory
             .create_dir_all(parent)
             .map_err(|e| e.to_string())?;
         let dir = if parent.as_os_str().is_empty() {
-            self.directory.try_clone()
+            directory.try_clone()
         } else {
-            self.directory.open_dir(parent)
+            directory.open_dir(parent)
         }
         .map_err(|e| e.to_string())?;
         let name = relative.file_name().ok_or("filename missing")?;

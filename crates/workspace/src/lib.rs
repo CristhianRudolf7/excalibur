@@ -205,6 +205,13 @@ impl Workspace {
     pub fn git(&self) -> GitWorkspace {
         GitWorkspace::new(self.clone())
     }
+    /// Host-owned generated worktree authority, separate from the user's tree.
+    pub fn database_path(&self) -> &Path {
+        self.db.path()
+    }
+    pub fn managed_worktree_root(&self) -> PathBuf {
+        self.data.join("worktrees")
+    }
     pub fn root(&self) -> &Path {
         &self.root
     }

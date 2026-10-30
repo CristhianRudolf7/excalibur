@@ -6,6 +6,7 @@ edition = "2024"
 name = "excalibur"
 path = "src/main.rs"
 [dependencies]
+excalibur-daemon = { path = "../daemon" }
 excalibur-types = { path = "../types" }
 excalibur-eval = { path = "../eval" }
 excalibur-engine = { path = "../engine" }
