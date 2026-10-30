@@ -1458,15 +1458,26 @@ conn.execute("UPDATE master_inbox SET state='done' WHERE message_id=?1 AND state
             }
             conn.execute("INSERT INTO master_action_receipts(operation_key,conversation_id,tool_name,arguments,state) VALUES(?1,?2,?3,?4,'intent')",(&key_owned,&conversation_owned,&name_owned,&arguments))?;Ok(None)
         }).await?;
-        if let Some(previous) = previous {
-            if cancel_request && previous["confirmation_required"] == true {
-                self.create_cancel_question(
-                    conversation,
-                    source.ok_or_else(|| Error::Invalid("cancellation needs a source".into()))?,
-                    key,
-                    &previous,
-                )
-                .await?;
+        if let Some(mut previous) = previous {
+            if cancel_request
+                && previous["confirmation_required"] == true
+                && !self
+                    .create_cancel_question(
+                        conversation,
+                        source
+                            .ok_or_else(|| Error::Invalid("cancellation needs a source".into()))?,
+                        key,
+                        &previous,
+                    )
+                    .await?
+            {
+                previous = cancellation::question_limit_result();
+                let encoded = previous.to_string();
+                let key = key.to_owned();
+                self.inner.db.write(Priority::Interactive, move |conn| {
+                    conn.execute("UPDATE master_action_receipts SET state='done',result=?2 WHERE operation_key=?1", (&key, &encoded))?;
+                    Ok(())
+                }).await?;
             }
             return Ok(self.inner.redactor.redact_json(&previous));
         }
@@ -1519,14 +1530,18 @@ conn.execute("UPDATE master_inbox SET state='done' WHERE message_id=?1 AND state
         if result.to_string().len() > 64 * 1024 {
             result = json!({"error":"fast action output exceeded the bounded master result limit"});
         }
-        if cancel_request && result["confirmation_required"] == true {
-            self.create_cancel_question(
-                conversation,
-                source.ok_or_else(|| Error::Invalid("cancellation needs a source".into()))?,
-                key,
-                &result,
-            )
-            .await?;
+        if cancel_request
+            && result["confirmation_required"] == true
+            && !self
+                .create_cancel_question(
+                    conversation,
+                    source.ok_or_else(|| Error::Invalid("cancellation needs a source".into()))?,
+                    key,
+                    &result,
+                )
+                .await?
+        {
+            result = cancellation::question_limit_result();
         }
         let encoded = result.to_string();
         let key = key.to_string();
