@@ -322,6 +322,17 @@ Un cambio de URL no levanta bloqueos de seguridad/versión ni control humano.
 Los cambios de ciclo de vida usan la tabla de transiciones validada; volver a un
 origen permitido no afirma por sí solo que haya una cuenta autenticada.
 
+La reconciliación usa eventos de navegación y URL de frames verificadas en caché.
+La consulta de targets del navegador se ejecuta fuera del cerrojo del modelo y en
+paralelo entre instancias. Las sondas de frame/conteo del renderizador también
+quedan fuera, con un presupuesto total de 500 ms, una sonda pendiente por pestaña
+y doce globales. Un timeout conserva el último estado conocido; no declara una
+caída. Se descartan resultados si cambió el target, la sesión CDP o la época del
+documento. Así siguen disponibles las otras ejecuciones y los eventos en escucha
+cuando una página ejecuta código sin fin. La admisión de entrada y la suspensión
+leen frames actuales bajo sus propias exclusiones de pestaña, fuera del cerrojo
+del modelo, y vuelven a comprobar la identidad antes de aplicar el resultado.
+
 Las instancias en escucha usan los tres flags contra la retención en segundo
 plano y emulación de foco. No reciben suspensión, congelación, descarte ni presión
 de memoria. El gestor reconcilia periódicamente los metadatos de targets; los
@@ -411,3 +422,12 @@ y registra los cambios reales de la página junto al número de notificaciones.
 El fixture del servicio espera el bloqueo por documento de error que corresponde
 a su proxy de rechazo total; los fixtures conservan explícitamente el ID de la
 sesión viva.
+
+
+`cargo test -p excalibur-browser --test sessions other_sessions_stay_responsive_with_a_spinning_renderer -- --nocapture`
+usa un renderizador real en bucle infinito junto a un contexto sano del mismo
+navegador y una escucha persistente. Acota a un segundo list/status, la exclusión
+y el cambio de otra pestaña y las lecturas RPC Unix; comprueba los intervalos de
+actividad del oyente, la sonda de entrada acotada y el cierre. Son comprobaciones
+sintéticas locales, guardadas en
+`target/test-evidence/browser/renderer_isolation/contract.json`.

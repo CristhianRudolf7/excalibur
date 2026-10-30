@@ -31,6 +31,10 @@ fn durable_sessions_and_protocol() {
 fn listener_events_and_document_recovery() {
     run_fixture("reconciliation_child", "listener_reconciliation");
 }
+#[test]
+fn other_sessions_stay_responsive_with_a_spinning_renderer() {
+    run_fixture("spin_child", "renderer_isolation");
+}
 fn run_fixture(child: &str, suite: &str) {
     if std::env::var("EXCALIBUR_BROWSER_TESTS").as_deref() == Ok("skip") {
         eprintln!("real sessions explicitly skipped");
@@ -1215,4 +1219,240 @@ async fn reconciliation_contract(root: PathBuf) {
     let _ = monitor.await;
     manager.shutdown().await.unwrap();
     server.abort();
+}
+
+#[test]
+#[ignore = "privilege dropping subprocess"]
+fn spin_child() {
+    let root = PathBuf::from(std::env::var_os("EXCALIBUR_SESSION_DIR").unwrap());
+    if unsafe { libc::geteuid() } == 0 {
+        let (uid, gid) = identity();
+        unsafe {
+            assert_eq!(libc::setgroups(0, std::ptr::null()), 0);
+            assert_eq!(libc::setgid(gid), 0);
+            assert_eq!(libc::setuid(uid), 0);
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(spin_contract(root));
+}
+async fn spin_contract(root: PathBuf) {
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = match proxy.local_addr().unwrap() {
+        std::net::SocketAddr::V4(v) => v,
+        _ => unreachable!(),
+    };
+    let serving = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = proxy.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = [0; 8192];
+                let n = stream.read(&mut request).await.unwrap();
+                let line = String::from_utf8_lossy(&request[..n]);
+                let body = if line.contains("spin.test") {
+                    r#"<!doctype html><title>spin</title><body><script>setTimeout(()=>{document.body.dataset.spinning='yes';while(true){}},1500)</script>"#
+                } else if line.contains("chat.test") {
+                    r#"<!doctype html><title>chat</title><body><script>let n=0;setInterval(()=>{document.title='chat '+(++n);const s=document.createElement('span');s.className='unread';document.body.append(s)},1000)</script>"#
+                } else {
+                    "<!doctype html><title>healthy</title><body>healthy"
+                };
+                let _=stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
+            });
+        }
+    });
+    let mut profiles = BTreeMap::new();
+    profiles.insert(
+        "personal".into(),
+        Profile {
+            sites: vec![Site {
+                name: "chat".into(),
+                rw: vec!["http://chat.test".into()],
+                listen: true,
+                listen_probe: ListenProbe {
+                    unread_selector: ".unread".into(),
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    let manager = Manager::open(Options {
+        data_dir: root.clone(),
+        binary: "/usr/bin/google-chrome-stable".into(),
+        proxy: address,
+        profiles,
+        compact: false,
+        version: VersionPolicy::default(),
+        chrome_args: vec![],
+    })
+    .await
+    .unwrap();
+    let monitor = manager.start();
+    let (listener, listener_tab) = ids(&manager
+        .open_session(
+            "listener",
+            Open {
+                profile: "personal".into(),
+                site: Some("chat".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap());
+    let (healthy, healthy_tab) = ids(&manager
+        .open_session("healthy", Open::default())
+        .await
+        .unwrap());
+    go(
+        &manager,
+        "healthy",
+        &healthy,
+        &healthy_tab,
+        "http://healthy.test",
+    )
+    .await;
+    eval(
+        &manager,
+        "healthy",
+        &healthy,
+        &healthy_tab,
+        "if(location.hostname!=='healthy.test')throw Error('loading');return true",
+    )
+    .await;
+    let (spin, spin_tab) = ids(&manager.open_session("spin", Open::default()).await.unwrap());
+    go(&manager, "spin", &spin, &spin_tab, "http://spin.test").await;
+    // This page shares the ephemeral browser with healthy, but has another context/renderer.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (client, cdp) = manager
+        .diagnostic_client("spin", &spin, &spin_tab)
+        .await
+        .unwrap();
+    let hung = client
+        .send_with_timeout(
+            Method::PageGetFrameTree,
+            json!({}),
+            Some(&cdp),
+            Duration::from_millis(250),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(hung, excalibur_cdp::Error::Timeout));
+    let (protocol_stop, stop_rx) = tokio::sync::watch::channel(false);
+    let socket = root.join("webd.sock");
+    let server = Server::bind(
+        &socket,
+        unsafe { libc::geteuid() },
+        unsafe { libc::getgid() },
+        Protocol::new(manager.clone()),
+    )
+    .unwrap();
+    let rpc_task = tokio::spawn(async move { server.run(stop_rx).await.unwrap() });
+    let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut read = BufReader::new(read);
+    let cursor = all_events(&manager, 0).await.last().unwrap()["cursor"]
+        .as_u64()
+        .unwrap();
+    let mut maxima = [0u128; 5];
+    let mut samples = 0;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(16) {
+        let measured = Instant::now();
+        let list = tokio::time::timeout(Duration::from_secs(1), manager.list("healthy"))
+            .await
+            .expect("list blocked by another renderer");
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["session_id"] == healthy)
+        );
+        maxima[0] = maxima[0].max(measured.elapsed().as_micros());
+        let measured = Instant::now();
+        let status = tokio::time::timeout(Duration::from_secs(1), manager.status())
+            .await
+            .expect("status blocked by another renderer");
+        assert_eq!(status["instances"].as_array().unwrap().len(), 2);
+        maxima[1] = maxima[1].max(measured.elapsed().as_micros());
+        let measured = Instant::now();
+        let lease = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.lease("healthy", &healthy, &healthy_tab, false),
+        )
+        .await
+        .expect("independent tab lease blocked")
+        .unwrap();
+        maxima[2] = maxima[2].max(measured.elapsed().as_micros());
+        drop(lease);
+        let measured = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.switch("healthy", &healthy, &healthy_tab),
+        )
+        .await
+        .expect("healthy switch blocked")
+        .unwrap();
+        maxima[3] = maxima[3].max(measured.elapsed().as_micros());
+        let measured = Instant::now();
+        let id = samples + 1;
+        tokio::time::timeout(Duration::from_secs(1),async{let request=json!({"jsonrpc":"2.0","id":id,"method":"status.get","params":{"op_key":format!("read-{id}"),"run_id":"healthy","deadline_ms":750}});write.write_all(format!("{request}\n").as_bytes()).await.unwrap();loop{let mut line=String::new();assert!(read.read_line(&mut line).await.unwrap()>0);let value:Value=serde_json::from_str(&line).unwrap();if value["id"]==id{assert!(value["error"].is_null(),"{value}");break}}}).await.expect("Unix RPC read blocked");
+        maxima[4] = maxima[4].max(measured.elapsed().as_micros());
+        samples += 1;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // An explicit input check on the stuck tab also waits outside the global model.
+    let pending_manager = manager.clone();
+    let ps = spin.clone();
+    let pt = spin_tab.clone();
+    let pending = tokio::spawn(async move { pending_manager.lease("spin", &ps, &pt, true).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(1), manager.status())
+        .await
+        .unwrap();
+    let fault = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(fault.kind, "cdp_error");
+    let events = all_events(&manager, cursor).await;
+    let activity = events
+        .iter()
+        .filter(|e| e["type"] == "listener_activity" && e["session_id"] == listener)
+        .collect::<Vec<_>>();
+    assert!(activity.len() >= 3, "listener stalled: {activity:?}");
+    for pair in activity.windows(2) {
+        let gap = pair[1]["at"].as_i64().unwrap() - pair[0]["at"].as_i64().unwrap();
+        assert!((5..=8).contains(&gap), "listener gap {gap}: {activity:?}");
+    }
+    assert!(activity.last().unwrap()["count"].as_i64().unwrap() >= 12);
+    assert_eq!(
+        manager.tabs("listener", &listener).await.unwrap()[0]["tab_id"],
+        listener_tab
+    );
+    assert!(maxima.iter().all(|latency| *latency < 1_000_000));
+    assert!(
+        client.pending_count() <= 4,
+        "timed-out probes accumulated pending CDP calls"
+    );
+    assert!(
+        manager.status().await["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["state"] != "crashed")
+    );
+    fs::write(root.join("contract.json"),serde_json::to_vec_pretty(&json!({"renderer_confirmed_unresponsive":true,"duration_seconds":started.elapsed().as_secs(),"samples":samples,"max_latency_microseconds":{"list":maxima[0],"status":maxima[1],"lease":maxima[2],"switch":maxima[3],"unix_rpc":maxima[4]},"listener_events":activity,"input_probe_bounded":true,"false_instance_crash":manager.status().await["instances"].as_array().unwrap().iter().any(|i|i["state"]=="crashed")})).unwrap()).unwrap();
+    protocol_stop.send_replace(true);
+    rpc_task.await.unwrap();
+    monitor.abort();
+    let _ = monitor.await;
+    tokio::time::timeout(Duration::from_secs(6), manager.shutdown())
+        .await
+        .expect("shutdown stalled on spinning renderer")
+        .unwrap();
+    serving.abort();
 }

@@ -306,6 +306,16 @@ and admits agent leases again. Security/version blocks and human control are
 not cleared by a URL change. Lifecycle changes use the checked transition table;
 returning to a permitted origin does not by itself assert a logged-in account.
 
+Frame reconciliation uses navigation events and cached, verified frame URLs.
+Browser target discovery runs outside the model lock, concurrently across
+instances. Renderer frame/count probes also run outside that lock, with a total
+500 ms budget, at most one pending probe per tab and twelve globally. A timeout
+leaves the last known state intact; it does not declare a crash. Completed probes
+are discarded if the target, CDP session or document epoch changed. This keeps
+other runs and listening events responsive when a page executes endless script.
+Input admission and suspension capture fresh frames under their own tab leases,
+outside the model lock, and check the identity again before applying results.
+
 Listening instances use the three background throttling flags and focus emulation.
 No suspend, freeze, discard or memory pressure command is sent to a listener.
 Target metadata is reconciled periodically; title changes produce
@@ -389,3 +399,11 @@ The long-polling fixture disables response caching, consumes each response body
 and records its actual page changes alongside notification counts.
 The service boundary fixture waits for the error-document block expected from its
 deny-all proxy, and session fixtures keep the live session ID explicitly.
+
+
+`cargo test -p excalibur-browser --test sessions other_sessions_stay_responsive_with_a_spinning_renderer -- --nocapture`
+uses an actual infinite-loop renderer alongside a healthy context in the same
+browser and a persistent listener. It bounds list/status, another tab's lease and
+switch, and Unix RPC reads to one second, checks listener event gaps and bounded
+input probing, and verifies shutdown. Measurements are local synthetic checks,
+recorded in `target/test-evidence/browser/renderer_isolation/contract.json`.

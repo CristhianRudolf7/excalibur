@@ -262,7 +262,12 @@ fn chrome_probe_bounds_total_time_and_stops_descendants() {
             .parse()
             .unwrap();
         let stopped = || match fs::read_to_string(format!("/proc/{pid}/status")) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                true
+            }
             Ok(s) => s
                 .lines()
                 .any(|line| line.starts_with("State:") && line.contains('Z')),

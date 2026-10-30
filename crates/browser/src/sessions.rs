@@ -312,6 +312,33 @@ impl Default for Open {
         }
     }
 }
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProbeKey {
+    tab: String,
+    target: String,
+    session: String,
+    epoch: u64,
+}
+impl ProbeKey {
+    fn of(tab: &Tab) -> Option<Self> {
+        Some(Self {
+            tab: tab.id.clone(),
+            target: tab.target_id.clone()?,
+            session: tab.cdp_session.clone()?,
+            epoch: tab.document_epoch,
+        })
+    }
+    fn matches(&self, m: &Model) -> bool {
+        m.tabs.get(&self.tab).and_then(Self::of).as_ref() == Some(self)
+    }
+}
+struct ProbeResult {
+    key: ProbeKey,
+    url: Option<String>,
+    count: Option<i64>,
+    crashed: bool,
+}
 #[derive(Default)]
 struct Model {
     sessions: BTreeMap<String, Session>,
@@ -331,6 +358,10 @@ struct Model {
     busy: HashMap<String, usize>,
     lifecycle: HashMap<String, tokio::sync::broadcast::Receiver<excalibur_cdp::Event>>,
     health: HashMap<String, tokio::time::Instant>,
+    unread_health: HashMap<String, tokio::time::Instant>,
+    frame_sources: HashMap<String, ProbeKey>,
+    probes: tokio::task::JoinSet<ProbeResult>,
+    pending_probes: HashMap<String, (ProbeKey, tokio::task::Id)>,
     modes: HashMap<String, String>,
 }
 /// SQLite is accessed only on Tokio's blocking pool, with a single writer mutex.
@@ -1227,22 +1258,18 @@ impl Manager {
             .map_err(|_| Fault::new("tab_busy", "30 second queue deadline"))?;
         self.accessible(run, sid, tid).await?;
         if input {
+            let (key, tree) = self.fresh_frame(run, sid, tid).await?;
             let m = self.model.lock().await;
-            let tab = &m.tabs[tid];
-            let session = &m.sessions[sid];
-            let instance = &m.instances[&session.instance_id];
-            let cdp = tab
-                .cdp_session
-                .as_deref()
-                .ok_or_else(|| Fault::new("session_recovering", sid))?;
-            let tree = instance
-                .client()
-                .send(Method::PageGetFrameTree, json!({}), Some(cdp))
-                .await?;
+            if !key.matches(&m) {
+                return Err(Fault::new(
+                    "session_recovering",
+                    "document changed during admission",
+                ));
+            }
             let current = tree["frameTree"]["frame"]["url"]
                 .as_str()
-                .unwrap_or(&tab.url);
-            self.document_allowed(session, current, true)?;
+                .ok_or_else(|| Fault::new("denied", "unknown document origin"))?;
+            self.document_allowed(&m.sessions[sid], current, true)?;
         }
         {
             let m = self.model.lock().await;
@@ -1299,18 +1326,6 @@ impl Manager {
     }
     async fn stop_tab(&self, m: &mut Model, tid: &str, suspend: bool) -> Result<()> {
         let t = m.tabs[tid].clone();
-        if suspend && let Some(cdp) = &t.cdp_session {
-            let s = &m.sessions[&t.session_id];
-            if let Some(instance) = m.instances.get(&s.instance_id) {
-                let tree = instance
-                    .client()
-                    .send(Method::PageGetFrameTree, json!({}), Some(cdp))
-                    .await?;
-                if let Some(url) = tree["frameTree"]["frame"]["url"].as_str() {
-                    m.tabs.get_mut(tid).unwrap().url = url.into();
-                }
-            }
-        }
         if let Some(target) = t.target_id {
             let s = &m.sessions[&t.session_id];
             if let Some(i) = m.instances.get(&s.instance_id) {
@@ -1372,7 +1387,24 @@ impl Manager {
                     .map_err(|_| Fault::new("tab_busy", tid))?,
             );
         }
+        let mut frames = vec![];
+        if suspend {
+            for tid in &tids {
+                frames.push(self.fresh_frame(run, sid, tid).await?);
+            }
+        }
         let mut m = self.model.lock().await;
+        for (key, frame) in frames {
+            if !key.matches(&m) {
+                return Err(Fault::new(
+                    "session_recovering",
+                    "document changed during suspension",
+                ));
+            }
+            if let Some(url) = frame["frameTree"]["frame"]["url"].as_str() {
+                m.tabs.get_mut(&key.tab).unwrap().url = url.into();
+            }
+        }
         let s = Self::owned(&m, run, sid)?.clone();
         if m.sessions[sid].state == SessionState::Busy {
             m.sessions
@@ -1669,9 +1701,32 @@ impl Manager {
         ))
     }
     pub async fn tick(&self) -> Result<()> {
+        let instances = {
+            let m = self.model.lock().await;
+            m.instances
+                .iter()
+                .map(|(key, instance)| (key.clone(), instance.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut discoveries = tokio::task::JoinSet::new();
+        for (key, instance) in instances {
+            discoveries.spawn(async move {
+                let targets = instance
+                    .client()
+                    .send_with_timeout(Method::TargetGetTargets, json!({}), None, PROBE_TIMEOUT)
+                    .await;
+                (key, instance, targets)
+            });
+        }
+        let mut snapshots = HashMap::new();
+        while let Some(result) = discoveries.join_next().await {
+            if let Ok((key, instance, Ok(targets))) = result {
+                snapshots.insert(key, (instance, targets));
+            }
+        }
         let mut m = self.model.lock().await;
+        let mut changed = self.collect_probes(&mut m).await?;
         let keys = m.instances.keys().cloned().collect::<Vec<_>>();
-        let mut changed = false;
         for key in keys {
             let i = m.instances[&key].clone();
             let status = i.status().borrow().clone();
@@ -1743,7 +1798,6 @@ impl Manager {
                 changed = true;
                 continue;
             }
-            let client = i.client();
             let mut events = vec![];
             if let Some(stream) = m.streams.get_mut(&key) {
                 for _ in 0..1024 {
@@ -1793,7 +1847,13 @@ impl Manager {
                 {
                     let tab = m.tabs.get_mut(&tid).unwrap();
                     tab.document_epoch += 1;
+                    if let Some(url) = event.params["frame"]["url"].as_str() {
+                        tab.url = url.into();
+                    }
                     tab.state = "ready".into();
+                    if let Some(key) = ProbeKey::of(tab) {
+                        m.frame_sources.insert(tid.clone(), key);
+                    }
                     changed = true;
                 } else if t.listen
                     && event.method == "Runtime.bindingCalled"
@@ -1811,10 +1871,12 @@ impl Manager {
                     }
                 }
             }
-            let targets = match client.send(Method::TargetGetTargets, json!({}), None).await {
-                Ok(v) => v,
-                Err(_) => continue,
+            let Some((source, targets)) = snapshots.remove(&key) else {
+                continue;
             };
+            if !Arc::ptr_eq(&source, &i) {
+                continue;
+            }
             let infos = targets["targetInfos"]
                 .as_array()
                 .cloned()
@@ -1835,15 +1897,11 @@ impl Manager {
                     .iter()
                     .find(|v| v["targetId"].as_str() == t.target_id.as_deref());
                 if let Some(info) = info {
-                    let mut url = info["url"].as_str().unwrap_or(&t.url).to_owned();
-                    if let Some(cdp) = &t.cdp_session
-                        && let Ok(frame) = client
-                            .send(Method::PageGetFrameTree, json!({}), Some(cdp))
-                            .await
-                        && let Some(actual) = frame["frameTree"]["frame"]["url"].as_str()
-                    {
-                        url = actual.into();
-                    }
+                    let url = if m.frame_sources.get(&tid).is_some_and(|key| key.matches(&m)) {
+                        t.url.clone()
+                    } else {
+                        info["url"].as_str().unwrap_or(&t.url).to_owned()
+                    };
                     let title = info["title"]
                         .as_str()
                         .unwrap_or("")
@@ -1860,60 +1918,6 @@ impl Manager {
                     if title != t.title {
                         m.tabs.get_mut(&tid).unwrap().title = title.clone();
                         changed = true;
-                    }
-                    if t.listen
-                        && !m
-                            .health
-                            .get(&tid)
-                            .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
-                    {
-                        m.health.insert(tid.clone(), tokio::time::Instant::now());
-                        if let Some(cdp) = &t.cdp_session {
-                            let tree = client
-                                .send(Method::PageGetFrameTree, json!({}), Some(cdp))
-                                .await;
-                            match tree {
-                                Err(excalibur_cdp::Error::Protocol { message, .. })
-                                    if message.contains("crashed") =>
-                                {
-                                    self.revive_listener(&mut m, &tid).await?;
-                                    changed = true;
-                                    continue;
-                                }
-                                Ok(tree) => {
-                                    let site = self.site(&s.profile, s.site.as_deref())?.unwrap();
-                                    if !site.listen_probe.unread_selector.is_empty()
-                                        && self.document_allowed(&s, &url, false).is_ok()
-                                    {
-                                        let count = read_unread(
-                                            client,
-                                            cdp,
-                                            &tree,
-                                            &site.listen_probe.unread_selector,
-                                        )
-                                        .await;
-                                        if let Some(count) = count
-                                            && m.counts.insert(tid.clone(), count) != Some(count)
-                                        {
-                                            let site_key = format!(
-                                                "{}/{}",
-                                                s.profile,
-                                                s.site.as_deref().unwrap_or("")
-                                            );
-                                            self.activity(
-                                                &mut m,
-                                                &site_key,
-                                                &s,
-                                                "unread_count",
-                                                Some(count),
-                                            )
-                                            .await?;
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
                     }
                     if t.listen {
                         let site_key = format!("{}/{}", s.profile, s.site.as_deref().unwrap_or(""));
@@ -2017,7 +2021,139 @@ impl Manager {
             self.db.save(&mut m).await?;
         }
         self.flush_activity(&mut m).await?;
+        self.schedule_probes(&mut m)?;
         Ok(())
+    }
+    fn schedule_probes(&self, m: &mut Model) -> Result<()> {
+        let tabs = m
+            .tabs
+            .values()
+            .filter(|t| t.state != "closed")
+            .cloned()
+            .collect::<Vec<_>>();
+        for tab in tabs {
+            if m.probes.len() >= 12 {
+                break;
+            }
+            let Some(key) = ProbeKey::of(&tab) else {
+                continue;
+            };
+            if m.pending_probes.contains_key(&tab.id)
+                || m.health
+                    .get(&tab.id)
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+            {
+                continue;
+            }
+            let session = &m.sessions[&tab.session_id];
+            let Some(instance) = m.instances.get(&session.instance_id) else {
+                continue;
+            };
+            let selector = if tab.listen
+                && !m
+                    .unread_health
+                    .get(&tab.id)
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+            {
+                m.unread_health
+                    .insert(tab.id.clone(), tokio::time::Instant::now());
+                self.site(&session.profile, session.site.as_deref())?
+                    .map(|site| site.listen_probe.unread_selector)
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            };
+            let client = instance.client().clone();
+            let request = key.clone();
+            let job = m
+                .probes
+                .spawn(async move { probe_tab(client, request, selector).await });
+            m.pending_probes.insert(tab.id.clone(), (key, job.id()));
+            m.health.insert(tab.id, tokio::time::Instant::now());
+        }
+        Ok(())
+    }
+    async fn collect_probes(&self, m: &mut Model) -> Result<bool> {
+        let mut changed = false;
+        while let Some(result) = m.probes.try_join_next() {
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    m.pending_probes.retain(|_, (_, id)| *id != error.id());
+                    continue;
+                }
+            };
+            if m.pending_probes
+                .get(&result.key.tab)
+                .is_some_and(|(key, _)| key == &result.key)
+            {
+                m.pending_probes.remove(&result.key.tab);
+            }
+            if !result.key.matches(m) {
+                continue;
+            }
+            let tid = result.key.tab.clone();
+            if result.crashed {
+                m.tabs.get_mut(&tid).unwrap().state = "crashed".into();
+                self.db
+                    .event("tab_state", json!({"tab_id":tid,"state":"crashed"}))
+                    .await?;
+                if m.tabs[&tid].listen {
+                    self.revive_listener(m, &tid).await?;
+                }
+                changed = true;
+                continue;
+            }
+            if let Some(url) = result.url {
+                let tab = m.tabs.get_mut(&tid).unwrap();
+                if tab.url != url {
+                    tab.url = url;
+                    tab.document_epoch += 1;
+                    changed = true;
+                }
+                if let Some(key) = ProbeKey::of(tab) {
+                    m.frame_sources.insert(tid.clone(), key);
+                }
+            }
+            if let Some(count) = result.count
+                && m.counts.insert(tid.clone(), count) != Some(count)
+            {
+                let session = m.sessions[&m.tabs[&tid].session_id].clone();
+                let key = format!(
+                    "{}/{}",
+                    session.profile,
+                    session.site.as_deref().unwrap_or("")
+                );
+                self.activity(m, &key, &session, "unread_count", Some(count))
+                    .await?;
+            }
+        }
+        Ok(changed)
+    }
+    async fn fresh_frame(&self, run: &str, sid: &str, tid: &str) -> Result<(ProbeKey, Value)> {
+        let (key, client) = {
+            let m = self.model.lock().await;
+            let session = Self::owned(&m, run, sid)?;
+            let tab = m
+                .tabs
+                .get(tid)
+                .ok_or_else(|| Fault::new("unknown_tab", tid))?;
+            if !Self::visible(&m, session, tab) {
+                return Err(Fault::new("denied", "tab_owner"));
+            }
+            let key = ProbeKey::of(tab).ok_or_else(|| Fault::new("session_recovering", sid))?;
+            let client = m.instances[&session.instance_id].client().clone();
+            (key, client)
+        };
+        let frame = client
+            .send_with_timeout(
+                Method::PageGetFrameTree,
+                json!({}),
+                Some(&key.session),
+                PROBE_TIMEOUT,
+            )
+            .await?;
+        Ok((key, frame))
     }
     async fn reconcile_documents(&self, m: &mut Model) -> Result<bool> {
         let ids = m.sessions.keys().cloned().collect::<Vec<_>>();
@@ -2181,6 +2317,39 @@ fn retry_delay(attempts: usize) -> Duration {
         _ => 30,
     })
 }
+async fn probe_tab(
+    client: excalibur_cdp::Client,
+    key: ProbeKey,
+    selector: Option<String>,
+) -> ProbeResult {
+    let mut result = ProbeResult {
+        key: key.clone(),
+        url: None,
+        count: None,
+        crashed: false,
+    };
+    let _ = tokio::time::timeout(PROBE_TIMEOUT, async {
+        match client
+            .send(Method::PageGetFrameTree, json!({}), Some(&key.session))
+            .await
+        {
+            Ok(tree) => {
+                result.url = tree["frameTree"]["frame"]["url"]
+                    .as_str()
+                    .map(str::to_owned);
+                if let Some(selector) = selector {
+                    result.count = read_unread(&client, &key.session, &tree, &selector).await;
+                }
+            }
+            Err(excalibur_cdp::Error::Protocol { message, .. }) if message.contains("crashed") => {
+                result.crashed = true
+            }
+            _ => {}
+        }
+    })
+    .await;
+    result
+}
 async fn read_unread(
     client: &excalibur_cdp::Client,
     cdp: &str,
@@ -2230,6 +2399,7 @@ fn remove_stale_lock(dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     #[test]
     fn restart_backoff_is_bounded() {
         assert_eq!(retry_delay(0), Duration::from_secs(1));
@@ -2241,6 +2411,7 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn only_document_blocks_clear_when_the_origin_is_allowed() {
         let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let mut profiles = BTreeMap::new();
         profiles.insert(
             "personal".into(),
@@ -2326,5 +2497,69 @@ mod lifecycle_tests {
             .unwrap();
         assert!(!manager.reconcile_documents(&mut model).await.unwrap());
         assert_eq!(model.sessions["s"].state, SessionState::HumanControl);
+    }
+    #[tokio::test]
+    async fn late_probe_results_cannot_modify_a_replaced_navigated_or_closed_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let manager = Manager::open(Options {
+            data_dir: directory.path().into(),
+            binary: "/not-used".into(),
+            proxy: "127.0.0.1:12345".parse().unwrap(),
+            profiles: BTreeMap::new(),
+            compact: false,
+            version: VersionPolicy::default(),
+            chrome_args: vec![],
+        })
+        .await
+        .unwrap();
+        let mut model = manager.model.lock().await;
+        model.tabs.insert(
+            "t".into(),
+            Tab {
+                id: "t".into(),
+                session_id: "s".into(),
+                target_id: Some("old-target".into()),
+                cdp_session: Some("old-session".into()),
+                owner_run: "r".into(),
+                label: None,
+                url: "http://login.test/".into(),
+                title: String::new(),
+                state: "ready".into(),
+                document_epoch: 1,
+                listen: true,
+            },
+        );
+        for change in ["replacement", "navigation", "close"] {
+            let old = ProbeKey::of(&model.tabs["t"]).unwrap();
+            let tab = model.tabs.get_mut("t").unwrap();
+            match change {
+                "replacement" => {
+                    tab.target_id = Some("new-target".into());
+                    tab.cdp_session = Some("new-session".into());
+                }
+                "navigation" => tab.document_epoch += 1,
+                _ => {
+                    tab.target_id = None;
+                    tab.cdp_session = None;
+                    tab.state = "closed".into();
+                }
+            }
+            model.probes.spawn(async move {
+                ProbeResult {
+                    key: old,
+                    url: Some("http://rw.test/".into()),
+                    count: Some(999),
+                    crashed: false,
+                }
+            });
+            while !model.probes.is_empty() {
+                assert!(!manager.collect_probes(&mut model).await.unwrap());
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(model.tabs["t"].url, "http://login.test/");
+            assert!(!model.counts.contains_key("t"));
+            assert!(!model.frame_sources.contains_key("t"));
+        }
     }
 }
