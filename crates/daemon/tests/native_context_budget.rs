@@ -53,7 +53,7 @@ fn native_memory_coordinator_reaches_the_model_without_relaxing_caller_caps() {
     runtimes.block_on(async {
         host.master.receive(Incoming{conversation:"chat".into(),client_id:"fixture".into(),client_msg_id:"source".into(),text:"/status".into(),scope:Some("project:default".into()),timezone:"UTC".into(),channel:"test".into(),reply_to:None,attachments:vec![]}).await.unwrap();
         let value=host.control_actions().invoke_scoped("chat","project:default","subagent",json!({"action":"spawn","name":"Native coordinator","goal":"Inspect the current task","deliverable":"A concise report"}),"native-budget-spawn").await.unwrap();
-        let id=value["id"].as_str().unwrap();let agent=host.orchestrator.agent(id).await.unwrap();let run=agent.run_id.as_ref().unwrap();
+        let id=value["agent_id"].as_str().unwrap_or_else(||panic!("missing agent_id in delegation response: {value}"));let agent=host.orchestrator.agent(id).await.unwrap();let run=agent.run_id.as_ref().unwrap();
         let snapshot=host.orchestrator.engine().load(run).await.unwrap();
         assert!(snapshot.spec.context.token_budgets[0]>4096);
         assert_eq!(&snapshot.spec.context.token_budgets[1..],&excalibur_context::ContextInput::new("","","").token_budgets[1..]);
