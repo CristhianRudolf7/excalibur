@@ -155,35 +155,46 @@ impl RobotsRules {
             .to_owned()
     }
 
-    /// All groups whose agent matches `token`, with match length.
-    /// Exact token equality outranks prefix matches; `*` only applies when
-    /// no other group matches (RFC 9309 section 2.2.1 fallback).
+    /// Groups whose agent matches `token`, filtered by specificity.
+    /// Exact token equality wins: when any exact group exists only exact
+    /// groups combine. Prefix groups (kept for compatibility) combine only
+    /// when no exact group matches; `*` applies only when neither matches
+    /// (RFC 9309 section 2.2.1 fallback).
     fn matching_groups(&self, user_agent: &str) -> Vec<&Group> {
         let token = Self::product_token(user_agent);
-        let mut matched: Vec<(&Group, usize)> = Vec::new();
+        let mut exact: Vec<&Group> = Vec::new();
+        let mut prefix: Vec<&Group> = Vec::new();
         let mut stars: Vec<&Group> = Vec::new();
         for group in &self.groups {
-            let mut best: Option<usize> = None;
+            let mut has_exact = false;
+            let mut has_prefix = false;
+            let mut has_star = false;
             for name in &group.agents {
                 if name == "*" {
-                    if !stars.iter().any(|existing| std::ptr::eq(*existing, group)) {
-                        stars.push(group);
-                    }
+                    has_star = true;
                 } else if *name == token {
-                    best = Some(best.map_or(name.len(), |b| b.max(name.len())));
+                    has_exact = true;
                 } else if !name.is_empty() && token.starts_with(name.as_str()) {
-                    best = Some(best.map_or(name.len(), |b| b.max(name.len())));
+                    has_prefix = true;
                 }
             }
-            if let Some(len) = best {
-                matched.push((group, len));
+            if has_exact {
+                if !exact.iter().any(|existing| std::ptr::eq(*existing, group)) {
+                    exact.push(group);
+                }
+            } else if has_prefix && !prefix.iter().any(|existing| std::ptr::eq(*existing, group)) {
+                prefix.push(group);
+            } else if has_star && !stars.iter().any(|existing| std::ptr::eq(*existing, group)) {
+                stars.push(group);
             }
         }
-        if matched.is_empty() {
-            return stars;
+        if !exact.is_empty() {
+            return exact;
         }
-        // RFC 9309 section 2.2.1: combine every matching group.
-        matched.into_iter().map(|(group, _)| group).collect()
+        if !prefix.is_empty() {
+            return prefix;
+        }
+        stars
     }
 
     /// Decide whether `path` (path + optional query) may be fetched.

@@ -72,3 +72,13 @@ fn cirrus_null_opening_text_is_admitted() {
     assert_eq!(parsed.opening_text, "");
     assert!(cirrus_admitted(&parsed, 10));
 }
+
+#[test]
+fn sitemap_entities_decode_in_single_pass() {
+    // BSF-19: `&amp;lt;` must decode to `&lt;`, not `<`.
+    let xml = "<urlset><url><loc>https://docs.example/q?v=&amp;lt;b&amp;gt;</loc></url></urlset>";
+    assert_eq!(
+        parse_sitemap_locs(xml, "docs.example"),
+        vec!["https://docs.example/q?v=&lt;b&gt;"]
+    );
+}

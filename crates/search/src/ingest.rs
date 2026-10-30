@@ -13,12 +13,45 @@ pub const MAX_SITEMAP_URLS: usize = 50_000;
 pub const MAX_SITEMAP_BYTES: usize = 50 * 1024 * 1024;
 
 /// Decode the five predefined XML entities used inside `<loc>` text.
+/// Single pass so `&amp;lt;` decodes to `&lt;` instead of `<`.
 fn decode_xml_entities(text: &str) -> String {
-    text.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some((decoded, len)) = decode_entity_at(rest) {
+            out.push_str(decoded);
+            rest = &rest[len..];
+        } else if let Some(pos) = rest.find('&') {
+            if pos == 0 {
+                out.push('&');
+                rest = &rest[1..];
+            } else {
+                out.push_str(&rest[..pos]);
+                rest = &rest[pos..];
+            }
+        } else {
+            out.push_str(rest);
+            break;
+        }
+    }
+    out
+}
+
+/// Match one of the five predefined XML entities at the start of `rest`.
+/// Returns the decoded text and the byte length of the entity.
+fn decode_entity_at(rest: &str) -> Option<(&'static str, usize)> {
+    for (entity, decoded) in [
+        ("&amp;", "&"),
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", "\""),
+        ("&apos;", "'"),
+    ] {
+        if rest.starts_with(entity) {
+            return Some((decoded, entity.len()));
+        }
+    }
+    None
 }
 
 /// Whether `target` belongs to `host_suffix`: exact host or a subdomain.

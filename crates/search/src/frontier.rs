@@ -145,6 +145,7 @@ pub struct FrontierStats {
 pub struct Frontier {
     conn: rusqlite::Connection,
     contact_url: String,
+    user_agent: String,
     host_page_budget: u32,
     max_inflight: usize,
     max_pages_per_sec: u32,
@@ -170,6 +171,7 @@ impl Frontier {
         let mut frontier = Self {
             conn,
             contact_url: contact_url.to_owned(),
+            user_agent: String::from("ExcaliburBot/0.1"),
             host_page_budget,
             max_inflight: max_inflight.max(1),
             max_pages_per_sec: 16,
@@ -189,6 +191,7 @@ impl Frontier {
         let mut frontier = Self {
             conn,
             contact_url: contact_url.to_owned(),
+            user_agent: String::from("ExcaliburBot/0.1"),
             host_page_budget: 30,
             max_inflight: 16,
             max_pages_per_sec: 16,
@@ -202,6 +205,20 @@ impl Frontier {
     /// Global pages-per-second cap (section 15.4). Defaults to 16.
     pub fn set_max_pages_per_sec(&mut self, limit: u32) {
         self.max_pages_per_sec = limit.max(1);
+    }
+
+    /// Crawler token used for per-URL robots decisions in `select_due`.
+    /// Defaults to `ExcaliburBot/0.1` and mirrors `SearchConfig::user_agent`.
+    #[must_use]
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    /// Override the crawler token used for robots decisions.
+    pub fn set_user_agent(&mut self, user_agent: &str) {
+        if !user_agent.trim().is_empty() {
+            self.user_agent = user_agent.to_owned();
+        }
     }
 
     fn migrate(&mut self) -> Result<()> {
@@ -246,7 +263,7 @@ impl Frontier {
         )?;
         // Backfill for databases created before seeded/interval columns.
         let _ = self.conn.execute(
-            "ALTER TABLE hosts ADD COLUMN seeded INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE hosts ADD COLUMN seeded INTEGER NOT NULL DEFAULT 0",
             [],
         );
         let _ = self.conn.execute(
@@ -487,11 +504,13 @@ impl Frontier {
     /// host prior then URL priority/depth/recency), at most one in flight
     /// per host, `max_inflight` overall and the per-second page cap.
     /// Both `queued` and due `indexed` (refresh) rows are eligible.
-    /// Hosts without fresh `robots.txt` are never dispatched and
-    /// robots-disallowed URLs are skipped. Selected rows move to
-    /// `fetching` atomically.
+    /// Hosts without fresh `robots.txt` are never dispatched.
+    /// Robots-disallowed candidates are marked `skipped` and the next
+    /// candidate for the same host is tried in the same call, using the
+    /// configured user agent. Selected rows move to `fetching` atomically.
     pub fn select_due(&mut self, now_secs: u64) -> Result<Vec<CrawlTask>> {
         let now = i64::try_from(now_secs).unwrap_or(0);
+        let user_agent = self.user_agent.clone();
         // Per-second page cap.
         if self.rate_window_sec != Some(now) {
             self.rate_window_sec = Some(now);
@@ -544,71 +563,79 @@ impl Frontier {
             if busy > 0 {
                 continue;
             }
-            // One URL per host: explicit priority, depth penalty,
-            // next_fetch recency and URL tie-break. last_modified recency
-            // applies when the field carries a unix timestamp; otherwise it
-            // is ignored (0).
-            let candidate: Option<(String, String, i64)> = tx
+            // Cache the host robots entry once per host; hosts without a
+            // fresh reachable entry are never dispatched (fail closed).
+            let robots_entry: Option<(String, i64, i64)> = tx
                 .query_row(
-                    "SELECT url_hash, url, depth FROM urls
-                     WHERE host = ?1
-                       AND ((state = 'queued' AND next_fetch <= ?2)
-                         OR (state = 'indexed' AND next_fetch <= ?2))
-                     ORDER BY priority ASC, depth ASC, next_fetch ASC, url ASC
-                     LIMIT 1",
-                    params![host, now],
+                    "SELECT robots_blob, robots_fetched_at, robots_reachable FROM hosts WHERE host = ?1",
+                    params![host],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            let Some((hash, url, depth)) = candidate else {
+            let Some((blob, fetched_at, reachable)) = robots_entry else {
                 continue;
             };
-            // Enforce per-URL robots decisions; skip disallowed without
-            // consuming a slot.
-            let allowed = {
-                let row: Option<(String, i64, i64)> = tx
+            if !Self::robots_fresh_for_host(fetched_at, reachable, now) || reachable != 1 {
+                continue;
+            }
+            let rules = if blob.is_empty() {
+                None
+            } else {
+                Some(RobotsRules::parse(&blob))
+            };
+            // One URL per host: explicit priority, depth penalty,
+            // next_fetch recency and URL tie-break. Robots-disallowed
+            // candidates are marked `skipped` so the next candidate for
+            // the same host is tried in this same call instead of
+            // blocking the host forever.
+            loop {
+                let candidate: Option<(String, String, i64)> = tx
                     .query_row(
-                        "SELECT robots_blob, robots_fetched_at, robots_reachable FROM hosts WHERE host = ?1",
-                        params![host],
+                        "SELECT url_hash, url, depth FROM urls
+                         WHERE host = ?1
+                           AND ((state = 'queued' AND next_fetch <= ?2)
+                             OR (state = 'indexed' AND next_fetch <= ?2))
+                         ORDER BY priority ASC, depth ASC, next_fetch ASC, url ASC
+                         LIMIT 1",
+                        params![host, now],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .optional()?;
-                match row {
-                    None => false,
-                    Some((blob, fetched_at, reachable)) => {
-                        if !Self::robots_fresh_for_host(fetched_at, reachable, now)
-                            || reachable != 1
-                        {
-                            false
-                        } else if blob.is_empty() {
-                            true
-                        } else {
-                            let normalized = normalize_url(&url)?;
-                            let rules = RobotsRules::parse(&blob);
-                            robots::decide(
-                                RobotsFetch::Ok,
-                                Some(&rules),
-                                "ExcaliburBot/0.1",
-                                &normalized.robots_path,
-                            )
-                            .allowed
-                        }
+                let Some((hash, url, depth)) = candidate else {
+                    break;
+                };
+                let allowed = match &rules {
+                    None => true,
+                    Some(parsed) => {
+                        let normalized = normalize_url(&url)?;
+                        robots::decide(
+                            RobotsFetch::Ok,
+                            Some(parsed),
+                            user_agent.as_str(),
+                            &normalized.robots_path,
+                        )
+                        .allowed
                     }
+                };
+                if !allowed {
+                    tx.execute(
+                        "UPDATE urls SET state = 'skipped' WHERE url_hash = ?1",
+                        params![hash],
+                    )?;
+                    continue;
                 }
-            };
-            if !allowed {
-                continue;
+                tx.execute(
+                    "UPDATE urls SET state = 'fetching', last_fetch = ?1 WHERE url_hash = ?2",
+                    params![now, hash],
+                )?;
+                hosts_used.insert(host.clone());
+                tasks.push(CrawlTask {
+                    url,
+                    host,
+                    depth: depth as u8,
+                });
+                break;
             }
-            tx.execute(
-                "UPDATE urls SET state = 'fetching', last_fetch = ?1 WHERE url_hash = ?2",
-                params![now, hash],
-            )?;
-            hosts_used.insert(host.clone());
-            tasks.push(CrawlTask {
-                url,
-                host,
-                depth: depth as u8,
-            });
         }
         tx.commit()?;
         self.rate_count += tasks.len();

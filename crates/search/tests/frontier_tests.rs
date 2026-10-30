@@ -567,3 +567,116 @@ fn refresh_interval_doubles_and_redispatches_indexed() {
     assert_eq!(tasks.len(), 1, "due indexed must redispatched");
     assert_eq!(tasks[0].url, "https://a.example/p");
 }
+
+#[test]
+fn robots_disallowed_head_does_not_block_host() {
+    // Q02 / BSF-17: a disallowed High URL must not starve a Normal URL.
+    let mut frontier = Frontier::open_memory("https://operator.example/contact").unwrap();
+    frontier.add_host("h.example", 0.5, Some(30)).unwrap();
+    frontier
+        .store_robots(
+            "h.example",
+            "User-agent: *\nDisallow: /secret\n",
+            true,
+            0,
+            None,
+        )
+        .unwrap();
+    frontier
+        .enqueue(
+            "https://h.example/secret",
+            0,
+            Priority::High,
+            Source::Web,
+            0,
+            2,
+        )
+        .unwrap();
+    frontier
+        .enqueue(
+            "https://h.example/public",
+            0,
+            Priority::Normal,
+            Source::Web,
+            0,
+            2,
+        )
+        .unwrap();
+    let tasks = frontier.select_due(0).unwrap();
+    assert_eq!(tasks.len(), 1, "allowed URL must dispatch: {tasks:?}");
+    assert_eq!(tasks[0].url, "https://h.example/public");
+    assert_eq!(
+        frontier.url_state("https://h.example/secret").unwrap(),
+        Some(excalibur_search::UrlState::Skipped),
+        "disallowed head must be skipped"
+    );
+    // A second call must not resurrect the skipped URL; the host is busy.
+    let again = frontier.select_due(0).unwrap();
+    assert!(again.is_empty(), "host busy, no redispatch: {again:?}");
+}
+
+#[test]
+fn select_due_uses_configured_user_agent() {
+    // BSF-17: per-URL robots decisions use the configured crawler token.
+    let mut frontier = Frontier::open_memory("https://operator.example/contact").unwrap();
+    frontier.set_user_agent("CustomBot/2.0");
+    assert_eq!(frontier.user_agent(), "CustomBot/2.0");
+    frontier.add_host("u.example", 0.5, Some(30)).unwrap();
+    frontier
+        .store_robots(
+            "u.example",
+            "User-agent: CustomBot\nDisallow: /secret\n\nUser-agent: *\nAllow: /\n",
+            true,
+            0,
+            None,
+        )
+        .unwrap();
+    frontier
+        .enqueue(
+            "https://u.example/secret",
+            0,
+            Priority::High,
+            Source::Web,
+            0,
+            2,
+        )
+        .unwrap();
+    frontier
+        .enqueue(
+            "https://u.example/public",
+            0,
+            Priority::Normal,
+            Source::Web,
+            0,
+            2,
+        )
+        .unwrap();
+    let tasks = frontier.select_due(0).unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].url, "https://u.example/public");
+}
+
+#[test]
+fn old_candidate_hosts_stay_candidates_after_migration() {
+    // BSF-18: databases created before `seeded` must not promote candidates.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("search.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE hosts(host TEXT PRIMARY KEY, domain TEXT NOT NULL DEFAULT '', prior REAL NOT NULL DEFAULT 0.2, next_fetch_at INTEGER NOT NULL DEFAULT 0, delay_ms INTEGER NOT NULL DEFAULT 1000, crawl_delay_ms INTEGER, robots_blob TEXT NOT NULL DEFAULT '', robots_fetched_at INTEGER NOT NULL DEFAULT -1, robots_reachable INTEGER NOT NULL DEFAULT 1, err_count INTEGER NOT NULL DEFAULT 0, parked_until INTEGER NOT NULL DEFAULT 0, page_budget INTEGER NOT NULL DEFAULT 30, pages_fetched INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE urls(url_hash TEXT PRIMARY KEY, url TEXT NOT NULL, host TEXT NOT NULL, depth INTEGER NOT NULL DEFAULT 0, priority INTEGER NOT NULL DEFAULT 10, state TEXT NOT NULL DEFAULT 'queued', source TEXT NOT NULL DEFAULT 'web', last_fetch INTEGER, next_fetch INTEGER NOT NULL DEFAULT 0, etag TEXT, last_modified TEXT, n_fetch INTEGER NOT NULL DEFAULT 0, n_change INTEGER NOT NULL DEFAULT 0, simhash INTEGER, content_hash TEXT, opstamp INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO hosts(host, domain) VALUES ('old.example', 'example')",
+            [],
+        )
+        .unwrap();
+    }
+    let frontier = Frontier::open(&path, "https://operator.example/contact", 30, 16).unwrap();
+    assert!(
+        !frontier.is_host_seeded("old.example").unwrap(),
+        "migrated candidate must stay unseeded"
+    );
+}

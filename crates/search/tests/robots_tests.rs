@@ -118,3 +118,22 @@ fn top_level_sitemap_is_kept() {
     let rules = RobotsRules::parse("Sitemap: https://x.example/s.xml\nUser-agent: *\nDisallow:\n");
     assert_eq!(rules.sitemaps(), &["https://x.example/s.xml".to_owned()]);
 }
+
+#[test]
+fn exact_group_ignores_prefix_group() {
+    // Q01 / BSF-03: an exact `Allow: /` group must not be polluted by an
+    // earlier prefix group that disallows `/private`.
+    let rules = RobotsRules::parse(
+        "User-agent: excalibur\nDisallow: /private\n\nUser-agent: excaliburbot\nAllow: /\n",
+    );
+    assert!(rules.is_allowed(AGENT, "/private/x"));
+    assert!(rules.is_allowed(AGENT, "/other"));
+}
+
+#[test]
+fn prefix_group_applies_without_exact_match() {
+    // Prefix groups still combine when no exact group matches.
+    let rules = RobotsRules::parse("User-agent: excalibur\nDisallow: /private\n");
+    assert!(!rules.is_allowed(AGENT, "/private/x"));
+    assert!(rules.is_allowed(AGENT, "/other"));
+}
