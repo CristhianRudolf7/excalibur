@@ -146,11 +146,32 @@ verificado en cinco segundos. Los targets nuevos y OOPIF se adjuntan con sesione
 planas y `waitForDebuggerOnStart`; solo se reanudan tras verificar sus procesos.
 Las identidades de proceso nuevas tienen hasta un segundo para terminar la
 inicialización del sandbox mientras sus targets siguen pausados. Un fallo después
-de que un renderizador haya pasado es inmediato. El monitor muestrea cada 50 ms,
-independiente de órdenes CDP y consultas de versión pendientes. Un fallo cierra la
-instancia con `sandbox_unavailable`; EOF o muerte del navegador genera
-`instance_crashed`, y las caídas de renderizadores generan eventos de target. El
-proceso principal del navegador permanece en los espacios de nombres del host;
+de que un renderizador haya pasado es inmediato. Un temporizador independiente
+muestrea procesos cada 50 ms y usa `spawn_blocking` para inspeccionar `/proc` y el
+estado del hijo. Los eventos de consola, red y página no provocan recorridos de
+procesos. Un fallo cierra la instancia con `sandbox_unavailable`; las caídas de
+renderizadores generan eventos de target.
+
+La supervisión consume un canal acotado separado con notificaciones de adjuntar,
+desconectar, caída de target y ciclo de vida del transporte. Un observador normal
+puede recibir `Lagged` al llenarse su cola acotada; eso no cierra CDP ni mata
+Chrome. Si se retrasa el propio canal de ciclo de vida, el supervisor reconcilia
+las sesiones adjuntas activas desde la caché de estado actual independiente del
+lector, verifica los targets pausados antes de reanudarlos y emite
+`events_resynchronized` con la cantidad omitida. Es reconciliación de estado, no
+un registro histórico sin pérdidas. El muestreo de procesos continúa aparte y la
+terminación del transporte se conserva en un canal watch separado aunque se
+pierdan notificaciones.
+
+`instance_crashed` significa salida/desaparición inesperada del navegador o fallo
+del transporte CDP: EOF, JSON/envoltorios de protocolo o datos de adjunto inválidos,
+sesión de respuesta incorrecta, trama excesiva del navegador/sin identidad o
+escrituras interrumpidas/fallidas. El retraso de un observador no es una caída.
+La imposibilidad de inspeccionar procesos desde el worker de bloqueo bloquea la
+supervisión sin afirmar que el navegador se haya caído. `Instance::close` y la
+liberación explícita generan `instance_stopped`; cerrar el cliente CDP crudo fuera
+de ese ciclo de vida es un fallo de transporte. El proceso principal del navegador
+permanece en los espacios de nombres del host;
 aquí no se añade un espacio de nombres de red exterior.
 
 CDP ofrece un catálogo de métodos escrito a mano, estructuras tipadas comunes de
@@ -202,7 +223,12 @@ operaciones como cancelar una descarga inexistente. Comprueba OOPIF reales, las
 cuatro condiciones del sandbox, oyentes TCP del árbol y ausencia de
 `DevToolsActivePort`, una instantánea DOM real de 70 MiB aislada a una sesión, aviso,
 bloqueo y refresco de versión, un binario copiado sin sandbox utilizable, caídas de
-renderizador/navegador y SIGKILL del padre con dos instancias. Guarda resúmenes
+renderizador/navegador y SIGKILL del padre con dos instancias. Una ráfaga real de
+10.000 eventos de consola desborda deliberadamente un observador normal mientras
+la instancia sigue Running/Degraded, responde a `Browser.getVersion`, conserva
+renderizadores verificados y adjunta otro target. Los fixtures de transporte
+comprueban también la entrega filtrada de ciclo de vida y recuperación de 400
+sesiones adjuntas activas tras un retraso de ese canal. Guarda resúmenes
 redactados de método/resultado y evidencia de procesos bajo
 `target/test-evidence/browser/cdp_contract/`. Los helpers de subproceso están
 marcados como ignorados para la invocación directa, pero los ejecutan sus pruebas

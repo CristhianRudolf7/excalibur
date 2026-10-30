@@ -139,11 +139,29 @@ renderer within five seconds. New targets and OOPIFs are attached with flattened
 sessions and `waitForDebuggerOnStart`; they are resumed only after verification.
 New process identities have up to one second to finish sandbox initialization
 while their targets remain paused. A failure after a renderer has passed is
-immediate. The process monitor samples every 50 ms independently of pending CDP
-commands and version requests. Failure closes the instance with
-`sandbox_unavailable`; EOF or browser death produces `instance_crashed`, and
-renderer crashes produce target events. The browser process itself remains in
-the host namespaces; no outer network namespace is added here.
+immediate. An independent timer samples processes every 50 ms, using
+`spawn_blocking` for `/proc` inspection and child status checks. Console, network
+and other page events do not trigger process scans. Failure closes the instance
+with `sandbox_unavailable`; renderer crashes produce target events.
+
+Supervision consumes a separate bounded channel containing only attachment,
+detachment, target-crash and transport lifecycle notifications. Ordinary event
+observers may receive `Lagged` when their bounded queue overflows; this neither
+closes CDP nor kills Chrome. If the lifecycle queue itself lags, the supervisor
+reconciles active attachments from the reader's independent current-state cache,
+verifies paused targets before resuming them and emits `events_resynchronized`
+with the skipped count. This is state reconciliation, not a lossless historical
+event journal. Process polling continues independently, and transport termination
+is retained in a separate watch channel even if notifications are lost.
+
+`instance_crashed` means unexpected browser exit/disappearance or CDP transport
+failure: EOF, invalid protocol JSON/envelopes or attachment payloads, response
+session mismatch, an oversized browser/unidentified frame, or interrupted/failed
+transport writes. An event observer falling behind is not a crash. Inability to
+inspect the process from the blocking worker blocks supervision instead of
+claiming a browser crash. Explicit `Instance::close` or drop produces
+`instance_stopped`; closing the raw CDP client outside that lifecycle is a
+transport failure. The browser process itself remains in the host namespaces; no outer network namespace is added here.
 
 CDP exposes a handwritten method catalog, common typed request/response structs,
 and generic JSON parameters. It handles NUL-delimited fragmented or concatenated
@@ -194,7 +212,11 @@ are recorded for operations such as cancelling a nonexistent download. It checks
 real OOPIFs, all four renderer sandbox conditions, process-tree TCP listeners and
 absence of `DevToolsActivePort`, a real 70 MiB DOM snapshot isolated to one session,
 version warning/block/refresh behavior, a copied binary lacking a usable sandbox,
-renderer/browser crashes and SIGKILL of a parent owning two instances. Redacted
+renderer/browser crashes and SIGKILL of a parent owning two instances. A burst of
+10,000 real console events intentionally overruns an ordinary observer while the
+instance remains Running/Degraded, answers `Browser.getVersion`, retains verified
+renderers and attaches another target. Transport fixtures also exercise filtered
+lifecycle delivery and recovery of 400 active attachments after lifecycle lag. Redacted
 method/result summaries and process evidence are written under
 `target/test-evidence/browser/cdp_contract/`. Subprocess helpers are marked ignored
 for direct invocation but are executed by their parent tests. Missing Chrome or

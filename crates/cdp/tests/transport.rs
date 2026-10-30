@@ -241,3 +241,97 @@ async fn routing_error_without_session_id_does_not_kill_other_sessions() {
         .unwrap();
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn console_backpressure_does_not_displace_lifecycle_or_responses() {
+    let (client, server) = pair();
+    let mut observer = client.subscribe_all();
+    let mut lifecycle = client.subscribe_lifecycle();
+    let (release, done) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (read, mut write) = tokio::io::split(server);
+        let mut read = BufReader::new(read);
+        let events = [
+            json!({"method":"Target.attachedToTarget","params":{"sessionId":"child"}}),
+            json!({"method":"Inspector.targetCrashed","params":{},"sessionId":"child"}),
+            json!({"method":"Target.detachedFromTarget","params":{"sessionId":"child"}}),
+        ];
+        for event in events {
+            let mut bytes = serde_json::to_vec(&event).unwrap();
+            bytes.push(0);
+            write.write_all(&bytes).await.unwrap();
+            for _ in 0..4000 {
+                write
+                    .write_all(b"{\"method\":\"Runtime.consoleAPICalled\",\"params\":{}}\0")
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut bytes = Vec::new();
+        read.read_until(0, &mut bytes).await.unwrap();
+        let request: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        let mut response = serde_json::to_vec(&json!({"id":request["id"],"result":{}})).unwrap();
+        response.push(0);
+        write.write_all(&response).await.unwrap();
+        let _ = done.await;
+    });
+    client
+        .send(Method::BrowserGetVersion, json!({}), None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        observer.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+    ));
+    for expected in [
+        "Target.attachedToTarget",
+        "Inspector.targetCrashed",
+        "Target.detachedFromTarget",
+    ] {
+        assert_eq!(lifecycle.recv().await.unwrap().method, expected);
+    }
+    assert!(client.attached_sessions().is_empty());
+    release.send(()).unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_lag_can_reconcile_every_active_attachment_without_closing() {
+    let (client, server) = pair();
+    let mut lifecycle = client.subscribe_lifecycle();
+    let (release, done) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (read, mut write) = tokio::io::split(server);
+        let mut read = BufReader::new(read);
+        for id in 0..400 {
+            let mut bytes=serde_json::to_vec(&json!({"method":"Target.attachedToTarget","params":{"sessionId":format!("child-{id}")}})).unwrap();
+            bytes.push(0);
+            write.write_all(&bytes).await.unwrap();
+        }
+        let mut bytes = Vec::new();
+        read.read_until(0, &mut bytes).await.unwrap();
+        let request: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        let mut response = serde_json::to_vec(&json!({"id":request["id"],"result":{}})).unwrap();
+        response.push(0);
+        write.write_all(&response).await.unwrap();
+        let _ = done.await;
+    });
+    client
+        .send(Method::BrowserGetVersion, json!({}), None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        lifecycle.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+    ));
+    let active = client.attached_sessions();
+    assert_eq!(active.len(), 400);
+    let ids: std::collections::HashSet<_> = active
+        .iter()
+        .map(|e| e.params["sessionId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 400);
+    assert!(client.closed().borrow().is_none());
+    release.send(()).unwrap();
+    server.await.unwrap();
+}

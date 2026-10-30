@@ -377,7 +377,7 @@ impl Instance {
         }
         *inner.assessment.lock().unwrap() = assessment;
         wait_for_sandbox(&inner).await.map_err(Error::Sandbox)?;
-        let mut event_rx = client.subscribe_all();
+        let event_rx = client.subscribe_lifecycle();
         client
             .send(
                 Method::TargetSetAutoAttach,
@@ -392,91 +392,12 @@ impl Instance {
                 Status::Degraded
             },
         );
-        let weak = Arc::downgrade(&inner);
-        let monitor_client = client.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(50));
-            let mut refresh = tokio::time::Instant::now() + Duration::from_secs(86400);
-            loop {
-                tokio::select! {
-                    _ = tick.tick() => {},
-                    event = event_rx.recv() => match event {
-                        Ok(event) if event.method == "Target.attachedToTarget" => {
-                            let weak=weak.clone(); let client=monitor_client.clone();
-                            tokio::spawn(async move {
-                                let Some(inner)=weak.upgrade() else {return;};
-                                if inner.killed.load(Ordering::SeqCst) {return;}
-                                let attached=match serde_json::from_value::<Attached>(event.params) {Ok(v)=>v,Err(_)=>{inner.stop(Status::Crashed,"instance_crashed","invalid attached target event".into());return;}};
-                                if let Err(e)=wait_for_sandbox(&inner).await {if !inner.killed.load(Ordering::SeqCst) {if e=="browser process unavailable" {inner.stop(Status::Crashed,"instance_crashed",e);}else{inner.stop(Status::Blocked,"sandbox_unavailable",e);}}return;}
-                                if (attached.target_info.kind=="page" || attached.target_info.kind=="iframe") && client.send(Method::TargetSetAutoAttach,json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true}),Some(&attached.session_id)).await.is_err() {return;}
-                                if attached.waiting_for_debugger {let _=client.send(Method::RuntimeRunIfWaitingForDebugger,json!({}),Some(&attached.session_id)).await;}
-                            });
-                        },
-                        Ok(event) if event.method == "Target.targetCrashed" || event.method == "Inspector.targetCrashed" || event.method == "session_crashed" => {
-                            if let Some(inner) = weak.upgrade() { let _ = inner.events.send(InstanceEvent {kind:"target_crashed".into(),detail: event.session_id.unwrap_or_default()}); }
-                        },
-                        Ok(event) if event.method == "instance_crashed" => {
-                            if let Some(inner)=weak.upgrade() {inner.stop(Status::Crashed,"instance_crashed","CDP EOF".into());} break;
-                        },
-                        Err(_) => { if let Some(inner) = weak.upgrade() { inner.stop(Status::Crashed,"instance_crashed","event stream lagged or closed".into()); } break; },
-                        _ => {},
-                    }
-                }
-                let Some(inner) = weak.upgrade() else {
-                    break;
-                };
-                if matches!(
-                    *inner.status.borrow(),
-                    Status::Stopped | Status::Blocked | Status::Crashed
-                ) {
-                    break;
-                }
-                if *inner.status.borrow() == Status::Stopping {
-                    continue;
-                }
-                let exited = inner
-                    .child
-                    .lock()
-                    .unwrap()
-                    .try_wait()
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if exited {
-                    inner.stop(Status::Crashed, "instance_crashed", "browser exited".into());
-                    break;
-                }
-                let tree =
-                    process::tree_for_profile(inner.child.lock().unwrap().id(), &inner.profile);
-                if tree.is_empty() {
-                    inner.stop(
-                        Status::Crashed,
-                        "instance_crashed",
-                        "browser process disappeared".into(),
-                    );
-                    break;
-                }
-                let checked = inner
-                    .gate
-                    .lock()
-                    .unwrap()
-                    .check(&tree, std::time::Instant::now());
-                if let Err(error) = checked {
-                    inner.stop(Status::Blocked, "sandbox_unavailable", error);
-                    break;
-                }
-                *inner.pids.lock().unwrap() = tree;
-                if tokio::time::Instant::now() >= refresh {
-                    let inner = inner.clone();
-                    let client = monitor_client.clone();
-                    tokio::spawn(async move {
-                        let _ = refresh_version(&inner, &client).await;
-                    });
-                    refresh = tokio::time::Instant::now() + Duration::from_secs(86400);
-                }
-            }
-            monitor_client.shutdown();
-        });
+        tokio::spawn(supervise_events(
+            Arc::downgrade(&inner),
+            client.clone(),
+            event_rx,
+        ));
+        tokio::spawn(supervise_processes(Arc::downgrade(&inner), client.clone()));
         Ok(Self {
             inner,
             client,
@@ -634,24 +555,239 @@ impl Drop for Instance {
     }
 }
 
+/// Steady-state process inspection runs only on the timer, never per page event.
+async fn supervise_processes(weak: std::sync::Weak<Inner>, client: Client) {
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut refresh = tokio::time::Instant::now() + Duration::from_secs(86400);
+    loop {
+        tick.tick().await;
+        let Some(inner) = weak.upgrade() else {
+            break;
+        };
+        let status = inner.status.borrow().clone();
+        if matches!(status, Status::Stopped | Status::Blocked | Status::Crashed) {
+            break;
+        }
+        if status == Status::Stopping {
+            continue;
+        }
+        let observed = inner.clone();
+        let checked = tokio::task::spawn_blocking(move || {
+            let exited = observed
+                .child
+                .lock()
+                .unwrap()
+                .try_wait()
+                .map_err(|e| (Status::Blocked, "supervision_unavailable", e.to_string()))?
+                .is_some();
+            if exited {
+                return Err((Status::Crashed, "instance_crashed", "browser exited".into()));
+            }
+            match sample_sandbox(&observed) {
+                Ok(_) => Ok(()),
+                Err(e) if e == "browser process unavailable" => {
+                    Err((Status::Crashed, "instance_crashed", e))
+                }
+                Err(e) => Err((Status::Blocked, "sandbox_unavailable", e)),
+            }
+        })
+        .await;
+        match checked {
+            Ok(Ok(())) => {}
+            Ok(Err((status, kind, detail))) => {
+                stop_observed(inner, status, kind, detail).await;
+                break;
+            }
+            Err(error) => {
+                stop_observed(
+                    inner,
+                    Status::Blocked,
+                    "supervision_unavailable",
+                    error.to_string(),
+                )
+                .await;
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= refresh {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let _ = refresh_version(&inner, &client).await;
+            });
+            refresh = tokio::time::Instant::now() + Duration::from_secs(86400);
+        }
+    }
+    client.shutdown();
+}
+
+async fn supervise_events(
+    weak: std::sync::Weak<Inner>,
+    client: Client,
+    mut events: broadcast::Receiver<excalibur_cdp::Event>,
+) {
+    let mut known = std::collections::HashSet::new();
+    let mut closed = client.closed();
+    loop {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        if inner.killed.load(Ordering::SeqCst) {
+            return;
+        }
+        let terminal = closed.borrow().clone();
+        if let Some(error) = terminal {
+            stop_observed(
+                inner,
+                Status::Crashed,
+                "instance_crashed",
+                format!("CDP transport closed: {error}"),
+            )
+            .await;
+            return;
+        }
+        drop(inner);
+        let received = tokio::select! {
+            _=closed.changed()=>continue,
+            event=events.recv()=>event,
+        };
+        match received {
+            Ok(event) if event.method == "Target.attachedToTarget" => {
+                if let Some(session) = event.params["sessionId"].as_str()
+                    && known.insert(session.to_owned())
+                {
+                    resume_verified_target(weak.clone(), client.clone(), event);
+                }
+            }
+            Ok(event) if event.method == "Target.detachedFromTarget" => {
+                if let Some(session) = event.params["sessionId"].as_str() {
+                    known.remove(session);
+                }
+            }
+            Ok(event)
+                if matches!(
+                    event.method.as_str(),
+                    "Target.targetCrashed" | "Inspector.targetCrashed" | "session_crashed"
+                ) =>
+            {
+                if let Some(inner) = weak.upgrade() {
+                    let _ = inner.events.send(InstanceEvent {
+                        kind: "target_crashed".into(),
+                        detail: event.session_id.unwrap_or_default(),
+                    });
+                }
+            }
+            Ok(_) => {} // Reliable transport closure is read from the sticky watch above.
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                // The reader retains current attachment state independently of this queue.
+                // Replaying it cannot lose a still-paused target, even if notifications lag.
+                let active = client.attached_sessions();
+                known.retain(|session| {
+                    active
+                        .iter()
+                        .any(|event| event.params["sessionId"].as_str() == Some(session))
+                });
+                for event in active {
+                    if let Some(session) = event.params["sessionId"].as_str()
+                        && known.insert(session.to_owned())
+                    {
+                        resume_verified_target(weak.clone(), client.clone(), event);
+                    }
+                }
+                if let Some(inner) = weak.upgrade() {
+                    let _=inner.events.send(InstanceEvent{kind:"events_resynchronized".into(),detail:format!("{skipped} lifecycle notifications skipped; active attachments reconciled")});
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+fn resume_verified_target(
+    weak: std::sync::Weak<Inner>,
+    client: Client,
+    event: excalibur_cdp::Event,
+) {
+    tokio::spawn(async move {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        if inner.killed.load(Ordering::SeqCst) {
+            return;
+        }
+        let attached = match serde_json::from_value::<Attached>(event.params) {
+            Ok(v) => v,
+            Err(_) => {
+                stop_observed(
+                    inner,
+                    Status::Crashed,
+                    "instance_crashed",
+                    "invalid attached target event".into(),
+                )
+                .await;
+                return;
+            }
+        };
+        if let Err(error) = wait_for_sandbox(&inner).await {
+            if !inner.killed.load(Ordering::SeqCst) {
+                let (status, kind) = if error == "browser process unavailable" {
+                    (Status::Crashed, "instance_crashed")
+                } else {
+                    (Status::Blocked, "sandbox_unavailable")
+                };
+                stop_observed(inner, status, kind, error).await;
+            }
+            return;
+        }
+        if (attached.target_info.kind == "page" || attached.target_info.kind == "iframe")
+            && client
+                .send(
+                    Method::TargetSetAutoAttach,
+                    json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true}),
+                    Some(&attached.session_id),
+                )
+                .await
+                .is_err()
+        {
+            return;
+        }
+        if attached.waiting_for_debugger {
+            let _ = client
+                .send(
+                    Method::RuntimeRunIfWaitingForDebugger,
+                    json!({}),
+                    Some(&attached.session_id),
+                )
+                .await;
+        }
+    });
+}
+async fn stop_observed(inner: Arc<Inner>, status: Status, kind: &'static str, detail: String) {
+    let _ = tokio::task::spawn_blocking(move || inner.stop(status, kind, detail)).await;
+}
+fn sample_sandbox(inner: &Inner) -> Result<(Vec<process::Process>, bool), String> {
+    if inner.killed.load(Ordering::SeqCst) {
+        return Err("instance closed".into());
+    }
+    let tree = process::tree_for_profile(inner.child.lock().unwrap().id(), &inner.profile);
+    if tree.is_empty() {
+        return Err("browser process unavailable".into());
+    }
+    let ready = inner
+        .gate
+        .lock()
+        .unwrap()
+        .check(&tree, std::time::Instant::now())?;
+    *inner.pids.lock().unwrap() = tree.clone();
+    Ok((tree, ready))
+}
 async fn wait_for_sandbox(inner: &Arc<Inner>) -> Result<Vec<process::Process>, String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if inner.killed.load(Ordering::SeqCst) {
-            return Err("instance closed".into());
-        }
-        let tree = process::tree_for_profile(inner.child.lock().unwrap().id(), &inner.profile);
-        if tree.is_empty() {
-            return Err("browser process unavailable".into());
-        }
-        let ready = inner
-            .gate
-            .lock()
-            .unwrap()
-            .check(&tree, std::time::Instant::now())?;
-        let renderers = tree.iter().filter(|p| p.kind == "renderer").count();
-        *inner.pids.lock().unwrap() = tree.clone();
-        if ready && renderers > 0 {
+        let observed = inner.clone();
+        let (tree, ready) = tokio::task::spawn_blocking(move || sample_sandbox(&observed))
+            .await
+            .map_err(|e| e.to_string())??;
+        if ready && tree.iter().any(|p| p.kind == "renderer") {
             return Ok(tree);
         }
         if tokio::time::Instant::now() >= deadline {

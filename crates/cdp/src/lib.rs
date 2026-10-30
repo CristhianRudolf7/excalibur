@@ -43,6 +43,8 @@ struct State {
     failed_sessions: Mutex<HashSet<String>>,
     topics: Mutex<HashMap<String, broadcast::Sender<Event>>>,
     all: broadcast::Sender<Event>,
+    lifecycle: broadcast::Sender<Event>,
+    attachments: Mutex<HashMap<String, Event>>,
     closed: watch::Sender<Option<Error>>,
     next_id: AtomicU64,
 }
@@ -61,6 +63,31 @@ impl State {
         }
     }
     fn emit(&self, event: Event) {
+        // Control traffic has its own bounded channel. The active attachment
+        // snapshot is updated first so a slow supervisor can reconcile on Lagged.
+        if event.method == "Target.attachedToTarget" {
+            if let Some(session) = event.params["sessionId"].as_str() {
+                self.attachments
+                    .lock()
+                    .unwrap()
+                    .insert(session.into(), event.clone());
+            }
+        } else if event.method == "Target.detachedFromTarget"
+            && let Some(session) = event.params["sessionId"].as_str()
+        {
+            self.attachments.lock().unwrap().remove(session);
+        }
+        if matches!(
+            event.method.as_str(),
+            "Target.attachedToTarget"
+                | "Target.detachedFromTarget"
+                | "Target.targetCrashed"
+                | "Inspector.targetCrashed"
+                | "session_crashed"
+                | "instance_crashed"
+        ) {
+            let _ = self.lifecycle.send(event.clone());
+        }
         if let Some(topic) = self
             .topics
             .lock()
@@ -107,12 +134,15 @@ impl Client {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (all, _) = broadcast::channel(1024);
+        let (lifecycle, _) = broadcast::channel(256);
         let (closed, _) = watch::channel(None);
         let state = Arc::new(State {
             pending: Mutex::new(HashMap::new()),
             failed_sessions: Mutex::new(HashSet::new()),
             topics: Mutex::new(HashMap::new()),
             all,
+            lifecycle,
+            attachments: Mutex::new(HashMap::new()),
             closed,
             next_id: AtomicU64::new(1),
         });
@@ -135,6 +165,21 @@ impl Client {
     }
     pub fn subscribe_all(&self) -> broadcast::Receiver<Event> {
         self.state.all.subscribe()
+    }
+    /// Bounded supervision events only; console/network traffic cannot displace these.
+    /// On Lagged reconcile active attachments with `attached_sessions` and inspect `closed`.
+    pub fn subscribe_lifecycle(&self) -> broadcast::Receiver<Event> {
+        self.state.lifecycle.subscribe()
+    }
+    /// Current active attachment events, including events missed by a slow receiver.
+    pub fn attached_sessions(&self) -> Vec<Event> {
+        self.state
+            .attachments
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
     }
     pub fn subscribe(&self, session: Option<&str>) -> broadcast::Receiver<Event> {
         self.state

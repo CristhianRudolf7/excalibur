@@ -237,6 +237,52 @@ async fn contract(root: &Path) {
     .await
     .expect("cross-origin fixture must produce an attached OOPIF");
 
+    // Deliberately leave the general observer unread: it must report loss, not kill Chrome.
+    call(client, Method::RuntimeEnable, json!({}), Some(&sid)).await;
+    let flood_context = context(client, &sid).await;
+    let mut slow_observer = client.subscribe_all();
+    let mut instance_events = instance.events();
+    let console_count = 10000;
+    let flooded=client.send_with_timeout(Method::RuntimeCallFunctionOn,json!({"functionDeclaration":"function(){for(let i=0;i<10000;i++)console.log('synthetic-console-event',i);return 10000}","executionContextId":flood_context,"returnByValue":true}),Some(&sid),Duration::from_secs(60)).await.unwrap();
+    assert_eq!(flooded["result"]["value"], console_count);
+    assert!(
+        matches!(
+            slow_observer.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+        ),
+        "fixture must exceed the ordinary observer queue"
+    );
+    let after_flood = call(client, Method::BrowserGetVersion, json!({}), None).await;
+    let after_processes = instance.verify_sandbox().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let flood_status = instance.status().borrow().clone();
+    assert!(
+        matches!(flood_status, Status::Running | Status::Degraded),
+        "{flood_status:?}"
+    );
+    loop {
+        match instance_events.try_recv() {
+            Ok(event) => assert_ne!(event.kind, "instance_crashed"),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("unexpected supervisor event loss: {error}"),
+        }
+    }
+    // Lifecycle handling still works after the flood: create and attach another page.
+    let fresh = call(
+        client,
+        Method::TargetCreateTarget,
+        json!({"url":"about:blank"}),
+        None,
+    )
+    .await["targetId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let fresh_sid = instance.attach_page(&fresh).await.unwrap();
+    let fresh_context = context(client, &fresh_sid).await;
+    let fresh_result=call(client,Method::RuntimeCallFunctionOn,json!({"functionDeclaration":"function(){return 42}","executionContextId":fresh_context,"returnByValue":true}),Some(&fresh_sid)).await;
+    assert_eq!(fresh_result["result"]["value"], 42);
+    fs::write(root.join("console-backpressure.json"),serde_json::to_vec_pretty(&json!({"console_events":console_count,"ordinary_observer_lagged":true,"status_after":flood_status,"version_after":after_flood["product"],"sandbox_after":after_processes,"new_target_after_flood":true,"false_instance_crashed":false})).unwrap()).unwrap();
     let other = call(
         client,
         Method::TargetCreateTarget,
