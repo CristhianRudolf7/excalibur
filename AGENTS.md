@@ -37,3 +37,5 @@
 
 - Conversational cancellation verification: `cargo test -p excalibur-master --test cancel_confirmation` and `cargo test -p excalibur-daemon --test cancel_confirmation` cover authenticated confirmation, durable decision replay, principal/scope isolation, denial, ambiguous/generated inputs, full-inbox intake and local HTTP through gateway/master/orchestrator. See [Daemon, master and subagents](docs/development/daemon.md).
 - Civil calendar verification: `cargo test -p excalibur-scheduler --test calendar` covers IANA gaps/folds, numeric five/six-field cron, leap years, scoped zone-change receipts, concurrent calendar ticks and additive migration of UTC timers. See [Durable timers and civil calendars](docs/development/scheduling.md); daemon dispatch remains pending.
+
+- Reminder domain verification: `cargo test -p excalibur-scheduler --test reminders` covers authenticated host bindings, keyed snapshots, generation conflicts, atomic snooze/cancellation, rollback and process interruption. See [Durable timers and civil calendars](docs/development/scheduling.md); reminder delivery and repeat-without-response policy remain pending host integration.
