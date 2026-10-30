@@ -357,3 +357,95 @@ async fn load_resolves_its_own_tools_and_host_owned_builtin_schemas() {
                 && tool["input_schema"]["properties"]["limit"]["type"] == "integer")
     );
 }
+
+struct ConcurrentTools(tokio::sync::Barrier);
+impl ToolRuntime for ConcurrentTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        Tools::default().definitions()
+    }
+    fn prepare<'a>(
+        &'a self,
+        run: &'a str,
+        call: ToolCall,
+    ) -> BoxFuture<'a, Result<PreparedTool, String>> {
+        Box::pin(async move { Tools::default().prepare(run, call).await })
+    }
+    fn execute<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: &'a PreparedTool,
+    ) -> BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            self.0.wait().await;
+            ToolResult::ok(json!({"concurrent":true}))
+        })
+    }
+    fn reconcile<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: &'a PreparedTool,
+    ) -> BoxFuture<'a, Reconcile> {
+        Box::pin(async move {
+            self.0.wait().await;
+            Reconcile::Retry
+        })
+    }
+}
+#[tokio::test]
+async fn independent_effects_and_reconciliation_enter_the_delegate_concurrently() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = index(dir.path()).await;
+    let db = Database::open(
+        dir.path().join("db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let runtime = SkillRuntime::new(
+        db,
+        Arc::new(ConcurrentTools(tokio::sync::Barrier::new(2))),
+        BTreeMap::from([("a".into(), index)]),
+        100000,
+        TokenCounter::default(),
+    )
+    .await
+    .unwrap();
+    runtime
+        .bind(
+            "r",
+            "a",
+            CatalogScope::new(TaskKind::Programming, "implementer"),
+            "independent",
+        )
+        .await
+        .unwrap();
+    let first = runtime
+        .prepare("r", call("read_file", json!({"path":"first"})))
+        .await
+        .unwrap();
+    let second = runtime
+        .prepare("r", call("read_file", json!({"path":"second"})))
+        .await
+        .unwrap();
+    let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::join!(
+            runtime.execute("r", "first", &first),
+            runtime.execute("r", "second", &second)
+        )
+    })
+    .await
+    .unwrap();
+    assert!(a.success && b.success);
+    let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::join!(
+            runtime.reconcile("r", "first", &first),
+            runtime.reconcile("r", "second", &second)
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(a, Reconcile::Retry);
+    assert_eq!(b, Reconcile::Retry);
+}

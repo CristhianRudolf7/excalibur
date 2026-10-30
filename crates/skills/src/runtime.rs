@@ -33,7 +33,7 @@ pub struct SkillRuntime {
     window: usize,
     counter: TokenCounter,
     core_tools: Vec<ToolDefinition>,
-    gates: std::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    gates: std::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>>,
 }
 impl SkillRuntime {
     pub async fn new(
@@ -63,13 +63,13 @@ impl SkillRuntime {
         self.core_tools = tools;
         self
     }
-    fn gate(&self, run: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn gate(&self, run: &str) -> Arc<tokio::sync::RwLock<()>> {
         let mut gates = self.gates.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(gate) = gates.get(run).and_then(std::sync::Weak::upgrade) {
             return gate;
         }
         gates.retain(|_, gate| gate.strong_count() > 0);
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
         gates.insert(run.into(), Arc::downgrade(&gate));
         gate
     }
@@ -510,7 +510,12 @@ impl ToolRuntime for SkillRuntime {
         tool: &'a PreparedTool,
     ) -> BoxFuture<'a, ToolResult> {
         Box::pin(async move {
-            let _guard = self.gate(run).lock_owned().await;
+            let gate = self.gate(run);
+            let (_shared, _exclusive) = if tool.call.name == "load_skill" {
+                (None, Some(gate.write_owned().await))
+            } else {
+                (Some(gate.read_owned().await), None)
+            };
             if own(&tool.call.name) {
                 if tool.data["skill_run"] != run {
                     return ToolResult::error("skill prepared run mismatch");
@@ -542,7 +547,7 @@ impl ToolRuntime for SkillRuntime {
         tool: &'a PreparedTool,
     ) -> BoxFuture<'a, Reconcile> {
         Box::pin(async move {
-            let _guard = self.gate(run).lock_owned().await;
+            let _guard = self.gate(run).read_owned().await;
             if own(&tool.call.name) {
                 if tool.data["skill_run"] != run {
                     return Reconcile::Uncertain("skill prepared run mismatch".into());

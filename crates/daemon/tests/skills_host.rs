@@ -148,9 +148,9 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
     *model.skills.lock().unwrap() = Some(host.skills.clone());
     let (run, agent_id, context) = runtimes.block_on(async {
         db.write(excalibur_store::Priority::Journal,|c|{
-            c.execute("INSERT OR IGNORE INTO principals(id) VALUES('owner')",[])?;
-            c.execute("INSERT INTO conversations(id,channel,principal_id,active_scope,scope_id) VALUES('chat','test','owner','project:default','project:default')",[])?;
-            c.execute("INSERT INTO messages(id,conversation_id,role,text,scope_id,principal_id) VALUES('memory-message','chat','user','SCOPED MEMORY MESSAGE','project:default','owner')",[])?;
+            c.execute("INSERT OR IGNORE INTO principals(id) VALUES('local')",[])?;
+            c.execute("INSERT INTO conversations(id,channel,principal_id,active_scope,scope_id) VALUES('chat','test','local','project:default','project:default')",[])?;
+            c.execute("INSERT INTO messages(id,conversation_id,role,text,scope_id,principal_id) VALUES('memory-message','chat','user','SCOPED MEMORY MESSAGE','project:default','local')",[])?;
             Ok(())
         }).await.unwrap();
         let parent = host
@@ -313,7 +313,12 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "resume timed out: {error}; model calls {}",
+                model.calls.load(Ordering::SeqCst)
+            )
+        });
         let state = host.orchestrator.engine().load(&run).await.unwrap();
         assert_eq!(
             state
