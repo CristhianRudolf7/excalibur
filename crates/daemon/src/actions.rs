@@ -270,8 +270,12 @@ impl DaemonActions {
                 return Ok((task,card));
             }
             if originals.is_empty(){return Err(excalibur_store::Error::Invalid("delegation requires persisted literal source messages"));}
-            let card=json!({"original":originals,"interpretation":goal,"requirements":[{"type":"functional","text":goal}],"criteria":[{"method":"inspection","statement":deliverable}],"assumptions":[],"open_questions":[],"pinned_instructions":[]}).to_string();
-            let id=TaskId::new().to_string();
+            let typed_id=TaskId::new();
+            let requirement=RequirementId::from_ulid(typed_id.ulid()).to_string();
+            let criterion=CriterionId::from_ulid(typed_id.ulid()).to_string();
+            let pins=client_constraints(&originals);
+            let card=json!({"original":originals,"interpretation":goal,"requirements":[{"id":requirement,"type":"functional","text":goal}],"criteria":[{"id":criterion,"requirement_id":requirement,"method":"inspection","statement":deliverable}],"assumptions":[],"open_questions":[],"pinned_instructions":pins}).to_string();
+            let id=typed_id.to_string();
             conn.execute("INSERT INTO daemon_task_requests VALUES(?1,?2,?3,?4,?5,?6,?7)",(&operation,&id,&conversation,&scope,&goal,&deliverable,&card))?;
             Ok((id,card))
         }).await.map_err(|e|e.to_string())?;
@@ -280,8 +284,12 @@ impl DaemonActions {
             .map_err(|_| "invalid durable task identity")?;
         let requirement = RequirementId::from_ulid(id.ulid()).to_string();
         let criterion = CriterionId::from_ulid(id.ulid()).to_string();
-        let card: Value =
+        let mut card: Value =
             serde_json::from_str(&card).map_err(|_| "invalid durable request card")?;
+        // Pending receipts from earlier hosts may contain literal-only references.
+        card["requirements"][0]["id"] = json!(requirement);
+        card["criteria"][0]["id"] = json!(criterion);
+        card["criteria"][0]["requirement_id"] = json!(requirement);
         let goal = card["interpretation"]
             .as_str()
             .ok_or("missing persisted interpretation")?;
@@ -290,12 +298,68 @@ impl DaemonActions {
             .ok_or("missing persisted criterion")?;
         let scope = scope.to_owned();
         let conversation = conversation.to_owned();
-        tasks.host_batch(&scope,&format!("request-task:{operation}"),json!({"ops":[
-            {"op":"create_task","id":task_id,"title":goal.chars().take(120).collect::<String>(),"data":{"request_card":card,"budget":budget,"project_id":scope.strip_prefix("project:"),"origin_conversation_id":conversation,"metadata":{"delegation_operation":operation}}},
+        let lookup_task = task_id.clone();
+        let lookup_scope = scope.clone();
+        let exists=tasks.database().read(excalibur_store::ReadLane::Interactive,move|conn|Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND COALESCE(scope_id,'general')=?2)",(&lookup_task,&lookup_scope),|row|row.get::<_,bool>(0))?)).await.map_err(|e|e.to_string())?;
+        let existing = if exists {
+            Some(
+                tasks
+                    .task(&scope, &task_id)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
+        if let Some(task) = &existing {
+            if task.metadata["delegation_operation"] != operation
+                || task.origin_conversation_id.as_deref() != Some(conversation.as_str())
+                || task.request_card["original"] != card["original"]
+                || task.request_card["interpretation"] != card["interpretation"]
+            {
+                return Err("existing task does not match the durable delegation receipt".into());
+            }
+        } else {
+            tasks.host_batch(&scope,&format!("request-task:{operation}"),json!({"ops":[
             {"op":"create_requirement","id":requirement,"data":{"text":goal,"state":"accepted","kind":"functional","priority":"must","project_id":scope.strip_prefix("project:")}},
             {"op":"create_criterion","id":criterion,"data":{"requirement_id":requirement,"statement":deliverable,"method":"inspection","expected":"Nonempty final response; additional observable criteria and checks remain authoritative when present","impact_area":[],"metadata":{"implicit_final_response":true}}},
+            {"op":"create_task","id":task_id,"title":goal.chars().take(120).collect::<String>(),"data":{"resolve_request_card_codes":true,"request_card":card.clone(),"budget":budget,"project_id":scope.strip_prefix("project:"),"origin_conversation_id":conversation,"metadata":{"delegation_operation":operation}}},
             {"op":"link_requirement","task":task_id,"requirement":requirement}
         ]})).await.map_err(|e|e.to_string())?;
+        }
+        let card = tasks
+            .task(&scope, &task_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .request_card;
+        let registry = excalibur_journal::instructions::InstructionStore::open(
+            self.orchestrator.database().clone(),
+            self.redactor.clone(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        for (index, pin) in card["pinned_instructions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if let Some(text) = pin.as_str() {
+                registry
+                    .register(
+                        &format!("request:{task_id}:instruction:{index}"),
+                        None,
+                        excalibur_journal::instructions::InstructionScope::Task(task_id.clone()),
+                        excalibur_journal::instructions::InstructionOrigin {
+                            kind: excalibur_journal::instructions::InstructionOriginKind::Host,
+                            reference: card["original"][0]["msg_id"].as_str().unwrap_or("").into(),
+                        },
+                        text,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         Ok(task_id)
     }
     async fn targets(&self, target: Option<&str>) -> Result<Vec<String>, String> {
@@ -325,6 +389,7 @@ impl DaemonActions {
                 a.id == target
                     || a.name.eq_ignore_ascii_case(target)
                     || a.run_id.as_deref() == Some(target)
+                    || a.task == target
             })
             .map(|a| a.id)
             .collect::<Vec<_>>();
@@ -492,6 +557,20 @@ impl DaemonActions {
                 .map(|agent| agent.id)
                 .collect::<BTreeSet<_>>();
             ids.retain(|id| roots.contains(id));
+        }
+        if command == "cancel" && ids.len() != 1 {
+            let mut candidates = Vec::new();
+            for id in ids {
+                let agent = self
+                    .orchestrator
+                    .agent(&id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                candidates.push(json!({"id":agent.id,"name":agent.name,"scope":agent.scope}));
+            }
+            return Ok(
+                json!({"selection_required":true,"candidates":candidates,"action":"cancel"}),
+            );
         }
         let mut result = Vec::new();
         for id in ids {
@@ -821,6 +900,7 @@ impl FastActions for DaemonActions {
                     let deliverable = args["deliverable"]
                         .as_str()
                         .unwrap_or("Verified result and explicit remaining work");
+                    let pinned_instructions = client_constraints(&originals);
                     let task = self
                         .request_task(
                             conversation,
@@ -840,13 +920,43 @@ impl FastActions for DaemonActions {
                         RequirementId::from_ulid(task_ulid).to_string(),
                         CriterionId::from_ulid(task_ulid).to_string(),
                     ];
-                    let agent=self.orchestrator.spawn(&self.master_agent,Delegation{operation:format!("delegate:{task}"),name:args["name"].as_str().unwrap_or("Coordinator").into(),profile:"coordinator".into(),scope:scope.to_owned(),task:task.clone(),origin_conversation:conversation.into(),goal:goal.into(),deliverable:deliverable.into(),inputs,pinned_instructions:vec![],suggested_skills:vec![],fork_context:false,token,spec:RunSpec{context:excalibur_context::ContextInput::new("Work within the delegated scope and permissions. Ask rather than guessing irreversible details.",goal,"host-time-in-durable-journal"),budget,criteria:vec![Criterion::FinalResponse{schema:None}]},priority:1}).await.map_err(|e|e.to_string())?;
+                    let agent=self.orchestrator.spawn(&self.master_agent,Delegation{operation:format!("delegate:{task}"),name:args["name"].as_str().unwrap_or("Coordinator").into(),profile:"coordinator".into(),scope:scope.to_owned(),task:task.clone(),origin_conversation:conversation.into(),goal:goal.into(),deliverable:deliverable.into(),inputs,pinned_instructions,suggested_skills:vec![],fork_context:false,token,spec:RunSpec{context:excalibur_context::ContextInput::new("Work within the delegated scope and permissions. Ask rather than guessing irreversible details.",goal,"host-time-in-durable-journal"),budget,criteria:vec![Criterion::FinalResponse{schema:None}]},priority:1}).await.map_err(|e|e.to_string())?;
                     Ok(
                         json!({"agent_id":agent.id,"run_id":agent.run_id,"task_id":task,"state":"ready"}),
                     )
                 }
                 _ => Err("master tool unavailable".into()),
             }
+        })
+    }
+    fn invoke_source_scoped<'a>(
+        &'a self,
+        conversation: &'a str,
+        scope: &'a str,
+        source: &'a str,
+        name: &'a str,
+        args: Value,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Value, String>> {
+        if name != "question" {
+            return self.invoke_scoped(conversation, scope, name, args, key);
+        }
+        Box::pin(async move {
+            // Model-selected optionality cannot waive a missing mandatory fact.
+            let id = self
+                .master()?
+                .ask_for_source(
+                    conversation,
+                    scope,
+                    source,
+                    args["text"].as_str().ok_or("question text required")?,
+                    true,
+                    None,
+                    excalibur_store::unix_seconds(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({"question_id":id,"blocking":true}))
         })
     }
     fn context<'a>(&'a self, conversation: &'a str) -> BoxFuture<'a, Result<Value, String>> {
@@ -904,3 +1014,38 @@ impl FastActions for DaemonActions {
     }
 }
 pub type SharedActions = Arc<DaemonActions>;
+
+/// Literal client constraints are never inferred from model/tool notices.
+fn client_constraints(originals: &[Value]) -> Vec<String> {
+    let mut pins = Vec::new();
+    for source in originals {
+        if let Some(text) = source["text"].as_str() {
+            for fragment in text.split_inclusive(['\n', '.', '!', '?']) {
+                let lower = fragment.trim_start().to_lowercase();
+                if [
+                    "must ",
+                    "never ",
+                    "do not ",
+                    "don't ",
+                    "no ",
+                    "debe ",
+                    "sin ",
+                    "prohibido ",
+                    "siempre ",
+                    "keep ",
+                    "conserva ",
+                    "only ",
+                    "solo ",
+                    "sólo ",
+                ]
+                .iter()
+                .any(|marker| lower.starts_with(marker))
+                    && !pins.iter().any(|pin| pin == fragment)
+                {
+                    pins.push(fragment.to_owned());
+                }
+            }
+        }
+    }
+    pins
+}

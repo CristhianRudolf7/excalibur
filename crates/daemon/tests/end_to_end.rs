@@ -85,7 +85,7 @@ fn authenticated_daemon_delegates_to_real_shared_engine_and_local_file_tools() {
             runtimes.work(),
         ))
         .unwrap();
-    runtimes.block_on(async {
+    let daemon_trajectory = runtimes.block_on(async {
         let receipt = host
             .master
             .receive(Incoming {
@@ -211,6 +211,7 @@ fn authenticated_daemon_delegates_to_real_shared_engine_and_local_file_tools() {
         assert!(events.iter().any(|e| e.kind == "message_received"
             || e.kind == "received"
             || e.kind == "user_message"));
+        trajectory
     });
     runtimes.block_on(host.close()).unwrap();
     let embedded_root = temp.path().join("embedded-project");
@@ -235,5 +236,80 @@ fn authenticated_daemon_delegates_to_real_shared_engine_and_local_file_tools() {
         std::fs::read(root.join("answer.txt")).unwrap()
     );
 
+    let embedded_trajectory: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result.logs_dir.join("trajectory.json")).unwrap())
+            .unwrap();
+    fn comparable(trajectory: &serde_json::Value) -> serde_json::Value {
+        let steps = trajectory["steps"].as_array().unwrap();
+        let calls = steps
+            .iter()
+            .flat_map(|step| step["tool_calls"].as_array().into_iter().flatten())
+            .map(
+                |call| json!({"function_name":call["function_name"],"arguments":call["arguments"]}),
+            )
+            .collect::<Vec<_>>();
+        let results = steps
+            .iter()
+            .flat_map(|step| {
+                step["observation"]["results"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+            })
+            .map(|result| {
+                serde_json::from_str::<serde_json::Value>(result["content"].as_str().unwrap())
+                    .unwrap()["success"]
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        json!({"calls":calls,"results":results,"state":trajectory["extra"]["final_state"]})
+    }
+    let expected = comparable(&daemon_trajectory);
+    assert_eq!(expected["calls"].as_array().unwrap().len(), 1);
+    assert_eq!(expected["results"], json!([true]));
+    assert_eq!(expected["state"], "completed");
+    assert_eq!(comparable(&embedded_trajectory), expected);
+    let metrics: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.logs_dir.join("excalibur/metrics.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metrics["final_state"], "completed");
+    assert_eq!(metrics["tool_calls"], 1);
+    // Reopen the completed episode's durable database independently. The exec
+    // adapter intentionally requires a fresh trial directory; this reads its
+    // persisted evidence rather than claiming a CLI resume mode.
+    runtimes.block_on(async {
+        let reopened = Database::open(
+            result.logs_dir.join("excalibur/main.db"),
+            DatabaseKind::Main,
+            Default::default(),
+        )
+        .unwrap();
+        let id = result.run_id.clone();
+        let (state, intents, effects) = reopened
+            .read(excalibur_store::ReadLane::Interactive, move |c| {
+                Ok((
+                    c.query_row("SELECT state FROM runs WHERE id=?1", [&id], |r| {
+                        r.get::<_, String>(0)
+                    })?,
+                    c.query_row(
+                        "SELECT count(*) FROM journal WHERE run_id=?1 AND kind='tool_intent'",
+                        [&id],
+                        |r| r.get::<_, u64>(0),
+                    )?,
+                    c.query_row(
+                        "SELECT count(*) FROM journal WHERE run_id=?1 AND kind='tool_result'",
+                        [&id],
+                        |r| r.get::<_, u64>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "completed");
+        assert_eq!(intents, 1);
+        assert_eq!(effects, 1);
+        reopened.shutdown().await.unwrap();
+    });
     runtimes.shutdown(Duration::from_secs(3));
 }

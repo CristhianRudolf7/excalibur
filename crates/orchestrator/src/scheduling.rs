@@ -2,9 +2,18 @@ use crate::*;
 use excalibur_engine::Status;
 impl Orchestrator {
     pub(crate) async fn ready_order(&self) -> Result<Vec<Agent>> {
+        let active = self
+            .inner
+            .running
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         let mut grouped = BTreeMap::<(u8, String), std::collections::VecDeque<Agent>>::new();
         for a in self.active_agents().await? {
-            if let Some(run) = &a.run_id
+            if !active.contains(&a.id)
+                && let Some(run) = &a.run_id
                 && matches!(
                     self.inner.engine.load(run).await?.status,
                     Status::Ready | Status::Running | Status::Verifying | Status::Recovering
@@ -19,34 +28,32 @@ impl Orchestrator {
                     .push_back(a);
             }
         }
-        let last = self.inner.last_scope.lock().unwrap().clone();
+        let mut service = self.inner.fair_service.lock().unwrap().clone();
         let mut ready = Vec::new();
         while !grouped.is_empty() {
-            let priority = grouped
-                .keys()
-                .next()
-                .map(|(priority, _)| *priority)
-                .unwrap_or(0);
-            let mut keys = grouped
+            let priority = grouped.keys().next().unwrap().0;
+            let key = grouped
                 .keys()
                 .filter(|(p, _)| *p == priority)
-                .cloned()
-                .collect::<Vec<_>>();
-            if let Some(last) = &last
-                && let Some(pos) = keys.iter().position(|(_, scope)| scope == last)
+                .min_by(|a, b| {
+                    let sa = *service.get(*a).unwrap_or(&0);
+                    let sb = *service.get(*b).unwrap_or(&0);
+                    let wa = u64::from(*self.inner.limits.project_weights.get(&a.1).unwrap_or(&1));
+                    let wb = u64::from(*self.inner.limits.project_weights.get(&b.1).unwrap_or(&1));
+                    sa.saturating_mul(wb)
+                        .cmp(&sb.saturating_mul(wa))
+                        .then_with(|| a.cmp(b))
+                })
+                .unwrap()
+                .clone();
+            if let Some(queue) = grouped.get_mut(&key)
+                && let Some(agent) = queue.pop_front()
             {
-                let len = keys.len();
-                keys.rotate_left((pos + 1) % len);
+                ready.push(agent);
+                *service.entry(key.clone()).or_default() += 1;
             }
-            for key in keys {
-                if let Some(queue) = grouped.get_mut(&key)
-                    && let Some(agent) = queue.pop_front()
-                {
-                    ready.push(agent);
-                }
-                if grouped.get(&key).is_some_and(|q| q.is_empty()) {
-                    grouped.remove(&key);
-                }
+            if grouped.get(&key).is_some_and(|queue| queue.is_empty()) {
+                grouped.remove(&key);
             }
         }
         Ok(ready)
@@ -60,6 +67,7 @@ impl Orchestrator {
             }
         }
         self.enforce_directive_deadlines(now()).await?;
+        self.service_question_deadlines(now()).await?;
         let _gate = self.inner.gate.lock().await;
         let high = self
             .inner
@@ -81,6 +89,42 @@ impl Orchestrator {
         let ready = self.ready_order().await?;
         let mut handles = self.inner.running.lock().await;
         let mut dispatched = vec![];
+        let capacity = host.admission_capacity();
+        let process_limit = self.inner.limits.process_limit.min(capacity.process_limit);
+        let provider_limit = self
+            .inner
+            .limits
+            .provider_concurrency
+            .min(capacity.provider_limit);
+        let mut reserved_processes = 0usize;
+        let mut parent_slots = BTreeMap::<String, usize>::new();
+        let admitted = self
+            .inner
+            .db
+            .read(ReadLane::Interactive, |c| {
+                let mut q = c.prepare("SELECT agent_id FROM orchestration_admissions")?;
+                Ok(q.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()?)
+            })
+            .await?;
+        for agent in self.active_agents().await? {
+            if agent.depth == 2
+                && admitted.contains(&agent.id)
+                && let Some(parent) = agent.parent_id
+            {
+                *parent_slots.entry(parent).or_default() += 1;
+            }
+        }
+
+        for id in handles.keys() {
+            let agent = self.agent(id).await?;
+            if agent.token.processes {
+                reserved_processes = reserved_processes
+                    .saturating_add(self.inner.limits.estimated_processes_per_run);
+            }
+        }
+        reserved_processes = reserved_processes.max(capacity.processes_active);
+        let mut reserved_provider = handles.len().max(capacity.provider_active);
         for a in ready {
             if handles.len() >= self.inner.limits.running
                 || (handles.len() as u64)
@@ -91,6 +135,29 @@ impl Orchestrator {
                 break;
             }
             if handles.contains_key(&a.id) {
+                continue;
+            }
+            if reserved_provider >= provider_limit {
+                break;
+            }
+            let process_cost = if a.token.processes {
+                self.inner.limits.estimated_processes_per_run
+            } else {
+                0
+            };
+            if reserved_processes.saturating_add(process_cost) > process_limit {
+                continue;
+            }
+            if a.depth == 2
+                && a.parent_id.as_ref().is_some_and(|parent| {
+                    parent_slots
+                        .get(parent)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_sub(usize::from(admitted.contains(&a.id)))
+                        >= self.inner.limits.children_per_parent
+                })
+            {
                 continue;
             }
             let run = a.run_id.clone().ok_or_else(|| invalid("run missing"))?;
@@ -104,6 +171,17 @@ impl Orchestrator {
                 continue;
             }
 
+            let admitted_id = a.id.clone();
+            self.inner
+                .db
+                .write(Priority::Journal, move |c| {
+                    c.execute(
+                        "INSERT OR IGNORE INTO orchestration_admissions VALUES(?1,unixepoch())",
+                        [admitted_id],
+                    )?;
+                    Ok(())
+                })
+                .await?;
             let engine = self.inner.engine.clone();
             let id = a.id.clone();
             let wake = self.inner.clone();
@@ -122,7 +200,24 @@ impl Orchestrator {
                     result
                 }),
             );
-            *self.inner.last_scope.lock().unwrap() = Some(a.scope);
+            reserved_processes = reserved_processes.saturating_add(process_cost);
+            reserved_provider = reserved_provider.saturating_add(1);
+            if a.depth == 2
+                && !admitted.contains(&a.id)
+                && let Some(parent) = &a.parent_id
+            {
+                *parent_slots.entry(parent.clone()).or_default() += 1;
+            }
+            *self
+                .inner
+                .fair_service
+                .lock()
+                .unwrap()
+                .entry((
+                    a.delegation.as_ref().map(|d| d.priority).unwrap_or(1),
+                    a.scope.clone(),
+                ))
+                .or_default() += 1;
             dispatched.push(id);
         }
         Ok(dispatched)
@@ -158,23 +253,28 @@ impl Orchestrator {
                         .await?;
                 }
             }
-            let state = self.inner.engine.load(run).await?;
-            self.emit_stop_notice(&a, &state).await?;
-            if terminal(&state.status)
-                && let Some(parent) = a.parent_id.as_ref()
-            {
-                let p = self.agent(parent).await?;
-                if let Some(parent_run) = p.run_id {
-                    excalibur_engine::settle_child_budget(
-                        self.inner.engine.journal(),
-                        &parent_run,
-                        &a.id,
-                    )
-                    .await?;
-                }
-            }
+            self.finalize_agent_stop(&a).await?;
         }
         Ok(n)
+    }
+    pub(crate) async fn finalize_agent_stop(&self, a: &Agent) -> Result<()> {
+        let run = a.run_id.as_ref().ok_or_else(|| invalid("run missing"))?;
+        let state = self.inner.engine.load(run).await?;
+        self.emit_stop_notice(a, &state).await?;
+        if terminal(&state.status)
+            && let Some(parent) = a.parent_id.as_ref()
+        {
+            let p = self.agent(parent).await?;
+            if let Some(parent_run) = p.run_id {
+                excalibur_engine::settle_child_budget(
+                    self.inner.engine.journal(),
+                    &parent_run,
+                    &a.id,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
     async fn emit_stop_notice(&self, a: &Agent, state: &excalibur_engine::Snapshot) -> Result<()> {
         let Some(class) = stop_notice_class(&state.status, state.reason.as_deref()) else {
@@ -258,19 +358,29 @@ impl Orchestrator {
                         self.set_pause_owner(&a.id, Some("resource".into()), true)
                             .await?;
                         action.pause.push(a.id.clone());
+                        self.emit_stop_notice(a, &self.inner.engine.load(run).await?)
+                            .await?;
+                        break;
                     }
                 }
             }
-            if rss > threshold.saturating_mul(120) / 100
-                && let Some(a) = all.iter().find(|a| action.pause.contains(&a.id))
-                && let Some(run) = &a.run_id
+            if action.pause.is_empty()
+                && rss > threshold.saturating_mul(120) / 100
                 && let Some(host) = host
-                && host
-                    .kill_largest_tool(run)
-                    .await
-                    .map_err(Error::Authority)?
             {
-                action.last_resort = Some(a.id.clone());
+                for a in &all {
+                    if self.paused_by(&a.id).await?.as_deref() == Some("resource")
+                        && let Some(run) = &a.run_id
+                        && self.inner.engine.load(run).await?.status == Status::Paused
+                        && host
+                            .kill_largest_tool(run)
+                            .await
+                            .map_err(Error::Authority)?
+                    {
+                        action.last_resort = Some(a.id.clone());
+                        break;
+                    }
+                }
             }
         } else if !high {
             drop(_control);
@@ -358,25 +468,44 @@ impl Orchestrator {
         Ok(())
     }
     pub async fn shutdown(&self) -> Result<()> {
-        let agents = self.active_agents().await?;
-        for a in &agents {
-            if let Some(run) = &a.run_id {
-                let s = self.inner.engine.load(run).await?;
+        let mut failure = None;
+        let agents = match self.active_agents().await {
+            Ok(agents) => agents,
+            Err(error) => {
+                failure = Some(error);
+                Vec::new()
+            }
+        };
+        for agent in agents {
+            let Some(run) = &agent.run_id else { continue };
+            let result = async {
+                let state = self.inner.engine.load(run).await?;
                 if matches!(
-                    s.status,
+                    state.status,
                     Status::Running | Status::Verifying | Status::Recovering
                 ) {
-                    let _control = self.inner.gate.lock().await;
+                    let _guard = self.inner.gate.lock().await;
                     if self.inner.engine.pause_if_active(run, "shutdown").await? {
-                        self.set_pause_owner(&a.id, Some("shutdown".into()), false)
+                        self.set_pause_owner(&agent.id, Some("shutdown".into()), false)
                             .await?;
                     }
                 }
+                Ok::<_, Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                failure.get_or_insert(error);
             }
         }
         let handles = std::mem::take(&mut *self.inner.running.lock().await);
         for (_, handle) in handles {
+            if failure.is_some() {
+                handle.abort();
+            }
             let _ = handle.await;
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         Ok(())
     }

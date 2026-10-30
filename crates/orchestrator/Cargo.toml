@@ -16,6 +16,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
 futures = "0.3"
 sha2 = "0.10"
+chrono = "0.4"
+chrono-tz = "0.10"
 [dev-dependencies]
 excalibur-models = { path = "../models" }
 tempfile = "3"

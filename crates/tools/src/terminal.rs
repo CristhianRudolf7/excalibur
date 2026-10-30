@@ -88,6 +88,7 @@ struct Inner {
     state: Mutex<State>,
     stopped: AtomicBool,
     run_sandboxes: Mutex<BTreeMap<String, SandboxConfig>>,
+    host_cgroups: Mutex<BTreeMap<String, PathBuf>>,
     run_limits: Mutex<BTreeMap<String, excalibur_types::runtime::ExecutionLimits>>,
 }
 #[derive(Default)]
@@ -112,6 +113,11 @@ struct Session {
     #[cfg(windows)]
     tty: bool,
 }
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminationReason {
+    MemoryExhaustion,
+}
 struct Output {
     file: File,
     path: PathBuf,
@@ -121,6 +127,7 @@ struct Output {
     exited: bool,
     exit_code: Option<i32>,
     timed_out: bool,
+    termination_reason: Option<TerminationReason>,
     error: Option<String>,
     persisted_blob: Option<String>,
 }
@@ -280,6 +287,7 @@ impl TerminalManager {
                 state: Mutex::new(State::default()),
                 stopped: AtomicBool::new(false),
                 run_sandboxes: Mutex::new(BTreeMap::new()),
+                host_cgroups: Mutex::new(BTreeMap::new()),
                 run_limits: Mutex::new(BTreeMap::new()),
             }),
         })
@@ -303,6 +311,28 @@ impl TerminalManager {
             .unwrap()
             .insert(run.into(), restricted);
         Ok(())
+    }
+    /// Trusted host-only per-execution cgroup binding; not a tool argument.
+    pub fn bind_cgroup(&self, run: &str, directory: PathBuf) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = prepare_cgroup(Some(&directory))?;
+            let mut groups = self
+                .inner
+                .host_cgroups
+                .lock()
+                .map_err(|_| "cgroup binding lock poisoned")?;
+            if groups.get(run).is_some_and(|old| old != &directory) {
+                return Err("execution cgroup cannot be rebound".into());
+            }
+            groups.insert(run.to_owned(), directory);
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (run, directory);
+            Err("delegated cgroups require Linux".into())
+        }
     }
     /// Attach a live security decision to future connections. Already-running
     /// proxies retain their guard, which consults current durable host policy.
@@ -373,11 +403,14 @@ impl TerminalManager {
             .get(run)
             .cloned()
             .or_else(|| self.inner.config.sandbox.clone());
-        let Some(sandbox) = sandbox else {
+        let Some(mut sandbox) = sandbox else {
             return ToolResult::error(
                 "exec requires an explicit host sandbox; command was not executed",
             );
         };
+        if let Some(group) = self.inner.host_cgroups.lock().unwrap().get(run) {
+            sandbox.cgroup_directory = Some(group.clone());
+        }
         let cwd = match sandbox.workspace.canonicalize() {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error.to_string()),
@@ -762,6 +795,14 @@ impl TerminalManager {
             .into_iter()
             .max_by_key(|s| rss.get(&s.pid).copied().unwrap_or(0))
             .ok_or("no managed process")?;
+        {
+            let mut output = session.output.lock().unwrap();
+            if output.exited {
+                return Ok(None);
+            }
+            output.termination_reason = Some(TerminationReason::MemoryExhaustion);
+            output.error = Some("terminated due to memory exhaustion".into());
+        }
         self.close(&session).await;
         self.inner.state.lock().unwrap().notices.push_back(
             json!({"run":run,"session_id":session.id,"reason":"terminated_for_memory_pressure"}),
@@ -873,10 +914,10 @@ impl TerminalManager {
         let truncated = truncated || text.len() > max;
         let text = crate::head_tail(&text, max);
         ToolResult {
-            success: true,
+            success: output.termination_reason.is_none(),
             full_output_blob: output.persisted_blob.clone(),
             output: json!({"session_id":session.id,"pid":session.pid,"output":text,"cursor":output.total,"truncated":truncated,
-            "exited":output.exited,"exit_code":output.exit_code,"timed_out":output.timed_out,"error":output.error,
+            "exited":output.exited,"exit_code":output.exit_code,"timed_out":output.timed_out,"error":output.error,"termination_reason":output.termination_reason,
             "spool_path":if output.persisted_blob.is_none(){Some(&output.path)}else{None}}),
         }
     }
@@ -950,6 +991,7 @@ impl TerminalManager {
                         exited: false,
                         exit_code: None,
                         timed_out: false,
+                        termination_reason: None,
                         error: None,
                         persisted_blob: None,
                     }),
@@ -1023,7 +1065,10 @@ impl TerminalManager {
                             Ok(Some(code)) => break Some(code),
                             Ok(None) => {}
                             Err(e) => {
-                                observed.output.lock().unwrap().error = Some(e.to_string());
+                                let mut output = observed.output.lock().unwrap();
+                                if output.termination_reason.is_none() {
+                                    output.error = Some(e.to_string());
+                                }
                                 break None;
                             }
                         }
@@ -1496,8 +1541,13 @@ fn launch(
             #[cfg(target_os = "linux")]
             {
                 // Background tool processes must not compete at the interactive
-                // daemon's scheduler priority. cgroup delegation remains host-owned.
-                if libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
+                // daemon's scheduler priority. Never raise an already lower priority.
+                *libc::__errno_location() = 0;
+                let current = libc::getpriority(libc::PRIO_PROCESS, 0);
+                if *libc::__errno_location() != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setpriority(libc::PRIO_PROCESS, 0, current.max(10)) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 libc::syscall(libc::SYS_ioprio_set, 1, 0, (2 << 13) | 7);
@@ -1595,6 +1645,40 @@ fn prepare_cgroup(directory: Option<&Path>) -> Result<Option<File>, String> {
     let mut info: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(name.as_ptr(), &mut info) } < 0 || info.f_type != 0x63677270 {
         return Err("host process cgroup must reside on a real cgroup v2 filesystem".into());
+    }
+    // A service manager explicitly delegates this execution's cgroup. Do not
+    // change a controller or move the daemon itself; reject insufficient delegation.
+    let parent = path.parent().ok_or("cgroup has no parent")?;
+    let parent_weight = fs::read_to_string(parent.join("cpu.weight"))
+        .map_err(|e| format!("parent CPU weight unavailable: {e}"))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "invalid parent CPU weight")?;
+    let membership = fs::read_to_string("/proc/self/cgroup")
+        .map_err(|e| format!("daemon cgroup unavailable: {e}"))?;
+    let daemon = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or("daemon cgroup v2 membership unavailable")?;
+    let daemon_weight = fs::read_to_string(
+        Path::new("/sys/fs/cgroup")
+            .join(daemon.trim_start_matches('/'))
+            .join("cpu.weight"),
+    )
+    .map_err(|e| format!("daemon CPU weight unavailable: {e}"))?
+    .trim()
+    .parse::<u32>()
+    .map_err(|_| "invalid daemon CPU weight")?;
+    if parent_weight <= 1 || daemon_weight <= 1 {
+        return Err("CPU weight cannot be lowered below the daemon and parent".into());
+    }
+    let weight = 10.min(parent_weight - 1).min(daemon_weight - 1);
+    fs::write(path.join("cpu.weight"), weight.to_string())
+        .map_err(|e| format!("delegated CPU weight is not writable: {e}"))?;
+    let actual = fs::read_to_string(path.join("cpu.weight"))
+        .map_err(|e| format!("delegated CPU weight cannot be verified: {e}"))?;
+    if actual.trim().parse::<u32>().ok() != Some(weight) {
+        return Err("delegated CPU weight was not applied".into());
     }
     OpenOptions::new()
         .write(true)

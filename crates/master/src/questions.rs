@@ -41,10 +41,55 @@ impl Master {
         default_answer: Option<String>,
         now: i64,
     ) -> Result<String> {
+        self.ask_for_source_inner(
+            conversation,
+            scope,
+            None,
+            text,
+            blocking,
+            default_answer,
+            now,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ask_for_source(
+        &self,
+        conversation: &str,
+        scope: &str,
+        source_message_id: &str,
+        text: &str,
+        blocking: bool,
+        default_answer: Option<String>,
+        now: i64,
+    ) -> Result<String> {
+        self.ask_for_source_inner(
+            conversation,
+            scope,
+            Some(source_message_id),
+            text,
+            blocking,
+            default_answer,
+            now,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn ask_for_source_inner(
+        &self,
+        conversation: &str,
+        scope: &str,
+        source: Option<&str>,
+        text: &str,
+        blocking: bool,
+        default_answer: Option<String>,
+        now: i64,
+    ) -> Result<String> {
         crate::validate_scope(scope)?;
         if self.inner.redactor.redact_text(scope) != scope {
             return Err(Error::Invalid("secret literal in question scope".into()));
         }
+        let source = source.map(str::to_string);
         let scope = scope.to_string();
         self.authorize_conversation(conversation).await?;
         if text.is_empty()
@@ -58,7 +103,7 @@ impl Master {
         let conversation = conversation.to_string();
         let text = self.inner.redactor.redact_text(text);
         let default_answer = default_answer.map(|s| self.inner.redactor.redact_text(&s));
-        self.inner.db.write(Priority::Interactive,move|conn|{let count:u32=conn.query_row("SELECT COUNT(*) FROM master_questions WHERE conversation_id=?1 AND answer IS NULL",[&conversation],|r|r.get(0))?;if count>=3{return Err(excalibur_store::Error::Invalid("at most three pending questions per conversation"));}conn.execute("INSERT INTO master_questions(id,conversation_id,scope_id,text,blocking,default_answer,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",(&saved,&conversation,&scope,&text,blocking,&default_answer,now))?;conn.execute("INSERT INTO master_events(conversation_id,kind,payload) VALUES(?1,'question',?2)",(&conversation,json!({"id":saved,"text":text,"blocking":blocking,"default_answer":default_answer}).to_string()))?;Ok(())}).await?;
+        self.inner.db.write(Priority::Interactive,move|conn|{let source=source.map(|source|conn.query_row("SELECT client_message_id FROM master_user_sources WHERE id=?1",[&source],|r|r.get::<_,String>(0)).optional().map(|literal|literal.unwrap_or(source))).transpose()?;if let Some(source)=&source {let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE id=?1 AND conversation_id=?2 AND scope_id=?3)",(source,&conversation,&scope),|r|r.get(0))?;if !valid{return Err(excalibur_store::Error::Invalid("question source does not belong to this scope"));}let count:u32=conn.query_row("SELECT COUNT(*) FROM master_question_sources WHERE source_message_id=?1",[source],|r|r.get(0))?;if count>=3{return Err(excalibur_store::Error::Invalid("at most three questions per source message"));}}conn.execute("INSERT INTO master_questions(id,conversation_id,scope_id,text,blocking,default_answer,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",(&saved,&conversation,&scope,&text,blocking,&default_answer,now))?;if let Some(source)=&source {conn.execute("INSERT INTO master_question_sources(question_id,source_message_id) VALUES(?1,?2)",(&saved,source))?;}conn.execute("INSERT INTO master_events(conversation_id,kind,payload) VALUES(?1,'question',?2)",(&conversation,json!({"id":saved,"text":text,"blocking":blocking,"default_answer":default_answer}).to_string()))?;Ok(())}).await?;
         Ok(id)
     }
     pub async fn answer_question(&self, conversation: &str, id: &str, answer: &str) -> Result<()> {
@@ -141,7 +186,7 @@ impl Master {
                 return Ok(QuestionRoute::Consumed(Some(scope)));
             }
             let kind=if unmatched {"clarification_not_matched"}else{"clarification_selection_required"};
-            let payload=redactor.redact_json(&json!({"source_message_id":source,"reply_to":analysis.reply_to,"question_ids":candidates.iter().map(|candidate|&candidate.0).collect::<Vec<_>>(),"reason":if unmatched {"The reply does not identify a pending question in this conversation."}else if !valid_text {"Clarification answers require 1..8192 text bytes without attachments."}else {"Select the pending question explicitly; no answer was guessed."}}));
+    let payload=redactor.redact_json(&json!({"source_message_id":source,"reply_to":analysis.reply_to,"question_ids":candidates.iter().map(|candidate|&candidate.0).collect::<Vec<_>>(),"reason":if unmatched {"The reply does not identify a pending question in this conversation."}else if !valid_text {"Clarification answers require 1..8192 text bytes without attachments."}else {"Select the pending question explicitly; no answer was guessed."}}));
             conn.execute("UPDATE master_inbox SET state='consumed' WHERE message_id=?1 AND state='routing'",[&source])?;
             conn.execute("INSERT INTO master_events(conversation_id,kind,payload) VALUES(?1,?2,?3)",(&conversation,kind,payload.to_string()))?;
             Ok(QuestionRoute::Consumed(None))
@@ -282,6 +327,7 @@ fn apply_answer(
     let message_id = MessageId::new().to_string();
     let text = format!("Clarification question: {question}\nUser answer: {answer}");
     conn.execute("INSERT INTO messages(id,conversation_id,role,text,scope_id,principal_id,reply_to) VALUES(?1,?2,'user',?3,?4,?5,?6)",(&message_id,conversation,&text,&scope,principal,source))?;
+    conn.execute("INSERT INTO master_answer_literals(message_id,source_message_id,literal_text) VALUES(?1,?2,?3)",(&message_id,source,answer))?;
     let payload=redactor.redact_json(&json!({"id":id,"answer":answer,"message_id":message_id,"source_message_id":source,"scope":scope}));
     conn.execute(
         "INSERT INTO master_events(conversation_id,kind,payload) VALUES(?1,'question_answered',?2)",

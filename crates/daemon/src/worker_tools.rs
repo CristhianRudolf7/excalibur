@@ -49,6 +49,7 @@ pub struct WorkerTools {
     privacy_roots: BTreeMap<String, Vec<PathBuf>>,
     routes: Mutex<BTreeMap<String, Route>>,
     bind_gate: tokio::sync::Mutex<()>,
+    cgroup_root: Option<PathBuf>,
 }
 impl WorkerTools {
     pub async fn new(
@@ -173,7 +174,64 @@ impl WorkerTools {
             privacy_roots,
             routes: Mutex::new(BTreeMap::new()),
             bind_gate: tokio::sync::Mutex::new(()),
+            cgroup_root: None,
         })
+    }
+    /// Service-manager delegated cgroup root; no controller is enabled implicitly.
+    pub fn with_cgroup_root(mut self, root: Option<PathBuf>) -> Result<Self, String> {
+        if let Some(root) = root {
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = root;
+                return Err("delegated cgroups require Linux".into());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let root = root.canonicalize().map_err(|e| e.to_string())?;
+                let path = std::ffi::CString::new(root.as_os_str().as_bytes())
+                    .map_err(|_| "invalid cgroup root")?;
+                let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+                if unsafe { libc::statfs(path.as_ptr(), &mut info) } < 0
+                    || info.f_type != 0x63677270
+                {
+                    return Err("delegated root must be a real cgroup v2 filesystem".into());
+                }
+                let controllers = std::fs::read_to_string(root.join("cgroup.subtree_control"))
+                    .map_err(|e| e.to_string())?;
+                if !controllers
+                    .split_whitespace()
+                    .any(|controller| controller == "cpu")
+                {
+                    return Err("CPU controller is not delegated to child cgroups".into());
+                }
+                self.cgroup_root = Some(root);
+            }
+        }
+        Ok(self)
+    }
+    fn bind_cgroup(&self, run: &str, local: &LocalTools) -> Result<(), String> {
+        if let Some(root) = &self.cgroup_root {
+            if run.len() > 128 {
+                return Err("invalid execution id for cgroup".into());
+            }
+            let name = run
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let directory = root.join(format!("excalibur-{name}"));
+            match std::fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(format!("execution cgroup cannot be created: {error}")),
+            }
+            if directory.canonicalize().map_err(|e| e.to_string())? != directory {
+                return Err("execution cgroup must not be a symlink".into());
+            }
+            local.terminals().bind_cgroup(run, directory)?;
+        }
+        Ok(())
     }
     pub fn workspace_for(&self, run: &str) -> Result<PathBuf, String> {
         Ok(self.route(run)?.local.workspace().root().to_path_buf())
@@ -200,6 +258,7 @@ impl WorkerTools {
         } else {
             LocalTools::new(self.db.clone(), root, policy).await?
         };
+        self.bind_cgroup(run, &tools)?;
         Ok(Arc::new(tools.restrict_scope_roots(route.allowed.clone())?))
     }
     pub fn managed_worktree_roots(&self) -> BTreeMap<String, PathBuf> {
@@ -421,6 +480,7 @@ impl WorkerTools {
             }
         };
         token.validate()?;
+        self.bind_cgroup(run, &local)?;
         self.claim_binding(agent, &source, &workspace, &parent_task, owner.as_deref())
             .await?;
         let mut routes = self
@@ -504,7 +564,65 @@ impl WorkerTools {
             .await?
             .is_some())
     }
+    pub fn with_project_services(
+        mut self,
+        services: BTreeMap<String, Arc<excalibur_tools::intelligence::ProjectIntelligence>>,
+    ) -> Result<Self, String> {
+        for (scope, services) in services {
+            if !scope.starts_with("project:") {
+                return Err("language services require a provisioned project scope".into());
+            }
+            let local = self
+                .sources
+                .get(&scope)
+                .ok_or("language service scope is not provisioned")?;
+            self.sources.insert(
+                scope,
+                Arc::new(local.as_ref().clone().with_intelligence(services)?),
+            );
+        }
+        Ok(self)
+    }
+    pub fn active_processes(&self) -> usize {
+        let runs = self
+            .routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        runs.iter()
+            .map(|run| {
+                self.live_status(run)
+                    .iter()
+                    .filter(|status| status["exited"] == false)
+                    .count()
+            })
+            .sum()
+    }
+    pub async fn unload_idle(&self) -> Result<usize, String> {
+        let mut locals = self.sources.values().cloned().collect::<Vec<_>>();
+        locals.extend(
+            self.routes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .map(|r| r.local.clone()),
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        let mut count = 0;
+        for local in locals {
+            if let Some(services) = local.project_intelligence()
+                && let Some(lsp) = &services.lsp
+                && seen.insert(Arc::as_ptr(lsp) as usize)
+            {
+                count += lsp.unload_idle().await;
+            }
+        }
+        Ok(count)
+    }
     pub async fn shutdown(&self) {
+        let _ = self.unload_idle().await;
         let mut all = self.sources.values().cloned().collect::<Vec<_>>();
         if let Ok(routes) = self.routes.lock() {
             all.extend(routes.values().map(|r| r.local.clone()));

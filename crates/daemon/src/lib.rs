@@ -23,5 +23,7 @@ pub mod projection;
 
 mod project_scope;
 
+pub mod services;
+
 pub mod memory;
 pub use memory::{MemoryFastActions, MemoryHost, MemoryOptions};
