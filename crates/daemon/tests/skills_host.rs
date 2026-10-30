@@ -19,6 +19,14 @@ struct Model {
     skill_file: std::path::PathBuf,
 }
 impl ModelGateway for Model {
+    // The local synthetic provider has a finite per-call ceiling. Leaving it
+    // unknown correctly reserves the entire remaining run on interruption.
+    fn call_bound(&self, _: &ModelRequest) -> Option<excalibur_models::ModelCallBound> {
+        Some(excalibur_models::ModelCallBound {
+            max_tokens: 32768,
+            max_cost_microusd: 0,
+        })
+    }
     fn complete(&self, request: ModelRequest) -> BoxFuture<'_, Result<ModelResponse, ModelError>> {
         Box::pin(async move {
             let step = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -320,6 +328,10 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
             )
         });
         let state = host.orchestrator.engine().load(&run).await.unwrap();
+        assert!(state.usage.estimated);
+        assert!(state.usage.input_tokens + state.usage.output_tokens >= 32768);
+        assert!(state.usage.input_tokens + state.usage.output_tokens < 100000);
+
         assert_eq!(
             state
                 .context_session
