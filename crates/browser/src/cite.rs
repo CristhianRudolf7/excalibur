@@ -50,8 +50,11 @@ pub fn normalize(text: &str) -> String {
 
 /// Locate `quote` inside `markdown`, returning byte offsets and fragment id.
 ///
-/// Exact match wins; otherwise a whitespace/case-normalized search is used.
-/// Returns `None` when the quote is absent.
+/// Exact match wins; otherwise a whitespace/case-normalized search is used
+/// and the normalized hit is mapped back to the exact raw byte span covering
+/// the matched words (char-boundary aligned). Returned offsets always index
+/// the raw `markdown`; normalizing `&markdown[start..end]` reproduces the
+/// normalized quote. Returns `None` when the quote is absent.
 pub fn locate(
     markdown: &str,
     fragments: &[Fragment],
@@ -64,19 +67,62 @@ pub fn locate(
         let end = start + quote.len();
         return Some((start, end, fragment_at(fragments, start)));
     }
-    let norm_md = normalize(markdown);
     let norm_q = normalize(quote);
     if norm_q.is_empty() {
         return None;
     }
-    norm_md.find(&norm_q)?;
-    // Map the normalized hit back to the raw markdown by scanning for the
-    // first long token of the quote.
-    let token = norm_q.split(' ').find(|t| t.len() >= 4).unwrap_or(&norm_q);
-    let approx = markdown.to_lowercase().find(token).unwrap_or(0);
-    let start = approx.min(markdown.len());
-    let end = (start + quote.len()).min(markdown.len());
+    let (start, end) = find_normalized_span(markdown, &norm_q)?;
     Some((start, end, fragment_at(fragments, start)))
+}
+
+/// Map a normalized quote to its exact raw byte span in `markdown`.
+///
+/// Tokenizes the raw document into words with byte ranges and finds the
+/// normalized token sequence as a contiguous window (case-insensitive,
+/// whitespace-flexible). The returned span covers the first matched word
+/// through the last one with original casing and spacing preserved, so the
+/// offsets are exact rather than approximate.
+fn find_normalized_span(markdown: &str, norm_q: &str) -> Option<(usize, usize)> {
+    let tokens: Vec<&str> = norm_q.split(' ').filter(|t| !t.is_empty()).collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut words: Vec<(usize, usize, String)> = Vec::new();
+    let mut word_start: Option<usize> = None;
+    for (idx, ch) in markdown.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = word_start.take() {
+                let word = &markdown[start..idx];
+                words.push((start, idx, word.to_lowercase()));
+            }
+        } else if word_start.is_none() {
+            word_start = Some(idx);
+        }
+    }
+    if let Some(start) = word_start.take() {
+        let word = &markdown[start..];
+        words.push((start, markdown.len(), word.to_lowercase()));
+    }
+    if words.len() < tokens.len() {
+        return None;
+    }
+    for window in 0..=words.len() - tokens.len() {
+        let mut ok = true;
+        for (offset, token) in tokens.iter().enumerate() {
+            if words[window + offset].2 != *token {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            let start = words[window].0;
+            let end = words[window + tokens.len() - 1].1;
+            if markdown.is_char_boundary(start) && markdown.is_char_boundary(end) && start < end {
+                return Some((start, end));
+            }
+        }
+    }
+    None
 }
 
 fn fragment_at(fragments: &[Fragment], offset: usize) -> String {

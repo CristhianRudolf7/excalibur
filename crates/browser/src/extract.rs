@@ -363,6 +363,65 @@ fn asks_javascript(html: &str) -> bool {
         || lower.contains("enable javascript to")
 }
 
+/// Parse `<meta name=robots ...>` directives in `html`.
+///
+/// Returns `(noindex, nofollow)` using comma-separated token matching, the
+/// same vocabulary as the search pipeline's `parse_robots_directives`. Only
+/// the first matching meta tag is honoured; absence means `(false, false)`.
+/// `X-Robots-Tag` headers are broker-owned (HTTP layer) and not inspected
+/// here.
+pub fn robots_meta_directives(html: &str) -> (bool, bool) {
+    let lower = html.to_lowercase();
+    let mut cursor = 0;
+    while let Some(open) = lower[cursor..].find("<meta") {
+        let base = cursor + open;
+        let Some(close_rel) = lower[base..].find('>') else {
+            break;
+        };
+        let tag = &lower[base..base + close_rel + 1];
+        cursor = base + close_rel + 1;
+        if !tag.contains("name") || !tag.contains("robots") {
+            continue;
+        }
+        let Some(content_at) = tag.find("content") else {
+            continue;
+        };
+        let after = &tag[content_at + "content".len()..];
+        let Some(eq) = after.find('=') else {
+            continue;
+        };
+        let mut value = after[eq + 1..].trim_start();
+        if value.starts_with('"') || value.starts_with('\'') {
+            let quote = value.as_bytes()[0] as char;
+            value = &value[1..];
+            if let Some(end) = value.find(quote) {
+                value = &value[..end];
+            }
+        } else if let Some(end) = value.find([' ', '/', '>']) {
+            value = &value[..end];
+        }
+        let mut noindex = false;
+        let mut nofollow = false;
+        for token in value.split(',').map(|part| part.trim()) {
+            match token {
+                "noindex" => noindex = true,
+                "nofollow" => nofollow = true,
+                _ => {}
+            }
+        }
+        return (noindex, nofollow);
+    }
+    (false, false)
+}
+
+/// True when `html` carries `<meta name=robots content=noindex...>`.
+///
+/// Index-enqueue hooks consult this together with the `robots.txt` decision;
+/// actual queue insertion stays broker-owned (pending B9).
+pub fn has_robots_noindex(html: &str) -> bool {
+    robots_meta_directives(html).0
+}
+
 fn has_empty_mount(html: &str, text_len: usize) -> bool {
     if text_len >= 500 {
         return false;

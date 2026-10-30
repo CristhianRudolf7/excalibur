@@ -152,6 +152,24 @@ impl Service {
     }
 }
 
+/// Index-enqueue decision for fetched `html` (hook for the broker/B9 lane).
+///
+/// Returns false when the policy disables enqueue or — with `respect_robots`
+/// — when the supplied `robots.txt` decision denies the path or the page
+/// carries `<meta name=robots content=noindex>`. Retrieval of `robots.txt`,
+/// DNS-bound egress and actual queue insertion stay broker-owned (pending
+/// B9); this helper keeps the service side honest about the 14.4 robots/index
+/// row without touching the serve path.
+pub fn should_enqueue_index(html: &str, robots_allow: bool, policy: &read::FetchPolicy) -> bool {
+    if !read::should_enqueue_index(robots_allow, policy) {
+        return false;
+    }
+    if policy.respect_robots && extract::has_robots_noindex(html) {
+        return false;
+    }
+    true
+}
+
 /// Minimal `YYYY-MM-DDTHH:MM:SSZ` rendering for a Unix timestamp.
 pub fn format_ts(now_secs: u64) -> String {
     // Days-to-date conversion for the cache timestamp (no chrono dependency).
