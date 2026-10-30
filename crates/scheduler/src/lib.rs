@@ -84,7 +84,7 @@ impl Scheduler {
         }
         db.write(Priority::Journal, move |c| {
             c.execute_batch("CREATE TABLE IF NOT EXISTS scheduler_schema(version INTEGER PRIMARY KEY,checksum TEXT NOT NULL)")?;
-            for (version,schema) in [(1,include_str!("schema.sql")),(2,include_str!("schema2.sql")),(3,include_str!("schema3.sql"))] {
+            for (version,schema) in [(1,include_str!("schema.sql")),(2,include_str!("schema2.sql")),(3,include_str!("schema3.sql")),(4,include_str!("schema4.sql"))] {
                 let checksum=format!("{:x}",Sha256::digest(schema.as_bytes()));
                 let known:Option<String>=c.query_row("SELECT checksum FROM scheduler_schema WHERE version=?1",[version],|r|r.get(0)).optional()?;
                 if known.as_ref().is_some_and(|stored|stored!=&checksum){return Err(Error::Invalid("scheduler schema checksum mismatch"));}

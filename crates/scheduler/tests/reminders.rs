@@ -371,3 +371,90 @@ async fn real_process_interruption_preserves_atomic_records() {
     );
     db.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn host_metadata_follows_only_the_winning_generation_and_legacy_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = db(&dir);
+    let reminders = open(&db, "p", "c").await;
+    let original = reminders
+        .apply("legacy".into(), create("legacy"))
+        .await
+        .unwrap();
+    let request = db
+        .read(ReadLane::Interactive, |c| {
+            Ok(c.query_row(
+                "SELECT request FROM scheduler_reminder_receipts WHERE operation_key='legacy'",
+                [],
+                |r| r.get::<_, String>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(request, serde_json::to_string(&create("legacy")).unwrap());
+    assert_eq!(
+        reminders
+            .apply("legacy".into(), create("legacy"))
+            .await
+            .unwrap(),
+        original
+    );
+    reminders
+        .apply_host(
+            "host-create".into(),
+            create("host"),
+            Some(serde_json::json!({"source":"creator"})),
+        )
+        .await
+        .unwrap();
+    let op = Operation::Snooze {
+        id: "host".into(),
+        generation: 1,
+        timing: Timing::At(20),
+    };
+    let (a, b) = tokio::join!(
+        reminders.apply_host(
+            "a".into(),
+            op.clone(),
+            Some(serde_json::json!({"source":"a"}))
+        ),
+        reminders.apply_host("b".into(), op, Some(serde_json::json!({"source":"b"})))
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    let winner = if a.is_ok() { "a" } else { "b" };
+    reminders.tick(20, false, 100).await.unwrap();
+    let pending = reminders
+        .pending(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|p| p.reminder.id == "host")
+        .unwrap();
+    assert_eq!(
+        reminders.metadata(&pending).await.unwrap().unwrap()["source"],
+        winner
+    );
+    reminders
+        .apply(
+            "inherit".into(),
+            Operation::Snooze {
+                id: "host".into(),
+                generation: 2,
+                timing: Timing::At(30),
+            },
+        )
+        .await
+        .unwrap();
+    reminders.tick(30, false, 100).await.unwrap();
+    let pending = reminders
+        .pending(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|p| p.reminder.id == "host")
+        .unwrap();
+    assert_eq!(
+        reminders.metadata(&pending).await.unwrap().unwrap()["source"],
+        winner
+    );
+}

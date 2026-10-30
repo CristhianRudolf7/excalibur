@@ -79,6 +79,28 @@ impl Master {
     }
     /// Flush fixed five-second buckets into one literal template per scope.
     pub async fn flush_notices(&self, now: i64) -> Result<usize> {
+        self.flush_notices_inner(now,None::<fn(&excalibur_store::rusqlite::Connection,&str)->excalibur_store::Result<bool>>).await
+    }
+    /// Host guards each pending member inside the grouped publication writer.
+    /// Suppressed members remain durable and pending without being acknowledged.
+    pub async fn flush_notices_checked(
+        &self,
+        now: i64,
+        check: impl Fn(&excalibur_store::rusqlite::Connection, &str) -> excalibur_store::Result<bool>
+        + Send
+        + 'static,
+    ) -> Result<usize> {
+        self.flush_notices_inner(now, Some(check)).await
+    }
+    async fn flush_notices_inner(
+        &self,
+        now: i64,
+        check: Option<
+            impl Fn(&excalibur_store::rusqlite::Connection, &str) -> excalibur_store::Result<bool>
+            + Send
+            + 'static,
+        >,
+    ) -> Result<usize> {
         let principal = self.inner.config.principal.clone();
         let inner = self.inner.clone();
         let count=self.inner.db.write(Priority::Interactive,move|conn| {
@@ -87,14 +109,33 @@ impl Master {
             let active=inner.active.lock().unwrap_or_else(|e|e.into_inner());
             let mut groups={let mut q=conn.prepare("SELECT conversation_id,scope_id,due_at FROM master_notice_outbox WHERE flushed=0 AND due_at<=?1 GROUP BY conversation_id,scope_id,due_at ORDER BY due_at,conversation_id,scope_id LIMIT 128")?;q.query_map([now],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
             groups.retain(|(conversation,_,_)|!active.contains_key(conversation));
+            let mut published=0;
             for (conversation,scope,due) in &groups {
-                let members={let mut q=conn.prepare("SELECT notice_id,content FROM master_notice_outbox WHERE conversation_id=?1 AND scope_id=?2 AND due_at=?3 AND flushed=0 ORDER BY notice_id LIMIT 32")?;q.query_map((conversation,scope,due),|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
+                let mut eligible=Vec::new();
+                let mut after:Option<String>=None;
+                loop {
+                    let page={let mut q=conn.prepare("SELECT notice_id,content FROM master_notice_outbox WHERE conversation_id=?1 AND scope_id=?2 AND due_at=?3 AND flushed=0 AND (?4 IS NULL OR notice_id>?4) ORDER BY notice_id LIMIT 32")?;q.query_map((conversation,scope,due,&after),|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
+                    if page.is_empty() {break;}
+                    after=page.last().map(|member|member.0.clone());
+                    for member in page {
+                        let allowed=match crate::notice_guards::origin(conn,&member.0)? {
+                            None=>true,
+                            Some(origin)=>match &check {None=>false,Some(check)=>check(conn,&origin)?},
+                        };
+                        if allowed {eligible.push(member);}
+                        if eligible.len()==32 {break;}
+                    }
+                    if eligible.len()==32 {break;}
+                }
+                let members=eligible;
+                if members.is_empty() {continue;}
                 let text=members.iter().map(|(_,content)|crate::templates::notice(&serde_json::from_str(content).unwrap_or_default())).collect::<Vec<_>>().join("\n");
                 let id=excalibur_types::MessageId::new().to_string();
                 conn.execute("INSERT INTO messages(id,conversation_id,role,text,scope_id,principal_id) VALUES(?1,?2,'assistant',?3,?4,?5)",(&id,conversation,&text,scope,&principal))?;
                 conn.execute("INSERT INTO master_events(conversation_id,kind,payload) VALUES(?1,'notification_group',?2)",(conversation,serde_json::json!({"message_id":id,"text":text,"scope":scope,"members":members.iter().map(|(id,_)|id).collect::<Vec<_>>(),"bucket":due}).to_string()))?;
+                published+=1;
                 for (notice,_) in members {conn.execute("UPDATE master_notice_outbox SET flushed=1 WHERE notice_id=?1",[notice])?;}
-            }Ok(groups.len())
+            }Ok(published)
         }).await?;
         self.inner.wake.notify_waiters();
         Ok(count)

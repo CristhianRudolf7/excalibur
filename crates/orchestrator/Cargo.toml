@@ -3,6 +3,7 @@ name = "excalibur-orchestrator"
 version = "0.1.0"
 edition = "2024"
 [dependencies]
+excalibur-scheduler = { path = "../scheduler" }
 excalibur-engine = { path = "../engine" }
 excalibur-journal = { path = "../journal" }
 excalibur-context = { path = "../context" }

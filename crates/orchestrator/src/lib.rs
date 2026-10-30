@@ -14,6 +14,7 @@ mod projects;
 mod recovery_test_support;
 pub use notifications::{
     HostNotificationAuthority, HostNotificationBinding, HostNotificationTarget,
+    host_notification_effect_allowed,
 };
 pub use profiles::CustomProfile;
 pub mod recovery;

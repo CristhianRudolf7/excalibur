@@ -4,6 +4,7 @@ mod context_request;
 mod fast_tools;
 pub use fast_tools::MasterFastTools;
 mod intake;
+mod notice_guards;
 mod provenance;
 mod questions;
 mod templates;
@@ -292,6 +293,7 @@ impl Master {
         .await?;
         provenance::migrate(&db).await?;
         cancellation::migrate(&db).await?;
+        notice_guards::migrate(&db).await?;
         let outage: bool = db
             .read(ReadLane::Interactive, |conn| {
                 Ok(conn.query_row(
@@ -703,6 +705,45 @@ impl Master {
         content: Value,
         class: &str,
     ) -> Result<u64> {
+        self.publish_notice_inner(id, conversation, content, class, None, |_| Ok(true))
+            .await
+    }
+    /// Host-only synchronous validation shares the durable sink transaction.
+    pub async fn publish_notice_checked(
+        &self,
+        id: &str,
+        conversation: &str,
+        content: Value,
+        class: &str,
+        origin: &str,
+        check: impl FnOnce(&excalibur_store::rusqlite::Connection) -> excalibur_store::Result<bool>
+        + Send
+        + 'static,
+    ) -> Result<u64> {
+        if origin.is_empty() || origin.len() > 512 {
+            return Err(Error::Invalid("invalid notice origin".into()));
+        }
+        self.publish_notice_inner(
+            id,
+            conversation,
+            content,
+            class,
+            Some(origin.to_owned()),
+            check,
+        )
+        .await
+    }
+    async fn publish_notice_inner(
+        &self,
+        id: &str,
+        conversation: &str,
+        content: Value,
+        class: &str,
+        origin: Option<String>,
+        check: impl FnOnce(&excalibur_store::rusqlite::Connection) -> excalibur_store::Result<bool>
+        + Send
+        + 'static,
+    ) -> Result<u64> {
         self.authorize_conversation(conversation).await?;
         if id.is_empty()
             || id.len() > 256
@@ -742,6 +783,13 @@ impl Master {
         );
         let principal = self.inner.config.principal.clone();
         let (cursor,new)=self.inner.db.write(Priority::Interactive,move|conn| {
+            match origin {
+                Some(origin)=>{
+                    if !check(conn)? {return Err(excalibur_store::Error::Invalid("host notice effect no longer authorized"));}
+                    notice_guards::bind(conn,&id,&origin)?;
+                },
+                None=>if notice_guards::origin(conn,&id)?.is_some() {return Err(excalibur_store::Error::Invalid("guarded notice requires host validation"));},
+            }
             if let Some((old_hash,cursor))=conn.query_row("SELECT fingerprint,event_sequence FROM master_notices WHERE id=?1",[&id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?))).optional()? {if old_hash!=fingerprint{return Err(excalibur_store::Error::Invalid("notice id reused with different payload"));}return Ok((cursor,false));}
             let scope=match notice_scope {Some(scope)=>scope,None=>conn.query_row("SELECT COALESCE(active_scope,'general') FROM conversations WHERE id=?1",[&conversation_owned],|r|r.get(0))?};
             conn.execute("INSERT INTO messages(id,conversation_id,role,text,scope_id,principal_id) VALUES(?1,?2,?3,?4,?5,?6)",(&message_id,&conversation_owned,if queue_urgent{"user"}else{"assistant"},&text,&scope,&principal))?;

@@ -29,3 +29,5 @@ pub mod memory;
 pub use memory::{MemoryFastActions, MemoryHost, MemoryOptions};
 
 pub mod skills;
+
+pub mod agenda;
