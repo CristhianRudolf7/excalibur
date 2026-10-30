@@ -342,14 +342,17 @@ impl Shadow {
             eprintln!("shadow collection deferred: a retained tree could not be protected");
             return;
         }
-        let _ = self
+        if self
             .git(
                 vec!["gc".into(), "--prune=1.hour.ago".into(), "--quiet".into()],
                 None,
                 None,
             )
-            .await;
-        let _ = std::fs::write(&marker, excalibur_store::unix_seconds().to_string());
+            .await
+            .is_ok()
+        {
+            let _ = std::fs::write(&marker, excalibur_store::unix_seconds().to_string());
+        }
     }
     pub(crate) async fn lookup(&self, id: &str) -> Result<Option<Snapshot>> {
         let (id, root) = (
