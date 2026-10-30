@@ -28,8 +28,11 @@ impl Engine {
             serde_json::to_string(&variants)?
         );
         let policy = self.effective_context_policy()?;
-        let core_tokens =
-            excalibur_context::estimate_tokens(&text).max(policy.counter.estimate_text(&text));
+        let core_message = Message::text("system", format!("[L0]\n{core}{core_suffix}"));
+        let core_tokens = excalibur_context::TokenCounter::with_margin(
+            policy.counter.core_layer_tokens(&core_message, &variants),
+        )
+        .max(excalibur_context::estimate_tokens(&text));
         let model_input_limit = self
             .model
             .context_policy_override()

@@ -1,5 +1,5 @@
 //! Local text tokenizers and durable, integer-only per-model calibration.
-use excalibur_types::runtime::{Message, ModelRequest};
+use excalibur_types::runtime::{Message, ModelRequest, ToolDefinition};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,6 +66,15 @@ impl TokenCounter {
             Some(bpe) => bpe.encode_ordinary(text).len(),
             None => scaled(text.chars().count(), self.tokens_per_million_chars),
         }
+    }
+    /// Exact L0 route shared by session validation and fresh native builders:
+    /// the framed core message plus the ordered eager tool schema array.
+    pub fn core_layer_tokens(&self, core: &Message, tools: &[ToolDefinition]) -> usize {
+        self.estimate_text(&core.content).saturating_add(
+            self.estimate_text(
+                &serde_json::to_string(tools).expect("serializable tool definitions"),
+            ),
+        )
     }
     pub fn estimate_text(&self, text: &str) -> usize {
         scaled(self.count_text(text), self.request_ratio_ppm)

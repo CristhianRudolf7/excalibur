@@ -669,28 +669,24 @@ impl ContextSession {
         let layer_budgets = input.token_budgets;
         input.token_budgets = [usize::MAX; 6];
         let mut compiled = crate::compile(&input)?;
-        compiled.estimated_tokens =
-            std::array::from_fn(|layer| match layer {
-                0 => {
-                    self.policy
-                        .counter
-                        .estimate_text(&compiled.request.messages[0].content)
-                        .saturating_add(self.policy.counter.estimate_text(
-                            &serde_json::to_string(&compiled.request.tools).unwrap(),
-                        ))
-                }
-                1..=3 => self
-                    .policy
-                    .counter
-                    .estimate_text(&compiled.request.messages[layer].content),
-                4 => self.policy.counter.count_messages(
-                    &compiled.request.messages[4..compiled.request.messages.len() - 1],
-                ),
-                _ => self
-                    .policy
-                    .counter
-                    .estimate_text(&compiled.request.messages.last().unwrap().content),
-            });
+        compiled.estimated_tokens = std::array::from_fn(|layer| match layer {
+            0 => self
+                .policy
+                .counter
+                .core_layer_tokens(&compiled.request.messages[0], &compiled.request.tools),
+            1..=3 => self
+                .policy
+                .counter
+                .estimate_text(&compiled.request.messages[layer].content),
+            4 => self
+                .policy
+                .counter
+                .count_messages(&compiled.request.messages[4..compiled.request.messages.len() - 1]),
+            _ => self
+                .policy
+                .counter
+                .estimate_text(&compiled.request.messages.last().unwrap().content),
+        });
         for (layer, budget) in layer_budgets
             .into_iter()
             .enumerate()
