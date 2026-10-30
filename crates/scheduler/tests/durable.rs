@@ -114,6 +114,17 @@ async fn exact_startup_time_is_not_skipped_and_overflow_finishes_timer() {
         .unwrap();
     a.create(timer("exact", MissedPolicy::Skip)).await.unwrap();
     assert_eq!(a.tick(100, true, 100).await.unwrap(), 1);
+    // Backlog must not suppress an occurrence due exactly at recovery.
+    assert_eq!(a.tick(120, true, 100).await.unwrap(), 1);
+    assert_eq!(
+        a.pending(100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|f| f.scheduled_at)
+            .collect::<Vec<_>>(),
+        [100, 120]
+    );
     let mut terminal = timer("last", MissedPolicy::RunAll);
     terminal.timing = Timing::Every {
         first: i64::MAX,
