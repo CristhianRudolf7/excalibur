@@ -8,3 +8,5 @@ CREATE TABLE IF NOT EXISTS web_tabs(id TEXT PRIMARY KEY,session_id TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS web_ops(op_key TEXT PRIMARY KEY,run_id TEXT NOT NULL,tool TEXT NOT NULL,request_hash TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN('received','dispatched','completed','failed')),result TEXT CHECK(result IS NULL OR json_valid(result)),created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS web_events(cursor INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT NOT NULL,data TEXT NOT NULL CHECK(json_valid(data)),at INTEGER NOT NULL);
 PRAGMA user_version=1;
+
+CREATE TABLE IF NOT EXISTS web_observation_blobs(hash TEXT NOT NULL,owner_run TEXT NOT NULL,snapshot TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(hash,owner_run,snapshot));

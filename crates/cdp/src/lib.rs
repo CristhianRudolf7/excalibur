@@ -44,6 +44,8 @@ struct State {
     topics: Mutex<HashMap<String, broadcast::Sender<Event>>>,
     all: broadcast::Sender<Event>,
     lifecycle: broadcast::Sender<Event>,
+    observation: broadcast::Sender<Event>,
+    console: broadcast::Sender<Event>,
     attachments: Mutex<HashMap<String, Event>>,
     closed: watch::Sender<Option<Error>>,
     next_id: AtomicU64,
@@ -96,6 +98,24 @@ impl State {
         {
             let _ = topic.send(event.clone());
         }
+        if event.method.starts_with("Page.")
+            || matches!(
+                event.method.as_str(),
+                "Network.requestWillBeSent"
+                    | "Network.responseReceived"
+                    | "Network.loadingFinished"
+                    | "Network.loadingFailed"
+                    | "Network.requestServedFromCache"
+            )
+        {
+            let _ = self.observation.send(event.clone());
+        }
+        if matches!(
+            event.method.as_str(),
+            "Runtime.consoleAPICalled" | "Runtime.exceptionThrown" | "Log.entryAdded"
+        ) {
+            let _ = self.console.send(event.clone());
+        }
         let _ = self.all.send(event);
     }
     fn fail_session(&self, session: &str) {
@@ -135,6 +155,8 @@ impl Client {
     {
         let (all, _) = broadcast::channel(1024);
         let (lifecycle, _) = broadcast::channel(256);
+        let (observation, _) = broadcast::channel(1024);
+        let (console, _) = broadcast::channel(2048);
         let (closed, _) = watch::channel(None);
         let state = Arc::new(State {
             pending: Mutex::new(HashMap::new()),
@@ -142,6 +164,8 @@ impl Client {
             topics: Mutex::new(HashMap::new()),
             all,
             lifecycle,
+            observation,
+            console,
             attachments: Mutex::new(HashMap::new()),
             closed,
             next_id: AtomicU64::new(1),
@@ -162,6 +186,14 @@ impl Client {
             });
         });
         client
+    }
+    /// Readiness events exclude console, response bodies and streaming frame traffic.
+    pub fn subscribe_observation(&self) -> broadcast::Receiver<Event> {
+        self.state.observation.subscribe()
+    }
+    /// Bounded console events; loss here never changes readiness or browser lifecycle.
+    pub fn subscribe_console(&self) -> broadcast::Receiver<Event> {
+        self.state.console.subscribe()
     }
     pub fn subscribe_all(&self) -> broadcast::Receiver<Event> {
         self.state.all.subscribe()

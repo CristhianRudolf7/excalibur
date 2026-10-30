@@ -195,6 +195,7 @@ async fn contract(root: PathBuf) {
                     rw: vec!["http://chat.test".into()],
                     login: vec!["http://login.test".into()],
                     listen: true,
+                    wait: None,
                     listen_probe: ListenProbe {
                         unread_selector: ".unread".into(),
                     },
@@ -658,6 +659,32 @@ async fn contract(root: PathBuf) {
     let cursor = m.db.events(0).await.unwrap().last().unwrap()["cursor"]
         .as_u64()
         .unwrap();
+    // The target can commit before the asynchronous document reconciliation completes.
+    eval(
+        &m,
+        "rpc",
+        rpc_sid,
+        other_tid,
+        "if(location.hostname!=='other.test')throw Error('loading');return true",
+    )
+    .await;
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let sessions = m.list("rpc").await;
+        if sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["session_id"] == rpc_sid && s["state"] == "ready")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "new tab did not reconcile: {sessions}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     m.switch("rpc", rpc_sid, other_tid).await.unwrap();
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(duration) {
@@ -1039,6 +1066,7 @@ async fn reconciliation_contract(root: PathBuf) {
                 rw: vec!["http://chat.test".into()],
                 login: vec!["http://login.test".into()],
                 listen: true,
+                wait: None,
                 listen_probe: ListenProbe {
                     unread_selector: ".unread".into(),
                 },
@@ -1271,6 +1299,7 @@ async fn spin_contract(root: PathBuf) {
                 name: "chat".into(),
                 rw: vec!["http://chat.test".into()],
                 listen: true,
+                wait: None,
                 listen_probe: ListenProbe {
                     unread_selector: ".unread".into(),
                 },

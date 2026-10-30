@@ -136,7 +136,17 @@ impl Protocol {
         }
         if matches!(
             r.method.as_str(),
-            "session.list" | "status.get" | "events.list"
+            "session.list"
+                | "status.get"
+                | "events.list"
+                | "observe.wait_ready"
+                | "observe.snapshot"
+                | "observe.subtree"
+                | "observe.validate_ref"
+                | "devtools.console"
+                | "devtools.network"
+                | "devtools.performance"
+                | "blob.read"
         ) {
             let v = tokio::time::timeout(
                 Duration::from_millis(deadline),
@@ -156,6 +166,11 @@ impl Protocol {
                 | "tab.switch"
                 | "tab.close"
                 | "site.set_login_state"
+                | "emulate.viewport"
+                | "nav.go"
+                | "nav.reload"
+                | "nav.back"
+                | "nav.forward"
         ) {
             return Err(Fault::new("method_not_found", "method is not implemented"));
         }
@@ -308,6 +323,32 @@ impl Protocol {
         let sid = || string(p, "session_id");
         let tid = || string(p, "tab_id");
         match method {
+            "observe.wait_ready"
+            | "observe.snapshot"
+            | "observe.subtree"
+            | "observe.validate_ref"
+            | "devtools.console"
+            | "devtools.network"
+            | "devtools.performance"
+            | "emulate.viewport"
+            | "nav.go"
+            | "nav.reload"
+            | "nav.back"
+            | "nav.forward" => {
+                self.manager
+                    .observe(run, sid()?, tid()?, method, p.clone())
+                    .await
+            }
+            "blob.read" => {
+                self.manager
+                    .observation_blob(
+                        run,
+                        string(p, "sha256")?,
+                        p["offset"].as_u64().unwrap_or(0),
+                        p["length"].as_u64().unwrap_or(65536) as usize,
+                    )
+                    .await
+            }
             "session.open" => {
                 let mut args = p.clone();
                 let o = args.as_object_mut().unwrap();

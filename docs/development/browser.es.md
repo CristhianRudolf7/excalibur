@@ -2,7 +2,8 @@
 
 `excalibur-cdp` implementa CDP asíncrono por tuberías nativas. `excalibur-browser`
 lanza y supervisa instancias de Chrome, verifica el sandbox de renderizadores y
-aplica la política de versiones y gestiona perfiles, sesiones y pestañas durables.
+aplica la política de versiones, gestiona perfiles, sesiones y pestañas durables
+y ofrece esperas de carga, observación y blobs privados de evidencias.
 `excalibur-webd` ofrece diagnósticos de entorno y un servicio JSON-RPC Unix local. `excalibur-search` y `excalibur-web-adapter` siguen vacíos.
 El adaptador del arnés, las herramientas web del agente y el frontend visor no están implementados.
 
@@ -271,6 +272,7 @@ rw = ["https://chat.example.org"]
 login = ["https://login.example.org"]
 listen = true
 listen_probe = { unread_selector = "" } # vacío: solo cambios de título
+wait = { selector = "main", strict_network = false }
 ```
 
 El perfil implícito `ephemeral` crea un BrowserContext desechable por ejecución,
@@ -431,3 +433,103 @@ y el cambio de otra pestaña y las lecturas RPC Unix; comprueba los intervalos d
 actividad del oyente, la sonda de entrada acotada y el cierre. Son comprobaciones
 sintéticas locales, guardadas en
 `target/test-evidence/browser/renderer_isolation/contract.json`.
+
+## Espera y observación de páginas
+
+La biblioteca y el protocolo Unix ofrecen `observe.wait_ready`,
+`observe.snapshot`, `observe.subtree`, `observe.validate_ref`, `blob.read`,
+`devtools.console`, `devtools.network`, `devtools.performance`, `emulate.viewport`
+y `nav.go|back|forward|reload`. Son operaciones del backend compartido. El registro
+de herramientas del agente, las acciones de entrada, el envío al modelo visual
+y el visor de intervención son componentes separados.
+
+Cada operación de pestaña requiere `run_id`, `session_id`, `tab_id` y
+`deadline_ms`. Navegación y emulación requieren además `op_key` y usan el
+protocolo durable. Las consultas devuelven `state: completed` con el valor en
+`result`. Por ejemplo, `observe.wait_ready` acepta:
+
+```json
+{"run_id":"local-run","session_id":"SESSION","tab_id":"TAB","deadline_ms":15000,"criteria":{"selector":"main.loaded","network_idle_ms":500,"dom_stable_ms":500,"timeout_ms":10000,"max_inflight":0,"strict_network":false}}
+```
+
+La espera combina el compromiso de navegación y la carga del documento, actividad
+de red del marco principal y sesiones OOPIF, condiciones visibles de selector o
+texto, y un MutationObserver con latido de animación en mundos aislados. Los
+valores predeterminados son 500 ms de quietud de red y estabilidad del DOM y un
+plazo de 10 s. WebSocket, EventSource, ping, medios y prefetch no cuentan. Las
+peticiones de más de 3 s pasan a larga duración; una página estable puede devolver
+`ready` con `network_busy` tras una ventana adicional de 500 ms + 2 s. El modo
+estricto devuelve timeout. `timeout` incluye `criteria_met` y URL de diagnóstico.
+Los marcos de desafío visibles, diálogos JavaScript, selectores de archivos,
+campos de verificación vacíos e indicadores de acceso producen `blocked`; observar no los resuelve. Los sitios pueden proporcionar los
+mismos criterios en su configuración opcional `wait`. El resultado ready se
+recuerda junto a los loaders de los marcos. La navegación invalida esa coincidencia;
+una instantánea sin resultado vigente espera automáticamente.
+
+`observe.snapshot` acepta `options` con `dom: interactive|full`,
+`extent: viewport|fullpage`, `screenshot: bool` y criterios `wait` opcionales.
+Combina DOMSnapshot y árboles de accesibilidad dentro de sus propias sesiones
+CDP, incluidos marcos del mismo proceso y OOPIF, con 3 s de presupuesto de
+recogida. Los componentes ausentes aparecen en `missing` con `partial: true`;
+el DOM disponible se conserva aunque la accesibilidad quede incompleta. La imagen
+se omite si falta DOM necesario para enmascarar los campos sensibles. Las
+cajas del iframe propietario trasladan las coordenadas a la vista superior.
+El árbol normalizado contiene jerarquía, atributos filtrados, roles, nombres,
+geometría, visibilidad, habilitación y motivos de interactividad. El texto ocupa
+como máximo 16 KiB y abarca la vista más una pantalla arriba y abajo; `omitted`
+cuenta controles conservados solo en el blob completo. Las regiones y encabezados
+mantienen el contexto. Texto de página, consola y red son datos no confiables.
+
+La captura se guarda como blob JPEG de calidad 60 tras traer la pestaña al frente.
+La altura de página completa se limita a 16.384 píxeles CSS. Los valores de
+contraseña, código de un solo uso y tarjeta se redactan en texto, elementos y
+árbol; sus rectángulos se enmascaran en la imagen. El host puede registrar secretos
+en el redactor compartido del baúl mediante `manager.observation.redactor`,
+aplicado antes de serializar. La instantánea incluye `vision_recommended` si se
+pide imagen o si la vista es principalmente visual y tiene menos de 20 nodos
+útiles de accesibilidad. No envía imágenes a un modelo.
+
+Las referencias (`eN` o `fKeN` en marcos) usan identidad de target, sesión CDP,
+marco, loader y nodo backend. Un nodo vivo conserva su referencia entre
+instantáneas; los números no se reciclan. Solo otra instantánea sustituye la
+vigente. `observe.validate_ref` acepta `snapshot_id` y `ref` y comprueba la
+instantánea, loader, marco, nodo vivo, conexión y huella de rol/nombre. Devuelve
+`valid` o `stale_ref` con `superseded`, `navigated`, `frame_gone`, `node_gone`,
+`node_detached`, `changed`, `takeover` o `browser_restarted`. Una clave sustituida
+puede incluir `remapped_ref`; validar no envía entrada ni elige otro nodo. El host
+puede invalidar una pestaña al intervenir mediante
+`manager.observation.invalidate(tab_id, "takeover").await`.
+`observe.subtree` lee el árbol comprimido guardado por `snapshot_id` y `ref`
+opcional, sin volver a capturar la página.
+
+Los blobs usan SHA-256 y zstd del almacenamiento existente dentro del directorio
+privado `observations/`. Un registro en webd autoriza cada hash para la ejecución
+solicitante durante 24 horas. `blob.read` requiere `sha256` y acepta `offset` sin
+comprimir y `length` (1–1.048.576); devuelve una ventana verificada en base64 y
+`total_bytes`. Otra ejecución no puede leerlo con solo conocer el hash.
+
+Los búferes de consola y red guardan hasta 500 registros cada uno. Admiten filtros
+`since_seq`, `limit`, `level` y `url_contains`; devuelven secuencia siguiente y
+recuento de descartes. La contrapresión de consola está aislada de la espera y
+supervisión. La pérdida de eventos de espera se informa y no produce un ready
+normal. Los resúmenes de red incluyen URL, método, estado, tipo, tamaño y tiempos,
+sin cuerpos ni cabeceras de autorización o cookies. `tainted: true` elimina también
+consulta y fragmento; es permanente para la pestaña. Los búferes de red se limitan
+a 2 MiB totales y 512 KiB por recurso; las pestañas en escucha solo recogen red
+durante operaciones explícitas, con limpieza al cancelar. El host dispone además de `settle_observation`: una
+ventana de navegación de 250 ms seguida de una espera de 5 s que informa
+`settled` sin enviar entrada. Rendimiento devuelve
+las métricas de Chrome.
+
+Los tamaños son `small` (360×740, DPR 3, móvil), `tablet` (768×1024), `desktop`
+(1280×900) y `large` (1440×900). `preset: custom` acepta `width`, `height`,
+`device_scale_factor` y `mobile`. Las imágenes usan dimensiones CSS lógicas.
+`user_agent` opcional solo se acepta en sesiones efímeras; las cuentas persistentes
+conservan su identidad de navegador.
+
+Ejecuta `cargo test -p excalibur-browser --test observe -- --nocapture` con Chrome
+real y páginas locales sintéticas. Comprueba esperas, bloqueos, 300 controles,
+shadow DOM abierto y cerrado, marcos y coordenadas OOPIF, 5.000 controles,
+redacción, referencias, subárboles guardados, blobs privados, captura en segundo
+plano, filtrado de cabeceras, límite de consola, métricas y tamaño móvil.
+Las evidencias quedan en `target/test-evidence/browser/observation/`.

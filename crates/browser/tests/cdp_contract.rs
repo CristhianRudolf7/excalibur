@@ -309,6 +309,12 @@ async fn contract(root: &Path) {
             || method.as_str().starts_with("Memory.");
         let session = if global { None } else { Some(sid.as_str()) };
         let params = match method {
+            Method::RuntimeReleaseObject => json!({"objectId":"nonexistent-object"}),
+            Method::NetworkSetUserAgentOverride => json!({"userAgent":"Excalibur local contract"}),
+            Method::DOMGetFrameOwner => json!({"frameId":"nonexistent-frame"}),
+            Method::AccessibilityGetPartialAXTree => {
+                json!({"nodeId":node(client,&sid,"#text").await})
+            }
             Method::BrowserSetDownloadBehavior => json!({"behavior":"deny","eventsEnabled":true}),
             Method::BrowserCancelDownload => json!({"guid":"nonexistent-local-fixture"}),
             Method::BrowserSetPermission => {
@@ -416,7 +422,7 @@ async fn contract(root: &Path) {
         let result = client.send(method, params, session).await;
         match result {
             Ok(_) => records.push(json!({"method":method.as_str(),"status":"ok"})),
-            Err(Error::Protocol{code,message}) if code != -32601 && matches!(method,Method::BrowserCancelDownload|Method::PageHandleJavaScriptDialog|Method::PageScreencastFrameAck|Method::FetchContinueRequest|Method::FetchFailRequest) => records.push(json!({"method":method.as_str(),"status":"expected_state_error","code":code,"message":message})),
+            Err(Error::Protocol{code,message}) if code != -32601 && matches!(method,Method::RuntimeReleaseObject|Method::DOMGetFrameOwner|Method::BrowserCancelDownload|Method::PageHandleJavaScriptDialog|Method::PageScreencastFrameAck|Method::FetchContinueRequest|Method::FetchFailRequest) => records.push(json!({"method":method.as_str(),"status":"expected_state_error","code":code,"message":message})),
             Err(error)=>panic!("contract {} failed: {error}",method.as_str()),
         }
         if matches!(

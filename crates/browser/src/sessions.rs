@@ -73,6 +73,7 @@ pub struct Site {
     pub login: Vec<String>,
     pub listen: bool,
     pub listen_probe: ListenProbe,
+    pub wait: Option<crate::observation::WaitCriteria>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -154,6 +155,16 @@ pub fn validate_profiles(profiles: &BTreeMap<String, Profile>) -> Result<()> {
                     return Err(Fault::new(
                         "invalid_config",
                         "site entries must be exact HTTP(S) origins",
+                    ));
+                }
+            }
+            if let Some(wait) = &s.wait {
+                wait.validate()
+                    .map_err(|e| Fault::new("invalid_config", e))?;
+                if s.listen && wait.strict_network {
+                    return Err(Fault::new(
+                        "invalid_config",
+                        "listening sites require non-strict network readiness",
                     ));
                 }
             }
@@ -485,6 +496,7 @@ impl Drop for TabLease {
     }
 }
 pub struct Manager {
+    pub observation: crate::observation::Observation,
     weak: Weak<Manager>,
     secret_service: bool,
     pub db: Database,
@@ -565,6 +577,7 @@ impl Manager {
                 .await
                 .unwrap_or(false);
         let manager = Arc::new_cyclic(|weak| Self {
+            observation: crate::observation::Observation::new(options.data_dir.clone()),
             secret_service,
             weak: weak.clone(),
             db,
@@ -2394,6 +2407,211 @@ fn remove_stale_lock(dir: &Path) -> Result<()> {
     }
     fs::remove_file(lock)?;
     Ok(())
+}
+
+impl Manager {
+    async fn observation_context(
+        &self,
+        run: &str,
+        sid: &str,
+        tid: &str,
+    ) -> Result<crate::observation::Context> {
+        self.accessible(run, sid, tid).await?;
+        let model = self.model.lock().await;
+        let session = Self::owned(&model, run, sid)?.clone();
+        let tab = model.tabs[tid].clone();
+        let client = model
+            .instances
+            .get(&session.instance_id)
+            .ok_or_else(|| Fault::new("session_recovering", sid))?
+            .client()
+            .clone();
+        Ok(crate::observation::Context {
+            session,
+            tab,
+            client,
+            logged_in: false,
+        })
+    }
+    /// Executes observation with a tab lease, never a global model guard across renderer calls.
+    pub async fn observe(
+        &self,
+        run: &str,
+        sid: &str,
+        tid: &str,
+        method: &str,
+        mut p: Value,
+    ) -> Result<Value> {
+        let _lease = self.lease(run, sid, tid, false).await?;
+        let mut ctx = self.observation_context(run, sid, tid).await?;
+        if let Some(site) = &ctx.session.site {
+            ctx.logged_in = self
+                .site_states(&ctx.session.profile)
+                .await?
+                .as_array()
+                .is_some_and(|states| {
+                    states
+                        .iter()
+                        .any(|v| v["name"] == *site && v["login_state"] == "logged_in")
+                });
+        }
+        // Blob authorization belongs to the requesting run, including shared listener observers.
+        ctx.session.owner_run = run.to_owned();
+        if let Some(site) = ctx.session.site.as_ref().and_then(|name| {
+            self.options
+                .profiles
+                .get(&ctx.session.profile)
+                .and_then(|profile| profile.sites.iter().find(|s| &s.name == name))
+        }) && let Some(criteria) = &site.wait
+        {
+            if p.get("criteria").is_none() {
+                p["criteria"] = json!(criteria);
+            }
+            if method == "observe.snapshot" && p["options"]["wait"].is_null() {
+                if p["options"].is_null() {
+                    p["options"] = json!({});
+                }
+                p["options"]["wait"] = json!(criteria);
+            }
+        }
+        match method {
+            "observe.wait_ready" => {
+                let criteria =
+                    serde_json::from_value(p.get("criteria").cloned().unwrap_or(json!({})))
+                        .map_err(|e| Fault::new("invalid_params", e))?;
+                Ok(json!(self.observation.wait(&ctx, criteria).await?))
+            }
+            "observe.snapshot" => {
+                let options =
+                    serde_json::from_value(p.get("options").cloned().unwrap_or(json!({})))
+                        .map_err(|e| Fault::new("invalid_params", e))?;
+                let result = self.observation.snapshot(&ctx, options).await?;
+                let blobs = std::iter::once(result.dom_tree_ref.sha256.clone())
+                    .chain(result.screenshot_ref.as_ref().map(|r| r.sha256.clone()))
+                    .collect::<Vec<_>>();
+                let run = run.to_owned();
+                let id = result.snapshot_id.clone();
+                self.db
+                    .call(move |c| {
+                        let tx = c.transaction()?;
+                        for hash in blobs {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO web_observation_blobs VALUES(?1,?2,?3,?4)",
+                                params![hash, run, id, now()],
+                            )?;
+                        }
+                        tx.commit()?;
+                        Ok(())
+                    })
+                    .await?;
+                Ok(json!(result))
+            }
+            "observe.subtree" => {
+                self.observation
+                    .subtree(&ctx, required(&p, "snapshot_id")?, p["ref"].as_str())
+                    .await
+            }
+            "observe.validate_ref" => {
+                self.observation
+                    .validate(&ctx, required(&p, "snapshot_id")?, required(&p, "ref")?)
+                    .await
+            }
+            "devtools.console" | "devtools.network" | "devtools.performance" => {
+                self.observation
+                    .devtools(&ctx, method.trim_start_matches("devtools."), p)
+                    .await
+            }
+            "emulate.viewport" => self.observation.emulate(&ctx, &p).await,
+            "nav.go" | "nav.reload" | "nav.back" | "nav.forward" => {
+                let frames = self.observation.frames(&ctx).await?;
+                let _network = self.observation.initialize(&ctx, &frames).await?;
+                if method != "nav.go" {
+                    self.document_allowed(&ctx.session, &frames[0].url, true)?;
+                }
+                let client = &ctx.client;
+                let cdp = ctx.tab.cdp_session.as_deref();
+                if method == "nav.go" {
+                    let url = required(&p, "url")?;
+                    self.document_allowed(&ctx.session, url, true)?;
+                    client
+                        .send_with_timeout(
+                            Method::PageNavigate,
+                            json!({"url":url}),
+                            cdp,
+                            Duration::from_secs(2),
+                        )
+                        .await?;
+                } else if method == "nav.reload" {
+                    client
+                        .send_with_timeout(
+                            Method::PageReload,
+                            json!({}),
+                            cdp,
+                            Duration::from_secs(2),
+                        )
+                        .await?;
+                } else {
+                    let history = client
+                        .send(Method::PageGetNavigationHistory, json!({}), cdp)
+                        .await?;
+                    let index = history["currentIndex"].as_i64().unwrap_or(0)
+                        + if method == "nav.back" { -1 } else { 1 };
+                    let entry = history["entries"]
+                        .as_array()
+                        .and_then(|a| usize::try_from(index).ok().and_then(|i| a.get(i)))
+                        .ok_or_else(|| Fault::new("invalid_params", "history boundary"))?;
+                    self.document_allowed(&ctx.session, entry["url"].as_str().unwrap_or(""), true)?;
+                    client
+                        .send_with_timeout(
+                            Method::PageNavigateToHistoryEntry,
+                            json!({"entryId":entry["id"]}),
+                            cdp,
+                            Duration::from_secs(2),
+                        )
+                        .await?;
+                }
+                let criteria =
+                    serde_json::from_value(p.get("criteria").cloned().unwrap_or(json!({})))
+                        .map_err(|e| Fault::new("invalid_params", e))?;
+                Ok(json!(self.observation.wait(&ctx, criteria).await?))
+            }
+            _ => Err(Fault::new("method_not_found", method)),
+        }
+    }
+    /// Internal post-dispatch readiness boundary; it sends no input and never fails an action.
+    pub async fn settle_observation(&self, run: &str, sid: &str, tid: &str) -> Value {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        match self
+            .observe(
+                run,
+                sid,
+                tid,
+                "observe.wait_ready",
+                json!({"criteria":{"timeout_ms":5000}}),
+            )
+            .await
+        {
+            Ok(wait) => json!({"settled":wait["status"]=="ready","wait":wait}),
+            Err(error) => json!({"settled":false,"error":error.kind}),
+        }
+    }
+    pub async fn observation_blob(
+        &self,
+        run: &str,
+        hash: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Value> {
+        self.observation
+            .read_blob(&self.db, run, hash, offset, length)
+            .await
+    }
+}
+fn required<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
+    p[key]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Fault::new("invalid_params", key))
 }
 
 #[cfg(test)]

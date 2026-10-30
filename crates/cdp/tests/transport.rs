@@ -335,3 +335,27 @@ async fn lifecycle_lag_can_reconcile_every_active_attachment_without_closing() {
     release.send(()).unwrap();
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn console_backpressure_does_not_displace_readiness_events() {
+    let (client, mut server) = pair();
+    let mut readiness = client.subscribe_observation();
+    let mut console = client.subscribe_console();
+    let writer = tokio::spawn(async move {
+        for _ in 0..10000 {
+            server.write_all(b"{\"method\":\"Runtime.consoleAPICalled\",\"sessionId\":\"page\",\"params\":{}}\0").await.unwrap();
+        }
+        server.write_all(b"{\"method\":\"Network.loadingFinished\",\"sessionId\":\"page\",\"params\":{\"requestId\":\"fetch\"}}\0").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+    let event = tokio::time::timeout(Duration::from_secs(5), readiness.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.method, "Network.loadingFinished");
+    assert!(matches!(
+        console.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+    ));
+    writer.await.unwrap();
+}

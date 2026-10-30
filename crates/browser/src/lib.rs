@@ -1,5 +1,6 @@
 //! Chrome instances, durable browser sessions and the local webd protocol.
 pub mod installation;
+pub mod observation;
 pub mod process;
 pub mod rpc;
 pub mod sessions;

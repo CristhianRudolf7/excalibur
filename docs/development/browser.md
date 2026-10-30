@@ -2,7 +2,8 @@
 
 `excalibur-cdp` implements asynchronous CDP over native pipes. `excalibur-browser`
 launches and supervises Chrome instances, verifies renderer sandbox state and
-applies version policy, and manages durable profiles, sessions and tabs.
+applies version policy, manages durable profiles, sessions and tabs, and provides
+readiness checks, page observation and private evidence blobs.
 `excalibur-webd` provides environment diagnostics and a local Unix JSON-RPC service. `excalibur-search` and `excalibur-web-adapter` remain empty boundaries.
 The host adapter, agent browser tools and viewer frontend are not implemented.
 
@@ -259,6 +260,7 @@ rw = ["https://chat.example.org"]
 login = ["https://login.example.org"]
 listen = true
 listen_probe = { unread_selector = "" } # empty: title changes only
+wait = { selector = "main", strict_network = false }
 ```
 
 The implicit `ephemeral` profile creates a new disposable BrowserContext per run,
@@ -407,3 +409,102 @@ browser and a persistent listener. It bounds list/status, another tab's lease an
 switch, and Unix RPC reads to one second, checks listener event gaps and bounded
 input probing, and verifies shutdown. Measurements are local synthetic checks,
 recorded in `target/test-evidence/browser/renderer_isolation/contract.json`.
+
+## Waiting and observing a page
+
+The browser library and Unix protocol provide `observe.wait_ready`,
+`observe.snapshot`, `observe.subtree`, `observe.validate_ref`, `blob.read`,
+`devtools.console`, `devtools.network`, `devtools.performance`, `emulate.viewport`
+and `nav.go|back|forward|reload`. These are shared backend operations. Agent tool
+registration, input actions, model vision routing and the intervention viewer
+remain separate components.
+
+Every tab operation requires `run_id`, `session_id`, `tab_id` and `deadline_ms`.
+Navigation and emulation also require `op_key` and use the durable operation
+protocol. Queries return `state: completed` with their value in `result`.
+For example, the method `observe.wait_ready` accepts:
+
+```json
+{"run_id":"local-run","session_id":"SESSION","tab_id":"TAB","deadline_ms":15000,"criteria":{"selector":"main.loaded","network_idle_ms":500,"dom_stable_ms":500,"timeout_ms":10000,"max_inflight":0,"strict_network":false}}
+```
+
+Readiness combines navigation commit and document readiness, network activity
+from the main frame and OOPIF sessions, visible selector/text conditions, and a
+MutationObserver and animation heartbeat in isolated worlds. Defaults are 500 ms
+of network quiet and DOM stability and a 10 s deadline. WebSocket, EventSource,
+ping, media and prefetch traffic do not count. Requests older than 3 s are long
+lived; an otherwise stable page can return `ready` with `network_busy` after an
+additional quiet window of 500 ms + 2 s. Strict network mode times out instead.
+`timeout` includes `criteria_met` and diagnostic URLs. Visible challenge frames,
+JavaScript dialogs, file choosers, empty verification fields and login indicators
+produce `blocked`; observing does not solve
+them. Sites may supply the same criteria in their optional `wait` configuration.
+A ready result is remembered with the frame loaders. Navigation invalidates that
+match; a snapshot without a current result waits automatically.
+
+`observe.snapshot` accepts `options` with `dom: interactive|full`,
+`extent: viewport|fullpage`, `screenshot: bool` and optional `wait` criteria.
+Capture combines DOMSnapshot with accessibility trees in their own CDP sessions,
+including same-process frames and OOPIFs, under a 3 s collection budget.
+Unavailable components appear in `missing` with `partial: true`; available DOM
+is retained when accessibility capture is incomplete. An image is withheld if
+missing DOM prevents complete sensitive-field masking. Frame owner rectangles
+translate child coordinates into the top-level viewport. The normalized tree
+contains hierarchy, filtered attributes, roles, names, geometry, visibility,
+enabled state and the reasons each control is interactive. Inline text is at
+most 16 KiB and covers the viewport plus a screen above and below; `omitted`
+counts controls retained only in the complete tree blob. Regions and headings
+preserve context. Page text, console and network output are untrusted data.
+
+A screenshot is stored as a JPEG quality 60 blob, after bringing the tab to the
+front. Full-page height is capped at 16,384 CSS pixels. Password, one-time-code
+and credit-card values are redacted in text, elements and the tree; their image
+rectangles are masked. The shared vault redactor can be populated by the host
+through `manager.observation.redactor` and is applied before serialization.
+The snapshot includes `vision_recommended` for an explicit image request or a
+mostly visual viewport with fewer than 20 useful accessibility nodes. It does
+not send an image to a model.
+
+References (`eN`, or `fKeN` in frames) use target, CDP session, frame, loader and
+backend-node identity. Living nodes retain their references across snapshots;
+numbers are not recycled. Only a snapshot supersedes the previous snapshot.
+`observe.validate_ref` accepts `snapshot_id` and `ref` and checks the current
+snapshot, loader, frame, live node, connection and role/name fingerprint.
+It returns `valid` or `stale_ref` with `superseded`, `navigated`, `frame_gone`,
+`node_gone`, `node_detached`, `changed`, `takeover` or `browser_restarted`.
+A superseded key may include `remapped_ref`; validation never dispatches input
+or silently chooses another node. The host can invalidate a tab on intervention
+with `manager.observation.invalidate(tab_id, "takeover").await`.
+`observe.subtree` reads the saved compressed tree, selected by `snapshot_id` and
+optional `ref`, without recapturing the page.
+
+Blobs use the existing store's SHA-256 and zstd implementation in the private
+`observations/` directory. A webd ledger authorizes each hash for the requesting
+run for 24 hours. `blob.read` requires `sha256` and accepts uncompressed `offset`
+and `length` (1–1,048,576); it returns a verified base64 window and `total_bytes`.
+A different run cannot read a hash merely by knowing it.
+
+Console and network rings hold at most 500 records each. Filters include
+`since_seq`, `limit`, `level` and `url_contains`; results include the next sequence
+and dropped-record count. Console backpressure is isolated from readiness and
+supervision events. Readiness event loss is reported explicitly and cannot
+produce a normal ready result. Network summaries contain URL, method, status,
+type, size and timing, never bodies or authorization/cookie headers. Set
+`tainted: true` to remove query strings and fragments as well; this is sticky
+for the tab. Network buffers are limited to 2 MiB total and 512 KiB per resource;
+listening tabs enable collection only during explicit operations, including
+cancellation cleanup. The host also has `settle_observation`: a 250 ms navigation
+window followed by a 5 s wait, reporting `settled` without dispatching input. Performance returns Chrome's performance metrics.
+
+Viewport presets are `small` (360×740, DPR 3, mobile), `tablet` (768×1024),
+`desktop` (1280×900) and `large` (1440×900). `preset: custom` accepts `width`,
+`height`, `device_scale_factor` and `mobile`. Images use logical CSS dimensions.
+An optional `user_agent` override is accepted only in an ephemeral session;
+persistent accounts retain their browser identity.
+
+Run `cargo test -p excalibur-browser --test observe -- --nocapture` for real Chrome
+against synthetic local pages. It checks waits, blocked conditions, 300 controls,
+open/closed shadow trees, frames and OOPIF coordinates, 5,000-control capture,
+redaction, references, saved subtrees, private blobs, background capture,
+network header filtering, console bounds, metrics and mobile viewport size.
+Evidence is written to `target/test-evidence/browser/observation/`.
