@@ -4,6 +4,7 @@ mod cache;
 mod metrics;
 mod native;
 mod replay;
+pub mod routing;
 pub use cache::*;
 use excalibur_providers::ProviderClient;
 use excalibur_types::runtime::{BoxFuture, Message, ModelRequest, ModelResponse, ToolCall, Usage};

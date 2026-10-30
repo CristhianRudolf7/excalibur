@@ -1219,6 +1219,17 @@ impl ProviderClient {
             provider: self.provider,
         })
     }
+    /// OpenAI Decisions API (`POST /v1/decisions`). The caller owns the typed
+    /// question body; this client adds no unsupported sampling parameters.
+    pub async fn openai_decision(&self, body: Value) -> Result<Value, Error> {
+        if self.provider != Provider::OpenAi {
+            return Err(Error::Unsupported);
+        }
+        if !body.is_object() {
+            return Err(Error::Configuration("request body must be an object"));
+        }
+        self.send(Method::POST, "decisions", Some(body)).await
+    }
     /// Send an Agent API request; the native body can contain tools and tool results.
     pub async fn perplexity_agent(&self, mut body: Value) -> Result<Value, Error> {
         if self.provider != Provider::PerplexityAgent {
