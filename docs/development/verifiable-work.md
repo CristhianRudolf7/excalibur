@@ -36,12 +36,14 @@ The tests README is a database projection. Only the section between `<!-- excali
 
 The deterministic loop detector covers identical results, repeated errors, cycles of two to five calls, lack of progress, repeated output text and repeated file fingerprint conflicts. It escalates from a corrective note to a strategy change and then a blocker. `exec_io wait_for` is an explicit wait, not a polling loop. Execution budgets and atomic child reservations cover steps, tokens, cost when priced, wall time and tool calls. A child must fit the parent's remaining budget at admission, including elapsed wall time; reservation edges are checked for cycles in the same writer transaction. Rejected reservations leave both journals unchanged. Managed command-group and retained-session limits are enforced at terminal admission; they are not a claim to count or cap every operating-system descendant. The host's sandbox/cgroup boundary remains separate.
 
+The verifier control monitor treats the child's own `completed` publication as a successful handoff to its result producer. The producer publishes this state before returning its verdict, so racing it against the control monitor must not turn a completed review into an interrupted job and admit a second review. Parent completion and parent/child pause, block, cancellation and failure remain controls. A deterministic real-journal regression checks these states without timer races; it does not establish the cause of earlier terminal timeouts.
+
 ## Verification and boundaries
 
 ```sh
 cargo test -p excalibur-tasks
 cargo test -p excalibur-engine --test verifiable_work
-cargo test -p excalibur-eval --test verifiable
+cargo test -p excalibur-eval --lib --test verifiable
 cargo test -p excalibur-tools --test terminal
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
