@@ -12,7 +12,9 @@ mod projects;
 #[cfg(test)]
 #[path = "../tests/support/mod.rs"]
 mod recovery_test_support;
-pub use notifications::{HostNotificationBinding, HostNotificationTarget};
+pub use notifications::{
+    HostNotificationAuthority, HostNotificationBinding, HostNotificationTarget,
+};
 pub use profiles::CustomProfile;
 pub mod recovery;
 mod scheduling;

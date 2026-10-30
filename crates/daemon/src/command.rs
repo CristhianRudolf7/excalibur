@@ -367,58 +367,77 @@ pub async fn deliver_notifications(
         .await
         .map_err(|e| e.to_string())?
     {
-        if !delivery.channel.starts_with("conversation:") && delivery.channel != "conversation" {
-            continue;
-        }
-        let target = delivery
-            .cross_conversation
-            .as_ref()
-            .unwrap_or(&delivery.notification.conversation);
-        let host_origin = orchestrator
-            .host_notification_origin(&delivery.notification.id)
-            .await
-            .map_err(|e| e.to_string())?;
-        let host_scope = orchestrator
-            .recovery()
-            .notification_scope(&delivery.notification.id)
-            .await
-            .map_err(|e| e.to_string())?;
-        let (scope, identity) = if let Some(origin) = host_origin {
-            (origin.scope, json!({"host":true,"source_kind":"host"}))
-        } else if let Some(scope) = host_scope {
-            (scope, json!({"host":true}))
-        } else {
-            let Ok(agent) = orchestrator.agent(&delivery.notification.agent_id).await else {
-                continue;
-            };
-            (agent.scope, json!({"name":agent.name,"agent_id":agent.id}))
-        };
-        let content = if delivery.cross_conversation.is_some() {
-            json!({"notification_id":delivery.notification.id,"origin":delivery.notification.conversation,"scope":scope,"summary":"Urgent update in the origin conversation"})
-        } else {
-            let mut content = json!({"notification_id":delivery.notification.id,"content":delivery.notification.content,"origin":delivery.notification.conversation,"scope":scope,"created_at":delivery.notification.created});
-            content
-                .as_object_mut()
-                .unwrap()
-                .extend(identity.as_object().unwrap().clone());
-            content
-        };
-        let key = format!("{}:{}", delivery.notification.id, delivery.channel);
-        let published = if delivery.cross_conversation.is_some() {
-            master.publish_link(&key, target, content).await
-        } else {
-            master
-                .publish_notice(&key, target, content, &delivery.notification.class)
-                .await
-        };
-        if published.is_ok() {
-            orchestrator
-                .confirm_delivery(&delivery.notification.id, &delivery.channel)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
+        deliver_notification(master, orchestrator, &delivery).await?;
     }
     master.flush_notices(now).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Attempt one previously fetched outbox delivery. Authority is checked again
+/// here so a revocation between polling and sending retains the pending attempt.
+pub async fn deliver_notification(
+    master: &excalibur_master::Master,
+    orchestrator: &excalibur_orchestrator::Orchestrator,
+    delivery: &excalibur_orchestrator::Delivery,
+) -> Result<(), String> {
+    if !delivery.channel.starts_with("conversation:") && delivery.channel != "conversation" {
+        return Ok(());
+    }
+    let target = delivery
+        .cross_conversation
+        .as_ref()
+        .unwrap_or(&delivery.notification.conversation);
+    let host_scope = orchestrator
+        .recovery()
+        .notification_scope(&delivery.notification.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Revalidate after retrieval, immediately before projecting/publishing.
+    // Revocation does not fall back to legacy agent or JSON authority.
+    let authority = orchestrator
+        .host_notification_authority(&delivery.notification.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (scope, identity) = match authority {
+        excalibur_orchestrator::HostNotificationAuthority::Revoked(_) => return Ok(()),
+        excalibur_orchestrator::HostNotificationAuthority::Authorized(origin) => {
+            (origin.scope, json!({"host":true,"source_kind":"host"}))
+        }
+        excalibur_orchestrator::HostNotificationAuthority::NotHost => {
+            if let Some(scope) = host_scope {
+                (scope, json!({"host":true}))
+            } else {
+                let Ok(agent) = orchestrator.agent(&delivery.notification.agent_id).await else {
+                    return Ok(());
+                };
+                (agent.scope, json!({"name":agent.name,"agent_id":agent.id}))
+            }
+        }
+    };
+    let content = if delivery.cross_conversation.is_some() {
+        json!({"notification_id":delivery.notification.id,"origin":delivery.notification.conversation,"scope":scope,"summary":"Urgent update in the origin conversation"})
+    } else {
+        let mut content = json!({"notification_id":delivery.notification.id,"content":delivery.notification.content,"origin":delivery.notification.conversation,"scope":scope,"created_at":delivery.notification.created});
+        content
+            .as_object_mut()
+            .unwrap()
+            .extend(identity.as_object().unwrap().clone());
+        content
+    };
+    let key = format!("{}:{}", delivery.notification.id, delivery.channel);
+    let published = if delivery.cross_conversation.is_some() {
+        master.publish_link(&key, target, content).await
+    } else {
+        master
+            .publish_notice(&key, target, content, &delivery.notification.class)
+            .await
+    };
+    if published.is_ok() {
+        orchestrator
+            .confirm_delivery(&delivery.notification.id, &delivery.channel)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
