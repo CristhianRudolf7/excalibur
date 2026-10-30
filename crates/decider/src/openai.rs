@@ -184,6 +184,7 @@ pub fn parse_response(request: &DecisionRequest, body: &Value) -> Result<Decisio
     }
     let usage = &body["usage"];
     let decision = Decision {
+        answer_origins: Default::default(),
         answers: parsed,
         backend: "openai-decisions".into(),
         model: body["model"].as_str().map(String::from),
@@ -221,7 +222,12 @@ impl Decider for OpenAiDecisions {
                 other => other,
             }
             .map_err(|e| DeciderError::Unavailable(e.to_string()))?;
-            parse_response(request, &response)
+            let mut decision = parse_response(request, &response)?;
+            if decision.model.is_none() {
+                decision.model = Some(self.model.clone());
+            }
+            decision.validate_for(request)?;
+            Ok(decision)
         })
     }
 }

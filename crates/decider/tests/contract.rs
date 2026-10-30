@@ -11,6 +11,7 @@ impl Decider for Mock {
     fn decide<'a>(&'a self, request: &'a DecisionRequest) -> BoxFuture<'a, Result<Decision>> {
         Box::pin(async move {
             Ok(Decision {
+                answer_origins: Default::default(),
                 answers: request
                     .questions
                     .iter()
@@ -49,6 +50,7 @@ fn final_verdict_is_forbidden_and_invalid_probabilities_fail() {
         Err(DeciderError::FinalVerdictForbidden)
     );
     let decision = Decision {
+        answer_origins: Default::default(),
         answers: vec![Answer::Predicate {
             name: "relevant".into(),
             probability: f64::NAN,
@@ -83,7 +85,10 @@ async fn refusals_fall_back_and_decisions_are_labeled_durably() {
         .await
         .unwrap();
     let samples = ledger
-        .labeled(DecisionPort::SkillRelevance, "relevant")
+        .labeled(
+            DecisionPort::SkillRelevance,
+            &routed.answers[0].calibration_key.storage_key(),
+        )
         .await
         .unwrap();
     assert_eq!(samples.len(), 1);
@@ -94,7 +99,10 @@ async fn refusals_fall_back_and_decisions_are_labeled_durably() {
     let reopened = DecisionLedger::open(&path).await.unwrap();
     assert_eq!(
         reopened
-            .labeled(DecisionPort::SkillRelevance, "relevant")
+            .labeled(
+                DecisionPort::SkillRelevance,
+                &routed.answers[0].calibration_key.storage_key()
+            )
             .await
             .unwrap()
             .len(),
@@ -137,6 +145,7 @@ fn contradictory_confidence_and_duplicate_choices_are_rejected() {
         vec![Question::choice("kind", "Choose", &["task", "chat"])],
     );
     let mut decision = Decision {
+        answer_origins: Default::default(),
         answers: vec![Answer::Choice {
             name: "kind".into(),
             choice: "task".into(),

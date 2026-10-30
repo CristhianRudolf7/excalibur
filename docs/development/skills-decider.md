@@ -17,3 +17,7 @@ cargo test -p excalibur-skills --test catalog
 cargo test -p excalibur-decider --test contract
 cargo clippy -p excalibur-skills -p excalibur-decider --all-targets -- -D warnings
 ```
+
+Decision calibration is scoped by `CalibrationKey`: port, a hash of the complete typed question (instructions, ordered options/levels and descriptions), and the answer's backend/model origin. Use the key returned on `RoutedAnswer` when labeling/calibrating that decision family. Partial fallback preserves origins separately for each answer. The ledger retains old records and thresholds; old unscoped keys cannot match the new scoped route. Its decoded `calibration_key` exposes the model and question fingerprint without storing state input text.
+
+The LLM adapter validates its response independently of provider schema enforcement: required fields/types, exactly one probability for every offered value, finite probabilities in [0,1], and a sum within 0.000001 of one. It preserves probabilities rather than normalizing arbitrary weights. Invalid JSON receives one correction attempt before bounded fallback. Request option/level descriptions and the complete serialized request have byte limits. `cargo test -p excalibur-decider --test llm_contract` exercises these paths through a deterministic mock model gateway, including retry, fallback and calibration isolation across model, backend and question changes.

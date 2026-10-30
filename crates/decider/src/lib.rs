@@ -257,9 +257,13 @@ impl DecisionRequest {
                     let values = choices.iter().map(|c| &c.value).collect::<BTreeSet<_>>();
                     if !(2..=255).contains(&choices.len())
                         || values.len() != choices.len()
-                        || choices
-                            .iter()
-                            .any(|c| c.value.is_empty() || c.value.len() > 256)
+                        || choices.iter().any(|c| {
+                            c.value.is_empty()
+                                || c.value.len() > 256
+                                || c.description
+                                    .as_ref()
+                                    .is_some_and(|d| d.len() > MAX_INSTRUCTIONS_BYTES)
+                        })
                     {
                         return invalid("choice questions need 2..255 unique nonempty values");
                     }
@@ -268,14 +272,25 @@ impl DecisionRequest {
                     let labels = levels.iter().map(|l| &l.label).collect::<BTreeSet<_>>();
                     if !(2..=10).contains(&levels.len())
                         || labels.len() != levels.len()
-                        || levels
-                            .iter()
-                            .any(|l| l.label.is_empty() || l.label.len() > 256)
+                        || levels.iter().any(|l| {
+                            l.label.is_empty()
+                                || l.label.len() > 256
+                                || l.description
+                                    .as_ref()
+                                    .is_some_and(|d| d.len() > MAX_INSTRUCTIONS_BYTES)
+                        })
                     {
                         return invalid("score questions need 2..10 unique ordered levels");
                     }
                 }
             }
+        }
+        if serde_json::to_vec(self)
+            .map_err(|_| DeciderError::Invalid("request cannot be serialized".into()))?
+            .len()
+            > MAX_INPUT_BYTES + MAX_INSTRUCTIONS_BYTES
+        {
+            return invalid("complete decision request exceeds its byte budget");
         }
         Ok(())
     }
@@ -453,8 +468,37 @@ pub struct DecisionUsage {
     pub cached_tokens: u64,
     pub output_tokens: u64,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnswerOrigin {
+    pub backend: String,
+    pub model: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CalibrationKey {
+    pub port: DecisionPort,
+    pub question: String,
+    pub question_hash: String,
+    pub origin: AnswerOrigin,
+}
+impl CalibrationKey {
+    pub fn new(port: DecisionPort, question: &Question, origin: AnswerOrigin) -> Self {
+        Self {
+            port,
+            question: question.name().into(),
+            question_hash: ledger::digest(
+                &serde_json::to_vec(question).expect("question serialization"),
+            ),
+            origin,
+        }
+    }
+    pub fn storage_key(&self) -> String {
+        serde_json::to_string(self).expect("calibration key serialization")
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Decision {
+    #[serde(default)]
+    pub answer_origins: BTreeMap<String, AnswerOrigin>,
     pub answers: Vec<Answer>,
     /// Backend identity of the answers (for example `openai-decisions` or `llm`).
     pub backend: String,
@@ -467,8 +511,31 @@ pub struct Decision {
     pub fallback_questions: Vec<String>,
 }
 impl Decision {
+    pub fn origin(&self, name: &str) -> AnswerOrigin {
+        self.answer_origins
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| AnswerOrigin {
+                backend: self.backend.clone(),
+                model: self.model.clone(),
+            })
+    }
     /// Answers must keep the request order and match each question's type.
     pub fn validate_for(&self, request: &DecisionRequest) -> Result<()> {
+        for answer in &self.answers {
+            let origin = self.origin(answer.name());
+            if origin.backend.trim().is_empty()
+                || origin.backend.len() > 512
+                || origin
+                    .model
+                    .as_ref()
+                    .is_some_and(|model| model.trim().is_empty() || model.len() > 256)
+            {
+                return Err(DeciderError::InvalidAnswer(
+                    "answer origin is invalid".into(),
+                ));
+            }
+        }
         if self.answers.len() != request.questions.len() {
             return Err(DeciderError::InvalidAnswer(
                 "answer count differs from question count".into(),
@@ -543,6 +610,8 @@ pub enum Verdict {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RoutedAnswer {
+    pub origin: AnswerOrigin,
+    pub calibration_key: CalibrationKey,
     pub answer: Answer,
     pub verdict: Verdict,
     pub thresholds: Thresholds,
@@ -619,17 +688,34 @@ impl Decider for FallbackDecider {
             let Ok(retry) = self.bounded(self.fallback.as_ref(), &subset).await else {
                 return Ok(primary);
             };
+            let origins = retry
+                .answers
+                .iter()
+                .map(|a| (a.name().to_string(), retry.origin(a.name())))
+                .collect::<BTreeMap<_, _>>();
+            let mut merged = primary.clone();
+            for answer in &primary.answers {
+                merged
+                    .answer_origins
+                    .insert(answer.name().into(), primary.origin(answer.name()));
+            }
             let mut replacements = retry
                 .answers
                 .into_iter()
                 .map(|a| (a.name().to_string(), a))
                 .collect::<BTreeMap<_, _>>();
-            let mut merged = primary;
             for answer in &mut merged.answers {
                 if let Some(replacement) = replacements.remove(answer.name()) {
+                    if let Some(origin) = origins.get(answer.name()) {
+                        merged
+                            .answer_origins
+                            .insert(answer.name().into(), origin.clone());
+                    }
                     *answer = replacement;
                 }
             }
+            merged.backend = self.identity.clone();
+            merged.model = None;
             merged.fallback_questions = refused.into_iter().collect();
             merged.usage.input_tokens += retry.usage.input_tokens;
             merged.usage.cached_tokens += retry.usage.cached_tokens;
@@ -663,11 +749,14 @@ impl DecisionService {
     pub fn ledger(&self) -> Option<&DecisionLedger> {
         self.ledger.as_ref()
     }
-    pub fn thresholds(&self, port: DecisionPort, question: &str) -> Thresholds {
+    pub fn thresholds(&self, key: &CalibrationKey) -> Thresholds {
+        if key.origin.model.is_none() {
+            return Thresholds::UNCALIBRATED;
+        }
         self.thresholds
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&(port, question.to_string()))
+            .get(&(key.port, key.storage_key()))
             .copied()
             .unwrap_or(Thresholds::UNCALIBRATED)
     }
@@ -677,28 +766,27 @@ impl DecisionService {
         decision.validate_for(request)?;
         let input_hash = ledger::digest(request.input.render().as_bytes());
         let mut answers = Vec::new();
-        for answer in decision.answers {
-            let thresholds = self.thresholds(request.port, answer.name());
+        for answer in &decision.answers {
+            let origin = decision.origin(answer.name());
+            let question = request
+                .questions
+                .iter()
+                .find(|q| q.name() == answer.name())
+                .expect("validated answer");
+            let key = CalibrationKey::new(request.port, question, origin.clone());
+            let thresholds = self.thresholds(&key);
             let verdict = thresholds.verdict(answer.probability());
             let record_id = match (&self.ledger, answer.probability()) {
                 (Some(ledger), Some(probability)) => Some(
                     ledger
                         .record(ledger::NewRecord {
                             port: request.port,
-                            question: answer.name().to_string(),
-                            kind: answer_kind(&answer).into(),
-                            backend: if decision
-                                .fallback_questions
-                                .iter()
-                                .any(|q| q == answer.name())
-                            {
-                                format!("{}:fallback", decision.backend)
-                            } else {
-                                decision.backend.clone()
-                            },
+                            question: key.storage_key(),
+                            kind: answer_kind(answer).into(),
+                            backend: origin.backend.clone(),
                             probability,
                             verdict,
-                            selected: selected(&answer),
+                            selected: selected(answer),
                             input_hash: input_hash.clone(),
                         })
                         .await?,
@@ -706,7 +794,9 @@ impl DecisionService {
                 _ => None,
             };
             answers.push(RoutedAnswer {
-                answer,
+                answer: answer.clone(),
+                origin,
+                calibration_key: key,
                 verdict,
                 thresholds,
                 record_id,
@@ -719,11 +809,12 @@ impl DecisionService {
             fallback_questions: decision.fallback_questions,
         })
     }
-    /// Calibrate one (port, question) from labeled ledger records, persist and install it.
+    /// Calibrate one backend/model and question semantics from its own labels.
+    /// Legacy unscoped records remain available for inspection but cannot match
+    /// the serialized keys used by this route.
     pub async fn calibrate(
         &self,
-        port: DecisionPort,
-        question: &str,
+        key: &CalibrationKey,
         target_precision: f64,
         min_support: usize,
     ) -> Result<CalibrationReport> {
@@ -731,13 +822,24 @@ impl DecisionService {
             .ledger
             .as_ref()
             .ok_or_else(|| DeciderError::Ledger("no ledger attached".into()))?;
-        let samples = ledger.labeled(port, question).await?;
+        if key
+            .origin
+            .model
+            .as_ref()
+            .is_none_or(|model| model.trim().is_empty())
+        {
+            return Err(DeciderError::Invalid(
+                "calibration requires a known model identity".into(),
+            ));
+        }
+        let storage = key.storage_key();
+        let samples = ledger.labeled(key.port, &storage).await?;
         let report = calibrate(&samples, target_precision, min_support)?;
-        ledger.store_thresholds(port, question, &report).await?;
+        ledger.store_thresholds(key.port, &storage, &report).await?;
         self.thresholds
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((port, question.to_string()), report.thresholds);
+            .insert((key.port, storage), report.thresholds);
         Ok(report)
     }
 }
@@ -756,16 +858,20 @@ fn selected(answer: &Answer) -> Option<String> {
         _ => None,
     }
 }
-/// Normalize a distribution, choose its mode and return (mode, confidence, distribution).
-pub(crate) fn normalized(values: &[(String, f64)]) -> Option<(usize, f64, Vec<f64>)> {
-    if values.is_empty() || values.iter().any(|(_, p)| !p.is_finite() || *p < 0.0) {
+/// Validate a unit distribution, choose its mode and preserve its probabilities.
+pub(crate) fn validated_distribution(values: &[(String, f64)]) -> Option<(usize, f64, Vec<f64>)> {
+    if values.is_empty()
+        || values
+            .iter()
+            .any(|(_, p)| !p.is_finite() || !(0.0..=1.0).contains(p))
+    {
         return None;
     }
     let total = values.iter().map(|(_, p)| p).sum::<f64>();
-    if total <= 0.0 {
+    if (total - 1.0).abs() > 1e-6 {
         return None;
     }
-    let distribution = values.iter().map(|(_, p)| p / total).collect::<Vec<_>>();
+    let distribution = values.iter().map(|(_, p)| *p).collect::<Vec<_>>();
     let (index, confidence) =
         distribution
             .iter()

@@ -17,3 +17,7 @@ cargo test -p excalibur-skills --test catalog
 cargo test -p excalibur-decider --test contract
 cargo clippy -p excalibur-skills -p excalibur-decider --all-targets -- -D warnings
 ```
+
+La calibración de decisiones se acota mediante `CalibrationKey`: puerto, hash de la pregunta tipada completa (instrucciones, opciones/niveles ordenados y descripciones) y origen backend/modelo de la respuesta. Usa la clave devuelta en `RoutedAnswer` al etiquetar/calibrar esa familia de decisiones. El respaldo parcial conserva el origen de cada respuesta. El registro mantiene los datos y umbrales anteriores; las claves antiguas sin ámbito no coinciden con la nueva ruta acotada. Su `calibration_key` decodificada expone el modelo y la huella de la pregunta sin almacenar el texto del estado de entrada.
+
+El adaptador LLM valida su respuesta independientemente del esquema del proveedor: campos/tipos obligatorios, exactamente una probabilidad por valor ofrecido, probabilidades finitas en [0,1] y suma con tolerancia 0,000001 respecto a uno. Conserva las probabilidades en vez de normalizar pesos arbitrarios. Un JSON inválido recibe un intento de corrección antes del respaldo acotado. Las descripciones de opciones/niveles y la solicitud serializada completa tienen límites de bytes. `cargo test -p excalibur-decider --test llm_contract` ejercita estas rutas mediante una pasarela de modelo simulada determinista, incluidos reintento, respaldo y aislamiento de calibración entre modelos, backends y cambios de pregunta.

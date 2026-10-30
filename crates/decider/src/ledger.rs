@@ -60,6 +60,7 @@ pub(crate) struct NewRecord {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LedgerRecord {
+    pub calibration_key: Option<crate::CalibrationKey>,
     pub id: String,
     pub port: String,
     pub question: String,
@@ -170,10 +171,14 @@ impl DecisionLedger {
                 let mut q = c.prepare("SELECT id,port,question,kind,backend,probability,verdict,selected,input_hash,label,label_source FROM decider_records WHERE port=?1 ORDER BY created_ms,id")?;
                 let rows = q
                     .query_map([&port], |r| {
+                        let stored: String = r.get(2)?;
+                        let calibration_key: Option<crate::CalibrationKey> = serde_json::from_str(&stored).ok();
+                        let question = calibration_key.as_ref().map(|key| key.question.clone()).unwrap_or(stored);
                         Ok(LedgerRecord {
+                            calibration_key,
                             id: r.get(0)?,
                             port: r.get(1)?,
-                            question: r.get(2)?,
+                            question,
                             kind: r.get(3)?,
                             backend: r.get(4)?,
                             probability: r.get(5)?,
