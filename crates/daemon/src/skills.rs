@@ -76,7 +76,8 @@ impl SkillsHost {
                 options.model_window.unwrap_or(policy.model_window),
                 counter,
             )
-            .await?,
+            .await?
+            .with_core_tools(excalibur_engine::builtin_tool_definitions()),
         );
         let mut watchers = Vec::new();
         for index in indexes.values() {

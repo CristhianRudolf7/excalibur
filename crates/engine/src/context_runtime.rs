@@ -437,11 +437,14 @@ impl Engine {
                 .append(
                     &id,
                     Message::text("user", text),
-                    HistoryReference {
-                        run_id: run.into(),
-                        to_sequence: s.last_sequence,
-                        ..Default::default()
-                    },
+                    session
+                        .history_lookup(&id)
+                        .map(|entry| entry.reference.clone())
+                        .unwrap_or_else(|| HistoryReference {
+                            run_id: run.into(),
+                            to_sequence: s.last_sequence,
+                            ..Default::default()
+                        }),
                 )
                 .map_err(|_| Error::Invalid("run session delta rejected"))?;
         }

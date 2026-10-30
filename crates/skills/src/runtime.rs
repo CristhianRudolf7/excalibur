@@ -32,6 +32,8 @@ pub struct SkillRuntime {
     indexes: BTreeMap<String, Arc<SkillIndex>>,
     window: usize,
     counter: TokenCounter,
+    core_tools: Vec<ToolDefinition>,
+    gates: std::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 impl SkillRuntime {
     pub async fn new(
@@ -51,7 +53,25 @@ impl SkillRuntime {
             indexes,
             window,
             counter,
+            core_tools: vec![],
+            gates: Default::default(),
         })
+    }
+    /// Engine-owned utility schemas supplied by the trusted host. This resolves
+    /// definitions only; it never bypasses the engine's builtin admission.
+    pub fn with_core_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
+        self.core_tools = tools;
+        self
+    }
+    fn gate(&self, run: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.gates.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(gate) = gates.get(run).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(run.into(), Arc::downgrade(&gate));
+        gate
     }
     /// Authority is selected by the host, never by a tool's project argument.
     /// Existing run bindings remain immutable across restart and catalog changes.
@@ -176,6 +196,16 @@ impl SkillRuntime {
             .await?
             .unwrap_or_else(|| self.delegate.definitions());
         all.extend(self.delegate.deferred_definitions(run).await?);
+        all.extend(definitions());
+        for builtin in &self.core_tools {
+            if all.iter().any(|tool| tool.name == builtin.name)
+                && self.delegate.overrides_builtin(run, &builtin.name).await
+            {
+                continue;
+            }
+            all.retain(|tool| tool.name != builtin.name);
+            all.push(builtin.clone());
+        }
         Ok(all.into_iter().map(|d| (d.name.clone(), d)).collect())
     }
     async fn receipt(
@@ -267,6 +297,10 @@ impl SkillRuntime {
 }
 
 impl ToolRuntime for SkillRuntime {
+    fn overrides_builtin<'a>(&'a self, run: &'a str, name: &'a str) -> BoxFuture<'a, bool> {
+        self.delegate.overrides_builtin(run, name)
+    }
+
     fn filesystem_confinement(&self, _run: &str) -> Option<FilesystemConfinement> {
         self.delegate.filesystem_confinement(_run)
     }
@@ -476,6 +510,7 @@ impl ToolRuntime for SkillRuntime {
         tool: &'a PreparedTool,
     ) -> BoxFuture<'a, ToolResult> {
         Box::pin(async move {
+            let _guard = self.gate(run).lock_owned().await;
             if own(&tool.call.name) {
                 if tool.data["skill_run"] != run {
                     return ToolResult::error("skill prepared run mismatch");
@@ -507,7 +542,11 @@ impl ToolRuntime for SkillRuntime {
         tool: &'a PreparedTool,
     ) -> BoxFuture<'a, Reconcile> {
         Box::pin(async move {
+            let _guard = self.gate(run).lock_owned().await;
             if own(&tool.call.name) {
+                if tool.data["skill_run"] != run {
+                    return Reconcile::Uncertain("skill prepared run mismatch".into());
+                }
                 return match self.receipt(run, key, &tool.call).await {
                     Ok(Some(r)) => Reconcile::Done(r),
                     Ok(None) => Reconcile::Retry,

@@ -15,12 +15,60 @@ use std::sync::{
 struct Model {
     calls: AtomicUsize,
     requests: Mutex<Vec<ModelRequest>>,
+    skills: Mutex<Option<Arc<excalibur_daemon::skills::SkillsHost>>>,
+    skill_file: std::path::PathBuf,
 }
 impl ModelGateway for Model {
     fn complete(&self, request: ModelRequest) -> BoxFuture<'_, Result<ModelResponse, ModelError>> {
         Box::pin(async move {
-            self.requests.lock().unwrap().push(request);
             let step = self.calls.fetch_add(1, Ordering::SeqCst);
+            if step == 2 {
+                let loaded: serde_json::Value = serde_json::from_str(
+                    &request
+                        .messages
+                        .iter()
+                        .find(|m| m.tool_call_id.as_deref() == Some("step-1"))
+                        .unwrap()
+                        .content,
+                )
+                .unwrap();
+                let tools = loaded["output"]["tools"].as_array().unwrap();
+                assert!(tools.iter().any(|tool| tool["name"] == "load_skill"));
+                assert!(
+                    tools
+                        .iter()
+                        .any(|tool| tool["name"] == "run_history_search")
+                );
+            }
+            if step == 6 {
+                let memory = request
+                    .messages
+                    .iter()
+                    .find(|m| m.tool_call_id.as_deref() == Some("step-5"))
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_str(&memory.content).unwrap();
+                assert_eq!(value["success"], true);
+                assert!(memory.content.contains("SCOPED MEMORY MESSAGE"));
+            }
+            if step == 7 {
+                let history = request
+                    .messages
+                    .iter()
+                    .find(|m| m.tool_call_id.as_deref() == Some("step-6"))
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_str(&history.content).unwrap();
+                assert_eq!(value["success"], true);
+                assert_eq!(value["output"]["scope"], "current_run");
+            }
+            self.requests.lock().unwrap().push(request);
+            if step == 2 {
+                std::fs::write(&self.skill_file, skill("CHANGED BODY")).unwrap();
+                let skills = self.skills.lock().unwrap().clone().unwrap();
+                skills.refresh("project:default").await.unwrap();
+            }
+            if step == 4 {
+                std::future::pending::<()>().await;
+            }
             let mut message = Message::text("assistant", "done");
             let action = match step {
                 0 => Some(("search_skills", json!({"query":"reactor"}))),
@@ -30,6 +78,11 @@ impl ModelGateway for Model {
                     json!({"path":"forbidden.txt","content":"must never exist"}),
                 )),
                 3 => Some(("read_file", json!({"path":"input.txt"}))),
+                5 => Some((
+                    "history_search",
+                    json!({"text":"SCOPED MEMORY MESSAGE","include":"messages"}),
+                )),
+                6 => Some(("run_history_search", json!({"limit":16}))),
                 _ => None,
             };
             if let Some((name, args)) = action {
@@ -53,7 +106,7 @@ impl ModelGateway for Model {
 }
 fn skill(body: &str) -> String {
     format!(
-        "---\nname: reactor\ndescription: Read reactor files and investigate reactor bugs\nallowed-tools: search_skills load_skill read_file\nmetadata:\n  excalibur.group: debugging\n  excalibur.tools: [read_file]\n---\n{body}\n"
+        "---\nname: reactor\ndescription: Read reactor files and investigate reactor bugs\nallowed-tools: search_skills load_skill read_file history_search run_history_search\nmetadata:\n  excalibur.group: debugging\n  excalibur.tools: read_file history_search run_history_search load_skill\n---\n{body}\n"
     )
 }
 #[test]
@@ -73,6 +126,8 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
     let model = Arc::new(Model {
         calls: AtomicUsize::new(0),
         requests: Mutex::new(vec![]),
+        skills: Mutex::new(None),
+        skill_file: root.join(".agents/skills/reactor/SKILL.md"),
     });
     let mut options = HostOptions::project(root.clone());
     options.memory = Some(excalibur_daemon::MemoryOptions {
@@ -90,7 +145,14 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
             runtimes.work(),
         ))
         .unwrap();
-    let (run, context) = runtimes.block_on(async {
+    *model.skills.lock().unwrap() = Some(host.skills.clone());
+    let (run, agent_id, context) = runtimes.block_on(async {
+        db.write(excalibur_store::Priority::Journal,|c|{
+            c.execute("INSERT OR IGNORE INTO principals(id) VALUES('owner')",[])?;
+            c.execute("INSERT INTO conversations(id,channel,principal_id,active_scope,scope_id) VALUES('chat','test','owner','project:default','project:default')",[])?;
+            c.execute("INSERT INTO messages(id,conversation_id,role,text,scope_id,principal_id) VALUES('memory-message','chat','user','SCOPED MEMORY MESSAGE','project:default','owner')",[])?;
+            Ok(())
+        }).await.unwrap();
         let parent = host
             .orchestrator
             .list_agents()
@@ -99,6 +161,8 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
             .into_iter()
             .find(|a| a.depth == 0)
             .unwrap();
+        let mut input=ContextInput::new("rules","task","now");
+        input.token_budgets[0]=16_000; // Full local, memory and coordination schemas.
         let agent = host
             .orchestrator
             .spawn(
@@ -106,7 +170,7 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
                 Delegation {
                     operation: "skills-e2e".into(),
                     name: "SkillsWorker".into(),
-                    profile: "implementer".into(),
+                    profile: "coordinator".into(),
                     scope: "project:default".into(),
                     task: excalibur_types::TaskId::new().to_string(),
                     origin_conversation: "chat".into(),
@@ -118,7 +182,7 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
                     fork_context: false,
                     token: parent.token,
                     spec: RunSpec {
-                        context: ContextInput::new("rules", "task", "now"),
+                        context: input,
                         budget: Budget::default(),
                         criteria: vec![Criterion::FinalResponse { schema: None }],
                     },
@@ -132,7 +196,7 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
             loop {
                 host.orchestrator.tick().await.unwrap();
                 let state = host.orchestrator.status(&agent.id).await.unwrap();
-                if state.state == "completed" {
+                if model.calls.load(Ordering::SeqCst) >= 5 {
                     break;
                 }
                 assert!(
@@ -144,6 +208,10 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
         })
         .await
         .unwrap();
+        host.orchestrator
+            .control(&agent.id, excalibur_orchestrator::Control::Pause)
+            .await
+            .unwrap();
         let context = host.skills.runtime.session_context(&run).await.unwrap();
         assert!(context.identity.contains("reactor"));
         assert!(context.suggested_skills.len() <= 3);
@@ -189,32 +257,73 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
         );
         drop(calls);
         assert!(!root.join("forbidden.txt").exists());
-        std::fs::write(
-            root.join(".agents/skills/reactor/SKILL.md"),
-            skill("CHANGED BODY"),
-        )
-        .unwrap();
-        host.skills.refresh("project:default").await.unwrap();
         let delta = host.skills.runtime.session_context(&run).await.unwrap();
         assert_eq!(delta.identity, context.identity);
         assert!(!delta.updates.is_empty());
-        (run, delta)
+        let state = host.orchestrator.engine().load(&run).await.unwrap();
+        assert_eq!(
+            state
+                .context_session
+                .as_ref()
+                .unwrap()
+                .history_search("Skill context update:", 0, 100)
+                .len(),
+            1
+        );
+        (run, agent.id, delta)
     });
+    *model.skills.lock().unwrap() = None;
     runtimes.block_on(host.close()).unwrap();
     drop(db);
     let db = Database::open(path, DatabaseKind::Main, Default::default()).unwrap();
+    let mut options = HostOptions::project(root);
+    options.memory = Some(excalibur_daemon::MemoryOptions {
+        maintenance_interval: None,
+        ..Default::default()
+    });
     let host = runtimes
         .block_on(DaemonHost::open(
             db,
-            HostOptions::project(root),
-            model,
+            options,
+            model.clone(),
             None,
             "synthetic-skills-host-token-00000000",
             Redactor::default(),
             runtimes.work(),
         ))
         .unwrap();
+    *model.skills.lock().unwrap() = Some(host.skills.clone());
     runtimes.block_on(async {
+        host.orchestrator
+            .control(&agent_id, excalibur_orchestrator::Control::Resume)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                host.orchestrator.tick().await.unwrap();
+                let status = host.orchestrator.status(&agent_id).await.unwrap();
+                if status.state == "completed" {
+                    break;
+                }
+                assert!(
+                    !matches!(status.state.as_str(), "failed" | "blocked"),
+                    "{status:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let state = host.orchestrator.engine().load(&run).await.unwrap();
+        assert_eq!(
+            state
+                .context_session
+                .as_ref()
+                .unwrap()
+                .history_search("Skill context update:", 0, 100)
+                .len(),
+            1
+        );
         assert_eq!(
             host.skills.runtime.session_context(&run).await.unwrap(),
             context
@@ -233,6 +342,7 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
             .await;
         assert!(denied.is_err());
     });
+    *model.skills.lock().unwrap() = None;
     runtimes.block_on(host.close()).unwrap();
     runtimes.shutdown(std::time::Duration::from_secs(3));
 }

@@ -8,7 +8,7 @@ La carga devuelve el cuerpo congelado como resultado de herramienta después de 
 
 La biblioteca `excalibur-decider` ofrece respuestas probabilísticas tipadas, respaldo acotado, abstención explícita, umbrales conservadores sin calibrar y un registro SQLite etiquetado. La calibración informa Brier/ECE/MCE y cobertura a partir de etiquetas locales suministradas. Los veredictos finales de corrección no tienen puerto de decisión. El enrutador de roles vincula modelos a roles y permite consultas aisladas al experto mientras mantiene estable la vinculación del ejecutor.
 
-Estas bibliotecas todavía no están conectadas al ciclo completo de contexto y ejecución del daemon. Quedan por integrar la aplicación automática de restricciones, la proyección de skills al contexto, los ocho puertos reales de decisión, las estadísticas durables de skills, la auditoría/promoción de skills curadas y el aprendizaje. No se afirma calidad del proveedor ni precisión calibrada en producción. Las pruebas usan dobles locales deterministas y nunca llaman a APIs de pago.
+El puente de sesiones de trabajadores conecta ahora el catálogo, contexto y restricciones descritos en [Sesiones de skills de trabajadores](skills-host.es.md). Siguen pendientes las sesiones de conversación del maestro, los ocho puertos reales de decisión, las estadísticas agregadas durables, la auditoría/promoción de skills curadas y el aprendizaje. No se afirma calidad del proveedor ni precisión calibrada en producción. Las pruebas usan dobles locales deterministas y nunca llaman a APIs de pago.
 
 Verificación:
 

@@ -86,11 +86,16 @@ fn call(name: &str, args: serde_json::Value) -> ToolCall {
 }
 fn write(root: &std::path::Path, name: &str, allowed: &str, tools: &str, body: &str) {
     std::fs::create_dir_all(root.join(name)).unwrap();
-    std::fs::write(root.join(name).join("SKILL.md"),format!("---\nname: {name}\ndescription: Read and debug reactor files\nallowed-tools: {allowed}\nmetadata:\n  excalibur.group: debugging\n  excalibur.tools: [{tools}]\n---\n{body}\n")).unwrap();
+    std::fs::write(root.join(name).join("SKILL.md"),format!("---\nname: {name}\ndescription: Read and debug reactor files\nallowed-tools: {allowed}\nmetadata:\n  excalibur.group: debugging\n  excalibur.tools: '{tools}'\n---\n{body}\n")).unwrap();
 }
 async fn index(root: &std::path::Path) -> Arc<SkillIndex> {
     let index = Arc::new(SkillIndex::new(vec![SkillRoot::user(root)]));
     index.refresh_background().await.unwrap();
+    assert!(
+        index.snapshot().diagnostics.is_empty(),
+        "{:?}",
+        index.snapshot().diagnostics
+    );
     index
 }
 #[tokio::test]
@@ -177,6 +182,15 @@ async fn durable_frozen_scope_hash_and_all_execution_paths_restrict_authority() 
         )
         .await
         .is_err()
+    );
+    assert!(
+        rt.prepare(
+            "run-a",
+            call("call_tool", json!({"name":"run_history_search","args":{}}))
+        )
+        .await
+        .unwrap_err()
+        .contains("allowed-tools")
     );
     assert!(
         rt.audit_builtin("run-a", &call("status", json!({})), None)
@@ -285,5 +299,61 @@ async fn schema_failure_never_activates_and_skill_cannot_grant_host_denial() {
             .await
             .unwrap_err()
             .contains("host denied")
+    );
+}
+
+#[tokio::test]
+async fn load_resolves_its_own_tools_and_host_owned_builtin_schemas() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "resolver",
+        "load_skill run_history_search",
+        "load_skill run_history_search",
+        "schema resolver",
+    );
+    let indexes = BTreeMap::from([("a".into(), index(dir.path()).await)]);
+    let db = Database::open(
+        dir.path().join("db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let runtime = SkillRuntime::new(
+        db,
+        Arc::new(Tools::default()),
+        indexes,
+        100000,
+        TokenCounter::default(),
+    )
+    .await
+    .unwrap()
+    .with_core_tools(vec![ToolDefinition {
+        name: "run_history_search".into(),
+        description: "host-owned journal".into(),
+        input_schema: json!({"type":"object","properties":{"limit":{"type":"integer"}}}),
+    }]);
+    runtime
+        .bind(
+            "r",
+            "a",
+            CatalogScope::new(TaskKind::Programming, "implementer"),
+            "resolver",
+        )
+        .await
+        .unwrap();
+    let prepared = runtime
+        .prepare("r", call("load_skill", json!({"name":"resolver"})))
+        .await
+        .unwrap();
+    let loaded = runtime.execute("r", "load", &prepared).await;
+    assert!(loaded.success, "{loaded:?}");
+    let schemas = loaded.output["tools"].as_array().unwrap();
+    assert!(schemas.iter().any(|tool| tool["name"] == "load_skill"));
+    assert!(
+        schemas
+            .iter()
+            .any(|tool| tool["name"] == "run_history_search"
+                && tool["input_schema"]["properties"]["limit"]["type"] == "integer")
     );
 }
