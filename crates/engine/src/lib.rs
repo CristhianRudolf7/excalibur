@@ -414,7 +414,7 @@ impl Snapshot {
                 self.loops = serde_json::from_value(p["state"].clone())?;
                 self.last_loop_step = p["step"].as_u64();
             }
-            "loop_detection" => {}
+            "loop_detection" | "step_heartbeat" => {}
             "child_budget_reserved" => {
                 let id = p["allocation_id"]
                     .as_str()
@@ -1195,6 +1195,39 @@ impl Engine {
         }
         Ok(applied)
     }
+    /// Pause a stalled running revision without waiting for its driver lock.
+    /// Pending tools are conservatively excluded: their effects need explicit reconciliation.
+    pub async fn pause_stalled_revision(&self, run: &str, sequence: u64) -> Result<bool> {
+        let state = self.load(run).await?;
+        if state.status != Status::Running
+            || state.last_sequence != sequence
+            || state
+                .calls
+                .values()
+                .any(|call| call.prepared.is_some() && call.result.is_none())
+        {
+            return Ok(false);
+        }
+        let applied = self
+            .journal
+            .set_state_if_revision(
+                run,
+                &["running"],
+                sequence,
+                "paused",
+                Some("watchdog_stalled".into()),
+                &format!("watchdog-stalled:{sequence}"),
+            )
+            .await?;
+        self.flush_events(run).await?;
+        if applied {
+            self.tools
+                .execution_state(run, "paused", Some("watchdog_stalled"))
+                .await
+                .map_err(|_| Error::Invalid("tool lifecycle update failed"))?;
+        }
+        Ok(applied)
+    }
     /// Automatic resume is conditional on the exact pause ownership reason and
     /// journal revision after acquiring the run boundary. User control wins races.
     pub async fn resume_if_reason(&self, run: &str, expected_reason: &str) -> Result<bool> {
@@ -1688,6 +1721,16 @@ impl Engine {
                 .execution_state(run, s.status.label(), s.reason.as_deref())
                 .await
                 .map_err(|_| Error::Invalid("tool lifecycle update failed"))?;
+            let heartbeat_key = format!("step:{}:heartbeat:{}", s.step, s.revision);
+            let heartbeat_step = s.step;
+            self.event(
+                run,
+                &mut s,
+                "step_heartbeat",
+                heartbeat_key,
+                json!({"step": heartbeat_step}),
+            )
+            .await?;
             self.tools
                 .begin_step(run, s.step)
                 .await

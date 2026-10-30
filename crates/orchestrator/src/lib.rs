@@ -17,6 +17,7 @@ pub use notifications::{
 };
 pub use profiles::CustomProfile;
 pub mod recovery;
+mod run_watchdog;
 mod scheduling;
 mod tools;
 pub use gate::OrchestrationGate;
@@ -210,6 +211,7 @@ impl Orchestrator {
             Ok(())
         })
         .await?;
+        run_watchdog::initialize(&db).await?;
         let recovery = recovery::RecoveryLedger::open(db.clone()).await?;
         Ok(Self {
             inner: Arc::new(Inner {

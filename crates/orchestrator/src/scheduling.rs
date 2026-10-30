@@ -61,6 +61,7 @@ impl Orchestrator {
     /// Reap finished tasks and admit ready work without occupying a worker for waiting parents.
     pub async fn tick(&self) -> Result<Vec<String>> {
         self.reap().await?;
+        self.watchdog_runs(now()).await?;
         for a in self.active_agents().await? {
             if a.run_id.is_some() {
                 self.deliver_mailbox(&a.id).await?;
