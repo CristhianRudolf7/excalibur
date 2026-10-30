@@ -10,8 +10,8 @@
 //! Only closed failure classifications are stored; no provider response body,
 //! header other than the retry hint, or credential ever reaches this module.
 use crate::{
-    FailureClass, ModelCallError, ModelError, ModelFailure, ModelGateway, ObservedResponse,
-    StreamDelta, StreamSink,
+    FailureClass, ModelCallError, ModelCallMetrics, ModelError, ModelFailure, ModelGateway,
+    ObservedResponse, StreamDelta, StreamSink,
 };
 use excalibur_types::runtime::{BoxFuture, ModelRequest, ModelResponse};
 use serde::{Deserialize, Serialize};
@@ -138,8 +138,13 @@ impl ResiliencePolicy {
         if b.window_ms == 0 || b.window_ms > hour || b.open_ms == 0 || b.open_ms > hour {
             return invalid("breaker window and open time must be positive and at most one hour");
         }
-        if b.failure_rate_percent >= 100 || b.min_samples == 0 || b.min_samples > 10_000 {
-            return invalid("failure rate must be below 100 % with 1 to 10000 minimum samples");
+        if b.failure_rate_percent >= 100
+            || b.min_samples == 0
+            || b.min_samples as usize > MAX_WINDOW
+        {
+            return invalid(
+                "failure rate must be below 100 % with 1 to 4096 minimum samples (the window capacity)",
+            );
         }
         Ok(())
     }
@@ -421,6 +426,13 @@ impl ProviderResilience {
     pub fn note_failover(&self, from: BreakerKey, to: BreakerKey, failure: ModelFailure) {
         self.event(ResilienceEvent::Failover { from, to, failure });
     }
+    /// True while the breaker rejects requests (open and not yet cooled down).
+    pub fn is_open(&self, key: &BreakerKey) -> bool {
+        let now = self.clock.monotonic();
+        Self::lock(&self.breakers)
+            .get(key)
+            .is_some_and(|b| matches!(b.state, State::Open { until } if until > now))
+    }
     pub fn snapshot(&self, key: &BreakerKey) -> BreakerSnapshot {
         let now = self.clock.monotonic();
         let window = Duration::from_millis(self.policy.breaker.window_ms);
@@ -673,8 +685,11 @@ impl FailoverGateway {
         sink: Option<StreamSink>,
         warm: bool,
     ) -> Result<ObservedResponse, ModelCallError> {
-        let mut previous: Vec<crate::ModelAttemptMetrics> = Vec::new();
-        let mut previous_calls = 0_u64;
+        // Metrics of routes that already failed over, and the conservative
+        // cost to charge for them when their own cost is unknown.
+        let mut earlier: Option<ModelCallMetrics> = None;
+        let mut earlier_charge = 0_u64;
+        let mut earlier_error: Option<ModelError> = None;
         for (index, route) in self.routes.iter().enumerate() {
             let emitted = Arc::new(AtomicBool::new(false));
             let result = match &sink {
@@ -699,33 +714,79 @@ impl FailoverGateway {
             };
             match result {
                 Ok(mut observed) => {
-                    if !previous.is_empty() {
-                        let mut attempts = std::mem::take(&mut previous);
-                        attempts.append(&mut observed.metrics.attempts);
-                        for (i, attempt) in attempts.iter_mut().enumerate() {
-                            attempt.index = i.min(u8::MAX as usize) as u8;
-                        }
-                        observed.metrics.attempts = attempts;
-                        observed.metrics.provider_calls = observed
-                            .metrics
-                            .provider_calls
-                            .saturating_add(previous_calls);
+                    if let Some(earlier) = &earlier {
+                        // The durable response usage is what budgets charge on
+                        // success: it includes every earlier route's estimate.
+                        let usage = &mut observed.response.usage;
+                        usage.input_tokens = usage
+                            .input_tokens
+                            .saturating_add(earlier.usage.input_tokens);
+                        usage.output_tokens = usage
+                            .output_tokens
+                            .saturating_add(earlier.usage.output_tokens);
+                        usage.cost_microusd = usage.cost_microusd.saturating_add(earlier_charge);
+                        usage.estimated |= !earlier.usage_known || earlier.usage.estimated;
+                        observed.metrics = merge_metrics(earlier, observed.metrics);
                     }
                     return Ok(observed);
                 }
-                Err(failure) => {
-                    if emitted.load(Ordering::SeqCst)
-                        || !self.should_fail_over(index, &failure.error)
-                    {
+                Err(mut failure) => {
+                    let stop = emitted.load(Ordering::SeqCst)
+                        || !self.should_fail_over(index, &failure.error);
+                    let route_charge = failure.metrics.cost_microusd.unwrap_or_else(|| {
+                        route
+                            .call_bound(&request)
+                            .map(|b| b.max_cost_microusd)
+                            .unwrap_or(0)
+                    });
+                    let merged = match &earlier {
+                        Some(earlier) => merge_metrics(earlier, *failure.metrics),
+                        None => *failure.metrics,
+                    };
+                    if stop {
+                        // CircuitOpen means nothing was sent: when an earlier
+                        // route did send, report its real failure instead.
+                        if failure.error.classification().class == FailureClass::CircuitOpen
+                            && let Some(previous) = earlier_error.take()
+                            && merged.provider_calls > 0
+                        {
+                            failure.error = previous;
+                        }
+                        failure.metrics = Box::new(merged);
                         return Err(failure);
                     }
-                    previous_calls = previous_calls.saturating_add(failure.metrics.provider_calls);
-                    previous.extend(failure.metrics.attempts.iter().cloned());
+                    if failure.error.classification().class != FailureClass::CircuitOpen {
+                        earlier_error = Some(failure.error.clone());
+                    }
+                    earlier_charge = earlier_charge.saturating_add(route_charge);
+                    earlier = Some(merged);
                 }
             }
         }
         unreachable!("the last route never fails over")
     }
+}
+/// Combine an earlier route's metrics with a later route's. The later route
+/// supplies identity (metadata, request hash); counters, usage, cost and
+/// duration are summed and knowledge flags are intersected. Attempt `index`
+/// values keep their per-route meaning (validation attempt of that route);
+/// the attempts' order is chronological across routes.
+fn merge_metrics(earlier: &ModelCallMetrics, mut later: ModelCallMetrics) -> ModelCallMetrics {
+    later.provider_calls = later.provider_calls.saturating_add(earlier.provider_calls);
+    later.provider_calls_known &= earlier.provider_calls_known;
+    let mut usage = earlier.usage.clone();
+    usage.add(&later.usage);
+    later.usage = usage;
+    later.usage_known &= earlier.usage_known;
+    later.cost_microusd = later
+        .cost_microusd
+        .zip(earlier.cost_microusd)
+        .map(|(a, b)| a.saturating_add(b));
+    later.duration_ms = later.duration_ms.saturating_add(earlier.duration_ms);
+    let mut attempts = earlier.attempts.clone();
+    attempts.append(&mut later.attempts);
+    later.attempts = attempts;
+    later
 }
 impl ModelGateway for FailoverGateway {
     fn rate_limits(&self) -> Option<(u64, u64)> {
@@ -759,12 +820,34 @@ impl ModelGateway for FailoverGateway {
             max_tokens: 0,
             max_cost_microusd: 0,
         };
+        // One call may spend on every route in turn, so the bound is the sum.
         for route in &self.routes {
             let next = route.call_bound(request)?;
-            bound.max_tokens = bound.max_tokens.max(next.max_tokens);
-            bound.max_cost_microusd = bound.max_cost_microusd.max(next.max_cost_microusd);
+            bound.max_tokens = bound.max_tokens.saturating_add(next.max_tokens);
+            bound.max_cost_microusd = bound
+                .max_cost_microusd
+                .saturating_add(next.max_cost_microusd);
         }
         Some(bound)
+    }
+    fn unload_idle(&self) -> BoxFuture<'_, Result<usize, ModelError>> {
+        Box::pin(async move {
+            let mut released = 0_usize;
+            for route in &self.routes {
+                released = released.saturating_add(route.unload_idle().await?);
+            }
+            Ok(released)
+        })
+    }
+    /// The primary route's catalog override. Fallbacks that disagree would
+    /// make the catalog depend on availability, so then none is offered.
+    fn deferred_catalog_override(&self) -> Option<Vec<excalibur_types::runtime::ToolDefinition>> {
+        let primary = self.routes[0].deferred_catalog_override();
+        self.routes[1..]
+            .iter()
+            .all(|r| r.deferred_catalog_override() == primary)
+            .then_some(primary)
+            .flatten()
     }
     fn complete_observed<'a>(
         &'a self,

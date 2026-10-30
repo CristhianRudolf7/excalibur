@@ -623,6 +623,19 @@ async fn open_breaker_switches_the_role_to_its_fallback_route() {
         );
         assert_eq!(observed.metrics.provider_calls, 3);
         assert_eq!(observed.metrics.attempts.len(), 3);
+        // The primary's failed requests are charged, not hidden.
+        assert!(!observed.metrics.usage_known);
+        assert!(observed.response.usage.estimated);
+        assert!(observed.response.usage.input_tokens > 5);
+        assert_eq!(
+            observed.metrics.usage.input_tokens,
+            observed
+                .metrics
+                .attempts
+                .iter()
+                .map(|a| a.usage.input_tokens)
+                .sum::<u64>()
+        );
     }
     let primary_key = resilience.key("OpenAi", "primary-model");
     assert_eq!(resilience.snapshot(&primary_key).consecutive_failures, 4);
@@ -656,8 +669,9 @@ async fn open_breaker_switches_the_role_to_its_fallback_route() {
             ..
         }
     )));
-    // Only one retry sleep per primary call that reached the provider.
-    assert_eq!(clock.sleeps().len(), 3);
+    // The primary slept once in each of the first two calls; the failure that
+    // opened its breaker in the third call failed over without sleeping.
+    assert_eq!(clock.sleeps().len(), 2);
 }
 
 #[tokio::test]
@@ -746,6 +760,10 @@ async fn provider_model_scope_keeps_models_independent() {
 async fn concurrent_callers_update_one_breaker_consistently() {
     let mut policy = policy();
     policy.breaker.consecutive_failures = 50;
+    // Disable the rate rule (it could open at the 10th failure) so only the
+    // consecutive rule under test can open the breaker: then at least 50
+    // permits are always admitted, whatever the scheduling.
+    policy.breaker.min_samples = 4_096;
     let (resilience, _clock) = shared(policy);
     let key = resilience.key("OpenAi", "m");
     let admitted = Arc::new(AtomicUsize::new(0));
@@ -896,4 +914,414 @@ fn invalid_policies_are_rejected() {
     assert_eq!(defaults.breaker.failure_rate_percent, 50);
     assert_eq!(defaults.breaker.open_ms, 60_000);
     assert_eq!(defaults.breaker.scope, BreakerScope::Provider);
+}
+
+// ---- Correction cycle 1 (audit of d42da58: PR-2 .. PR-7) ----
+
+/// Mirror of the failure branch of `crates/engine/src/context_runtime.rs`
+/// (summary budget charging, lines 367-381 at 570823d): nothing charged when
+/// the call provably sent nothing, recorded usage when known, otherwise the
+/// pre-dispatch bound. Kept literal so a change in either side is visible.
+fn context_runtime_charge(
+    failure: &excalibur_models::ModelCallError,
+    bound: &excalibur_models::ModelCallBound,
+) -> excalibur_types::runtime::Usage {
+    let metrics = &failure.metrics;
+    if metrics.provider_calls_known && metrics.provider_calls == 0 {
+        excalibur_types::runtime::Usage::default()
+    } else if metrics.usage_known {
+        excalibur_types::runtime::Usage {
+            input_tokens: metrics.usage.input_tokens,
+            output_tokens: metrics.usage.output_tokens,
+            cost_microusd: metrics.cost_microusd.unwrap_or(0),
+            estimated: metrics.usage.estimated,
+        }
+    } else {
+        excalibur_types::runtime::Usage {
+            input_tokens: bound.max_tokens,
+            cost_microusd: bound.max_cost_microusd,
+            estimated: true,
+            ..Default::default()
+        }
+    }
+}
+
+#[tokio::test]
+async fn retried_attempts_are_charged_like_final_failures() {
+    let (resilience, _clock) = shared(policy());
+    let server = mock(vec![status("500 Internal Server Error", &[]), ok("done")]).await;
+    let gw = gateway(
+        Provider::OpenAi,
+        &server.url,
+        "m",
+        ModelRole::Worker,
+        &resilience,
+    );
+    let observed = gw.complete_observed(request()).await.unwrap();
+    assert!(
+        !observed.metrics.usage_known,
+        "a retried attempt's usage is unknown"
+    );
+    let retried = &observed.metrics.attempts[0];
+    assert!(retried.usage.estimated);
+    assert!(
+        retried.usage.input_tokens > 100,
+        "conservative input estimate"
+    );
+    assert_eq!(
+        observed.metrics.usage.input_tokens,
+        retried.usage.input_tokens + 5
+    );
+    // The durable response usage that budgets charge on success includes it.
+    assert!(observed.response.usage.estimated);
+    assert_eq!(
+        observed.response.usage.input_tokens,
+        retried.usage.input_tokens + 5
+    );
+    // The pre-dispatch bound covers the resends allowed by the policy.
+    let plain = OpenAiGateway::new(
+        ProviderClient::with_base_url(
+            Provider::OpenAi,
+            Secret::new("synthetic-key").unwrap(),
+            &server.url,
+        )
+        .unwrap(),
+        GatewayConfig::new("m", ModelRole::Worker),
+    )
+    .unwrap();
+    let with = gw.call_bound(&request()).unwrap().max_tokens;
+    let without = plain.call_bound(&request()).unwrap().max_tokens;
+    assert!(with > without + 2 * retried.usage.input_tokens);
+}
+
+#[tokio::test]
+async fn retried_priced_success_keeps_a_known_conservative_cost() {
+    use excalibur_models::{ModelPrice, PriceTable};
+    let (resilience, _clock) = shared(policy());
+    let server = mock(vec![status("503 Service Unavailable", &[]), ok("done")]).await;
+    let table = PriceTable {
+        version: "synthetic-tariff-v1".into(),
+        entries: vec![ModelPrice {
+            provider: "OpenAi".into(),
+            model: "m".into(),
+            input_microusd_per_million: 1_000_000,
+            cache_read_microusd_per_million: None,
+            cache_write_microusd_per_million_by_ttl: Default::default(),
+            output_microusd_per_million: 1_000_000,
+            reasoning_microusd_per_million: None,
+        }],
+    };
+    let gw = gateway(
+        Provider::OpenAi,
+        &server.url,
+        "m",
+        ModelRole::Worker,
+        &resilience,
+    )
+    .with_price_table(table)
+    .unwrap();
+    let observed = gw.complete_observed(request()).await.unwrap();
+    let retried_cost = observed.metrics.attempts[0].cost_microusd.unwrap();
+    assert!(retried_cost > 0, "the unreported resend is priced");
+    assert_eq!(
+        observed.metrics.cost_microusd,
+        Some(retried_cost + observed.metrics.attempts[1].cost_microusd.unwrap())
+    );
+    assert_eq!(
+        observed.response.usage.cost_microusd,
+        observed.metrics.cost_microusd.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn context_runtime_budget_charging_sees_sent_and_unsent_calls_correctly() {
+    let mut policy = policy();
+    policy.retry.max_retries = 2;
+    let (resilience, clock) = shared(policy);
+    let key = resilience.key("OpenAi", "m");
+    for _ in 0..4 {
+        resilience.admit(&key).unwrap().record(Outcome::Failure);
+    }
+    let server = mock(vec![status("500 Internal Server Error", &[]); 2]).await;
+    let gw = gateway(
+        Provider::OpenAi,
+        &server.url,
+        "m",
+        ModelRole::Worker,
+        &resilience,
+    );
+    let bound = gw.call_bound(&request()).unwrap();
+    // A sent request whose failure opens the breaker: a real Server failure,
+    // never CircuitOpen, and charged at the conservative bound.
+    let sent = gw.complete_observed(request()).await.unwrap_err();
+    assert_eq!(class(&sent.error), FailureClass::Server);
+    assert_eq!(sent.metrics.provider_calls, 1);
+    assert!(!sent.metrics.usage_known);
+    let charged = context_runtime_charge(&sent, &bound);
+    assert_eq!(charged.input_tokens, bound.max_tokens);
+    assert!(charged.estimated);
+    assert!(
+        clock.sleeps().is_empty(),
+        "no backoff once the breaker opened"
+    );
+    // A call rejected before sending: CircuitOpen, provably nothing sent,
+    // nothing charged.
+    let unsent = gw.complete_observed(request()).await.unwrap_err();
+    assert_eq!(class(&unsent.error), FailureClass::CircuitOpen);
+    assert!(unsent.metrics.provider_calls_known);
+    assert_eq!(unsent.metrics.provider_calls, 0);
+    assert_eq!(
+        context_runtime_charge(&unsent, &bound),
+        excalibur_types::runtime::Usage::default()
+    );
+    assert_eq!(server.count(), 1);
+}
+
+#[tokio::test]
+async fn breaker_opening_skips_the_backoff_and_fails_over_immediately() {
+    let (resilience, clock) = shared(policy());
+    let key = resilience.key("OpenAi", "p");
+    for _ in 0..4 {
+        resilience.admit(&key).unwrap().record(Outcome::Failure);
+    }
+    let primary_server = mock(vec![status(
+        "429 Too Many Requests",
+        &["Retry-After: 45".into()],
+    )])
+    .await;
+    let fallback_server = mock(vec![ok("fallback")]).await;
+    let role = FailoverGateway::new(vec![
+        Arc::new(gateway(
+            Provider::OpenAi,
+            &primary_server.url,
+            "p",
+            ModelRole::Worker,
+            &resilience,
+        )),
+        Arc::new(gateway(
+            Provider::DeepSeek,
+            &fallback_server.url,
+            "f",
+            ModelRole::Worker,
+            &resilience,
+        )),
+    ])
+    .unwrap();
+    let observed = role.complete_observed(request()).await.unwrap();
+    assert_eq!(observed.response.message.content, "fallback");
+    assert!(
+        clock.sleeps().is_empty(),
+        "the 45 s Retry-After is not waited"
+    );
+    assert_eq!(primary_server.count(), 1);
+    assert_eq!(observed.metrics.provider_calls, 2);
+}
+
+#[tokio::test]
+async fn failover_aggregates_metrics_when_every_route_fails() {
+    let mut policy = policy();
+    policy.retry.max_retries = 0;
+    let (resilience, _clock) = shared(policy);
+    let primary_server = mock(vec![status("500 Internal Server Error", &[])]).await;
+    let fallback_server = mock(vec![status("503 Service Unavailable", &[])]).await;
+    let routes: Vec<Arc<dyn ModelGateway>> = vec![
+        Arc::new(gateway(
+            Provider::OpenAi,
+            &primary_server.url,
+            "p",
+            ModelRole::Worker,
+            &resilience,
+        )),
+        Arc::new(gateway(
+            Provider::DeepSeek,
+            &fallback_server.url,
+            "f",
+            ModelRole::Worker,
+            &resilience,
+        )),
+    ];
+    let role = FailoverGateway::new(routes.clone()).unwrap();
+    let failure = role.complete_observed(request()).await.unwrap_err();
+    assert_eq!(class(&failure.error), FailureClass::Server);
+    assert_eq!(failure.metrics.provider_calls, 2);
+    assert!(failure.metrics.provider_calls_known);
+    assert!(!failure.metrics.usage_known);
+    assert_eq!(failure.metrics.attempts.len(), 2);
+    assert_eq!(
+        failure.metrics.usage.input_tokens,
+        failure
+            .metrics
+            .attempts
+            .iter()
+            .map(|a| a.usage.input_tokens)
+            .sum::<u64>()
+    );
+    assert_eq!(failure.metrics.metadata.model.as_deref(), Some("f"));
+    // The reservation is the sum of the routes: one call may spend on each.
+    let sum = routes
+        .iter()
+        .map(|r| r.call_bound(&request()).unwrap().max_tokens)
+        .sum::<u64>();
+    assert_eq!(role.call_bound(&request()).unwrap().max_tokens, sum);
+}
+
+#[tokio::test]
+async fn failover_reports_sent_primary_requests_when_the_fallback_is_open() {
+    let mut policy = policy();
+    policy.retry.max_retries = 0;
+    let (resilience, _clock) = shared(policy);
+    let fallback_key = resilience.key("DeepSeek", "f");
+    for _ in 0..5 {
+        resilience
+            .admit(&fallback_key)
+            .unwrap()
+            .record(Outcome::Failure);
+    }
+    let primary_server = mock(vec![status("500 Internal Server Error", &[])]).await;
+    let fallback_server = mock(vec![ok("never")]).await;
+    let role = FailoverGateway::new(vec![
+        Arc::new(gateway(
+            Provider::OpenAi,
+            &primary_server.url,
+            "p",
+            ModelRole::Worker,
+            &resilience,
+        )),
+        Arc::new(gateway(
+            Provider::DeepSeek,
+            &fallback_server.url,
+            "f",
+            ModelRole::Worker,
+            &resilience,
+        )),
+    ])
+    .unwrap();
+    let failure = role.complete_observed(request()).await.unwrap_err();
+    // CircuitOpen is reserved for calls that sent nothing: the primary's
+    // real failure is reported.
+    assert_eq!(class(&failure.error), FailureClass::Server);
+    assert_eq!(
+        failure.metrics.provider_calls, 1,
+        "the primary's sent request must not be reported as none"
+    );
+    assert!(!failure.metrics.usage_known);
+    let bound = role.call_bound(&request()).unwrap();
+    assert_eq!(
+        context_runtime_charge(&failure, &bound).input_tokens,
+        bound.max_tokens
+    );
+    assert_eq!(fallback_server.count(), 0);
+}
+
+/// Scripted route: streams one delta and then fails, or answers.
+struct Scripted {
+    fail: bool,
+    calls: AtomicUsize,
+    unload: usize,
+}
+impl Scripted {
+    fn new(fail: bool, unload: usize) -> Arc<Self> {
+        Arc::new(Self {
+            fail,
+            calls: AtomicUsize::new(0),
+            unload,
+        })
+    }
+}
+impl ModelGateway for Scripted {
+    fn unload_idle(&self) -> BoxFuture<'_, Result<usize, ModelError>> {
+        let unload = self.unload;
+        Box::pin(async move { Ok(unload) })
+    }
+    fn complete<'a>(
+        &'a self,
+        _request: ModelRequest,
+    ) -> BoxFuture<'a, Result<excalibur_types::runtime::ModelResponse, ModelError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let fail = self.fail;
+        Box::pin(async move {
+            if fail {
+                Err(ModelError::ProviderFailure(ModelFailure {
+                    class: FailureClass::Server,
+                    http_status: Some(502),
+                }))
+            } else {
+                Ok(excalibur_types::runtime::ModelResponse {
+                    message: Message::text("assistant", "scripted"),
+                    usage: Default::default(),
+                })
+            }
+        })
+    }
+    fn complete_stream<'a>(
+        &'a self,
+        request: ModelRequest,
+        sink: StreamSink,
+    ) -> BoxFuture<'a, Result<excalibur_types::runtime::ModelResponse, ModelError>> {
+        Box::pin(async move {
+            sink(StreamDelta::Text {
+                attempt: 0,
+                delta: "partial".into(),
+            });
+            self.complete(request).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_stream_that_emitted_a_delta_never_fails_over() {
+    let primary = Scripted::new(true, 2);
+    let fallback = Scripted::new(false, 3);
+    let role = FailoverGateway::new(vec![primary.clone(), fallback.clone()]).unwrap();
+    let sink: StreamSink = Arc::new(|_| {});
+    let error = role.complete_stream(request(), sink).await.unwrap_err();
+    assert_eq!(class(&error), FailureClass::Server);
+    assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
+    // The same failure without an emitted delta does fail over.
+    let response = role.complete(request()).await.unwrap();
+    assert_eq!(response.message.content, "scripted");
+    assert_eq!(fallback.calls.load(Ordering::SeqCst), 1);
+    // unload_idle reaches every route.
+    assert_eq!(role.unload_idle().await.unwrap(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_callers_get_exactly_one_half_open_probe() {
+    let mut policy = policy();
+    policy.breaker.consecutive_failures = 1;
+    let (resilience, clock) = shared(policy);
+    let key = resilience.key("OpenAi", "m");
+    resilience.admit(&key).unwrap().record(Outcome::Failure);
+    clock.advance(Duration::from_secs(60));
+    let barrier = Arc::new(tokio::sync::Barrier::new(32));
+    let mut tasks = Vec::new();
+    for _ in 0..32 {
+        let resilience = resilience.clone();
+        let key = key.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            // Hold any granted permit until every caller has tried.
+            resilience.admit(&key).ok()
+        }));
+    }
+    let mut granted = Vec::new();
+    for task in tasks {
+        if let Some(permit) = task.await.unwrap() {
+            granted.push(permit);
+        }
+    }
+    assert_eq!(granted.len(), 1, "exactly one concurrent probe");
+    granted.pop().unwrap().record(Outcome::Success);
+    assert_eq!(resilience.snapshot(&key).state, BreakerState::Closed);
+}
+
+#[test]
+fn minimum_sample_cannot_exceed_the_window_capacity() {
+    let clock: Arc<dyn ResilienceClock> = ManualClock::new();
+    let mut policy = ResiliencePolicy::default();
+    policy.breaker.min_samples = 4_096;
+    assert!(ProviderResilience::new(policy.clone(), clock.clone()).is_ok());
+    policy.breaker.min_samples = 4_097;
+    assert!(ProviderResilience::new(policy, clock).is_err());
 }
