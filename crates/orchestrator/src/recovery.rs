@@ -170,17 +170,21 @@ impl RecoveryLedger {
             let crashes:u64=c.query_row("SELECT count(*) FROM daemon_boots WHERE crashed_at>=?1 AND crashed_at<=?2",rusqlite::params![at.saturating_sub(WINDOW),at],|r|r.get(0))?;
             let master: String=c.query_row("SELECT id FROM orchestration_agents WHERE depth=0 ORDER BY id LIMIT 1",[],|r|r.get(0))?;
             let conversations=c.prepare("SELECT id,COALESCE(active_scope,scope_id,'general') FROM conversations ORDER BY id")?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
-            let mut query=c.prepare("SELECT d.run_id,d.decision,d.reason,a.id,json_extract(a.body,'$.origin_conversation'),a.scope FROM daemon_recovery_decisions d JOIN orchestration_agents a ON a.run_id=d.run_id WHERE d.boot_id=?1 ORDER BY d.run_id")?;
+            let mut query=c.prepare("SELECT d.run_id,d.decision,d.reason,a.id,json_extract(a.body,'$.origin_conversation'),json_extract(a.body,'$.scope') FROM daemon_recovery_decisions d JOIN orchestration_agents a ON a.run_id=d.run_id WHERE d.boot_id=?1 ORDER BY d.run_id")?;
             let decisions=query.query_map([&boot],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
-            let enqueue=|subject:&str,agent:&str,conversation:&str,class:&str,content:Value|->excalibur_store::Result<()> {
-                let id=format!("ntf_{}",digest(format!("startup:{boot}:{subject}").as_bytes()));
-                let inserted=c.execute("INSERT OR IGNORE INTO daemon_recovery_notification_receipts VALUES(?1,?2,?3)",rusqlite::params![boot,subject,id])?;
+            let enqueue=|notice_boot:&str,subject:&str,agent:&str,conversation:&str,class:&str,content:Value|->excalibur_store::Result<()> {
+                let id=format!("ntf_{}",digest(format!("startup:{notice_boot}:{subject}").as_bytes()));
+                let inserted=c.execute("INSERT OR IGNORE INTO daemon_recovery_notification_receipts VALUES(?1,?2,?3)",rusqlite::params![notice_boot,subject,id])?;
                 if inserted>0 {c.execute("INSERT INTO orchestration_notifications(id,agent_id,conversation,class,content,created,acknowledged) VALUES(?1,?2,?3,?4,?5,?6,0)",rusqlite::params![id,agent,conversation,class,content.to_string(),at])?;}
                 Ok(())
             };
-            for (run,decision,reason,agent,origin,scope) in &decisions {
-                if decision=="blocked" && conversations.iter().any(|(id,_)|id==origin) {
-                    enqueue(&format!("decision:{run}:{decision}"),agent,origin,"urgent",json!({"kind":"recovery_blocked","boot_id":boot,"run_id":run,"decision":decision,"reason":reason,"origin_conversation":origin,"scope":scope,"text":format!("{run}: {decision}: {reason}")}))?;
+            // A process may stop after persisting a decision but before publishing.
+            // Drain every unreceipted blocked decision, retaining its original boot.
+            let mut pending=c.prepare("SELECT d.boot_id,d.run_id,d.decision,d.reason,a.id,json_extract(a.body,'$.origin_conversation'),json_extract(a.body,'$.scope') FROM daemon_recovery_decisions d JOIN orchestration_agents a ON a.run_id=d.run_id WHERE d.decision='blocked' AND NOT EXISTS(SELECT 1 FROM daemon_recovery_notification_receipts r WHERE r.boot_id=d.boot_id AND r.subject='decision:'||d.run_id||':'||d.decision) ORDER BY d.boot_id,d.run_id")?;
+            let pending=pending.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            for (notice_boot,run,decision,reason,agent,origin,scope) in pending {
+                if conversations.iter().any(|(id,_)|id==&origin) {
+                    enqueue(&notice_boot,&format!("decision:{run}:{decision}"),&agent,&origin,"urgent",json!({"kind":"recovery_blocked","boot_id":notice_boot,"run_id":run,"decision":decision,"reason":reason,"origin_conversation":origin,"scope":scope,"text":format!("{run}: {decision}: {reason}")}))?;
                 }
             }
             for (conversation,scope) in conversations {
@@ -194,11 +198,19 @@ impl RecoveryLedger {
                 let counts=scoped.iter().fold(std::collections::BTreeMap::<String,usize>::new(),|mut counts,row|{*counts.entry(row.1.clone()).or_default()+=1;counts});
                 let text=format!("Startup recovery: {crashes} recent unclean restarts; safe mode {}. Decisions in {scope}: {}. Details are attached; full recovery state is available.",if safe_until>at{"active"}else{"inactive"},serde_json::to_string(&counts).unwrap_or_default());
                 let agent=scoped.first().map(|row|row.3.as_str()).unwrap_or(&master);
-                enqueue(&format!("conversation:{conversation}"),agent,&conversation,if safe_until>at{"urgent"}else{"normal"},json!({"kind":"recovery_summary","boot_id":boot,"scope":scope,"origin_conversation":conversation,"safe_mode":safe_until>at,"safe_until":safe_until,"recent_crashes":crashes,"counts":counts,"decisions":details,"omitted_decisions":scoped.len().saturating_sub(details.len()),"text":text}))?;
+                enqueue(&boot,&format!("conversation:{conversation}"),agent,&conversation,if safe_until>at{"urgent"}else{"normal"},json!({"kind":"recovery_summary","boot_id":boot,"scope":scope,"origin_conversation":conversation,"safe_mode":safe_until>at,"safe_until":safe_until,"recent_crashes":crashes,"counts":counts,"decisions":details,"omitted_decisions":scoped.len().saturating_sub(details.len()),"text":text}))?;
             }
             Ok(())
         }).await?;
         Ok(())
+    }
+    /// Host scope comes only from a receipt-backed recovery notification, never
+    /// from an ordinary agent's user-supplied JSON content.
+    pub async fn notification_scope(&self, id: &str) -> Result<Option<String>> {
+        let id = id.to_owned();
+        Ok(self.db.read(ReadLane::Interactive, move |c| {
+            Ok(c.query_row("SELECT json_extract(n.content,'$.scope') FROM daemon_recovery_notification_receipts r JOIN orchestration_notifications n ON n.id=r.notification_id WHERE n.id=?1", [id], |r| r.get(0)).optional()?)
+        }).await?)
     }
     pub async fn exit_safe_mode(&self, operation: &str, at: i64) -> Result<()> {
         self.control(operation, "exit_safe_mode", "", at).await

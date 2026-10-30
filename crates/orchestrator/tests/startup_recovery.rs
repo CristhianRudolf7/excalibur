@@ -434,9 +434,29 @@ async fn uncertain_recovery_emits_scoped_urgent_notice_and_deduplicates_after_da
     let secret = f.host.spawn(&f.master.id, secret).await.unwrap();
     let secret_run = secret.run_id.unwrap();
     let b = boot(&f, at + 1, Autonomy::Autonomous).await;
+    // The decision is durable but no notification has been published. Simulate
+    // process loss at this exact boundary, then start a new database incarnation.
+    assert!(f.host.notifications("origin").await.unwrap().is_empty());
+    f.host.shutdown().await.unwrap();
+    drop(f.host);
+    f.db.shutdown().await.unwrap();
+    drop(f.db);
+    let f = open_fixture(f.dir).await;
+    let next = boot(&f, at + 2, Autonomy::Autonomous).await;
+    assert!(
+        f.host
+            .recovery()
+            .status(at + 2)
+            .await
+            .unwrap()
+            .decisions
+            .iter()
+            .any(|decision| decision.run_id == run && decision.decision == "preserved")
+    );
+
     f.host
         .recovery()
-        .publish_summary(&b.id, at + 1)
+        .publish_summary(&next.id, at + 2)
         .await
         .unwrap();
     let notices = f.host.notifications("origin").await.unwrap();
@@ -451,6 +471,7 @@ async fn uncertain_recovery_emits_scoped_urgent_notice_and_deduplicates_after_da
             "uncertain effects need a real urgent notification, not just an on-demand status row",
         );
     let content: serde_json::Value = serde_json::from_str(&urgent.content).unwrap();
+    assert_eq!(content["boot_id"], b.id);
     assert_eq!(content["run_id"], run);
     assert_eq!(content["origin_conversation"], "origin");
     assert_eq!(content["scope"], "general");
@@ -489,7 +510,7 @@ async fn uncertain_recovery_emits_scoped_urgent_notice_and_deduplicates_after_da
     let count = notices.len();
     f.host
         .recovery()
-        .publish_summary(&b.id, at + 2)
+        .publish_summary(&next.id, at + 3)
         .await
         .unwrap();
     assert_eq!(f.host.notifications("origin").await.unwrap().len(), count);
@@ -507,7 +528,7 @@ async fn uncertain_recovery_emits_scoped_urgent_notice_and_deduplicates_after_da
     let ledger = excalibur_orchestrator::recovery::RecoveryLedger::open(reopened.clone())
         .await
         .unwrap();
-    ledger.publish_summary(&b.id, at + 3).await.unwrap();
+    ledger.publish_summary(&next.id, at + 4).await.unwrap();
     let owner = run.clone();
     let (count_after, intents, results): (usize, u64, u64) = reopened
         .read(ReadLane::Interactive, move |c| {

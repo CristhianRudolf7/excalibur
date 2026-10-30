@@ -353,6 +353,15 @@ async fn housekeeping_iteration(
         .await
         .map_err(|e| e.to_string())?;
     master.retry_pending().await.map_err(|e| e.to_string())?;
+    deliver_notifications(&master, &orchestrator, now).await
+}
+
+/// Deliver the shared durable notification outbox without changing its scope.
+pub async fn deliver_notifications(
+    master: &excalibur_master::Master,
+    orchestrator: &excalibur_orchestrator::Orchestrator,
+    now: i64,
+) -> Result<(), String> {
     for delivery in orchestrator
         .pending_deliveries(now)
         .await
@@ -365,13 +374,28 @@ async fn housekeeping_iteration(
             .cross_conversation
             .as_ref()
             .unwrap_or(&delivery.notification.conversation);
-        let Ok(agent) = orchestrator.agent(&delivery.notification.agent_id).await else {
-            continue;
+        let host_scope = orchestrator
+            .recovery()
+            .notification_scope(&delivery.notification.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (scope, identity) = if let Some(scope) = host_scope {
+            (scope, json!({"host":true}))
+        } else {
+            let Ok(agent) = orchestrator.agent(&delivery.notification.agent_id).await else {
+                continue;
+            };
+            (agent.scope, json!({"name":agent.name,"agent_id":agent.id}))
         };
         let content = if delivery.cross_conversation.is_some() {
-            json!({"notification_id":delivery.notification.id,"origin":delivery.notification.conversation,"scope":agent.scope,"summary":"Urgent update in the origin conversation"})
+            json!({"notification_id":delivery.notification.id,"origin":delivery.notification.conversation,"scope":scope,"summary":"Urgent update in the origin conversation"})
         } else {
-            json!({"notification_id":delivery.notification.id,"content":delivery.notification.content,"origin":delivery.notification.conversation,"scope":agent.scope,"name":agent.name,"agent_id":agent.id,"created_at":delivery.notification.created})
+            let mut content = json!({"notification_id":delivery.notification.id,"content":delivery.notification.content,"origin":delivery.notification.conversation,"scope":scope,"created_at":delivery.notification.created});
+            content
+                .as_object_mut()
+                .unwrap()
+                .extend(identity.as_object().unwrap().clone());
+            content
         };
         let key = format!("{}:{}", delivery.notification.id, delivery.channel);
         let published = if delivery.cross_conversation.is_some() {
