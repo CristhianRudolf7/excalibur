@@ -133,6 +133,7 @@ fn authenticated_confirmation_survives_restart_and_cancels_once_with_full_inbox(
         server.abort();(agent,other,question)
     });
     runtimes.block_on(host.close()).unwrap();
+    drop(db);
     let db = Database::open(
         temp.path().join("main.db"),
         DatabaseKind::Main,
