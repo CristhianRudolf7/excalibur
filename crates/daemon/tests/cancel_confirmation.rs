@@ -125,7 +125,7 @@ fn authenticated_confirmation_survives_restart_and_cancels_once_with_full_inbox(
             for i in 0..128 {
                 let id=format!("generated-{i}");
                 c.execute("INSERT INTO messages(id,conversation_id,role,text,scope_id,principal_id) SELECT ?1,id,'user','yes','project:default',principal_id FROM conversations WHERE id='cancel-origin'",[&id])?;
-                c.execute("INSERT INTO master_inbox(message_id,conversation_id,preanalysis,state,created_seq) VALUES(?1,'cancel-origin','{}','unavailable',0)",[id])?;
+                c.execute("INSERT INTO master_inbox(message_id,conversation_id,preanalysis,state,created_seq) VALUES(?1,'cancel-origin','{}','unavailable',?2)",(id,100000+i))?;
             }Ok(())
         }).await.unwrap();
         assert_eq!(controls(&db).await,0);

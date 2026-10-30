@@ -379,3 +379,219 @@ async fn version_three_pending_question_migrates_without_losing_authorization() 
     assert_eq!(actions.effects.lock().unwrap().len(), 1);
     master.shutdown().await;
 }
+
+#[derive(Default)]
+struct BoundedRequests(AtomicUsize);
+impl FastActions for BoundedRequests {
+    fn execute<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: Option<&'a str>,
+        _: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<Value, String>> {
+        Box::pin(async { Err("no explicit command expected".into()) })
+    }
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition {
+                name: "subagent".into(),
+                description: "Request cancellation".into(),
+                input_schema: json!({"type":"object","properties":{"action":{"const":"cancel"},"target":{"type":"string"}},"required":["action","target"]}),
+            },
+            ToolDefinition {
+                name: "clock".into(),
+                description: "Independent work".into(),
+                input_schema: json!({"type":"object"}),
+            },
+        ]
+    }
+    fn invoke<'a>(
+        &'a self,
+        _: &'a str,
+        name: &'a str,
+        args: Value,
+        _: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<Value, String>> {
+        Box::pin(async move {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if name == "clock" {
+                Ok(json!({"independent":"completed"}))
+            } else {
+                Ok(json!({"confirmation_required":true,"target":args["target"],"scope":"general"}))
+            }
+        })
+    }
+}
+struct FourRequests(AtomicUsize);
+impl ModelGateway for FourRequests {
+    fn complete(
+        &self,
+        _: ModelRequest,
+    ) -> BoxFuture<'_, std::result::Result<ModelResponse, ModelError>> {
+        Box::pin(async move {
+            if self.0.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Err(ModelError::Provider);
+            }
+            let mut message = Message::text("assistant", "");
+            for index in 0..4 {
+                message.tool_calls.push(ToolCall {
+                    id: format!("cancel-{index}"),
+                    name: "subagent".into(),
+                    arguments: json!({"action":"cancel","target":format!("worker-{index}")})
+                        .to_string(),
+                });
+            }
+            message.tool_calls.push(ToolCall {
+                id: "clock-final".into(),
+                name: "clock".into(),
+                arguments: "{}".into(),
+            });
+            Ok(ModelResponse {
+                message,
+                usage: Usage::default(),
+            })
+        })
+    }
+}
+struct ResumeIndependent;
+impl ModelGateway for ResumeIndependent {
+    fn complete(
+        &self,
+        request: ModelRequest,
+    ) -> BoxFuture<'_, std::result::Result<ModelResponse, ModelError>> {
+        Box::pin(async move {
+            let result = request
+                .messages
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some("cancel-3"))
+                .unwrap();
+            let result: Value = serde_json::from_str(&result.content).unwrap();
+            assert_eq!(result["confirmation_required"], false);
+            assert!(result["error"].as_str().unwrap().contains("at most three"));
+            assert!(
+                request
+                    .messages
+                    .iter()
+                    .any(|m| m.tool_call_id.as_deref() == Some("clock-final")
+                        && m.content.contains("completed"))
+            );
+            Ok(ModelResponse {
+                message: Message::text("assistant", "Independent work completed."),
+                usage: Usage::default(),
+            })
+        })
+    }
+}
+#[tokio::test]
+async fn fourth_request_is_durable_tool_rejection_and_independent_work_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(
+        dir.path().join("main.db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let actions = Arc::new(BoundedRequests::default());
+    let master = Master::open(
+        db.clone(),
+        Default::default(),
+        Arc::new(FourRequests(AtomicUsize::new(0))),
+        None,
+        actions.clone(),
+        Redactor::default(),
+    )
+    .await
+    .unwrap();
+    master
+        .receive(incoming(
+            "four",
+            "Cancel four workers and continue independent work",
+            None,
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let unavailable: bool = db
+                .read(ReadLane::Interactive, |c| {
+                    Ok(c.query_row(
+                        "SELECT unavailable FROM master_health WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .await
+                .unwrap();
+            if unavailable {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(actions.0.load(Ordering::SeqCst), 5);
+    assert_eq!(master.questions("origin").await.unwrap().len(), 3);
+    assert!(
+        !master
+            .events(0, 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "turn_failed")
+    );
+    master.shutdown().await;
+    // Reconstruct the interruption boundary after the fourth durable receipt,
+    // before its tool message and before the independent fifth call.
+    db.write(Priority::Interactive, |c| {
+        let encoded: String = c.query_row("SELECT messages FROM master_turn_state WHERE conversation_id='origin'", [], |r|r.get(0))?;
+        let mut messages: Vec<Message> = serde_json::from_str(&encoded).unwrap();
+        let boundary = messages.iter().position(|m|m.tool_call_id.as_deref()==Some("cancel-3")).unwrap();
+        messages.truncate(boundary);
+        c.execute("UPDATE master_turn_state SET messages=?1 WHERE conversation_id='origin'", [serde_json::to_string(&messages).unwrap()])?;
+        c.execute("DELETE FROM master_action_receipts WHERE tool_name='clock'", [])?;
+        let fourth: String = c.query_row("SELECT result FROM master_action_receipts WHERE operation_key LIKE '%:cancel-3' AND state='done'", [], |r|r.get(0))?;
+        assert_eq!(serde_json::from_str::<Value>(&fourth).unwrap()["confirmation_required"], false);
+        Ok(())
+    }).await.unwrap();
+    let replay_actions = Arc::new(BoundedRequests::default());
+    let master = Master::open(
+        db.clone(),
+        Default::default(),
+        Arc::new(ResumeIndependent),
+        None,
+        replay_actions.clone(),
+        Redactor::default(),
+    )
+    .await
+    .unwrap();
+    master.model_available().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if master
+                .history("origin", None, 100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.text == "Independent work completed.")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(replay_actions.0.load(Ordering::SeqCst), 1);
+    assert_eq!(master.questions("origin").await.unwrap().len(), 3);
+    assert!(
+        !master
+            .events(0, 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "turn_failed")
+    );
+    master.shutdown().await;
+}
