@@ -4,6 +4,7 @@ mod context_request;
 mod fast_tools;
 pub use fast_tools::MasterFastTools;
 mod intake;
+mod notice_flush;
 mod notice_guards;
 mod provenance;
 mod questions;
@@ -294,6 +295,7 @@ impl Master {
         provenance::migrate(&db).await?;
         cancellation::migrate(&db).await?;
         notice_guards::migrate(&db).await?;
+        notice_flush::migrate(&db).await?;
         let outage: bool = db
             .read(ReadLane::Interactive, |conn| {
                 Ok(conn.query_row(

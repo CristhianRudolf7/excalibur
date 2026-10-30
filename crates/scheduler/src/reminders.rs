@@ -123,6 +123,25 @@ impl Reminders {
         metadata: Option<serde_json::Value>,
         check: impl FnOnce(&rusqlite::Connection) -> Result<()> + Send + 'static,
     ) -> Result<Reminder> {
+        self.apply_host_validated(key, operation, metadata, check, |_, _, _| Ok(()))
+            .await
+    }
+    /// Validate the effective winning generation and inherited host metadata in
+    /// the same writer, before any mutation or operation receipt can commit.
+    pub async fn apply_host_validated(
+        &self,
+        key: String,
+        operation: Operation,
+        metadata: Option<serde_json::Value>,
+        check: impl FnOnce(&rusqlite::Connection) -> Result<()> + Send + 'static,
+        validate: impl FnOnce(
+            &rusqlite::Connection,
+            &Reminder,
+            Option<&serde_json::Value>,
+        ) -> Result<()>
+        + Send
+        + 'static,
+    ) -> Result<Reminder> {
         if !bounded(&key, 256) {
             return Err(invalid());
         }
@@ -184,6 +203,17 @@ impl Reminders {
                 Operation::Delete{..}=>reminder.state=State::Deleted,
                 Operation::Create(_)=>{},
             }
+            let effective_metadata=match &metadata {
+                Some(value)=>Some(value.clone()),
+                None=>match expected {
+                    None=>None,
+                    Some(expected)=>{
+                        let body:Option<String>=c.query_row("SELECT body FROM scheduler_reminder_metadata WHERE scope=?1 AND id=?2 AND generation=?3",rusqlite::params![scope,id,expected],|r|r.get(0)).optional()?;
+                        body.map(|body|decode::<serde_json::Value>(&body)).transpose()?
+                    },
+                },
+            };
+            validate(c,&reminder,effective_metadata.as_ref())?;
             if let Some(first)=first {
                 let timer=encode(&("reminder",&id,reminder.generation))?;
                 let definition=encode(&Schedule{id:timer.clone(),scope:scope.clone(),timing:reminder.timing.clone(),missed:MissedPolicy::RunOnceNow,payload:serde_json::Value::Null})?;

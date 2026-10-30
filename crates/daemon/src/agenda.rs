@@ -54,7 +54,26 @@ impl Agenda {
         };
         Ok(self
             .reminders
-            .apply_host_checked(key, operation, metadata, move |c| target.validate(c))
+            .apply_host_validated(
+                key,
+                operation,
+                metadata,
+                move |c| target.validate(c),
+                |c, reminder, metadata| {
+                    if reminder.state == excalibur_scheduler::reminders::State::Active {
+                        let binding: HostNotificationBinding = serde_json::from_value(
+                            metadata.cloned().ok_or(excalibur_store::Error::Invalid(
+                                "reminder has no host delivery binding",
+                            ))?,
+                        )
+                        .map_err(|_| {
+                            excalibur_store::Error::Invalid("invalid reminder host metadata")
+                        })?;
+                        binding.validate_reminder(c, reminder.preferred_channel.as_deref())?;
+                    }
+                    Ok(())
+                },
+            )
             .await?)
     }
     pub async fn list(
@@ -91,7 +110,15 @@ impl Agenda {
                 let Some(metadata) = self.reminders.metadata(&pending).await? else {
                     continue;
                 };
-                let binding: HostNotificationBinding = serde_json::from_value(metadata)?;
+                let Ok(binding) = serde_json::from_value::<HostNotificationBinding>(metadata)
+                else {
+                    continue;
+                };
+                // Legacy invalid routes remain observable in list/pending, but
+                // cannot poison another binding's dispatch page or gain an ACK.
+                if !binding.allows_channel(pending.reminder.preferred_channel.as_deref()) {
+                    continue;
+                }
                 let target = match self.orchestrator.bind_host_notification(binding).await {
                     Ok(target) => target,
                     Err(excalibur_orchestrator::Error::Storage(
@@ -99,6 +126,11 @@ impl Agenda {
                             "host notification source is not authorized",
                         ),
                     )) => continue,
+                    Err(excalibur_orchestrator::Error::Invalid(message))
+                        if message == "invalid host notification binding" =>
+                    {
+                        continue;
+                    }
                     Err(error) => return Err(error.into()),
                 };
                 // Hash the typed scheduler fire identity in a versioned JSON tuple.

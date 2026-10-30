@@ -107,25 +107,18 @@ impl Master {
             // Admission and grouped publication share the same short guard.
             // Due rows for occupied conversations remain untouched.
             let active=inner.active.lock().unwrap_or_else(|e|e.into_inner());
-            let mut groups={let mut q=conn.prepare("SELECT conversation_id,scope_id,due_at FROM master_notice_outbox WHERE flushed=0 AND due_at<=?1 GROUP BY conversation_id,scope_id,due_at ORDER BY due_at,conversation_id,scope_id LIMIT 128")?;q.query_map([now],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
-            groups.retain(|(conversation,_,_)|!active.contains_key(conversation));
+            let groups=crate::notice_flush::groups(conn,&principal,now)?;
             let mut published=0;
-            for (conversation,scope,due) in &groups {
+            for group in &groups {
+                let (conversation,scope,due)=(&group.conversation,&group.scope,&group.due);
+                if active.contains_key(conversation) {continue;}
                 let mut eligible=Vec::new();
-                let mut after:Option<String>=None;
-                loop {
-                    let page={let mut q=conn.prepare("SELECT notice_id,content FROM master_notice_outbox WHERE conversation_id=?1 AND scope_id=?2 AND due_at=?3 AND flushed=0 AND (?4 IS NULL OR notice_id>?4) ORDER BY notice_id LIMIT 32")?;q.query_map((conversation,scope,due,&after),|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
-                    if page.is_empty() {break;}
-                    after=page.last().map(|member|member.0.clone());
-                    for member in page {
-                        let allowed=match crate::notice_guards::origin(conn,&member.0)? {
-                            None=>true,
-                            Some(origin)=>match &check {None=>false,Some(check)=>check(conn,&origin)?},
-                        };
-                        if allowed {eligible.push(member);}
-                        if eligible.len()==32 {break;}
-                    }
-                    if eligible.len()==32 {break;}
+                for member in crate::notice_flush::members(conn,&principal,group)? {
+                    let allowed=match crate::notice_guards::origin(conn,&member.0)? {
+                        None=>true,
+                        Some(origin)=>match &check {None=>false,Some(check)=>check(conn,&origin)?},
+                    };
+                    if allowed {eligible.push(member);}
                 }
                 let members=eligible;
                 if members.is_empty() {continue;}
@@ -135,6 +128,7 @@ impl Master {
                 conn.execute("INSERT INTO master_events(conversation_id,kind,payload) VALUES(?1,'notification_group',?2)",(conversation,serde_json::json!({"message_id":id,"text":text,"scope":scope,"members":members.iter().map(|(id,_)|id).collect::<Vec<_>>(),"bucket":due}).to_string()))?;
                 published+=1;
                 for (notice,_) in members {conn.execute("UPDATE master_notice_outbox SET flushed=1 WHERE notice_id=?1",[notice])?;}
+                crate::notice_flush::finish(conn,&principal,group)?;
             }Ok(published)
         }).await?;
         self.inner.wake.notify_waiters();

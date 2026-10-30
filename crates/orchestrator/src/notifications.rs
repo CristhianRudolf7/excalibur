@@ -11,6 +11,52 @@ pub struct HostNotificationBinding {
     /// Host-configured routes. This grants no external delivery adapter.
     pub approved_channels: Vec<String>,
 }
+impl HostNotificationBinding {
+    fn valid_shape(&self) -> bool {
+        !([
+            &self.principal,
+            &self.scope,
+            &self.conversation,
+            &self.source,
+        ]
+        .iter()
+        .any(|v| v.is_empty() || v.len() > 512)
+            || self.approved_channels.len() > 32
+            || self.approved_channels.iter().any(|v| {
+                v.is_empty()
+                    || v.len() > 512
+                    || v.starts_with("conversation:")
+                        && v != &format!("conversation:{}", self.conversation)
+            }))
+    }
+    /// Host-configured routes do not widen the accepted source's authority.
+    pub fn allows_channel(&self, preferred: Option<&str>) -> bool {
+        preferred.is_none_or(|channel| {
+            self.approved_channels
+                .iter()
+                .any(|allowed| allowed == channel)
+        })
+    }
+    /// Synchronous source and route validation for a host reminder mutation.
+    pub fn validate_reminder(
+        &self,
+        c: &rusqlite::Connection,
+        preferred: Option<&str>,
+    ) -> excalibur_store::Result<()> {
+        if !self.valid_shape() {
+            return Err(excalibur_store::Error::Invalid(
+                "invalid host notification binding",
+            ));
+        }
+        validate_host_source(c, self)?;
+        if !self.allows_channel(preferred) {
+            return Err(excalibur_store::Error::Invalid(
+                "unapproved host reminder route",
+            ));
+        }
+        Ok(())
+    }
+}
 /// Sealed host-only handle. Not exposed through model tools or deserialization.
 #[derive(Clone, Debug)]
 pub struct HostNotificationTarget {
@@ -119,22 +165,7 @@ impl Orchestrator {
         &self,
         binding: HostNotificationBinding,
     ) -> Result<HostNotificationTarget> {
-        if [
-            &binding.principal,
-            &binding.scope,
-            &binding.conversation,
-            &binding.source,
-        ]
-        .iter()
-        .any(|v| v.is_empty() || v.len() > 512)
-            || binding.approved_channels.len() > 32
-            || binding.approved_channels.iter().any(|v| {
-                v.is_empty()
-                    || v.len() > 512
-                    || v.starts_with("conversation:")
-                        && v != &format!("conversation:{}", binding.conversation)
-            })
-        {
+        if !binding.valid_shape() {
             return Err(invalid("invalid host notification binding"));
         }
         let body = serde_json::to_string(&binding)?;

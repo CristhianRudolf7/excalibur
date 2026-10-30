@@ -726,3 +726,388 @@ fn durable_sink_guards_survive_reopen_and_legacy_flush_cannot_bypass_them() {
     });
     rt.block_on(host.close()).unwrap();
 }
+
+async fn accepted_binding(host: &DaemonHost, principal: &str, id: &str) -> HostNotificationBinding {
+    let receipt = host
+        .master
+        .receive(Incoming {
+            conversation: "agenda".into(),
+            client_id: "client".into(),
+            client_msg_id: id.into(),
+            text: "literal reminder request".into(),
+            scope: Some("project:default".into()),
+            timezone: "UTC".into(),
+            channel: "fixture".into(),
+            reply_to: None,
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    host.master.stop_turn("agenda").await.unwrap();
+    HostNotificationBinding {
+        principal: principal.into(),
+        scope: "project:default".into(),
+        conversation: "agenda".into(),
+        source: receipt.message_id,
+        approved_channels: vec![],
+    }
+}
+async fn queue_checked(
+    host: &DaemonHost,
+    id: &str,
+    origin: &excalibur_orchestrator::Notification,
+    text: &str,
+) {
+    let notification_id = origin.id.clone();
+    host.master.publish_notice_checked(id,"agenda",serde_json::json!({"scope":"project:default","content":text,"created_at":origin.created,"notification_id":origin.id}),"normal",&origin.id,move |c|excalibur_orchestrator::host_notification_effect_allowed(c,&notification_id,1000)).await.unwrap();
+}
+struct NoActions;
+impl excalibur_master::FastActions for NoActions {
+    fn execute<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: Option<&'a str>,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<serde_json::Value, String>> {
+        Box::pin(async { Err("no fixture actions".into()) })
+    }
+}
+#[test]
+fn bounded_group_rotation_survives_reopen_and_excludes_other_principals() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("project")).unwrap();
+    let rt = RuntimeSet::new(2, 1).unwrap();
+    let db = Database::open(
+        temp.path().join("main.db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let host = crash_host(temp.path(), &rt, db.clone());
+    rt.block_on(async {
+        let principal = HostOptions::project(temp.path().join("project"))
+            .master_config
+            .principal;
+        let revoked = accepted_binding(&host, &principal, "revoked-source").await;
+        let valid = accepted_binding(&host, &principal, "valid-source").await;
+        let revoked_target = host
+            .orchestrator
+            .bind_host_notification(revoked.clone())
+            .await
+            .unwrap();
+        let valid_target = host
+            .orchestrator
+            .bind_host_notification(valid)
+            .await
+            .unwrap();
+        for index in 0..128 {
+            let notice = host
+                .orchestrator
+                .notify_host(
+                    &revoked_target,
+                    &format!("group-{index:03}"),
+                    "normal",
+                    "revoked group",
+                    None,
+                    10 + index * 5,
+                )
+                .await
+                .unwrap();
+            queue_checked(
+                &host,
+                &format!("group-{index:03}"),
+                &notice,
+                "revoked group",
+            )
+            .await;
+        }
+        let valid = host
+            .orchestrator
+            .notify_host(
+                &valid_target,
+                "group-128",
+                "normal",
+                "valid group",
+                None,
+                650,
+            )
+            .await
+            .unwrap();
+        // Keep this due strictly after the first 128 groups (last revoked is 645).
+        queue_checked(&host, "group-128", &valid, "valid group").await;
+        let foreign = excalibur_master::Master::open(
+            db.clone(),
+            excalibur_master::MasterConfig {
+                principal: "other-principal".into(),
+                ..Default::default()
+            },
+            Arc::new(Offline),
+            None,
+            Arc::new(NoActions),
+            Redactor::default(),
+        )
+        .await
+        .unwrap();
+        foreign
+            .receive(Incoming {
+                conversation: "foreign".into(),
+                client_id: "client".into(),
+                client_msg_id: "foreign".into(),
+                text: "foreign literal".into(),
+                scope: None,
+                timezone: "UTC".into(),
+                channel: "fixture".into(),
+                reply_to: None,
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        foreign.stop_turn("foreign").await.unwrap();
+        foreign
+            .publish_notice(
+                "foreign-notice",
+                "foreign",
+                serde_json::json!({"scope":"general","content":"foreign pending","created_at":1}),
+                "normal",
+            )
+            .await
+            .unwrap();
+        foreign.shutdown().await;
+        let source = revoked.source;
+        db.write(Priority::Journal, move |c| {
+            c.execute(
+                "DELETE FROM master_client_receipts WHERE message_id=?1",
+                [source],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = checks.clone();
+        assert_eq!(
+            host.master
+                .flush_notices_checked(1000, move |c, id| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    excalibur_orchestrator::host_notification_effect_allowed(c, id, 1000)
+                })
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 128);
+        assert_eq!(
+            db.read(ReadLane::Interactive, |c| Ok(c.query_row(
+                "SELECT count(*) FROM master_events WHERE kind='notification_group'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?))
+            .await
+            .unwrap(),
+            0
+        );
+    });
+    rt.block_on(host.close()).unwrap();
+    drop(db);
+    let db = Database::open(
+        temp.path().join("main.db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let host = crash_host(temp.path(), &rt, db.clone());
+    rt.block_on(async {
+        let checks=Arc::new(AtomicUsize::new(0));let observed=checks.clone();
+        assert_eq!(host.master.flush_notices_checked(1000,move |c,id|{observed.fetch_add(1,Ordering::SeqCst);excalibur_orchestrator::host_notification_effect_allowed(c,id,1000)}).await.unwrap(),1);
+        assert_eq!(checks.load(Ordering::SeqCst),1);
+        let (group,revoked_pending,foreign_pending,foreign_groups)=db.read(ReadLane::Interactive,|c|Ok((c.query_row("SELECT payload FROM master_events WHERE kind='notification_group' AND conversation_id='agenda'",[],|r|r.get::<_,String>(0))?,c.query_row("SELECT count(*) FROM master_notice_outbox WHERE flushed=0 AND conversation_id='agenda'",[],|r|r.get::<_,i64>(0))?,c.query_row("SELECT count(*) FROM master_notice_outbox WHERE flushed=0 AND conversation_id='foreign'",[],|r|r.get::<_,i64>(0))?,c.query_row("SELECT count(*) FROM master_events WHERE kind='notification_group' AND conversation_id='foreign'",[],|r|r.get::<_,i64>(0))?))).await.unwrap();
+        assert!(group.contains("valid group"));assert!(!group.contains("revoked group"));assert_eq!(revoked_pending,128);assert_eq!(foreign_pending,1);assert_eq!(foreign_groups,0);
+    });
+    rt.block_on(host.close()).unwrap();
+}
+#[test]
+fn bounded_member_rotation_survives_reopen_without_empty_groups() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("project")).unwrap();
+    let rt = RuntimeSet::new(2, 1).unwrap();
+    let db = Database::open(
+        temp.path().join("main.db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let host = crash_host(temp.path(), &rt, db.clone());
+    rt.block_on(async {
+        let principal = HostOptions::project(temp.path().join("project"))
+            .master_config
+            .principal;
+        let revoked = accepted_binding(&host, &principal, "revoked-source").await;
+        let valid = accepted_binding(&host, &principal, "valid-source").await;
+        let revoked_target = host
+            .orchestrator
+            .bind_host_notification(revoked.clone())
+            .await
+            .unwrap();
+        let valid_target = host
+            .orchestrator
+            .bind_host_notification(valid)
+            .await
+            .unwrap();
+        let revoked_notice = host
+            .orchestrator
+            .notify_host(
+                &revoked_target,
+                "member-revoked",
+                "normal",
+                "revoked member",
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        let valid_notice = host
+            .orchestrator
+            .notify_host(
+                &valid_target,
+                "member-valid",
+                "normal",
+                "valid member",
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        for index in 0..128 {
+            queue_checked(
+                &host,
+                &format!("member-{index:03}"),
+                &revoked_notice,
+                "revoked member",
+            )
+            .await;
+        }
+        queue_checked(&host, "member-128", &valid_notice, "valid member").await;
+        let source = revoked.source;
+        db.write(Priority::Journal, move |c| {
+            c.execute(
+                "DELETE FROM master_client_receipts WHERE message_id=?1",
+                [source],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let checks = Arc::new(AtomicUsize::new(0));
+            let observed = checks.clone();
+            assert_eq!(
+                host.master
+                    .flush_notices_checked(1000, move |c, id| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        excalibur_orchestrator::host_notification_effect_allowed(c, id, 1000)
+                    })
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(checks.load(Ordering::SeqCst), 32);
+        }
+    });
+    rt.block_on(host.close()).unwrap();
+    drop(db);
+    let db = Database::open(
+        temp.path().join("main.db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let host = crash_host(temp.path(), &rt, db.clone());
+    rt.block_on(async {
+        for expected in [0, 0, 1] {
+            let checks = Arc::new(AtomicUsize::new(0));
+            let observed = checks.clone();
+            assert_eq!(
+                host.master
+                    .flush_notices_checked(1000, move |c, id| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        excalibur_orchestrator::host_notification_effect_allowed(c, id, 1000)
+                    })
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert!(checks.load(Ordering::SeqCst) <= 32);
+        }
+        let (groups, group, pending) = db
+            .read(ReadLane::Interactive, |c| {
+                Ok((
+                    c.query_row(
+                        "SELECT count(*) FROM master_events WHERE kind='notification_group'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                    c.query_row(
+                        "SELECT payload FROM master_events WHERE kind='notification_group'",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )?,
+                    c.query_row(
+                        "SELECT count(*) FROM master_notice_outbox WHERE flushed=0",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(groups, 1);
+        assert!(group.contains("valid member"));
+        assert!(!group.contains("revoked member"));
+        assert_eq!(pending, 128);
+    });
+    rt.block_on(host.close()).unwrap();
+}
+
+#[test]
+fn routes_are_validated_before_commit_and_legacy_denials_do_not_poison_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("project")).unwrap();
+    let rt = RuntimeSet::new(2, 1).unwrap();
+    let db = Database::open(
+        temp.path().join("main.db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let host = crash_host(temp.path(), &rt, db.clone());
+    rt.block_on(async {
+        let principal=HostOptions::project(temp.path().join("project")).master_config.principal;
+        let binding=accepted_binding(&host,&principal,"creator").await;
+        let agenda=Agenda::open(host.orchestrator.clone(),binding.clone()).await.unwrap();
+        let denied=|id:&str|Operation::Create(Definition{id:id.into(),text:"unapproved reminder".into(),timing:Timing::At(10),preferred_channel:Some("external:unapproved".into()),task:None});
+        assert!(agenda.apply("denied-create".into(),denied("bad")).await.is_err());
+        let counts=db.read(ReadLane::Interactive,|c|Ok((c.query_row("SELECT count(*) FROM scheduler_reminders",[],|r|r.get::<_,i64>(0))?,c.query_row("SELECT count(*) FROM scheduler_timers",[],|r|r.get::<_,i64>(0))?,c.query_row("SELECT count(*) FROM scheduler_reminder_metadata",[],|r|r.get::<_,i64>(0))?,c.query_row("SELECT count(*) FROM scheduler_reminder_receipts WHERE operation_key='denied-create'",[],|r|r.get::<_,i64>(0))?))).await.unwrap();assert_eq!(counts,(0,0,0,0));
+        agenda.apply("valid-create".into(),definition("zzz-valid")).await.unwrap();
+        let reminders=Reminders::open(db.clone(),binding.scope.clone(),binding.principal.clone(),binding.conversation.clone(),None).await.unwrap();
+        // Simulate a durable pre-fix host record through the existing opaque
+        // metadata API. It retains its receipt and must never acquire an ACK.
+        reminders.apply_host("legacy-denied-create".into(),denied("aaa-legacy-denied"),Some(serde_json::to_value(&binding).unwrap())).await.unwrap();
+        let mut later=accepted_binding(&host,&principal,"later-source").await;
+        later.approved_channels.push("external:unapproved".into());
+        let later_agenda=Agenda::open(host.orchestrator.clone(),later).await.unwrap();
+        assert!(later_agenda.apply("legacy-denied-snooze".into(),Operation::Snooze{id:"aaa-legacy-denied".into(),generation:1,timing:Timing::At(20)}).await.is_err());
+        reminders.tick(10,false,100).await.unwrap();
+        assert_eq!(agenda.tick_once(10,1).await.unwrap(),1);
+        let notices=host.orchestrator.notifications("agenda").await.unwrap();assert_eq!(notices.len(),1);assert_eq!(notices[0].content,"reminder zzz-valid");
+        let pending=reminders.pending(100).await.unwrap();assert_eq!(pending.len(),1);assert_eq!(pending[0].reminder.id,"aaa-legacy-denied");assert_eq!(pending[0].reminder.generation,1);
+        assert_eq!(reminders.metadata(&pending[0]).await.unwrap().unwrap()["source"],binding.source);
+        let (generation_metadata,failed_receipt,original_source)=db.read(ReadLane::Interactive,|c|Ok((c.query_row("SELECT count(*) FROM scheduler_reminder_metadata WHERE id='aaa-legacy-denied' AND generation=2",[],|r|r.get::<_,i64>(0))?,c.query_row("SELECT count(*) FROM scheduler_reminder_receipts WHERE operation_key='legacy-denied-snooze'",[],|r|r.get::<_,i64>(0))?,c.query_row("SELECT json_extract(body,'$.source') FROM scheduler_reminder_metadata WHERE id='zzz-valid' AND generation=1",[],|r|r.get::<_,String>(0))?))).await.unwrap();
+        assert_eq!(generation_metadata,0);assert_eq!(failed_receipt,0);assert_eq!(original_source,binding.source);
+        deliver_notifications(&host.master,&host.orchestrator,100).await.unwrap();
+        assert_eq!(agenda.tick_once(100,1).await.unwrap(),0);
+    });
+    rt.block_on(host.close()).unwrap();
+}
