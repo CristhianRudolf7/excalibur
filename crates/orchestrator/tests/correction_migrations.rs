@@ -27,11 +27,12 @@ async fn additive_control_timer_migration_preserves_original_checksum_and_existi
     assert_eq!(reopened.agent(&p.id).await.unwrap().token, p.token);
     let checksum =
         f.db.read(ReadLane::Interactive, |c| {
-            assert_eq!(
-                c.query_row("SELECT count(*) FROM orchestration_schema", [], |r| r
-                    .get::<_, u64>(0))?,
-                2
-            );
+            // Version 3 (host notification targets) must survive reapplying version 2.
+            let versions = c
+                .prepare("SELECT version FROM orchestration_schema ORDER BY version")?
+                .query_map([], |r| r.get::<_, u64>(0))?
+                .collect::<std::result::Result<Vec<u64>, excalibur_store::rusqlite::Error>>()?;
+            assert_eq!(versions, [1, 2, 3]);
             Ok(c.query_row(
                 "SELECT checksum FROM orchestration_schema WHERE version=1",
                 [],
