@@ -125,6 +125,36 @@ fn now() -> i64 {
 fn invalid(s: &str) -> Error {
     Error::Invalid(s.into())
 }
+fn lane_marker(lane: u8) -> String {
+    format!("\n[excalibur-host-lane:{lane}]\n")
+}
+/// The host lane marker is owned by the orchestrator: every existing marker is
+/// removed and exactly one is appended. A trailing marker (the one a previous
+/// preparation appended) is removed byte-exactly, so re-preparing a stored
+/// delegation yields `{core}{marker}` again, the same text native sizing counted
+/// with its lane suffix. Interior markers are still neutralized to a newline, and
+/// a trailing remnant that would join the appended marker into a second one is
+/// dropped, until no marker can be assembled.
+fn with_lane_marker(layer: &str, priority: u8) -> String {
+    let mut core = layer.to_owned();
+    loop {
+        let before = core.len();
+        for lane in 0..=3 {
+            let marker = lane_marker(lane);
+            for tail in [marker.as_str(), marker.trim_end_matches('\n')] {
+                if core.ends_with(tail) {
+                    core.truncate(core.len() - tail.len());
+                }
+            }
+            core = core.replace(&marker, "\n");
+        }
+        if core.len() == before {
+            break;
+        }
+    }
+    core.push_str(&lane_marker(priority));
+    core
+}
 impl Orchestrator {
     pub async fn open(db: Database, engine: Arc<Engine>, limits: Limits) -> Result<Self> {
         if limits.running == 0
@@ -555,14 +585,8 @@ impl Orchestrator {
                 .await
                 .map_err(Error::Authority)?;
         }
-        for lane in 0..=3 {
-            delegation.spec.context.layers[0] = delegation.spec.context.layers[0]
-                .replace(&format!("\n[excalibur-host-lane:{lane}]\n"), "\n");
-        }
-        delegation.spec.context.layers[0].push_str(&format!(
-            "\n[excalibur-host-lane:{}]\n",
-            delegation.priority
-        ));
+        delegation.spec.context.layers[0] =
+            with_lane_marker(&delegation.spec.context.layers[0], delegation.priority);
         let operation = delegation.operation.clone();
         let prepared = serde_json::to_string(&delegation)?;
         let prepared = self
