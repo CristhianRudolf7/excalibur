@@ -27,10 +27,20 @@ fn run() -> Result<bool, String> {
         return runtime.block_on(serve(config, binary));
     }
     runtime.block_on(async {
-        // Until the network broker is integrated, this diagnostic owns a deny-all proxy.
+        // Diagnostic loopback: UID-checked, deny-all. Real serving forwards
+        // to the HostProxy broker (12.3); this check never browses externally.
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
         let address = match proxy.local_addr().map_err(|e| e.to_string())? { std::net::SocketAddr::V4(v) => v, _ => return Err("IPv4 loopback required".into()) };
-        let deny = tokio::spawn(async move { while let Ok((stream, _)) = proxy.accept().await { drop(stream); } });
+        let expected = unsafe { libc::geteuid() };
+        let deny = tokio::spawn(async move {
+            loop {
+                match excalibur_webd::loopback::accept_owned(&proxy, expected).await {
+                    Ok(Some(_)) => {},
+                    Ok(None) => {},
+                    Err(_) => break,
+                }
+            }
+        });
         use std::os::unix::fs::DirBuilderExt;
         let profile = config.web.data_dir.join(format!("instance-check-{}-{}", std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
         std::fs::DirBuilder::new().mode(0o700).create(&profile).map_err(|e| e.to_string())?;
@@ -43,7 +53,7 @@ fn run() -> Result<bool, String> {
         let result = match result {
             Ok(instance) => {
                 let processes=instance.verify_sandbox().await.map_err(|e|e.to_string())?;
-                let evidence = serde_json::json!({"ready":true,"version":instance.version,"warnings":instance.warnings,"assessment":instance.assessment(),"processes":processes,"sandbox_verified":true,"network":"deny_all_diagnostic_proxy"});
+                let evidence = serde_json::json!({"ready":true,"version":instance.version,"warnings":instance.warnings,"assessment":instance.assessment(),"processes":processes,"sandbox_verified":true,"network":"uid_checked_loopback_deny_all"});
                 instance.close().await.map_err(|e|e.to_string())?;
                 println!("{}",serde_json::to_string_pretty(&evidence).map_err(|e| e.to_string())?); Ok(true)
             },
@@ -68,6 +78,18 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
         rpc::{Protocol, Server},
         sessions::{Manager, Options},
     };
+    // Egress broker (12.3): HostProxy with pinned DNS, no private/loopback
+    // answers and only web ports. The loopback listener below verifies the
+    // peer UID so only the web user can reach the broker through Chrome's
+    // proxy settings.
+    let broker =
+        excalibur_sandbox::network::HostProxy::start(excalibur_sandbox::network::ProxyConfig::new(
+            excalibur_sandbox::network::NetworkPolicy::Full,
+        ))
+        .map_err(|e| e.to_string())?;
+    let broker_path = broker.socket_path().to_owned();
+    // Keep the broker alive for the whole service lifetime.
+    let _broker = broker;
     let proxy = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| e.to_string())?;
@@ -75,9 +97,20 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
         std::net::SocketAddr::V4(v) => v,
         _ => return Err("IPv4 loopback required".into()),
     };
-    let deny = tokio::spawn(async move {
-        while let Ok((stream, _)) = proxy.accept().await {
-            drop(stream)
+    let expected = unsafe { libc::geteuid() };
+    let forward = tokio::spawn(async move {
+        loop {
+            let accepted = excalibur_webd::loopback::accept_owned(&proxy, expected).await;
+            match accepted {
+                Ok(Some(stream)) => {
+                    let path = broker_path.clone();
+                    tokio::spawn(async move {
+                        let _ = excalibur_webd::loopback::forward_to_unix(stream, &path).await;
+                    });
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
         }
     });
     let manager = Manager::open(Options {
@@ -109,7 +142,7 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
     });
     println!(
         "{}",
-        serde_json::json!({"ready":true,"socket":config.web.run_dir.join("webd.sock"),"network":"deny_all_until_broker_integration"})
+        serde_json::json!({"ready":true,"socket":config.web.run_dir.join("webd.sock"),"network":"host_proxy_full_80_443_uid_checked_loopback"})
     );
     let result = server.run(rx).await;
     signals.abort();
@@ -117,7 +150,7 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
     let _ = monitor.await;
     protocol.drain().await;
     let closed = manager.shutdown().await;
-    deny.abort();
+    forward.abort();
     result.and(closed).map_err(|e| e.to_string())?;
     Ok(true)
 }

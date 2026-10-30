@@ -9,7 +9,7 @@ confianza del host que aplica a esos efectos la autorización del arnés, la
 autoridad de archivos, el control de archivos y `SecretExecutor`.
 `excalibur-webd` ofrece diagnósticos de entorno y un servicio JSON-RPC Unix local.
 `excalibur-search` sigue vacío. El registro de herramientas web del agente, la
-composición del host y el frontend visor no están implementados.
+composición del host no están implementados; el visor de intervención existe solo como ayudas del backend (código de un solo uso, cookie, cabeceras de seguridad y dibujo del lienzo en `excalibur-webd`), sin endpoint servido todavía.
 
 Instala Rust estable con rustfmt y clippy, un compilador C/C++, `pkg-config`,
 cabeceras de desarrollo de OpenSSL y una compilación verificada de bubblewrap
@@ -113,7 +113,7 @@ sudo target/debug/excalibur-webd --check-instance /ruta/absoluta/web.toml
 ```
 
 Este diagnóstico retira privilegios antes de construir Tokio, prepara un perfil
-privado único, inicia un proxy loopback propio que rechaza toda conexión, lanza
+privado único, inicia un listener loopback propio que solo acepta pares del UID web (mapeados en `/proc/net/tcp` y `/proc/net/tcp6`) y descarta las conexiones aceptadas del diagnóstico sin reenviarlas, lanza
 Chrome headless, obtiene `Browser.getVersion`, verifica el árbol de renderizadores
 y emite JSON antes de cerrar y borrar su perfil temporal. No expone endpoint RPC ni visor, y no
 navega a sitios externos. `sandbox_verified` solo es true con una inspección de
@@ -141,9 +141,11 @@ desactivación del sandbox, depuración TCP, evasión de certificados, automatiz
 y sustitución de flags gestionados. El host solo puede seleccionar el almacén de
 Secret Service tras verificar ese servicio; en otro caso `basic` lleva un aviso
 explícito frente a lectores locales. El diagnóstico usa un perfil vacío y `basic`.
-No están implementadas la integración del broker ni la gestión de perfiles de
-aplicación; el argumento del proxy es una frontera del host confiable, no una
-afirmación de aislamiento completo de salida.
+La gestión de perfiles de
+aplicación no está implementada. `--serve` arranca el broker de salida (`HostProxy`)
+y reenvía a su socket Unix solo las conexiones loopback del mismo UID, cerrando
+los pares de otro UID sin reenviarlos; el argumento del proxy sigue siendo una
+frontera del host confiable, no una afirmación de aislamiento completo de salida.
 
 La verificación exige `Seccomp: 2`, `NoNewPrivs: 1` y espacios de nombres de usuario
 y red distintos del navegador. El arranque exige al menos un renderizador
@@ -317,7 +319,9 @@ disponer de intervención. La admisión de documentos del agente acepta solo los
 lectura/escritura configurados; los de login son exclusivos de personas. La
 exclusión para entrada comprueba la URL real del frame y devuelve
 `denied(human_only_origin)` en un origen de login. La detección de login y la
-intervención humana todavía no se exponen por RPC.
+intervención humana se exponen por RPC mediante `takeover.start` y
+`takeover.end`, que llevan una sesión bloqueada a `human_control` y de vuelta
+(véase la sección de intervención).
 
 Los bloqueos de origen conservan `blocked_reason` (`needs_login` o
 `document_origin`). La reconciliación lee el frame superior real, incluidas las
@@ -413,8 +417,9 @@ ventanas activas, comprueba eventos de título y temporizadores y mata su
 renderizador para verificar recuperación. `EXCALIBUR_LISTEN_TEST_SECONDS` permite
 acortar una ejecución de desarrollo; solo los 600 segundos por defecto satisfacen
 la escucha prolongada. Evidencias en
-`target/test-evidence/browser/{sessions,webd_boundary}/`. No hay frontend visor
-para revisión visual.
+`target/test-evidence/browser/{sessions,webd_boundary}/`. El lienzo del visor, la
+autenticación y las cabeceras de seguridad existen como ayudas del backend; todavía
+no se sirve ningún endpoint del visor para revisión visual.
 
 
 `cargo test -p excalibur-browser --test sessions listener_events_and_document_recovery -- --nocapture`
@@ -696,3 +701,79 @@ relleno, una caída simulada del host tras la marca de uso que no se reintenta y
 la ausencia del valor secreto en archivos de webd y del host, eventos, auditoría
 y salida de las pruebas.
 Las evidencias quedan en `target/test-evidence/browser/actions/`.
+
+## Red, contenido, bloqueos e intervención
+
+`--serve` escucha el proxy de Chrome en `127.0.0.1:<aleatorio>` y comprueba
+cada conexión aceptada contra `/proc/net/tcp` y `/proc/net/tcp6`: solo un par
+del UID web alcanza al broker de salida (`HostProxy` con DNS fijado, sin
+respuestas privadas/loopback, solo puertos web) por su socket Unix
+(`excalibur_webd::loopback::{accept_owned, forward_to_unix}`); cualquier otro
+par se cierra sin reenvío, así el listener no sirve como proxy abierto.
+`net::check_loopback_uid` interpreta ambas tablas (IPv4 little-endian, IPv6
+con palabras invertidas) y falla cerrado ante pares desconocidos. El
+diagnóstico `--check-instance` aplica la misma comprobación de UID y descarta
+las conexiones aceptadas sin reenviarlas.
+
+La admisión de documentos compara orígenes comprometidos de frames, nunca
+cadenas (`net::document_origin`: `esquema://host[:puerto]` exacto, sin
+userinfo). La navegación superior a `file:`, `chrome:`, `chrome-extension:`,
+`devtools:`, `javascript:` o `data:` se deniega
+(`net::is_forbidden_scheme`). Los perfiles persistentes solo admiten los
+orígenes configurados: la lectura acepta `rw` o `ro`, la entrada exige `rw`
+(`denied(origin_not_writable)`) y los orígenes `login` quedan para personas
+(`denied(human_only_origin)`). `credential_frames` deben ser orígenes HTTPS
+exactos y los orígenes `ro` no pueden solaparse con `rw` ni `login`. Las
+sesiones efímeras registran cada origen nuevo navegado
+(`Manager::note_ephemeral_origin`); la comprobación determinista C4
+(`net::exfiltration_check` vía `Manager::navigation_risk`) marca POST entre
+orígenes y consultas o fragmentos de más de 128 caracteres (o más de 4,5 bits
+de entropía de Shannon por carácter) hacia un origen nuevo, para que una
+ejecución contaminada pida aprobación antes de confirmar.
+
+Cada contexto nuevo deniega doce permisos sensibles con
+`Browser.setPermission` antes de navegar (`permissions::denial_params`:
+geolocalización, notificaciones, cámara, micrófono, MIDI, portapapeles,
+sensores, detección de inactividad, acceso a red local, captura de pantalla,
+gestión de ventanas y almacenamiento compartido); si una denegación falla, la
+apertura falla y ningún contexto corre sin ellas. La configuración del sitio
+puede conceder permisos concretos después.
+
+La detección de bloqueos es determinista. La sonda de readiness corre en un
+mundo aislado e informa `{kind, vendor, signals, confidence, url}` para
+`blocked_captcha`, `blocked_by_site`, `needs_login` y `needs_2fa`, incluidos
+frames de reto, marcadores invisibles de reCAPTCHA, páginas de bloqueo
+perimetrales y orígenes de identidad, con señales de corroboración en
+título/texto. `wait_ready` solo acepta la sonda con
+`observation::detectors::classify_probe_blocked` (tipos desconocidos,
+confianza baja y señales vacías nunca bloquean) y puede elevar la confianza
+media con un estado de documento corroborante (`elevate_with_status`); las
+señales de baja confianza quedan como `degraded`.
+
+Una sesión bloqueada puede entrar en intervención por RPC: `takeover.start`
+pasa `Blocked` a `human_control` con instante de inicio, mientras
+`takeover.end{resolved}` devuelve una intervención resuelta a `Ready`,
+avanzando la época documental de cada pestaña e invalidando referencias
+previas como `stale_ref(takeover)`; una intervención sin resolver o vencida
+(15 minutos) vuelve a `Blocked` con `blocked_unresolved`. El visor es una
+biblioteca del backend (`webd::viewer`): código de 8 caracteres de un solo uso
+válido 10 minutos, consumido por POST en una cookie `HttpOnly;
+SameSite=Strict` ligada a la pestaña y al plazo, exigida junto a coincidencia
+exacta de `Origin` para el WebSocket; el código nunca se lee de la URL. Las
+respuestas llevan `Content-Security-Policy: default-src 'none'; img-src data:
+blob:; script-src 'self'; style-src 'self'; connect-src 'self';
+frame-ancestors 'none'; base-uri 'none'; form-action 'self';
+require-trusted-types-for 'script'` más cabeceras `nosniff`, sin referrer y
+sin caché, y el título/origen de la página solo se dibujan como texto escapado,
+`textContent` y canvas. Servir el endpoint del visor y la revisión visual 18.5
+quedan pendientes.
+
+Ejecuta `cargo test -p excalibur-browser --lib` y
+`cargo test -p excalibur-webd --lib`. Cubren tablas proc y UID, orígenes,
+entropía y exfiltración, las doce denegaciones y su forma CDP, clasificación de
+detectores y páginas de control, códigos de intervención y visor de un solo uso
+con caducidad, cookie/origen del socket, cabeceras CSP y escape de marcado. Las
+matrices 9.5 con Chrome real y páginas de control, la caducidad de 15 minutos,
+los rechazos del visor, el flujo `input_required` del arnés,
+`blocked_requires_human` no interactivo y la revisión del visor servido quedan
+pendientes.

@@ -70,6 +70,8 @@ fn id() -> String {
 pub struct Site {
     pub name: String,
     pub rw: Vec<String>,
+    #[serde(default)]
+    pub ro: Vec<String>,
     pub login: Vec<String>,
     pub listen: bool,
     pub listen_probe: ListenProbe,
@@ -151,11 +153,27 @@ pub fn validate_profiles(profiles: &BTreeMap<String, Profile>) -> Result<()> {
                     "site requires unique name and document origins",
                 ));
             }
-            for o in s.rw.iter().chain(&s.login) {
+            for o in s.rw.iter().chain(&s.ro).chain(&s.login) {
                 if origin(o).as_deref() != Some(o.as_str()) {
                     return Err(Fault::new(
                         "invalid_config",
                         "site entries must be exact HTTP(S) origins",
+                    ));
+                }
+            }
+            for o in &s.credential_frames {
+                if origin(o).as_deref() != Some(o.as_str()) {
+                    return Err(Fault::new(
+                        "invalid_config",
+                        "credential frames must be exact HTTP(S) origins",
+                    ));
+                }
+            }
+            for o in &s.ro {
+                if s.rw.contains(o) || s.login.contains(o) {
+                    return Err(Fault::new(
+                        "invalid_config",
+                        "read-only origins must not overlap rw or login origins",
                     ));
                 }
             }
@@ -268,6 +286,8 @@ pub struct Session {
     pub credentials: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub takeover_started_at: Option<i64>,
 }
 impl Session {
     fn set_state(&mut self, next: SessionState, reason: Option<&str>) -> Result<()> {
@@ -909,6 +929,18 @@ impl Manager {
             .client()
             .send(Method::BrowserSetDownloadBehavior, download_policy, None)
             .await?;
+        // Deny sensitive permissions (12.6) for the new context before any
+        // navigation. Failures fail the open so no context runs without the
+        // denials.
+        {
+            let client = m.instances[&key].client().clone();
+            let context_id = context.clone();
+            for params in crate::permissions::denial_params(None, context_id.as_deref()) {
+                client
+                    .send(Method::BrowserSetPermission, params, None)
+                    .await?;
+            }
+        }
         let sid = id();
         let s = Session {
             id: sid.clone(),
@@ -921,6 +953,7 @@ impl Manager {
             listen: site.as_ref().is_some_and(|s| s.listen),
             state: SessionState::Opening,
             blocked_reason: None,
+            takeover_started_at: None,
             origins: site.as_ref().map(|s| s.rw.clone()).unwrap_or_default(),
             credentials: request.credentials,
             created_at: now(),
@@ -1143,6 +1176,9 @@ impl Manager {
         if url == "about:blank" && !input {
             return Ok(());
         }
+        if crate::net::is_forbidden_scheme(url) {
+            return Err(Fault::new("denied", "unsupported_scheme"));
+        }
         let o = origin(url).ok_or_else(|| Fault::new("denied", "unsupported_scheme"))?;
         if s.profile == "ephemeral" {
             return Ok(());
@@ -1151,10 +1187,35 @@ impl Manager {
         if site.login.contains(&o) {
             return Err(Fault::new("denied", "human_only_origin"));
         }
-        if !site.rw.contains(&o) {
+        if input {
+            if !site.rw.contains(&o) {
+                return Err(Fault::new("denied", "origin_not_writable"));
+            }
+            return Ok(());
+        }
+        if !site.rw.contains(&o) && !site.ro.contains(&o) {
             return Err(Fault::new("denied", "document_origin"));
         }
         Ok(())
+    }
+    /// Ephemeral origin-set tracking (C2): record a newly navigated origin.
+    /// Returns true when the origin was not previously recorded. Persistent
+    /// sessions never grow their origin set through navigation.
+    pub fn note_ephemeral_origin(session: &mut Session, url: &str) -> bool {
+        let Some(o) = origin(url) else {
+            return false;
+        };
+        if session.origins.contains(&o) {
+            return false;
+        }
+        session.origins.push(o);
+        true
+    }
+    /// Deterministic C4 navigation risk for a contaminated run.
+    /// Returns `Some(reason)` when approval is required before committing.
+    pub fn navigation_risk(from_url: &str, to_url: &str, method: &str) -> Option<String> {
+        let from = origin(from_url);
+        crate::net::exfiltration_check(from.as_deref(), to_url, method)
     }
     async fn install_probe(&self, i: &Instance, cdp: &str, s: &Session) -> Result<()> {
         let site = self.site(&s.profile, s.site.as_deref())?.unwrap();
@@ -2646,6 +2707,102 @@ impl Manager {
             .read_blob(&self.db, run, hash, offset, length)
             .await
     }
+    /// Begin human intervention on a blocked session (9.2).
+    /// Moves `Blocked` to `HumanControl` and records the start time for the
+    /// 15-minute deadline. The viewer authenticates the person separately.
+    pub async fn takeover_start(&self, run: &str, sid: &str, now: i64) -> Result<Value> {
+        let mut m = self.model.lock().await;
+        let s = m
+            .sessions
+            .get(sid)
+            .ok_or_else(|| Fault::new("unknown_session", sid))?;
+        if s.owner_run != run {
+            return Err(Fault::new("denied", "session_owner"));
+        }
+        if s.state != SessionState::Blocked {
+            return Err(Fault::new(
+                "invalid_state",
+                "takeover requires a blocked session",
+            ));
+        }
+        let session = m.sessions.get_mut(sid).unwrap();
+        session.set_state(SessionState::HumanControl, None)?;
+        session.takeover_started_at = Some(now);
+        session.updated_at = now;
+        self.db.save(&mut m).await?;
+        self.db
+            .event(
+                "session_state",
+                json!({"session_id":sid,"state":"human_control","started_at":now}),
+            )
+            .await?;
+        Ok(json!({"session_id":sid,"state":"human_control","started_at":now}))
+    }
+    /// End human intervention (9.2). A resolved takeover returns the session
+    /// to `Ready` and invalidates live references as `stale_ref(takeover)`;
+    /// an unresolved or expired intervention returns to `Blocked` with
+    /// `blocked_unresolved` so the agent can decide.
+    pub async fn takeover_end(
+        &self,
+        run: &str,
+        sid: &str,
+        resolved: bool,
+        now: i64,
+    ) -> Result<Value> {
+        let started = {
+            let m = self.model.lock().await;
+            let s = m
+                .sessions
+                .get(sid)
+                .ok_or_else(|| Fault::new("unknown_session", sid))?;
+            if s.owner_run != run {
+                return Err(Fault::new("denied", "session_owner"));
+            }
+            if s.state != SessionState::HumanControl {
+                return Err(Fault::new("invalid_state", "no human intervention to end"));
+            }
+            s.takeover_started_at.unwrap_or(now)
+        };
+        let expired = now - started > crate::takeover::INTERVENTION_TTL_SECS;
+        let ok = resolved && !expired;
+        // Bump epochs and invalidate live references before changing state so
+        // every prior snapshot validates as `stale_ref(takeover)`.
+        let tabs: Vec<String> = {
+            let m = self.model.lock().await;
+            m.tabs
+                .values()
+                .filter(|tab| tab.session_id == sid && tab.state != "closed")
+                .map(|tab| tab.id.clone())
+                .collect()
+        };
+        for tid in &tabs {
+            self.observation.invalidate(tid, "takeover").await;
+        }
+        let mut m = self.model.lock().await;
+        for tid in &tabs {
+            if let Some(tab) = m.tabs.get_mut(tid) {
+                tab.document_epoch += 1;
+            }
+        }
+        let session = m.sessions.get_mut(sid).unwrap();
+        if ok {
+            session.set_state(SessionState::Ready, None)?;
+        } else {
+            session.set_state(SessionState::Blocked, Some("blocked_unresolved"))?;
+        }
+        session.takeover_started_at = None;
+        session.updated_at = now;
+        let state = session.state.clone();
+        let reason = session.blocked_reason.clone();
+        self.db.save(&mut m).await?;
+        self.db
+            .event(
+                "session_state",
+                json!({"session_id":sid,"state":state,"reason":reason,"resolved":ok,"expired":expired}),
+            )
+            .await?;
+        Ok(json!({"session_id":sid,"state":state,"reason":reason,"resolved":ok,"expired":expired}))
+    }
 }
 fn required<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
     p[key]
@@ -2823,6 +2980,7 @@ mod lifecycle_tests {
             listen: false,
             state: SessionState::Ready,
             blocked_reason: None,
+            takeover_started_at: None,
             origins: vec![],
             credentials: vec![],
             created_at: now(),

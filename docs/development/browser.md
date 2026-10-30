@@ -8,7 +8,7 @@ credential filling. `excalibur-web-adapter` is the trusted host library that app
 the harness authorization, file authority, file control and `SecretExecutor` to
 those effects. `excalibur-webd` provides environment diagnostics and a local Unix
 JSON-RPC service. `excalibur-search` remains an empty boundary. Agent browser tool
-registration, host composition and the viewer frontend are not implemented.
+registration and host composition are not implemented; the intervention viewer exists only as backend helpers (single-use code, cookie, security headers and shell rendering in `excalibur-webd`), with no served viewer endpoint yet.
 
 Install a stable Rust toolchain with rustfmt and clippy, a C/C++ compiler,
 `pkg-config`, OpenSSL development headers and a verified bubblewrap build (at
@@ -106,7 +106,7 @@ sudo target/debug/excalibur-webd --check-instance /absolute/path/web.toml
 ```
 
 This diagnostic drops privileges before constructing Tokio, prepares a private
-unique profile, starts an owned loopback proxy that rejects every connection,
+unique profile, starts an owned loopback listener that only accepts peers owned by the web UID (mapped through `/proc/net/tcp` and `/proc/net/tcp6`) and drops accepted diagnostic connections without forwarding,
 launches headless Chrome, obtains `Browser.getVersion`, verifies the renderer tree
 and prints JSON evidence before closing and removing its temporary profile. It
 exposes no RPC or viewer endpoint and does not browse external sites. `sandbox_verified`
@@ -133,9 +133,11 @@ Extra flags have a strict allowlist: sandbox disabling, TCP debugging, certifica
 bypasses, automation and overrides of managed flags are rejected. The host may
 select the Secret Service password store only after verifying that service;
 otherwise `basic` carries an explicit local-reader warning. The diagnostic uses
-an empty profile and `basic`. Network broker integration and application profile
-management are not implemented; the loopback proxy argument is a trusted host
-boundary, not a claim of complete egress isolation.
+an empty profile and `basic`. Application profile
+management is not implemented. `--serve` starts the egress broker (`HostProxy`)
+and forwards only same-UID loopback connections to its Unix socket, closing
+foreign-UID peers without forwarding; the loopback proxy argument remains a
+trusted host boundary, not a claim of complete egress isolation.
 
 Renderer checks require `Seccomp: 2`, `NoNewPrivs: 1`, and user/network namespaces
 different from the browser process. Initial startup requires at least one verified
@@ -300,8 +302,9 @@ an instance already in another mode returns `mode_unavailable`. Without a
 display, `headed` also returns that error until intervention support is available. Agent document admission accepts only
 configured read/write origins; login origins are human-only. The input lease
 checks the actual current frame URL under exclusion and returns
-`denied(human_only_origin)` for a login origin. Login detection and human
-takeover are not yet exposed by RPC.
+`denied(human_only_origin)` for a login origin. The readiness probe reports login and challenge markers; `takeover.start` and
+`takeover.end` move a blocked session into `human_control` and back over RPC
+(see the intervention section below).
 
 Document-origin blocks retain a `blocked_reason` (`needs_login` or
 `document_origin`). Reconciliation reads the actual top-level frame, including
@@ -391,8 +394,9 @@ listening contract runs a synthetic long-polling page for ten minutes while othe
 windows are active, verifies title events and live timers, and kills its renderer
 to verify recovery. `EXCALIBUR_LISTEN_TEST_SECONDS` can shorten a development run;
 only the default 600-second run satisfies the prolonged listening check. Evidence
-is in `target/test-evidence/browser/{sessions,webd_boundary}/`. There is no viewer
-frontend to validate visually.
+is in `target/test-evidence/browser/{sessions,webd_boundary}/`. The viewer shell,
+authentication and security headers exist as backend helpers; no viewer endpoint
+is served for visual validation yet.
 
 
 `cargo test -p excalibur-browser --test sessions listener_events_and_document_recovery -- --nocapture`
@@ -657,3 +661,75 @@ without resolution, a navigation between check and fill, a simulated host crash
 after the use mark that is not retried, and the absence of the secret value from
 webd and host files, events, audit and test output.
 Evidence is written to `target/test-evidence/browser/actions/`.
+
+## Network, content, blocks and intervention
+
+`--serve` binds the Chrome proxy listener on `127.0.0.1:<random>` and checks
+every accepted connection against `/proc/net/tcp` and `/proc/net/tcp6`: only a
+peer owned by the web UID reaches the egress broker (`HostProxy` with pinned
+DNS, no private/loopback answers, web ports only) over its Unix socket
+(`excalibur_webd::loopback::{accept_owned, forward_to_unix}`); any other peer
+is closed without forwarding, so the listener cannot be reused as an open
+proxy. `net::check_loopback_uid` parses both proc tables (little-endian IPv4,
+per-word reversed IPv6) and fails closed on unknown peers. The diagnostic
+`--check-instance` path applies the same UID check and drops accepted
+connections without forwarding.
+
+Document admission compares committed frame origins, never raw strings
+(`net::document_origin`: exact `scheme://host[:port]`, no userinfo).
+Top-level navigation to `file:`, `chrome:`, `chrome-extension:`, `devtools:`,
+`javascript:` or `data:` is denied (`net::is_forbidden_scheme`). Persistent
+profiles admit only configured document origins: reads accept `rw` or `ro`,
+input requires `rw` (`denied(origin_not_writable)`), and `login` origins stay
+human-only (`denied(human_only_origin)`). `credential_frames` must be exact
+HTTPS origins and `ro` origins must not overlap `rw` or `login`. Ephemeral
+sessions record each newly navigated origin
+(`Manager::note_ephemeral_origin`); the deterministic C4 check
+(`net::exfiltration_check` via `Manager::navigation_risk`) flags
+cross-origin POSTs and queries or fragments longer than 128 characters (or
+above 4.5 bits of Shannon entropy per character) sent to a new origin, so a
+contaminated run can require approval before committing.
+
+Every new browser context denies twelve sensitive permissions through
+`Browser.setPermission` before any navigation (`permissions::denial_params`:
+geolocation, notifications, camera, microphone, MIDI, clipboard, sensors,
+idle detection, local network access, display capture, window management and
+shared storage); a denial failure fails the session open, so no context runs
+without them. Site configuration may grant concrete permissions later.
+
+Block detection is deterministic. The readiness probe runs in an isolated
+world and reports `{kind, vendor, signals, confidence, url}` for
+`blocked_captcha`, `blocked_by_site`, `needs_login` and `needs_2fa`, covering
+challenge frames, invisible reCAPTCHA markers, perimeter block pages and
+identity origins, with corroborating title/text signals. `wait_ready` accepts
+the probe payload only through `observation::detectors::classify_probe_blocked`
+(unknown kinds, low confidence and empty signals never block) and can elevate
+medium confidence with a corroborating document status
+(`elevate_with_status`); low-confidence signals stay `degraded`.
+
+A blocked session can enter human intervention over RPC: `takeover.start`
+moves `Blocked` to `human_control` with a start timestamp, while
+`takeover.end{resolved}` returns a resolved intervention to `Ready`, advancing
+every live tab document epoch and invalidating prior references as
+`stale_ref(takeover)`; an unresolved or over-deadline (15 minutes)
+intervention returns to `Blocked` with `blocked_unresolved`. The viewer itself
+is a backend library (`webd::viewer`): an 8-character single-use code valid
+for 10 minutes, consumed by POST into an `HttpOnly; SameSite=Strict` cookie
+bound to the tab and deadline, required together with an exact `Origin` match
+for WebSocket upgrade; the code is never read from the URL. Responses carry
+`Content-Security-Policy: default-src 'none'; img-src data: blob:; script-src
+'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none';
+base-uri 'none'; form-action 'self'; require-trusted-types-for 'script'` plus
+`nosniff`, no referrer and no-store headers, and page-controlled title and
+origin render through escaped text, `textContent` and canvas only. Serving the
+viewer endpoint and the 18.5 visual review remain pending.
+
+Run `cargo test -p excalibur-browser --lib` and
+`cargo test -p excalibur-webd --lib`. These cover proc-table parsing and UID
+matching, origin/entropy/exfiltration checks, the twelve default denials and
+their CDP shape, detector classification and control pages, single-use and
+expiring takeover and viewer codes, cookie/origin socket checks, CSP headers
+and markup escaping. The real-Chrome 9.5 block matrices and control pages, the
+15-minute expiry fixture, the viewer rejection cases, the harness
+`input_required` flow, non-interactive `blocked_requires_human` and the served
+viewer review stay pending.

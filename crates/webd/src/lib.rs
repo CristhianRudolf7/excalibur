@@ -1,4 +1,6 @@
 //! Linux environment preparation. No browser, listener or profile is started here.
+pub mod loopback;
+pub mod viewer;
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::CString,
