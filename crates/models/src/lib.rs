@@ -4,12 +4,14 @@ mod cache;
 mod metrics;
 mod native;
 mod replay;
+pub mod resilience;
 pub mod routing;
 pub use cache::*;
 use excalibur_providers::ProviderClient;
 use excalibur_types::runtime::{BoxFuture, Message, ModelRequest, ModelResponse, ToolCall, Usage};
 pub use metrics::*;
 pub use replay::*;
+pub use resilience::{FailoverGateway, ProviderResilience, ResiliencePolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -246,8 +248,77 @@ pub struct OpenAiGateway {
     client: ProviderClient,
     config: GatewayConfig,
     pricing: Option<Arc<PriceTable>>,
+    resilience: Option<Arc<ProviderResilience>>,
+}
+/// A provider attempt that failed and was retried with the identical request.
+struct RetriedAttempt {
+    failure: ModelFailure,
+    duration_ms: u64,
 }
 impl OpenAiGateway {
+    /// Opt into shared retry/backoff and circuit-breaker state, normally
+    /// [`ProviderResilience::process`]. The request body, identity and wire
+    /// format are unchanged; only failed provider attempts are affected.
+    pub fn with_resilience(mut self, resilience: Arc<ProviderResilience>) -> Self {
+        self.resilience = Some(resilience);
+        self
+    }
+    pub fn resilience(&self) -> Option<&Arc<ProviderResilience>> {
+        self.resilience.as_ref()
+    }
+    async fn resilient<T, F, Fut>(
+        &self,
+        mut call: F,
+        retried: &mut Vec<RetriedAttempt>,
+    ) -> Result<T, ModelError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, excalibur_providers::FailureDetail>>,
+    {
+        let Some(resilience) = &self.resilience else {
+            return call().await.map_err(|detail| provider_error(detail.error));
+        };
+        let key = resilience.key(&format!("{:?}", self.client.provider()), &self.config.model);
+        let mut retry = 0_u32;
+        loop {
+            let permit = resilience
+                .admit(&key)
+                .map_err(ModelError::ProviderFailure)?;
+            let started = resilience.clock().monotonic();
+            match call().await {
+                Ok(value) => {
+                    permit.record(crate::resilience::Outcome::Success);
+                    return Ok(value);
+                }
+                Err(detail) => {
+                    let error = provider_error(detail.error);
+                    let failure = error.classification();
+                    permit.record(if crate::resilience::is_availability_failure(&failure) {
+                        crate::resilience::Outcome::Failure
+                    } else {
+                        crate::resilience::Outcome::Neutral
+                    });
+                    let Some(delay) =
+                        resilience.retry_delay(&key, retry, &failure, detail.retry_after.as_ref())
+                    else {
+                        return Err(error);
+                    };
+                    retried.push(RetriedAttempt {
+                        failure,
+                        duration_ms: resilience
+                            .clock()
+                            .monotonic()
+                            .saturating_sub(started)
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                    });
+                    resilience.clock().sleep(delay).await;
+                    retry += 1;
+                }
+            }
+        }
+    }
     pub fn new(client: ProviderClient, config: GatewayConfig) -> Result<Self, ModelError> {
         if config.model.trim().is_empty() || config.max_output_tokens == 0 {
             return Err(ModelError::Configuration(
@@ -270,6 +341,7 @@ impl OpenAiGateway {
             client,
             config,
             pricing: None,
+            resilience: None,
         })
     }
     /// The trusted host supplies the versioned tariff; no prices are downloaded.
@@ -459,17 +531,51 @@ impl OpenAiGateway {
             }
             let input_bytes = counted_wire.to_string().len() as u64;
             metrics.provider_calls += 1;
+            let mut retried = Vec::new();
             let raw = if let Some(sink) = &sink {
-                self.stream_once(body.clone(), sink, attempt).await
-            } else {
-                self.client
-                    .native_chat(&self.config.model, body.clone())
+                self.stream_once(body.clone(), sink, attempt, &mut retried)
                     .await
-                    .map_err(provider_error)
-                    .and_then(|raw| native::response(self.client.provider(), raw))
+            } else {
+                self.resilient(
+                    || {
+                        self.client
+                            .native_chat_detailed(&self.config.model, body.clone())
+                    },
+                    &mut retried,
+                )
+                .await
+                .and_then(|raw| native::response(self.client.provider(), raw))
             };
+            // Each retried attempt resent the identical body and received no
+            // usable response; it is recorded with no reported usage.
+            for retry in retried {
+                metrics.provider_calls += 1;
+                metrics.attempts.push(ModelAttemptMetrics {
+                    index: attempt,
+                    duration_ms: retry.duration_ms,
+                    usage: UsageBreakdown {
+                        estimated: true,
+                        ..UsageBreakdown::zero()
+                    },
+                    cost_microusd: None,
+                    error: Some(retry.failure),
+                });
+            }
             let raw = match raw {
                 Ok(raw) => raw,
+                Err(error) if error.classification().class == FailureClass::CircuitOpen => {
+                    // The open breaker rejected the attempt: nothing was sent.
+                    metrics.provider_calls -= 1;
+                    metrics.duration_ms = elapsed_ms(started);
+                    metrics.attempts.push(ModelAttemptMetrics {
+                        index: attempt,
+                        duration_ms: elapsed_ms(attempt_started),
+                        usage: UsageBreakdown::zero(),
+                        cost_microusd: None,
+                        error: Some(error.classification()),
+                    });
+                    return Err(ModelCallError { error, metrics });
+                }
                 Err(error) => {
                     metrics.duration_ms = elapsed_ms(started);
                     metrics.cost_microusd = None;
@@ -666,7 +772,10 @@ impl OpenAiGateway {
         mut body: Value,
         sink: &StreamSink,
         attempt: u8,
+        retried: &mut Vec<RetriedAttempt>,
     ) -> Result<Value, ModelError> {
+        // Only opening the stream is retried: once a delta reached the sink
+        // a failure is reported, never silently restarted.
         if matches!(
             self.client.provider(),
             excalibur_providers::Provider::Anthropic
@@ -674,18 +783,26 @@ impl OpenAiGateway {
                 | excalibur_providers::Provider::Vertex
         ) {
             let stream = self
-                .client
-                .stream_native_chat(&self.config.model, body)
-                .await
-                .map_err(provider_error)?;
+                .resilient(
+                    || {
+                        self.client
+                            .stream_native_chat_detailed(&self.config.model, body.clone())
+                    },
+                    retried,
+                )
+                .await?;
             return native::stream(self.client.provider(), stream, sink, attempt).await;
         }
         body["stream_options"] = json!({"include_usage":true});
         let mut stream = self
-            .client
-            .stream_native_chat(&self.config.model, body)
-            .await
-            .map_err(provider_error)?;
+            .resilient(
+                || {
+                    self.client
+                        .stream_native_chat_detailed(&self.config.model, body.clone())
+                },
+                retried,
+            )
+            .await?;
         let mut content = String::new();
         let mut calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
         let mut finish = None;
