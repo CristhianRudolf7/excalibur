@@ -216,7 +216,7 @@ fn authenticated_confirmation_survives_restart_and_cancels_once_with_full_inbox(
 
 #[derive(Default)]
 struct NaturalCancel {
-    target: std::sync::Mutex<String>,
+    targets: std::sync::Mutex<Vec<String>>,
     calls: AtomicUsize,
 }
 impl ModelGateway for NaturalCancel {
@@ -224,13 +224,13 @@ impl ModelGateway for NaturalCancel {
         Box::pin(async move {
             let mut message = Message::text("assistant", "Waiting for human confirmation.");
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                message.tool_calls.push(ToolCall {
-                    id: "request-cancel".into(),
-                    name: "subagent".into(),
-                    arguments:
-                        json!({"action":"cancel","target":self.target.lock().unwrap().clone()})
-                            .to_string(),
-                });
+                for (index, target) in self.targets.lock().unwrap().iter().enumerate() {
+                    message.tool_calls.push(ToolCall {
+                        id: format!("request-cancel-{index}"),
+                        name: "subagent".into(),
+                        arguments: json!({"action":"cancel","target":target}).to_string(),
+                    });
+                }
             }
             Ok(ModelResponse {
                 message,
@@ -267,19 +267,23 @@ fn natural_language_master_request_opens_confirmation_without_control() {
         let (url, server) = serve(&host).await;
         send(&url, "init", "/status", None).await;
         let agent = worker(&host, "Natural").await;
-        *model.target.lock().unwrap() = agent.id.clone();
-        send(&url, "natural", "Please cancel Natural", None).await;
+        let other = worker(&host, "OtherNatural").await;
+        *model.targets.lock().unwrap() = vec![agent.id.clone(), other.id.clone()];
+        send(
+            &url,
+            "natural",
+            "Please cancel Natural and OtherNatural",
+            None,
+        )
+        .await;
         let question = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if let Some(question) = host
-                    .master
-                    .questions("cancel-origin")
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .next()
-                {
-                    break question;
+                let questions = host.master.questions("cancel-origin").await.unwrap();
+                if questions.len() == 2 {
+                    break questions
+                        .into_iter()
+                        .find(|q| q.text.contains(&agent.id))
+                        .unwrap();
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -291,6 +295,17 @@ fn natural_language_master_request_opens_confirmation_without_control() {
         // Stop the model turn before confirmation so only the host fast path runs.
         host.master.stop_turn("cancel-origin").await.unwrap();
         let calls = model.calls.load(Ordering::SeqCst);
+        let rejected = host
+            .master
+            .questions("cancel-origin")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|q| q.text.contains(&other.id))
+            .unwrap();
+        send(&url, "reject-natural", "no", Some(&rejected.id)).await;
+        send(&url, "late-natural", "yes", Some(&rejected.id)).await;
+        assert_eq!(controls(&db).await, 0);
         send(&url, "confirm-natural", "yes", Some(&question.id)).await;
         assert_eq!(controls(&db).await, 1);
         assert_eq!(model.calls.load(Ordering::SeqCst), calls);

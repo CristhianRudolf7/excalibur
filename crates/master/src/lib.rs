@@ -1416,6 +1416,7 @@ conn.execute("UPDATE master_inbox SET state='done' WHERE message_id=?1 AND state
                 self.create_cancel_question(
                     conversation,
                     source.ok_or_else(|| Error::Invalid("cancellation needs a source".into()))?,
+                    key,
                     &previous,
                 )
                 .await?;
@@ -1475,6 +1476,7 @@ conn.execute("UPDATE master_inbox SET state='done' WHERE message_id=?1 AND state
             self.create_cancel_question(
                 conversation,
                 source.ok_or_else(|| Error::Invalid("cancellation needs a source".into()))?,
+                key,
                 &result,
             )
             .await?;
