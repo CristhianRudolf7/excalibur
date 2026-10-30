@@ -449,3 +449,131 @@ async fn independent_effects_and_reconciliation_enter_the_delegate_concurrently(
     assert_eq!(a, Reconcile::Retry);
     assert_eq!(b, Reconcile::Retry);
 }
+
+#[tokio::test]
+async fn conversation_catalog_is_frozen_but_each_source_has_independent_policy_and_typed_keys() {
+    use excalibur_skills::conversation::ConversationBinding;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("skills");
+    write(
+        &root,
+        "reactor",
+        "search_skills load_skill read_file",
+        "read_file",
+        "original",
+    );
+    let index = index(&root).await;
+    let db = Database::open(
+        dir.path().join("db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let rt = SkillRuntime::new(
+        db.clone(),
+        Arc::new(Tools::default()),
+        BTreeMap::from([("a".into(), index.clone())]),
+        10000,
+        TokenCounter::for_model("gpt-4o"),
+    )
+    .await
+    .unwrap();
+    let binding = ConversationBinding {
+        principal: "p:a".into(),
+        conversation: "b".into(),
+        scope: "a".into(),
+        source: "source".into(),
+    };
+    let mut ambiguous = binding.clone();
+    ambiguous.principal = "p".into();
+    ambiguous.conversation = "a:b".into();
+    assert_ne!(binding.run_key(), ambiguous.run_key());
+    let run = rt
+        .bind_conversation_turn(
+            &binding,
+            CatalogScope::new(TaskKind::Programming, "implementer"),
+            "reactor",
+        )
+        .await
+        .unwrap();
+    let frozen = rt.session_context(&run).await.unwrap();
+    {
+        let guard = rt
+            .admit_call(&run, &call("write_file", json!({})))
+            .await
+            .unwrap();
+        let load = rt.invoke_skill(&run, "load", call("load_skill", json!({"name":"reactor"})));
+        tokio::pin!(load);
+        // Polling activation once while admission is held must remain pending.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(load.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(guard);
+        assert!(load.await.unwrap().success);
+    }
+    assert!(
+        rt.admit_call(&run, &call("write_file", json!({})))
+            .await
+            .is_err()
+    );
+    write(&root, "new-skill", "read_file", "", "new catalog entry");
+    index.refresh_background().await.unwrap();
+    let mut next = binding.clone();
+    next.source = "second".into();
+    let next_run = rt
+        .bind_conversation_turn(
+            &next,
+            CatalogScope::new(TaskKind::Programming, "implementer"),
+            "new-skill",
+        )
+        .await
+        .unwrap();
+    let context = rt.session_context(&next_run).await.unwrap();
+    assert_eq!(context.identity, frozen.identity);
+    assert!(context.suggested_skills.len() <= 3);
+    assert!(
+        !context
+            .suggested_skills
+            .iter()
+            .any(|s| s.contains("new-skill"))
+    );
+    assert!(
+        rt.admit_call(&next_run, &call("write_file", json!({})))
+            .await
+            .is_ok()
+    );
+    drop(rt);
+    let rt = SkillRuntime::new(
+        db.clone(),
+        Arc::new(Tools::default()),
+        BTreeMap::from([("a".into(), index)]),
+        10000,
+        TokenCounter::for_model("gpt-4o"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rt.bind_conversation_turn(
+            &binding,
+            CatalogScope::new(TaskKind::Programming, "implementer"),
+            "different suggestion query"
+        )
+        .await
+        .unwrap(),
+        run
+    );
+    assert_eq!(rt.session_context(&run).await.unwrap(), frozen);
+    assert!(
+        rt.admit_call(&run, &call("write_file", json!({})))
+            .await
+            .is_err()
+    );
+    let replay = rt
+        .invoke_skill(&run, "load", call("load_skill", json!({"name":"reactor"})))
+        .await
+        .unwrap();
+    assert!(replay.success);
+    db.shutdown().await.unwrap();
+}

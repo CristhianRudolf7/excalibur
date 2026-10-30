@@ -27,11 +27,11 @@ fn storage(e: impl std::fmt::Display) -> String {
 }
 
 pub struct SkillRuntime {
-    db: Database,
+    pub(crate) db: Database,
     delegate: Arc<dyn ToolRuntime>,
-    indexes: BTreeMap<String, Arc<SkillIndex>>,
+    pub(crate) indexes: BTreeMap<String, Arc<SkillIndex>>,
     window: usize,
-    counter: TokenCounter,
+    pub(crate) counter: TokenCounter,
     core_tools: Vec<ToolDefinition>,
     gates: std::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>>,
 }
@@ -138,7 +138,10 @@ impl SkillRuntime {
             .await
             .map_err(storage)
     }
-    async fn read(&self, run: &str) -> Result<Option<(String, SkillSession, Vec<String>)>, String> {
+    pub(crate) async fn read(
+        &self,
+        run: &str,
+    ) -> Result<Option<(String, SkillSession, Vec<String>)>, String> {
         let run = run.to_owned();
         let row: Option<(String, String, String, String)> = self
             .db
@@ -188,6 +191,21 @@ impl SkillRuntime {
             return Err("tool denied by active skill allowed-tools".into());
         }
         Ok(())
+    }
+    /// Shared admission for host adapters whose effects already have their own
+    /// durable receipts. Keep this guard through the effect: activation waits
+    /// for ordinary effects, while independent effects may proceed together.
+    pub async fn admit_call(
+        &self,
+        run: &str,
+        call: &ToolCall,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
+        if own(&call.name) {
+            return Err("skill operations require runtime execution".into());
+        }
+        let guard = self.gate(run).read_owned().await;
+        self.check(run, call).await?;
+        Ok(guard)
     }
     async fn schemas(&self, run: &str) -> Result<BTreeMap<String, ToolDefinition>, String> {
         let mut all = self
@@ -241,6 +259,22 @@ impl SkillRuntime {
             })
             .await
             .map_err(storage)
+    }
+    /// Idempotent direct skill port for hosts with an existing outer effect journal.
+    pub async fn invoke_skill(
+        &self,
+        run: &str,
+        key: &str,
+        call: ToolCall,
+    ) -> Result<ToolResult, String> {
+        if !own(&call.name) {
+            return Err("not a skill operation".into());
+        }
+        if let Some(result) = self.receipt(run, key, &call).await? {
+            return Ok(result);
+        }
+        let prepared = self.prepare(run, call).await?;
+        Ok(self.execute(run, key, &prepared).await)
     }
     async fn perform(
         &self,

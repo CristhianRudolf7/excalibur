@@ -11,7 +11,7 @@ use excalibur_memory::{
 use excalibur_models::ModelGateway;
 use excalibur_orchestrator::{Agent, Delegation, Orchestrator};
 use excalibur_store::{ReadLane, rusqlite::OptionalExtension};
-use excalibur_types::runtime::{BoxFuture, ToolDefinition, ToolRuntime};
+use excalibur_types::runtime::{BoxFuture, RunContext, ToolDefinition, ToolRuntime};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -494,6 +494,20 @@ impl MemoryFastActions {
     }
 }
 impl FastActions for MemoryFastActions {
+    fn deferred_schemas<'a>(
+        &'a self,
+        request: excalibur_master::MasterContextRequest<'a>,
+    ) -> BoxFuture<'a, Result<Vec<ToolDefinition>, String>> {
+        self.inner.deferred_schemas(request)
+    }
+
+    fn session_context<'a>(
+        &'a self,
+        request: excalibur_master::MasterContextRequest<'a>,
+    ) -> BoxFuture<'a, Result<RunContext, String>> {
+        self.inner.session_context(request)
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = self.inner.definitions();
         definitions.retain(|d| !Self::own(&d.name));

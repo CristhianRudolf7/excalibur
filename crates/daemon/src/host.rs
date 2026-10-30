@@ -488,6 +488,16 @@ impl DaemonHost {
             )),
             None => fast_actions,
         };
+        let fast_actions: Arc<dyn excalibur_master::FastActions> = Arc::new(
+            crate::master_skills::MasterSkillFastActions::new(
+                db.clone(),
+                fast_actions,
+                &skills,
+                master_config.principal.clone(),
+                redactor.clone(),
+            )
+            .await?,
+        );
         if let Some(memory) = &memory {
             memory.spawn_maintenance(
                 &work,

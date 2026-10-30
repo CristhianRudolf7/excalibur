@@ -143,3 +143,90 @@ async fn the_master_discovers_only_fast_domain_tools_and_cannot_reach_the_slow_e
     );
     assert_eq!(runtime.0.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn deferred_skill_metadata_intersects_the_authorized_run_and_scope_without_becoming_eager() {
+    use excalibur_master::MasterContextRequest;
+    struct Scoped(Arc<Runtime>);
+    impl ToolRuntime for Scoped {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            self.0.definitions()
+        }
+        fn run_definitions<'a>(
+            &'a self,
+            run: &'a str,
+        ) -> BoxFuture<'a, Result<Option<Vec<ToolDefinition>>, String>> {
+            Box::pin(async move {
+                Ok(Some(if run == "authorized" {
+                    self.definitions()
+                } else {
+                    vec![]
+                }))
+            })
+        }
+        fn prepare<'a>(
+            &'a self,
+            run: &'a str,
+            call: ToolCall,
+        ) -> BoxFuture<'a, Result<PreparedTool, String>> {
+            self.0.prepare(run, call)
+        }
+        fn execute<'a>(
+            &'a self,
+            run: &'a str,
+            key: &'a str,
+            tool: &'a PreparedTool,
+        ) -> BoxFuture<'a, ToolResult> {
+            self.0.execute(run, key, tool)
+        }
+        fn reconcile<'a>(
+            &'a self,
+            run: &'a str,
+            key: &'a str,
+            tool: &'a PreparedTool,
+        ) -> BoxFuture<'a, Reconcile> {
+            self.0.reconcile(run, key, tool)
+        }
+    }
+    let runtime = Arc::new(Scoped(Arc::new(Runtime(AtomicUsize::new(0)))));
+    let defs = runtime.definitions();
+    let mut fast = CatalogTool::from_definition(defs[0].clone());
+    fast.fast = true;
+    fast.timeout_ms = 1000;
+    let catalog = Arc::new(
+        ToolCatalog::new(vec![fast, CatalogTool::from_definition(defs[1].clone())]).unwrap(),
+    );
+    let request = || MasterContextRequest {
+        principal: "local",
+        conversation: "chat",
+        original_scope: "project:one",
+        source_message_id: "accepted-source",
+    };
+    for (run, count) in [("authorized", 1), ("denied-run", 0)] {
+        let adapter = MasterFastTools::new(
+            Arc::new(NoActions),
+            runtime.clone(),
+            catalog.clone(),
+            run.into(),
+            ["project:one".into()].into(),
+        )
+        .unwrap();
+        let schemas = adapter.deferred_schemas(request()).await.unwrap();
+        assert_eq!(schemas.len(), count);
+        if count == 1 {
+            assert_eq!(schemas[0], defs[0]);
+        }
+        assert!(
+            !adapter
+                .definitions()
+                .iter()
+                .any(|d| d.name == "quick_lookup")
+        );
+        let mut foreign = request();
+        foreign.original_scope = "project:other";
+        assert!(adapter.deferred_schemas(foreign).await.unwrap().is_empty());
+        let mut unscoped = request();
+        unscoped.source_message_id = "";
+        assert!(adapter.deferred_schemas(unscoped).await.is_err());
+    }
+}

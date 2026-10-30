@@ -10,6 +10,7 @@ use std::{collections::BTreeSet, sync::Arc};
 /// non-fast catalog entry at both discovery and actual execution.
 pub struct MasterFastTools {
     core: Arc<dyn FastActions>,
+    secured_delegate: Arc<dyn ToolRuntime>,
     deferred: DeferredTools,
     run: String,
     scopes: BTreeSet<String>,
@@ -42,7 +43,8 @@ impl MasterFastTools {
         }
         Ok(Self {
             core,
-            deferred: DeferredTools::new(secured_delegate, catalog, CallerRole::Master)?,
+            deferred: DeferredTools::new(secured_delegate.clone(), catalog, CallerRole::Master)?,
+            secured_delegate,
             run,
             scopes,
         })
@@ -52,6 +54,60 @@ impl MasterFastTools {
     }
 }
 impl FastActions for MasterFastTools {
+    fn deferred_schemas<'a>(
+        &'a self,
+        request: crate::MasterContextRequest<'a>,
+    ) -> BoxFuture<'a, Result<Vec<ToolDefinition>, String>> {
+        Box::pin(async move {
+            if request.principal.is_empty()
+                || request.conversation.is_empty()
+                || request.source_message_id.is_empty()
+            {
+                return Err("master deferred schema source/scope is not authorized".into());
+            }
+            let in_scope = self.scopes.contains(request.original_scope);
+            let mut schemas = self.core.deferred_schemas(request).await?;
+            if !in_scope {
+                return Ok(schemas);
+            }
+            let mut available = self
+                .secured_delegate
+                .run_definitions(&self.run)
+                .await?
+                .unwrap_or_else(|| self.secured_delegate.definitions());
+            available.extend(
+                self.secured_delegate
+                    .deferred_definitions(&self.run)
+                    .await?,
+            );
+            // The existing catalog is validated against the secured adapter,
+            // pinned by authorized run and filtered by CallerRole::Master.
+            for definition in self.deferred.deferred_definitions(&self.run).await? {
+                let Some(metadata) = self.deferred.catalog().get(&definition.name) else {
+                    continue;
+                };
+                if metadata.fast
+                    && metadata.timeout_ms <= 10_000
+                    && !forbidden(&metadata.name)
+                    && available.iter().any(|d| {
+                        d.name == definition.name && d.input_schema == definition.input_schema
+                    })
+                {
+                    schemas.retain(|d| d.name != definition.name);
+                    schemas.push(definition);
+                }
+            }
+            Ok(schemas)
+        })
+    }
+
+    fn session_context<'a>(
+        &'a self,
+        request: crate::MasterContextRequest<'a>,
+    ) -> BoxFuture<'a, Result<RunContext, String>> {
+        self.core.session_context(request)
+    }
+
     fn confirm_cancel<'a>(
         &'a self,
         conversation: &'a str,
@@ -189,6 +245,7 @@ fn forbidden(name: &str) -> bool {
         name,
         "exec"
             | "exec_io"
+            | "terminal"
             | "read_file"
             | "file_edit"
             | "file_write"
