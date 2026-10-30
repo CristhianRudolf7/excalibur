@@ -50,6 +50,18 @@ async fn worker(host: &DaemonHost, name: &str) -> excalibur_orchestrator::Agent 
         .into_iter()
         .find(|a| a.depth == 0)
         .unwrap();
+    let budget = Budget::default();
+    let (context, _) = host
+        .orchestrator
+        .engine()
+        .native_context(
+            "rules",
+            "task",
+            "fixed",
+            &budget,
+            "\n[excalibur-host-lane:1]\n",
+        )
+        .unwrap();
     host.orchestrator
         .spawn(
             &parent.id,
@@ -68,8 +80,8 @@ async fn worker(host: &DaemonHost, name: &str) -> excalibur_orchestrator::Agent 
                 fork_context: false,
                 token: parent.token,
                 spec: RunSpec {
-                    context: excalibur_context::ContextInput::new("rules", "task", "fixed"),
-                    budget: Budget::default(),
+                    context,
+                    budget,
                     criteria: vec![Criterion::FinalResponse { schema: None }],
                 },
                 priority: 1,
