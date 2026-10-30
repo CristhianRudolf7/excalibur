@@ -8,7 +8,7 @@ credential filling. `excalibur-web-adapter` is the trusted host library that app
 the harness authorization, file authority, file control and `SecretExecutor` to
 those effects. `excalibur-webd` provides environment diagnostics and a local Unix
 JSON-RPC service. `excalibur-search` remains an empty boundary. Agent browser tool
-registration and host composition are not implemented; the intervention viewer exists only as backend helpers (single-use code, cookie, security headers and shell rendering in `excalibur-webd`), with no served viewer endpoint yet.
+registration and host composition are not implemented; the intervention viewer is served by `excalibur-webd --serve` over real TCP (single-use code, `HttpOnly;SameSite=Strict` cookie, exact `Origin` checks, strict CSP headers and shell rendering), covered by `viewer_http` and `viewer_viewport` over local synthetic fixtures.
 
 Install a stable Rust toolchain with rustfmt and clippy, a C/C++ compiler,
 `pkg-config`, OpenSSL development headers and a verified bubblewrap build (at
@@ -394,9 +394,7 @@ listening contract runs a synthetic long-polling page for ten minutes while othe
 windows are active, verifies title events and live timers, and kills its renderer
 to verify recovery. `EXCALIBUR_LISTEN_TEST_SECONDS` can shorten a development run;
 only the default 600-second run satisfies the prolonged listening check. Evidence
-is in `target/test-evidence/browser/{sessions,webd_boundary}/`. The viewer shell,
-authentication and security headers exist as backend helpers; no viewer endpoint
-is served for visual validation yet.
+is in `target/test-evidence/browser/{sessions,webd_boundary}/`. The viewer shell, authentication and security headers are served by `excalibur-webd --serve` for visual validation, covered by `viewer_http` (real TCP) and `viewer_viewport` (small/large Chrome presets) with evidence in `target/test-evidence/browser/viewer/`.
 
 
 `cargo test -p excalibur-browser --test sessions listener_events_and_document_recovery -- --nocapture`

@@ -9,7 +9,7 @@ confianza del host que aplica a esos efectos la autorización del arnés, la
 autoridad de archivos, el control de archivos y `SecretExecutor`.
 `excalibur-webd` ofrece diagnósticos de entorno y un servicio JSON-RPC Unix local.
 `excalibur-search` sigue vacío. El registro de herramientas web del agente, la
-composición del host no están implementados; el visor de intervención existe solo como ayudas del backend (código de un solo uso, cookie, cabeceras de seguridad y dibujo del lienzo en `excalibur-webd`), sin endpoint servido todavía.
+composición del host no están implementados; el visor de intervención lo sirve `excalibur-webd --serve` por TCP real (código de un solo uso, cookie `HttpOnly;SameSite=Strict`, comprobaciones exactas de `Origin`, cabeceras CSP estrictas y dibujo del lienzo), cubierto por `viewer_http` y `viewer_viewport` con fixtures sintéticas locales.
 
 Instala Rust estable con rustfmt y clippy, un compilador C/C++, `pkg-config`,
 cabeceras de desarrollo de OpenSSL y una compilación verificada de bubblewrap
@@ -417,9 +417,7 @@ ventanas activas, comprueba eventos de título y temporizadores y mata su
 renderizador para verificar recuperación. `EXCALIBUR_LISTEN_TEST_SECONDS` permite
 acortar una ejecución de desarrollo; solo los 600 segundos por defecto satisfacen
 la escucha prolongada. Evidencias en
-`target/test-evidence/browser/{sessions,webd_boundary}/`. El lienzo del visor, la
-autenticación y las cabeceras de seguridad existen como ayudas del backend; todavía
-no se sirve ningún endpoint del visor para revisión visual.
+`target/test-evidence/browser/{sessions,webd_boundary}/`. El lienzo del visor, la autenticación y las cabeceras de seguridad los sirve `excalibur-webd --serve` para revisión visual, cubiertos por `viewer_http` (TCP real) y `viewer_viewport` (presets pequeño/grande de Chrome) con evidencias en `target/test-evidence/browser/viewer/`.
 
 
 `cargo test -p excalibur-browser --test sessions listener_events_and_document_recovery -- --nocapture`
