@@ -754,6 +754,10 @@ fn call_schema() -> Value {
     json!({"$schema":SCHEMA_URI,"type":"object","properties":{"name":{"type":"string","pattern":"^[a-z_][a-z0-9_]{0,63}$"},"args":{"type":"object"},"arguments":{"type":"object"}},"required":["name"],"oneOf":[{"required":["args"],"not":{"required":["arguments"]}},{"required":["arguments"],"not":{"required":["args"]}}],"additionalProperties":false})
 }
 impl ToolRuntime for DeferredTools {
+    fn overrides_builtin<'a>(&'a self, run: &'a str, name: &'a str) -> BoxFuture<'a, bool> {
+        self.delegate.overrides_builtin(run, name)
+    }
+
     fn run_definitions<'a>(
         &'a self,
         run: &'a str,

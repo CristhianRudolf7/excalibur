@@ -419,6 +419,16 @@ impl MemoryTools {
     }
 }
 impl ToolRuntime for MemoryTools {
+    fn overrides_builtin<'a>(&'a self, run: &'a str, name: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            if name == "history_search" && self.binding(run).await.is_some() {
+                true
+            } else {
+                self.delegate.overrides_builtin(run, name).await
+            }
+        })
+    }
+
     fn filesystem_confinement(&self, run: &str) -> Option<FilesystemConfinement> {
         self.delegate.filesystem_confinement(run)
     }

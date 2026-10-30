@@ -783,7 +783,13 @@ impl Engine {
             ));
         }
         spec.context.tools = self.tools.definitions();
-        spec.context.tools.extend(builtin_definitions());
+        // The durable seed is validated before host bindings exist. Runtime
+        // ownership is resolved before the first compiled context below.
+        let reserved = builtin_definitions();
+        spec.context
+            .tools
+            .retain(|tool| !reserved.iter().any(|builtin| builtin.name == tool.name));
+        spec.context.tools.extend(reserved);
         spec.context.tools.sort_by(|a, b| a.name.cmp(&b.name));
         excalibur_context::ContextSession::new(
             spec.context.clone(),
@@ -2709,6 +2715,13 @@ impl Engine {
         Ok(())
     }
     async fn scheduling(&self, run: &str, call: &ToolCall, timeout: u64) -> ToolScheduling {
+        if self.tools.overrides_builtin(run, &call.name).await {
+            return self
+                .tools
+                .scheduling(run, call)
+                .await
+                .unwrap_or_else(ToolScheduling::isolated);
+        }
         if episode_utilities::is_builtin(&call.name)
             || matches!(
                 call.name.as_str(),
@@ -2735,6 +2748,9 @@ impl Engine {
         run: &str,
         call: ToolCall,
     ) -> std::result::Result<PreparedTool, String> {
+        if self.tools.overrides_builtin(run, &call.name).await {
+            return self.tools.prepare(run, call).await;
+        }
         if episode_utilities::is_builtin(&call.name) {
             return episode_utilities::prepare(call);
         }
@@ -2785,6 +2801,9 @@ impl Engine {
         }
     }
     async fn execute(&self, run: &str, key: &str, tool: &PreparedTool) -> ToolResult {
+        if self.tools.overrides_builtin(run, &tool.call.name).await {
+            return self.tools.execute(run, key, tool).await;
+        }
         let builtin = episode_utilities::is_builtin(&tool.call.name)
             || matches!(
                 tool.call.name.as_str(),

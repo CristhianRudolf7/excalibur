@@ -247,6 +247,11 @@ pub struct FilesystemConfinement {
     pub snapshot_owner: String,
 }
 pub trait ToolRuntime: Send + Sync {
+    /// A trusted scoped adapter can own a same-named engine utility. The host
+    /// binding must keep this routing stable for the run, including restart.
+    fn overrides_builtin<'a>(&'a self, _run: &'a str, _name: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
     /// A positively confined filesystem and run-owned snapshot namespace.
     /// Generic runtimes deliberately provide no attestation.
     fn filesystem_confinement(&self, _run: &str) -> Option<FilesystemConfinement> {
