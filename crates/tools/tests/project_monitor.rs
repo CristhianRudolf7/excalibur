@@ -371,7 +371,7 @@ async fn gitignore_excluded_files_never_queue_project_changes() {
     db.shutdown().await.unwrap();
 }
 #[tokio::test]
-async fn agent_exec_changes_are_attributed_before_marking_them_external() {
+async fn shared_exec_changes_retain_unverified_provenance() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
     std::fs::create_dir(&root).unwrap();
@@ -416,17 +416,136 @@ async fn agent_exec_changes_are_attributed_before_marking_them_external() {
         .unwrap();
     let result = tools.execute(&run, "spawn", &prepared).await;
     assert!(result.success, "{result:?}");
-    tools.end_step(&run, 0).await.unwrap();
+    // The exec step is still open. A second writer changes an unrelated path;
+    // the closing whole-tree snapshot must never claim that writer's content.
+    std::fs::write(root.join("human.txt"), "human-a").unwrap();
     monitor.scan_now().await.unwrap();
     let changes = seen.0.lock().unwrap().clone();
-    assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].0.path, PathBuf::from("agent.txt"));
+    assert_eq!(changes.len(), 2, "{changes:?}");
+    for (change, _) in &changes {
+        assert!(
+            change.external,
+            "shared observation needs revalidation: {change:?}"
+        );
+        assert_eq!(
+            change.origin,
+            excalibur_tools::monitor::ChangeOrigin::Unattributed
+        );
+    }
     assert!(
-        !changes[0].0.external,
-        "the agent's own exec output is not an outside change: {changes:?}"
+        changes
+            .iter()
+            .any(|(c, _)| c.path == Path::new("agent.txt"))
     );
+    assert!(
+        changes
+            .iter()
+            .any(|(c, _)| c.path == Path::new("human.txt"))
+    );
+    tools.end_step(&run, 0).await.unwrap();
+    // An ABA edit returns to content captured by the closing exec snapshot.
+    // A historical postimage is content evidence, not writer identity.
+    for text in ["human-b", "human-a"] {
+        seen.0.lock().unwrap().clear();
+        std::fs::write(root.join("human.txt"), text).unwrap();
+        monitor.scan_now().await.unwrap();
+        let changes = seen.0.lock().unwrap().clone();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(changes[0].0.external, "ABA cannot prove exec authorship");
+        assert_eq!(
+            changes[0].0.origin,
+            excalibur_tools::monitor::ChangeOrigin::Unattributed
+        );
+    }
     monitor.stop().await;
     drop(monitor);
+    drop(tools);
+    db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_pending_provenance_is_scoped_and_neutral_notice_replays_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("source.rs"), "current").unwrap();
+    let db = Database::open(
+        temp.path().join("main.db"),
+        DatabaseKind::Main,
+        StorageConfig::default(),
+    )
+    .unwrap();
+    let journal = excalibur_journal::Journal::new(db.clone()).await.unwrap();
+    let run = journal
+        .create_run("legacy-monitor", json!({"synthetic":true}))
+        .await
+        .unwrap();
+    let tools = LocalTools::new(db.clone(), root.clone(), ToolPolicy::default())
+        .await
+        .unwrap();
+    let initial = ProjectMonitor::start(tools.clone(), None, vec![])
+        .await
+        .unwrap();
+    initial.stop().await;
+    drop(initial);
+    let project = root.to_string_lossy().into_owned();
+    let path = root.join("source.rs").to_string_lossy().into_owned();
+    let owner = run.clone();
+    let ids = db.write(Priority::Journal, move |c| {
+        let hash:String=c.query_row("SELECT hash FROM project_observations WHERE project=?1 AND path='source.rs'",[&project],|r|r.get(0))?;
+        let mut ids=Vec::new();
+        for (scope,state) in [(project.as_str(),"pending"),("another-project","pending"),(project.as_str(),"processed")] {
+            c.execute("INSERT INTO project_changes(project,path,previous_hash,current_hash,external,state) VALUES(?1,'source.rs','legacy',?2,0,?3)",excalibur_store::rusqlite::params![scope,hash,state])?;
+            ids.push(c.last_insert_rowid());
+        }
+        c.execute("INSERT INTO leases(path,holder_id,expires_at) VALUES(?1,?2,unixepoch()+600)",excalibur_store::rusqlite::params![path,owner])?;
+        Ok(ids)
+    }).await.unwrap();
+    let seen = Arc::new(Observed(Mutex::new(vec![])));
+    for _ in 0..2 {
+        let monitor = ProjectMonitor::start(tools.clone(), Some(seen.clone()), vec![])
+            .await
+            .unwrap();
+        monitor.scan_now().await.unwrap();
+        monitor.stop().await;
+    }
+    let rows = db
+        .read(ReadLane::Interactive, move |c| {
+            ids.into_iter()
+                .map(|id| {
+                    c.query_row(
+                        "SELECT external,state FROM project_changes WHERE id=?1",
+                        [id],
+                        |r| Ok((r.get::<_, bool>(0)?, r.get::<_, String>(1)?)),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (true, "processed".into()),
+            (false, "pending".into()),
+            (false, "processed".into())
+        ]
+    );
+    {
+        let observed = seen.0.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].0.origin, ChangeOrigin::Unattributed);
+    }
+    let entries = journal.entries(&run, 0, 100).await.unwrap();
+    let notices = entries
+        .iter()
+        .filter(|e| e.kind == "directive_received")
+        .collect::<Vec<_>>();
+    assert_eq!(notices.len(), 1, "{entries:?}");
+    let text = notices[0].payload["text"].as_str().unwrap();
+    assert!(text.contains("unverified writer provenance"), "{text}");
+    assert!(!text.contains("outside Excalibur"));
     drop(tools);
     db.shutdown().await.unwrap();
 }
