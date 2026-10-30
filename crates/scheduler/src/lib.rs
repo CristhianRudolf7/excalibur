@@ -1,6 +1,7 @@
 //! Durable UTC timers and a scoped delivery outbox. Consumers must honor fire IDs
 //! as idempotency keys; acknowledging delivery cannot make an external effect atomic.
 pub mod calendar;
+pub mod reminders;
 
 use excalibur_store::{Database, DatabaseKind, Error, Priority, ReadLane, Result, rusqlite};
 use rusqlite::OptionalExtension;
@@ -83,7 +84,7 @@ impl Scheduler {
         }
         db.write(Priority::Journal, move |c| {
             c.execute_batch("CREATE TABLE IF NOT EXISTS scheduler_schema(version INTEGER PRIMARY KEY,checksum TEXT NOT NULL)")?;
-            for (version,schema) in [(1,include_str!("schema.sql")),(2,include_str!("schema2.sql"))] {
+            for (version,schema) in [(1,include_str!("schema.sql")),(2,include_str!("schema2.sql")),(3,include_str!("schema3.sql"))] {
                 let checksum=format!("{:x}",Sha256::digest(schema.as_bytes()));
                 let known:Option<String>=c.query_row("SELECT checksum FROM scheduler_schema WHERE version=?1",[version],|r|r.get(0)).optional()?;
                 if known.as_ref().is_some_and(|stored|stored!=&checksum){return Err(Error::Invalid("scheduler schema checksum mismatch"));}
@@ -329,14 +330,14 @@ impl Scheduler {
         }
         let scope = self.scope.clone();
         self.db.read(ReadLane::Background, move |c| {
-            let mut q=c.prepare("SELECT id,timer_id,scheduled_at,payload FROM scheduler_fires WHERE scope=?1 AND delivered=0 ORDER BY scheduled_at,id LIMIT ?2")?;
+            let mut q=c.prepare("SELECT id,timer_id,scheduled_at,payload FROM scheduler_fires WHERE scope=?1 AND delivered=0 AND NOT EXISTS (SELECT 1 FROM scheduler_cancelled_fires x WHERE x.scope=scheduler_fires.scope AND x.fire_id=scheduler_fires.id) ORDER BY scheduled_at,id LIMIT ?2")?;
             let rows=q.query_map(rusqlite::params![scope,limit],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
             rows.into_iter().map(|(id,schedule,scheduled_at,payload)|Ok(Fire{id,schedule,scheduled_at,payload:serde_json::from_str(&payload).map_err(json_error)?})).collect()
         }).await
     }
     pub async fn acknowledge(&self, fire_id: String) -> Result<bool> {
         let scope = self.scope.clone();
-        self.db.write(Priority::Journal,move|c|Ok(c.execute("UPDATE scheduler_fires SET delivered=1 WHERE scope=?1 AND id=?2 AND delivered=0",rusqlite::params![scope,fire_id])?==1)).await
+        self.db.write(Priority::Journal,move|c|Ok(c.execute("UPDATE scheduler_fires SET delivered=1 WHERE scope=?1 AND id=?2 AND delivered=0 AND NOT EXISTS (SELECT 1 FROM scheduler_cancelled_fires x WHERE x.scope=scheduler_fires.scope AND x.fire_id=scheduler_fires.id)",rusqlite::params![scope,fire_id])?==1)).await
     }
 }
 
