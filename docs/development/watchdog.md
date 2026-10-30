@@ -1,0 +1,11 @@
+# Interactive service-manager watchdog
+
+On Linux the foreground daemon reads `NOTIFY_SOCKET`, `WATCHDOG_USEC` and `WATCHDOG_PID` once without modifying process environment. A configured notification endpoint must be an absolute filesystem or `@` abstract Unix datagram address. Invalid numeric values, missing notification endpoints for an enabled watchdog and unavailable endpoints fail startup explicitly. A valid foreign PID disables watchdog timing, as specified by systemd; readiness and stopping notifications still apply when the socket is configured. With no configuration, notification is disabled.
+
+After the host and listener initialize, a task on the existing interactive executor sends `READY=1`, then `WATCHDOG=1` every half timeout (microsecond precision, minimum timeout two microseconds). Missed ticks are skipped. The task sends `STOPPING=1` when graceful shutdown begins. A nonblocking send failure requests controlled shutdown and contributes an error to the boot outcome, preventing a false clean-exit receipt. This does not change provider models, runtime topology or tool approval policy.
+
+The unit must supply `Type=notify`, appropriate `NotifyAccess=main` and `WatchdogSec=`. The implementation does not install units, enable linger, configure restart/backoff, implement platform installers or claim a real systemd restart test. Other platforms reject an explicitly configured notification endpoint; an unconfigured daemon remains usable there.
+
+`cargo test -p excalibur-daemon --test watchdog` covers protocol validation, foreign PID behavior, filesystem and abstract datagrams, readiness/heartbeat/stopping and lost-sink failure. A small subprocess fixture deliberately blocks its current-thread interactive executor; an external monotonic socket supervisor detects absent heartbeats and kills/reaps it. This validates the notification mechanism, not a hang of every thread in the production two-worker runtime or OS service restart. Backend checks on the fixed candidate are pending.
+
+Protocol references: [sd_notify](https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html) and [sd_watchdog_enabled](https://www.freedesktop.org/software/systemd/man/latest/sd_watchdog_enabled.html). Environment variables are never unset after threads start; hosts must keep service-manager configuration outside model and tool authority.
