@@ -132,6 +132,7 @@ impl Master {
             let ids=q.query_map((&conversation,&principal,&scope,cursor),|r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
             let reply_cancel=if let Some(reply)=&analysis.reply_to {c.query_row("SELECT EXISTS(SELECT 1 FROM master_cancel_confirmations WHERE question_id=?1)",[reply],|r|r.get::<_,bool>(0))?}else{false};
             if analysis.reply_to.is_some() && !reply_cancel {return Ok(false);}
+            if !reply_cancel && decision(&text).is_none() {return Ok(false);}
             if analysis.command.is_some() && !reply_cancel {return Ok(false);}
             if ids.is_empty() && !reply_cancel {return Ok(false);}
             // A bare yes is safe only if exactly one question of any kind is pending.
