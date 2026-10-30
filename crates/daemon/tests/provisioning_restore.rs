@@ -354,8 +354,16 @@ fn recovery_summary_without_project_agents_enters_project_master_inbox() {
         .unwrap();
     interactive.block_on(async {
         let at = excalibur_store::unix_seconds();
+        // Use real principal-scoped intake to establish the conversation and
+        // its foreign-key owner, rather than assuming Master::open creates it.
+        host.master.receive(excalibur_master::Incoming {
+            conversation: "scoped-recovery".into(), client_id: "startup-scope-fixture".into(),
+            client_msg_id: "establish-conversation".into(), text: "status".into(),
+            scope: Some("project:a".into()), timezone: "UTC".into(), channel: "local-test".into(),
+            reply_to: None, attachments: vec![],
+        }).await.unwrap();
+        host.master.stop_turn("scoped-recovery").await.unwrap();
         db.write(Priority::Journal, move |c| {
-            c.execute("INSERT INTO conversations(id,principal_id,scope_id,active_scope) VALUES('scoped-recovery','local','project:a','project:a')", [])?;
             c.execute("UPDATE daemon_recovery_state SET safe_until=?1", [at + 1800])?;
             Ok(())
         }).await.unwrap();

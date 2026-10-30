@@ -90,6 +90,12 @@ impl RecoveryLedger {
         }
         let id = AgentId::new().to_string();
         Ok(self.db.write(Priority::Journal, move |c| {
+            // Only the host's exact confirmed CAS proves a recovery block. A
+            // rejected CAS emits no row; user/model blocks use other keys.
+            let registered_agents:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='orchestration_agents')",[],|r|r.get(0))?;
+            if registered_agents {
+                c.execute("INSERT OR IGNORE INTO daemon_recovery_decisions(boot_id,run_id,decision,reason,resume_after_safe) SELECT b.id,j.run_id,'blocked',json_extract(j.payload,'$.reason'),0 FROM daemon_boots b JOIN journal j ON j.idempotency_key='recovery:'||b.id||':'||j.run_id JOIN orchestration_agents a ON a.run_id=j.run_id WHERE j.kind='state_change' AND j.state='confirmed' AND json_extract(j.payload,'$.state')='blocked' AND json_extract(j.payload,'$.reason') IN ('possible crash cause: quarantined','recovery: unresolved effect requires reconciliation')", [])?;
+            }
             let previous:Option<(String,i64,Option<i64>)>=c.query_row("SELECT b.id,b.last_seen,b.clean_exit FROM daemon_recovery_state s JOIN daemon_boots b ON b.id=s.boot_id WHERE s.id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
             let unclean=previous.as_ref().is_some_and(|v|v.2.is_none());
             if let Some((old,_,None))=&previous {
@@ -282,6 +288,14 @@ impl Orchestrator {
         boot: &BootRecord,
         autonomy: Autonomy,
     ) -> Result<RecoveryStatus> {
+        self.recover_startup_inner(boot, autonomy, |_| Ok(())).await
+    }
+    async fn recover_startup_inner(
+        &self,
+        boot: &BootRecord,
+        autonomy: Autonomy,
+        after_state: impl Fn(&str) -> Result<()>,
+    ) -> Result<RecoveryStatus> {
         let status = self.recovery().status(now()).await?;
         let mut agents = self.active_agents().await?;
         agents.sort_by_key(|a| {
@@ -406,6 +420,7 @@ impl Orchestrator {
                 if !applied {
                     continue;
                 }
+                after_state(run)?;
             }
             if decision == "ready" && owned_pause {
                 self.inner
@@ -546,5 +561,241 @@ impl Orchestrator {
                 .await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod atomic_notice_tests {
+    use super::*;
+    use crate::recovery_test_support::*;
+    use excalibur_types::runtime::{PreparedTool, ToolCall};
+
+    #[tokio::test]
+    async fn confirmed_recovery_cas_survives_loss_before_decision_without_repeating_effect() {
+        let f = fixture().await;
+        let at = now();
+        let first = f.host.recovery().begin(at).await.unwrap();
+        f.host
+            .recover_startup(&first, Autonomy::Autonomous)
+            .await
+            .unwrap();
+        f.db.write(Priority::Journal, |c| {
+            c.execute("INSERT INTO conversations(id,active_scope) VALUES('origin','general'),('other','general')", [])?;
+            Ok(())
+        }).await.unwrap();
+        let mut task = delegation("uncertain-cas", "general", 300);
+        task.profile = "coordinator".into();
+        task.origin_conversation = "origin".into();
+        let agent = f.host.spawn(&f.master.id, task).await.unwrap();
+        let run = agent.run_id.unwrap();
+        f.host
+            .engine()
+            .journal()
+            .set_state(&run, "running", None, "fixture:running")
+            .await
+            .unwrap();
+        let prepared = PreparedTool {
+            call: ToolCall {
+                id: "external".into(),
+                name: "irreversible".into(),
+                arguments: "{}".into(),
+            },
+            effect: Effect::NonIdempotent,
+            resources: vec![],
+            exclusive: true,
+            data: json!({}),
+        };
+        f.host
+            .engine()
+            .journal()
+            .append(
+                &run,
+                "tool_intent",
+                "fixture:uncertain",
+                json!({"index":0,"prepared":prepared}),
+            )
+            .await
+            .unwrap();
+        let interrupted = f.host.recovery().begin(at + 1).await.unwrap();
+        let result = f
+            .host
+            .recover_startup_inner(&interrupted, Autonomy::Autonomous, |actual| {
+                assert_eq!(actual, run);
+                Err(invalid(
+                    "injected process loss after confirmed recovery CAS",
+                ))
+            })
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("injected process loss")
+        );
+        assert_eq!(
+            f.host.engine().load(&run).await.unwrap().status,
+            Status::Blocked
+        );
+        assert!(
+            f.host
+                .recovery()
+                .status(at + 1)
+                .await
+                .unwrap()
+                .decisions
+                .is_empty()
+        );
+        assert!(f.host.notifications("origin").await.unwrap().is_empty());
+        f.host.shutdown().await.unwrap();
+        drop(f.host);
+        f.db.shutdown().await.unwrap();
+        drop(f.db);
+        let f = open_fixture(f.dir).await;
+        let next = f.host.recovery().begin(at + 2).await.unwrap();
+        f.host
+            .recover_startup(&next, Autonomy::Autonomous)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            f.host
+                .recovery()
+                .publish_summary(&next.id, at + 2)
+                .await
+                .unwrap();
+        }
+        let notices = f.host.notifications("origin").await.unwrap();
+        let blocked = notices
+            .iter()
+            .filter(|notice| {
+                serde_json::from_str::<Value>(&notice.content).unwrap()["kind"]
+                    == "recovery_blocked"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].class, "urgent");
+        let payload: Value = serde_json::from_str(&blocked[0].content).unwrap();
+        assert_eq!(payload["boot_id"], interrupted.id);
+        assert_eq!(payload["run_id"], run);
+        assert_eq!(payload["origin_conversation"], "origin");
+        assert_eq!(payload["scope"], "general");
+        assert_eq!(
+            payload["reason"],
+            "recovery: unresolved effect requires reconciliation"
+        );
+        assert!(
+            f.host
+                .notifications("other")
+                .await
+                .unwrap()
+                .iter()
+                .all(|n| !n.content.contains(&run))
+        );
+        assert!(f.host.tick().await.unwrap().is_empty());
+        let owner = run.clone();
+        let (intents, results): (u64, u64) =
+            f.db.read(ReadLane::Interactive, move |c| {
+                Ok((
+                    c.query_row(
+                        "SELECT count(*) FROM journal WHERE run_id=?1 AND kind='tool_intent'",
+                        [&owner],
+                        |r| r.get(0),
+                    )?,
+                    c.query_row(
+                        "SELECT count(*) FROM journal WHERE run_id=?1 AND kind='tool_result'",
+                        [&owner],
+                        |r| r.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!((intents, results), (1, 0));
+        f.host.shutdown().await.unwrap();
+        f.db.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn rejected_cas_and_user_block_are_not_reconstructed_as_host_decisions() {
+        let f = fixture().await;
+        let at = now();
+        let first = f.host.recovery().begin(at).await.unwrap();
+        f.host
+            .recover_startup(&first, Autonomy::Autonomous)
+            .await
+            .unwrap();
+        f.db.write(Priority::Journal, |c| {
+            c.execute(
+                "INSERT INTO conversations(id,active_scope) VALUES('origin','general')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let mut task = delegation("user-block", "general", 300);
+        task.origin_conversation = "origin".into();
+        task.profile = "coordinator".into();
+        let agent = f.host.spawn(&f.master.id, task).await.unwrap();
+        let run = agent.run_id.unwrap();
+        let journal = f.host.engine().journal();
+        journal
+            .set_state(&run, "running", None, "fixture:running")
+            .await
+            .unwrap();
+        journal
+            .set_state(
+                &run,
+                "blocked",
+                Some("recovery: unresolved effect requires reconciliation".into()),
+                "user:block",
+            )
+            .await
+            .unwrap();
+        let snapshot = f.host.engine().load(&run).await.unwrap();
+        let key = format!("recovery:{}:{run}", first.id);
+        assert!(
+            !journal
+                .set_state_if_revision(
+                    &run,
+                    &["running"],
+                    snapshot.last_sequence,
+                    "blocked",
+                    Some("recovery: unresolved effect requires reconciliation".into()),
+                    &key
+                )
+                .await
+                .unwrap()
+        );
+        // Even an exact-looking operation key is insufficient without the
+        // confirmed state_change kind and blocked payload from the real CAS.
+        journal.append(&run, "model_response", &key, json!({"state":"blocked","reason":"recovery: unresolved effect requires reconciliation"})).await.unwrap();
+        let next = f.host.recovery().begin(at + 1).await.unwrap();
+        f.host
+            .recover_startup(&next, Autonomy::Autonomous)
+            .await
+            .unwrap();
+        f.host
+            .recovery()
+            .publish_summary(&next.id, at + 1)
+            .await
+            .unwrap();
+        assert!(
+            f.host
+                .notifications("origin")
+                .await
+                .unwrap()
+                .iter()
+                .all(|n| {
+                    serde_json::from_str::<Value>(&n.content).unwrap()["kind"] != "recovery_blocked"
+                })
+        );
+        assert_eq!(
+            f.host.engine().load(&run).await.unwrap().status,
+            Status::Blocked
+        );
+        let id = first.id;
+        let missing: u64 = f.db.read(ReadLane::Interactive, move |c| Ok(c.query_row("SELECT count(*) FROM daemon_recovery_decisions WHERE boot_id=?1 AND decision='blocked'", [id], |r| r.get(0))?)).await.unwrap();
+        assert_eq!(missing, 0);
+        f.host.shutdown().await.unwrap();
+        f.db.shutdown().await.unwrap();
     }
 }
