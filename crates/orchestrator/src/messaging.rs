@@ -8,7 +8,7 @@ impl Orchestrator {
         sender: &str,
         recipient: &str,
         kind: &str,
-        payload: Value,
+        mut payload: Value,
         priority: &str,
     ) -> Result<AgentMessage> {
         if client_id.is_empty()
@@ -35,6 +35,32 @@ impl Orchestrator {
             && from.parent_id.as_deref() != Some(recipient)
         {
             return Err(invalid("upward message required"));
+        }
+        let submitted = serde_json::to_string(&payload)?;
+        if kind == "question" {
+            let optional = matches!(
+                payload["reason_kind"].as_str(),
+                Some("optional_preference" | "material_ambiguity" | "trivial")
+            ) && !payload["default"].is_null();
+            let mut required = !optional
+                || payload["required_data"] == true
+                || payload["irreversible"] == true
+                || payload["external"] == true
+                || payload["host_requires_blocking"] == true;
+            if let Some(run) = &from.run_id {
+                let state = self.inner.engine.load(run).await?;
+                required |= state.calls.values().any(|call| {
+                    call.result.is_none()
+                        && call.prepared.as_ref().is_some_and(|tool| {
+                            tool.effect == excalibur_types::runtime::Effect::NonIdempotent
+                        })
+                });
+            }
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("blocking".into(), json!(required));
+            } else {
+                return Err(invalid("question payload must be an object"));
+            }
         }
         self.validate_durable(&payload)?;
         let encoded = serde_json::to_string(&payload)?;
@@ -72,7 +98,10 @@ impl Orchestrator {
                     .map(|key| (run.clone(), key.to_owned()))
             })
             .filter(|_| {
-                kind == "blocked" || kind == "question" && message.payload["blocking"] != false
+                kind == "blocked"
+                    || kind == "question"
+                        && (message.payload["blocking"] != false
+                            || message.payload["wait_for_answer"] == true)
             })
             .map(|(run, key)| {
                 (
@@ -88,11 +117,14 @@ impl Orchestrator {
                         .unwrap_or_else(|| message.payload.to_string()),
                 )
             });
+        let epoch = self.inner.incarnation.clone();
         let m = message.clone();
         let result=self.inner.db.write(Priority::Journal,move|c|{
             let old:Option<(String,String,String,String,String)>=c.query_row("SELECT m.id,m.recipient,m.kind,m.payload,COALESCE(o.priority,m.priority) FROM orchestration_messages m LEFT JOIN orchestration_message_originals o ON o.id=m.id WHERE m.sender=?1 AND m.client_id=?2",rusqlite::params![m.sender,m.client_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-            if let Some((id,recipient,kind,payload,priority))=old{if recipient!=m.recipient||kind!=m.kind||payload!=encoded||priority!=m.priority{return Err(excalibur_store::Error::Invalid("mail operation reused"));}return Ok(id);}
+            if let Some((id,recipient,kind,payload,priority))=old{let same_payload=if kind=="question" {let raw:Option<String>=c.query_row("SELECT body FROM orchestration_question_inputs WHERE message_id=?1",[&id],|r|r.get(0)).optional()?;raw.map_or(payload==encoded,|raw|raw==submitted)}else{payload==encoded};if recipient!=m.recipient||kind!=m.kind||!same_payload||priority!=m.priority{return Err(excalibur_store::Error::Invalid("mail operation reused"));}return Ok(id);}
             c.execute("INSERT INTO orchestration_messages VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'pending')",rusqlite::params![m.id,m.client_id,m.sender,m.recipient,m.kind,encoded,m.priority,m.created,m.step])?;c.execute("INSERT INTO orchestration_message_originals VALUES(?1,?2)",rusqlite::params![m.id,m.priority])?;
+            if m.kind=="directive" {c.execute("INSERT INTO orchestration_directive_clocks VALUES(?1,0,?2,?3,?4,?5)",rusqlite::params![m.id,m.created,false,epoch,None::<u64>])?;}
+            if m.kind=="question" {c.execute("INSERT INTO orchestration_question_inputs VALUES(?1,?2)",rusqlite::params![m.id,submitted])?;c.execute("INSERT INTO orchestration_question_deadlines VALUES(?1,?2,?3,?4,?5,?6,'open')",rusqlite::params![m.id,m.sender,m.payload["blocking"]==true,m.payload.get("default").map(Value::to_string),m.created,m.created+86400])?;}
             if let Some((run,key,kind,reason))=control{c.execute("INSERT INTO orchestration_agent_controls VALUES(?1,?2,?3,?4,?5,?6)",rusqlite::params![m.id,m.sender,run,key,kind,reason])?;}
             Ok(m.id)
         }).await?;
@@ -145,12 +177,27 @@ impl Orchestrator {
     }
     pub(crate) async fn latest_report(&self, agent: &str) -> Result<Option<Value>> {
         let agent = agent.to_owned();
-        let row=self.inner.db.read(ReadLane::Interactive,move|c|Ok(c.query_row("SELECT payload,step,created FROM orchestration_messages WHERE sender=?1 AND kind IN ('report','completion','blocked') ORDER BY created DESC,id DESC LIMIT 1",[agent],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,i64>(2)?))).optional()?)).await?;
-        row.map(|(text,step,created)|Ok(json!({"payload":serde_json::from_str::<Value>(&text)?,"step":step,"created":created}))).transpose()
+        let row=self.inner.db.read(ReadLane::Interactive,move|c|Ok(c.query_row("SELECT payload,step,created,id FROM orchestration_messages WHERE sender=?1 AND kind IN ('report','completion','blocked') ORDER BY created DESC,id DESC LIMIT 1",[agent],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).optional()?)).await?;
+        row.map(|(text,step,created,id)|Ok(json!({"id":id,"payload":serde_json::from_str::<Value>(&text)?,"step":step,"created":created}))).transpose()
     }
     /// Deliver into the durable engine context. A directive is acknowledged only
     /// after a subsequent model request, never merely because it was enqueued.
     pub async fn deliver_mailbox(&self, recipient: &str) -> Result<usize> {
+        self.deliver_mailbox_inner(recipient, false, now()).await
+    }
+    pub(crate) async fn deliver_mailbox_at_boundary(&self, recipient: &str) -> Result<usize> {
+        self.deliver_mailbox_inner(recipient, true, now()).await
+    }
+    /// Explicit host clock for deterministic service/recovery verification.
+    pub async fn deliver_mailbox_at(&self, recipient: &str, at: i64) -> Result<usize> {
+        self.deliver_mailbox_inner(recipient, false, at).await
+    }
+    async fn deliver_mailbox_inner(
+        &self,
+        recipient: &str,
+        boundary: bool,
+        at: i64,
+    ) -> Result<usize> {
         let agent = self.agent(recipient).await?;
         let Some(run) = &agent.run_id else {
             return Ok(0);
@@ -186,7 +233,8 @@ impl Orchestrator {
             }
             let mut induced = false;
             let delivery_guard = self.inner.gate.lock().await;
-            if message.priority == "interrupt"
+            if !boundary
+                && message.priority == "interrupt"
                 && state.status != Status::Paused
                 && self.inner.engine.pause_if_active(run, "directive").await?
             {
@@ -214,7 +262,16 @@ impl Orchestrator {
                     .await?;
             }
             let id = message.id.clone();
-            self.inner.db.write(Priority::Journal,move|c|{c.execute("UPDATE orchestration_messages SET state='delivered' WHERE id=?1 AND state='pending'",[id])?;Ok(())}).await?;
+            let directive = message.kind == "directive";
+            let epoch = self.inner.incarnation.clone();
+            let clock_active = state.status == Status::Running
+                && !state
+                    .calls
+                    .values()
+                    .any(|call| call.prepared.is_some() && call.result.is_none());
+            self.inner.db.write(Priority::Journal,move|c|{
+                if directive {c.execute("UPDATE orchestration_directive_clocks SET last_at=?2,active=?5,epoch=?3,start_step=?4 WHERE message_id=?1 AND start_step IS NULL",rusqlite::params![id,at,epoch,state.step,clock_active])?;}
+                c.execute("UPDATE orchestration_messages SET state='delivered' WHERE id=?1 AND state='pending'",[id])?;Ok(())}).await?;
             drop(delivery_guard);
             if induced && self.paused_by(recipient).await?.as_deref() == Some(message.id.as_str()) {
                 if self.inner.engine.resume_if_reason(run, "directive").await? {
@@ -309,24 +366,32 @@ impl Orchestrator {
     }
     pub async fn enforce_directive_deadlines(&self, at: i64) -> Result<Vec<String>> {
         let mut escalated = Vec::new();
-        for a in self.list_agents().await? {
+        for a in self.active_agents().await? {
             let Some(run) = &a.run_id else { continue };
             let state = self.inner.engine.load(run).await?;
-            if state.status != Status::Running {
-                continue;
-            }
-            for m in self
-                .mailbox(&a.id)
-                .await?
-                .into_iter()
-                .filter(|m| m.kind == "directive")
-            {
-                let long_tool = state
+            let active = state.status == Status::Running
+                && !state
                     .calls
                     .values()
-                    .any(|c| c.prepared.is_some() && c.result.is_none());
-                if state.step.saturating_sub(m.step) >= 2 || at - m.created >= 120 && !long_tool {
-                    let id = m.id.clone();
+                    .any(|call| call.prepared.is_some() && call.result.is_none());
+            for message in self.mailbox(&a.id).await?.into_iter().filter(|m| {
+                m.kind == "directive" && m.state == "delivered" && m.priority == "normal"
+            }) {
+                let (id, epoch, step) = (
+                    message.id.clone(),
+                    self.inner.incarnation.clone(),
+                    state.step,
+                );
+                let due=self.inner.db.write(Priority::Journal,move|c| {
+                    c.execute("INSERT OR IGNORE INTO orchestration_directive_clocks VALUES(?1,0,?2,?3,?4,?5)",rusqlite::params![id,at,active,epoch,if active{Some(step)}else{None}])?;
+                    let (elapsed,last,was,old_epoch,start):(i64,i64,bool,String,Option<u64>)=c.query_row("SELECT running_seconds,last_at,active,epoch,start_step FROM orchestration_directive_clocks WHERE message_id=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+                    let elapsed=elapsed.saturating_add(if active&&was&&epoch==old_epoch{at.saturating_sub(last).max(0)}else{0});
+                    let start=start.or(if active{Some(step)}else{None});
+                    c.execute("UPDATE orchestration_directive_clocks SET running_seconds=?2,last_at=?3,active=?4,epoch=?5,start_step=?6 WHERE message_id=?1",rusqlite::params![id,elapsed,at,active,epoch,start])?;
+                    Ok(active&&(elapsed>=120||start.is_some_and(|start|step.saturating_sub(start)>=2)))
+                }).await?;
+                if due {
+                    let id = message.id.clone();
                     self.inner.db.write(Priority::Journal,move|c|{c.execute("UPDATE orchestration_messages SET priority='interrupt',state='pending' WHERE id=?1 AND state!='acked'",[id])?;Ok(())}).await?;
                     self.deliver_mailbox(&a.id).await?;
                     escalated.push(a.id.clone());

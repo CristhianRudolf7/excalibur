@@ -65,10 +65,18 @@ impl Orchestrator {
             ..Default::default()
         };
         let root_pause = self.paused_by(target).await?;
+        let cascade_owner = root_pause
+            .as_ref()
+            .filter(|owner| !matches!(owner.as_str(), "resource" | "shutdown"))
+            .cloned()
+            .unwrap_or_else(|| operation.to_owned());
         for a in tree {
             let Some(run) = &a.run_id else { continue };
             let before = self.inner.engine.load(run).await?;
             if terminal(&before.status) {
+                if matches!(action, Control::Cancel { .. }) {
+                    self.finalize_agent_stop(&a).await?;
+                }
                 report.unchanged.push(a.id);
                 continue;
             }
@@ -76,25 +84,22 @@ impl Orchestrator {
                 Control::Pause | Control::Interrupt => {
                     if before.status == Status::Paused {
                         let owner = self.paused_by(&a.id).await?;
+                        // Repeated human pause/interrupt retains its cascade
+                        // ownership. Independently paused descendants keep theirs.
                         if a.id == target
-                            || owner.as_deref() == Some("resource")
-                            || owner.as_deref() == Some("shutdown")
+                            && owner
+                                .as_deref()
+                                .is_none_or(|owner| matches!(owner, "resource" | "shutdown"))
                         {
                             self.set_pause_owner(&a.id, Some(operation.to_owned()), false)
                                 .await?;
-                            self.inner
-                                .engine
-                                .pause_with_reason(
-                                    run,
-                                    if a.id == target { "user" } else { "parent" },
-                                )
-                                .await?;
+                            self.inner.engine.pause_with_reason(run, "user").await?;
                         }
                         report.unchanged.push(a.id);
                         continue;
                     }
                     // Persist ownership before the state transition, so retry preserves cascade ownership.
-                    self.set_pause_owner(&a.id, Some(operation.to_owned()), false)
+                    self.set_pause_owner(&a.id, Some(cascade_owner.clone()), false)
                         .await?;
                     if let Err(error) = self
                         .inner
@@ -121,6 +126,7 @@ impl Orchestrator {
                 Control::Resume => {
                     let owned = self.paused_by(&a.id).await?;
                     if before.status == Status::Paused
+                        && owned.as_deref() != Some("resource")
                         && (a.id == target || owned.is_some() && owned == root_pause)
                     {
                         self.inner.engine.resume(run).await?;
@@ -137,6 +143,7 @@ impl Orchestrator {
                         return Err(error.into());
                     }
                     self.set_pause_owner(&a.id, None, false).await?;
+                    self.finalize_agent_stop(&a).await?;
                     report.affected.push(a.id);
                 }
                 Control::Redirect { text } => {

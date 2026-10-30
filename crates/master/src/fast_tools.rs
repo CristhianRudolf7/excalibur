@@ -91,6 +91,22 @@ impl FastActions for MasterFastTools {
         }
         self.core.invoke(conversation, name, args, key)
     }
+    fn invoke_source_scoped<'a>(
+        &'a self,
+        conversation: &'a str,
+        scope: &'a str,
+        source_message_id: &'a str,
+        name: &'a str,
+        args: Value,
+        key: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<Value, String>> {
+        if matches!(name, "search_tools" | "call_tool") {
+            self.invoke_scoped(conversation, scope, name, args, key)
+        } else {
+            self.core
+                .invoke_source_scoped(conversation, scope, source_message_id, name, args, key)
+        }
+    }
     fn invoke_scoped<'a>(
         &'a self,
         conversation: &'a str,

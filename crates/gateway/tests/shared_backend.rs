@@ -226,6 +226,80 @@ async fn project_listing_is_lazy_paged_ignored_filtered_and_bounded_by_host_auth
                 .is_err()
         );
     }
+    // Nested rooted patterns must not accidentally match a sibling/root file.
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(root.join("src/.gitignore"), "/nested-only.txt\n!keep.tmp\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "ignored.txt\n*.tmp\n").unwrap();
+    for name in ["nested-only.txt", "keep.tmp", "drop.tmp"] {
+        std::fs::write(root.join("src").join(name), "fixture").unwrap();
+    }
+    std::fs::write(root.join("nested-only.txt"), "root visible").unwrap();
+    for name in [
+        ".agents",
+        ".codex",
+        ".config",
+        ".github",
+        ".gitlab",
+        ".circleci",
+    ] {
+        std::fs::create_dir_all(root.join(name)).unwrap();
+        std::fs::create_dir_all(root.join("src").join(name)).unwrap();
+    }
+    std::fs::write(root.join(".github/workflow.yml"), "real user content").unwrap();
+    let nested = backend
+        .dispatch("files.list", json!({"project":"p","path":"src"}))
+        .await
+        .unwrap();
+    let names = nested["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"keep.tmp"), "{nested}");
+    assert!(!names.contains(&"nested-only.txt"));
+    assert!(!names.contains(&"drop.tmp"));
+    assert!(!names.contains(&".config"));
+    let listed = backend
+        .dispatch("files.list", json!({"project":"p"}))
+        .await
+        .unwrap();
+    let names = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"nested-only.txt"));
+    assert!(names.contains(&".github"));
+    assert!(!names.contains(&".agents"));
+    assert!(!names.contains(&".config"));
+    for i in 500..10_007 {
+        std::fs::write(root.join("node_modules").join(format!("{i:05}.js")), "x").unwrap();
+    }
+    let mut after = Value::Null;
+    let mut found = std::collections::BTreeSet::new();
+    loop {
+        let page = backend
+            .dispatch(
+                "files.list",
+                json!({"project":"p","path":"node_modules","limit":500,"after":after}),
+            )
+            .await
+            .unwrap();
+        for entry in page["entries"].as_array().unwrap() {
+            assert!(
+                found.insert(entry["name"].as_str().unwrap().to_owned()),
+                "duplicate page entry"
+            );
+        }
+        if page["has_more"] == false {
+            break;
+        }
+        assert_ne!(after, page["next"]);
+        after = page["next"].clone();
+    }
+    assert_eq!(found.len(), 10_007);
     master.shutdown().await;
     db.shutdown().await.unwrap();
 }

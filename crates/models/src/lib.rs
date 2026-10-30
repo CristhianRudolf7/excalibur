@@ -64,6 +64,11 @@ pub type StreamSink = Arc<dyn Fn(StreamDelta) + Send + Sync>;
 /// Stream deltas are provisional UI data. Only the returned complete response may
 /// enter the durable execution protocol; callbacks must never execute tool fragments.
 pub trait ModelGateway: Send + Sync {
+    /// Release only idle host-owned local inference resources. Remote-only
+    /// adapters have nothing resident and return zero without making a request.
+    fn unload_idle(&self) -> BoxFuture<'_, Result<usize, ModelError>> {
+        Box::pin(async { Ok(0) })
+    }
     fn rate_limits(&self) -> Option<(u64, u64)> {
         None
     }

@@ -5,11 +5,16 @@ use serde_json::Value;
 use std::{collections::BTreeSet, path::PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Limits {
     pub running: usize,
     pub children_per_parent: usize,
     pub ram_bytes: u64,
     pub estimated_run_bytes: u64,
+    pub process_limit: usize,
+    pub estimated_processes_per_run: usize,
+    pub provider_concurrency: usize,
+    pub project_weights: std::collections::BTreeMap<String, u16>,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -18,6 +23,12 @@ impl Default for Limits {
             children_per_parent: 4,
             ram_bytes: 4 * 1024 * 1024 * 1024,
             estimated_run_bytes: 64 * 1024 * 1024,
+            process_limit: std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
+            estimated_processes_per_run: 1,
+            provider_concurrency: 8,
+            project_weights: Default::default(),
         }
     }
 }
@@ -166,6 +177,7 @@ pub struct NotificationPolicy {
     pub quiet_start_minute: Option<u16>,
     pub quiet_end_minute: Option<u16>,
     pub utc_offset_minutes: i32,
+    pub timezone: Option<String>,
     pub urgent_during_quiet: bool,
 }
 impl Default for NotificationPolicy {
@@ -176,6 +188,7 @@ impl Default for NotificationPolicy {
             quiet_start_minute: None,
             quiet_end_minute: None,
             utc_offset_minutes: 0,
+            timezone: None,
             urgent_during_quiet: true,
         }
     }
@@ -203,4 +216,23 @@ pub struct ResourceAction {
     pub pause: Vec<String>,
     pub resume: Vec<String>,
     pub last_resort: Option<String>,
+}
+
+/// Measured host capacity, distinct from per-run estimates and worker limits.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionCapacity {
+    pub process_limit: usize,
+    pub processes_active: usize,
+    pub provider_limit: usize,
+    pub provider_active: usize,
+}
+impl Default for AdmissionCapacity {
+    fn default() -> Self {
+        Self {
+            process_limit: usize::MAX,
+            processes_active: 0,
+            provider_limit: usize::MAX,
+            provider_active: 0,
+        }
+    }
 }

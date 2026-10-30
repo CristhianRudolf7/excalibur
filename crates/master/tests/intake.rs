@@ -114,3 +114,42 @@ fn spanish_project_command_alias_uses_the_same_deterministic_action() {
             .command
     );
 }
+#[test]
+fn raw_identifiers_and_clock_boundaries_do_not_lose_compound_requests() {
+    let lexicon = Lexicon::default();
+    let raw = excalibur_types::AgentId::new().ulid().to_string();
+    assert_eq!(
+        lexicon
+            .analyze_at(&format!("status {raw}"), "UTC", 0)
+            .unwrap()
+            .identifiers,
+        vec![raw]
+    );
+    for text in [
+        "tomorrow version2",
+        "mañana archivo5.rs",
+        "tomorrow h12",
+        "tomorrow /tmp/5",
+    ] {
+        assert!(
+            lexicon
+                .analyze_at(text, "UTC", 0)
+                .unwrap()
+                .temporal
+                .is_empty(),
+            "{text}"
+        );
+    }
+    for text in ["/pause agt_x and change R4", "/pause agt_x y cambia R4"] {
+        assert_eq!(
+            lexicon
+                .analyze_at(text, "UTC", 0)
+                .unwrap()
+                .command
+                .unwrap()
+                .target
+                .as_deref(),
+            Some("agt_x")
+        );
+    }
+}

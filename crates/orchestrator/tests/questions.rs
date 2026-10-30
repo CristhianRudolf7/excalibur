@@ -23,7 +23,7 @@ impl ModelGateway for AskingModel {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let mut message = Message::text("assistant", "Synthetic response");
             if call == 0 {
-                message.tool_calls.push(ToolCall{id:"question-call".into(),name:"agent_message".into(),arguments:if self.blocked{json!({"action":"blocked","payload":{"reason":"Synthetic required input is missing"}})}else{json!({"action":"question","payload":{"question":"Choose a synthetic destination","blocking":self.blocking}})}.to_string()});
+                message.tool_calls.push(ToolCall{id:"question-call".into(),name:"agent_message".into(),arguments:if self.blocked{json!({"action":"blocked","payload":{"reason":"Synthetic required input is missing"}})}else{json!({"action":"question","payload":{"question":"Choose a synthetic destination","blocking":self.blocking,"reason_kind":if self.blocking{"required_data"}else{"optional_preference"},"default":"Synthetic destination A"}})}.to_string()});
             }
             Ok(ModelResponse {
                 message,
@@ -210,4 +210,100 @@ async fn unconfirmed_communication_effect_is_reconciled_before_wait_admission() 
         host.engine().load(run).await.unwrap().status,
         Status::Waiting
     );
+}
+
+#[tokio::test]
+async fn mutable_worker_cannot_choose_nonblocking_but_readonly_optional_wait_can_default() {
+    for mutable in [true, false] {
+        let f = fixture().await;
+        let adapter = Arc::new(OrchestratorTools::new(no_tools()));
+        struct OptionalWait {
+            calls: AtomicUsize,
+        }
+        impl ModelGateway for OptionalWait {
+            fn complete(
+                &self,
+                _: ModelRequest,
+            ) -> BoxFuture<'_, std::result::Result<ModelResponse, ModelError>> {
+                Box::pin(async move {
+                    let mut message = Message::text("assistant", "Synthetic done");
+                    if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        message.tool_calls.push(ToolCall{id:"question".into(),name:"agent_message".into(),arguments:json!({"action":"question","payload":{"question":"Optional reversible label?","reason_kind":"optional_preference","default":"local-label","blocking":false,"host_requires_blocking":false,"wait_for_answer":true}}).to_string()});
+                    }
+                    Ok(ModelResponse {
+                        message,
+                        usage: Usage::default(),
+                    })
+                })
+            }
+        }
+        let model = Arc::new(OptionalWait {
+            calls: AtomicUsize::new(0),
+        });
+        let engine = Arc::new(Engine::new(
+            f.host.engine().journal().clone(),
+            model.clone(),
+            adapter.clone(),
+        ));
+        let host = Orchestrator::open(f.db.clone(), engine, Limits::default())
+            .await
+            .unwrap()
+            .with_authority(authority());
+        adapter.attach(&host).unwrap();
+        let mut token = f.master.token.clone();
+        if mutable {
+            token.roots.push(excalibur_security::Root {
+                path: f.dir.path().canonicalize().unwrap(),
+                write: true,
+            });
+        }
+        let master = host
+            .rebind_master_at_startup(&f.master.name, token.clone())
+            .await
+            .unwrap();
+        let mut pd = delegation("p", "general", 300);
+        pd.token = token.clone();
+        let p = host.spawn(&master.id, pd).await.unwrap();
+        let mut cd = delegation("c", "general", 30);
+        cd.token = token;
+        let c = host.spawn(&p.id, cd).await.unwrap();
+        let run = c.run_id.as_ref().unwrap();
+        assert_eq!(
+            host.engine().run(run).await.unwrap().status,
+            Status::Waiting
+        );
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        let question = host
+            .mailbox(&p.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.kind == "question")
+            .unwrap();
+        assert_eq!(question.payload["blocking"], mutable);
+        if mutable {
+            assert!(
+                host.service_question_deadlines(question.created + 900)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                host.engine().load(run).await.unwrap().status,
+                Status::Waiting
+            );
+        } else {
+            assert_eq!(
+                host.service_question_deadlines(question.created + 900)
+                    .await
+                    .unwrap(),
+                vec![question.id]
+            );
+            assert_eq!(
+                host.engine().run(run).await.unwrap().status,
+                Status::Completed
+            );
+            assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+        }
+    }
 }

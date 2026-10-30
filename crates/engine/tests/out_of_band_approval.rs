@@ -13,13 +13,23 @@ use tokio::sync::Notify;
 struct Pending {
     pending: AtomicBool,
     expired: AtomicBool,
+    decide_during_pending_read: AtomicBool,
 }
 impl ToolRuntime for Pending {
     fn definitions(&self) -> Vec<ToolDefinition> {
         Vec::new()
     }
     fn pending_approval<'a>(&'a self, _: &'a str) -> BoxFuture<'a, bool> {
-        Box::pin(async { self.pending.load(Ordering::SeqCst) })
+        Box::pin(async {
+            let pending = self.pending.load(Ordering::SeqCst);
+            if self
+                .decide_during_pending_read
+                .swap(false, Ordering::SeqCst)
+            {
+                self.pending.store(false, Ordering::SeqCst);
+            }
+            pending
+        })
     }
     fn approval_blocked<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Option<String>> {
         Box::pin(async {
@@ -92,6 +102,7 @@ async fn fixture(
     let tools = Arc::new(Pending {
         pending: AtomicBool::new(pending),
         expired: AtomicBool::new(expired),
+        decide_during_pending_read: AtomicBool::new(false),
     });
     let model = Arc::new(Model {
         calls: AtomicUsize::new(0),
@@ -176,5 +187,79 @@ async fn approval_during_inference_prevents_completion_and_resume_reuses_confirm
     engine.resume(&run).await.unwrap();
     assert_eq!(engine.run(&run).await.unwrap().status, Status::Completed);
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    db.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_approval_resume_never_waits_for_live_inference_or_reopens_a_user_pause() {
+    let (_root, db, engine, _tools, model, run) = fixture(false, false).await;
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let run = run.clone();
+        async move { engine.run(&run).await.unwrap() }
+    });
+    model.entered.notified().await;
+    assert!(
+        !tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.resume_after_approval(&run)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    );
+    engine.pause(&run).await.unwrap();
+    assert!(
+        !tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.resume_after_approval(&run)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    );
+    model.release.notify_one();
+    assert_eq!(driver.await.unwrap().reason.as_deref(), Some("user"));
+    assert_eq!(engine.load(&run).await.unwrap().status, Status::Paused);
+    db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn automatic_system_resume_queues_without_waiting_on_the_old_driver_boundary() {
+    let (_root, db, engine, tools, _model, run) = fixture(true, false).await;
+    assert_eq!(engine.run(&run).await.unwrap().status, Status::Paused);
+    tools.pending.store(false, Ordering::SeqCst);
+    let old_driver_boundary = engine.journal().lock_run(&run).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.resume_after_approval(&run)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    );
+    assert_eq!(engine.load(&run).await.unwrap().status, Status::Ready);
+    engine.pause(&run).await.unwrap();
+    assert!(!engine.resume_after_approval(&run).await.unwrap());
+    assert_eq!(
+        engine.load(&run).await.unwrap().reason.as_deref(),
+        Some("user")
+    );
+    drop(old_driver_boundary);
+    db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn approval_committed_between_pending_read_and_pause_cannot_leave_a_lost_wakeup() {
+    let (_root, db, engine, tools, model, run) = fixture(true, false).await;
+    tools
+        .decide_during_pending_read
+        .store(true, Ordering::SeqCst);
+    let state = engine.run(&run).await.unwrap();
+    assert_eq!(state.status, Status::Ready);
+    assert_eq!(engine.load(&run).await.unwrap().status, Status::Ready);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert!(!tools.pending.load(Ordering::SeqCst));
     db.shutdown().await.unwrap();
 }

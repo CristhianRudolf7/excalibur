@@ -127,7 +127,17 @@ impl OrchestratorTools {
                                 &agent.id,
                                 parent,
                                 action,
-                                args["payload"].clone(),
+                                {
+                                    let mut payload = args["payload"].clone();
+                                    if action == "question"
+                                        && (agent.token.processes
+                                            || !agent.token.external_actions.is_empty()
+                                            || agent.token.roots.iter().any(|root| root.write))
+                                    {
+                                        payload["host_requires_blocking"] = json!(true);
+                                    }
+                                    payload
+                                },
                                 "normal",
                             )
                             .await?,
@@ -423,6 +433,12 @@ impl ToolRuntime for OrchestratorTools {
             self.delegate.begin_step(run, step).await?;
             let host = self.host()?;
             let agent = host.agent_for_run(run).await.map_err(|e| e.to_string())?;
+            host.observe_plan_progress(&agent, step)
+                .await
+                .map_err(|e| e.to_string())?;
+            host.deliver_mailbox_at_boundary(&agent.id)
+                .await
+                .map_err(|e| e.to_string())?;
             if !host
                 .apply_agent_control(&agent.id)
                 .await
@@ -431,6 +447,15 @@ impl ToolRuntime for OrchestratorTools {
                 host.apply_child_wait(&agent.id)
                     .await
                     .map_err(|e| e.to_string())?;
+            }
+            let status = host.status(&agent.id).await.map_err(|e| e.to_string())?;
+            if status.report_reminder {
+                let last = status
+                    .last_report
+                    .as_ref()
+                    .and_then(|value| value["id"].as_str())
+                    .unwrap_or("initial");
+                host.engine().receive_agent_message(run,&format!("report-reminder:{run}:{last}:{}",step/15),"report","orchestrator",json!({"reminder":"Update your plan or send a brief progress report; retain deterministic evidence of completed work."})).await.map_err(|e|e.to_string())?;
             }
             Ok(())
         })

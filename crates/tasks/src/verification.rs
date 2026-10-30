@@ -706,8 +706,13 @@ impl CheckRunner {
                     biased;
                     _=tokio::time::sleep_until(deadline)=>break Err(None),
                     result=&mut execution=>break Ok(result),
-                    _=tokio::time::sleep(Duration::from_millis(25))=>{
-                        let (state,_)=journal.state(run).await?;
+                    control=async {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        journal.state(run).await
+                    }=>{
+                        // Poll execution while status is queued: both may use
+                        // the same bounded reader lane.
+                        let (state,_)=control?;
                         if !matches!(state.as_str(),"running"|"verifying") {break Err(Some(state=="cancelled"));}
                     }
                 }
@@ -2233,5 +2238,158 @@ impl TaskCompletionGate {
         let owner = verdict.verifier_run_id.clone();
         let job_id=self.store.db.read(ReadLane::Interactive,move|c|Ok(c.query_row("SELECT id FROM task_verifier_jobs WHERE verifier_run_id=?1 AND state='completed' ORDER BY id DESC LIMIT 1",[owner],|r|r.get(0))?)).await?;
         Ok(StageVerification { job_id, verdict })
+    }
+}
+
+#[cfg(test)]
+mod concurrent_reader_polling {
+    use super::*;
+    use excalibur_store::Database;
+    use std::{future::Future, pin::Pin, sync::Mutex, task::Poll, time::Instant};
+    async fn poll_once<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
+        std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *future).poll(cx))).await
+    }
+    struct ReaderRuntime {
+        db: Database,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        queued: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        effects: AtomicU64,
+    }
+    impl ToolRuntime for ReaderRuntime {
+        fn definitions(&self) -> Vec<excalibur_types::runtime::ToolDefinition> {
+            vec![]
+        }
+        fn prepare<'a>(
+            &'a self,
+            _: &'a str,
+            _: ToolCall,
+        ) -> BoxFuture<'a, std::result::Result<PreparedTool, String>> {
+            Box::pin(async { Err("unused fixture preparation".into()) })
+        }
+        fn execute<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a PreparedTool,
+        ) -> BoxFuture<'a, ToolResult> {
+            Box::pin(async move {
+                let release = self.release.lock().unwrap().take().unwrap();
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let db = self.db.clone();
+                let holder = tokio::spawn(async move {
+                    db.read(ReadLane::Interactive, move |_| {
+                        started_tx.send(()).unwrap();
+                        release.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap()
+                });
+                started_rx.await.unwrap();
+                let mut read = Box::pin(self.db.read(ReadLane::Interactive, |_| Ok(77)));
+                assert!(poll_once(&mut read).await.is_pending());
+                self.queued
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                assert_eq!(read.await.unwrap(), 77);
+                holder.await.unwrap();
+                self.effects.fetch_add(1, Ordering::SeqCst);
+                ToolResult::ok(json!({"exited":true,"exit_code":0}))
+            })
+        }
+        fn reconcile<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a PreparedTool,
+        ) -> BoxFuture<'a, Reconcile> {
+            Box::pin(async { Reconcile::Retry })
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn check_control_polls_execution_while_its_status_read_is_waiting() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            directory.path().join("main.db"),
+            excalibur_store::DatabaseKind::Main,
+            Default::default(),
+        )
+        .unwrap();
+        let store = TaskStore::open(db.clone()).await.unwrap();
+        let journal = excalibur_journal::Journal::new(db.clone()).await.unwrap();
+        let run = journal
+            .create_run("reader-polling", json!({"fixture":true}))
+            .await
+            .unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (queued_tx, mut queued_rx) = tokio::sync::oneshot::channel();
+        let runtime = Arc::new(ReaderRuntime {
+            db: db.clone(),
+            release: Mutex::new(Some(release_rx)),
+            queued: Mutex::new(Some(queued_tx)),
+            effects: AtomicU64::new(0),
+        });
+        let runner = CheckRunner::new(runtime.clone(), directory.path().into());
+        let prepared = PreparedTool {
+            call: ToolCall {
+                id: "reader-effect".into(),
+                name: "exec".into(),
+                arguments: "{}".into(),
+            },
+            effect: excalibur_types::runtime::Effect::Pure,
+            resources: vec![],
+            exclusive: false,
+            data: json!({}),
+        };
+        // Keep the paused clock explicit while real SQLite blocking jobs run.
+        let keep_awake = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut check = Box::pin(runner.invoke_monitored(
+            &store,
+            &run,
+            "controlled-reader",
+            &prepared,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        ));
+        let watchdog = Instant::now();
+        loop {
+            assert!(poll_once(&mut check).await.is_pending());
+            if queued_rx.try_recv().is_ok() {
+                break;
+            }
+            assert!(
+                watchdog.elapsed() < Duration::from_secs(10),
+                "execution reader did not queue"
+            );
+            tokio::task::yield_now().await;
+        }
+        // The execution read precedes the status read in the one-reader FIFO.
+        // Trigger exactly one status poll before making that FIFO available.
+        tokio::time::advance(Duration::from_millis(25)).await;
+        assert!(poll_once(&mut check).await.is_pending());
+        release_tx.send(()).unwrap();
+        let result = loop {
+            if let Poll::Ready(result) = poll_once(&mut check).await {
+                break result.unwrap();
+            }
+            assert!(
+                watchdog.elapsed() < Duration::from_secs(10),
+                "status polling parked the execution owning the next reader reservation"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert!(result.success);
+        assert_eq!(runtime.effects.load(Ordering::SeqCst), 1);
+        keep_awake.abort();
+        let _ = keep_awake.await;
+        drop(check);
+        db.shutdown().await.unwrap();
     }
 }
