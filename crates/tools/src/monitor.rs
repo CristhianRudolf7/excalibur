@@ -1,9 +1,6 @@
 //! Explicit project lifecycle adapter: filesystem events feed a durable change queue.
 use crate::LocalTools;
-use excalibur_store::{
-    Priority, ReadLane,
-    rusqlite::{OptionalExtension, params},
-};
+use excalibur_store::{Priority, ReadLane, rusqlite::params};
 use excalibur_tasks::TaskStore;
 use excalibur_types::runtime::BoxFuture;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -18,13 +15,25 @@ use std::{
 };
 use tokio::sync::{Mutex, mpsc};
 
+/// Content provenance is independent of the identity of a filesystem writer.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChangeOrigin {
+    /// Initial observation; no transition or writer is asserted.
+    Baseline,
+    /// Shared-workspace observations do not identify their writer, including exec.
+    #[default]
+    Unattributed,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectChange {
     pub id: i64,
     pub path: PathBuf,
     pub previous_hash: Option<String>,
     pub current_hash: Option<String>,
+    /// Compatibility flag: revalidation is required, not proof of an outside writer.
     pub external: bool,
+    #[serde(default)]
+    pub origin: ChangeOrigin,
     #[serde(default = "semantic_change_default")]
     pub semantic_changed: bool,
 }
@@ -121,7 +130,8 @@ impl ProjectMonitor {
         evidence: Vec<EvidenceTarget>,
         projections: Vec<PathBuf>,
     ) -> Result<Self, String> {
-        tools.db.write(Priority::Normal,|c| {c.execute_batch("CREATE TABLE IF NOT EXISTS project_observations(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path));CREATE TABLE IF NOT EXISTS project_changes(id INTEGER PRIMARY KEY AUTOINCREMENT,project TEXT NOT NULL,path TEXT NOT NULL,previous_hash TEXT,current_hash TEXT,external INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'pending');CREATE INDEX IF NOT EXISTS project_changes_pending ON project_changes(project,state,id);CREATE TABLE IF NOT EXISTS project_semantics(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path));CREATE TABLE IF NOT EXISTS project_change_semantics(change_id INTEGER PRIMARY KEY REFERENCES project_changes(id),changed INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS project_exec_attribution(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path));")?;Ok(())}).await.map_err(|e|e.to_string())?;
+        let recovery_project = tools.root.to_string_lossy().into_owned();
+        tools.db.write(Priority::Normal,move |c| {c.execute_batch("CREATE TABLE IF NOT EXISTS project_observations(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path));CREATE TABLE IF NOT EXISTS project_changes(id INTEGER PRIMARY KEY AUTOINCREMENT,project TEXT NOT NULL,path TEXT NOT NULL,previous_hash TEXT,current_hash TEXT,external INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'pending');CREATE INDEX IF NOT EXISTS project_changes_pending ON project_changes(project,state,id);CREATE TABLE IF NOT EXISTS project_semantics(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path));CREATE TABLE IF NOT EXISTS project_change_semantics(change_id INTEGER PRIMARY KEY REFERENCES project_changes(id),changed INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS project_exec_attribution(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path));")?;c.execute("UPDATE project_changes SET external=1 WHERE project=?1 AND state='pending'",[recovery_project])?;Ok(())}).await.map_err(|e|e.to_string())?;
         let monitor = Self {
             inner: Arc::new(MonitorInner {
                 tools,
@@ -297,24 +307,17 @@ impl ProjectMonitor {
             );
             current.insert(relative, crate::files::hash(&bytes));
         }
-        // Content the agent produced through `exec` is recorded when its
-        // step closes its shadow snapshot; the write below attributes it to
-        // Excalibur before any change is marked external. Changes observed
-        // while an exec step is still open are attributed the same way.
-        let exec_open = tools.has_open_exec_step();
+        // A shared-workspace exec window or closing snapshot cannot identify
+        // the writer. Even an old native postimage may match a later human ABA edit.
         let project = tools.root.to_string_lossy().into_owned();
         tools.db.write(Priority::Normal,move|c| {
             let old={let mut stmt=c.prepare("SELECT path,hash FROM project_observations WHERE project=?1")?;stmt.query_map([&project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<BTreeMap<_,_>,_>>()?};
             let old_semantics={let mut q=c.prepare("SELECT path,hash FROM project_semantics WHERE project=?1")?;q.query_map([&project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<BTreeMap<_,_>,_>>()?};
-            let old_attribution={let mut q=c.prepare("SELECT path,hash FROM project_exec_attribution WHERE project=?1")?;q.query_map([&project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<BTreeMap<_,_>,_>>()?};
             let initial=baseline&&old.is_empty();
             for path in old.keys().chain(current.keys()).collect::<std::collections::BTreeSet<_>>() {
                 if old.get(path)==current.get(path) {if let Some(hash)=semantics.get(path){c.execute("INSERT INTO project_semantics VALUES(?1,?2,?3) ON CONFLICT(project,path) DO UPDATE SET hash=excluded.hash",params![project,path,hash])?;}continue}
                 {
-                    let absolute=Path::new(&project).join(path).to_string_lossy().into_owned();
-                    let latest:Option<Option<String>>=c.query_row("SELECT postimage_blob FROM file_versions WHERE path=?1 ORDER BY rowid DESC LIMIT 1",[absolute],|r|r.get(0)).optional()?;
-                    let agent_made=exec_open || old_attribution.get(path).is_some_and(|hash|Some(hash)==current.get(path));
-                    let external=!initial && !agent_made && latest.as_ref().is_none_or(|hash|hash.as_ref()!=current.get(path));
+                    let external=!initial;
                     c.execute("INSERT INTO project_changes(project,path,previous_hash,current_hash,external) VALUES(?1,?2,?3,?4,?5)",params![project,path,old.get(path),current.get(path),external])?;
                     let projected=projections.contains(path);let empty=crate::files::hash(b"");
                     let before=old_semantics.get(path).or_else(||old.get(path)).or(if projected{Some(&empty)}else{None});
@@ -343,7 +346,7 @@ impl ProjectMonitor {
         let project = tools.root.to_string_lossy().into_owned();
         let changes=tools.db.read(ReadLane::Interactive,move|c|{
             let mut stmt=c.prepare("SELECT pc.id,pc.path,pc.previous_hash,pc.current_hash,pc.external,COALESCE(ps.changed,1) FROM project_changes pc LEFT JOIN project_change_semantics ps ON ps.change_id=pc.id WHERE pc.project=?1 AND pc.state='pending' ORDER BY pc.id LIMIT 256")?;
-            Ok(stmt.query_map([project],|r|Ok(ProjectChange{id:r.get(0)?,path:PathBuf::from(r.get::<_,String>(1)?),previous_hash:r.get(2)?,current_hash:r.get(3)?,external:r.get(4)?,semantic_changed:r.get(5)?}))?.collect::<Result<Vec<_>,_>>()?)
+            Ok(stmt.query_map([project],|r|Ok(ProjectChange{id:r.get(0)?,path:PathBuf::from(r.get::<_,String>(1)?),previous_hash:r.get(2)?,current_hash:r.get(3)?,external:r.get(4)?,origin:if r.get::<_,bool>(4)?{ChangeOrigin::Unattributed}else{ChangeOrigin::Baseline},semantic_changed:r.get(5)?}))?.collect::<Result<Vec<_>,_>>()?)
         }).await.map_err(|e|e.to_string())?;
         let journal = excalibur_journal::Journal::new(tools.db.clone())
             .await
@@ -421,7 +424,7 @@ impl ProjectMonitor {
                 for run in holders {
                     let id = format!("external-file:{}", change.id);
                     let text = tools.policy.redactor.redact_text(&format!(
-                        "{} changed outside Excalibur; its previous read fingerprint is stale.",
+                        "{} changed with unverified writer provenance; reread it because its previous read fingerprint is stale.",
                         relative
                     ));
                     journal

@@ -296,15 +296,6 @@ impl LocalTools {
             .and_then(|mut buffered| buffered.remove(run))
             .unwrap_or_default()
     }
-    /// True while any run has an open shadow-tracked exec step. The project
-    /// monitor treats changes observed in that window as agent-made instead
-    /// of reporting its own `exec` output as an outside change.
-    pub(crate) fn has_open_exec_step(&self) -> bool {
-        self.exec_open_steps
-            .lock()
-            .map(|open| !open.is_empty())
-            .unwrap_or(false)
-    }
     fn mark_exec_step_open(&self, run: &str) {
         if let Ok(mut open) = self.exec_open_steps.lock() {
             open.insert(run.into());

@@ -371,7 +371,7 @@ async fn gitignore_excluded_files_never_queue_project_changes() {
     db.shutdown().await.unwrap();
 }
 #[tokio::test]
-async fn agent_exec_changes_are_attributed_before_marking_them_external() {
+async fn shared_exec_changes_retain_unverified_provenance() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
     std::fs::create_dir(&root).unwrap();
@@ -416,15 +416,47 @@ async fn agent_exec_changes_are_attributed_before_marking_them_external() {
         .unwrap();
     let result = tools.execute(&run, "spawn", &prepared).await;
     assert!(result.success, "{result:?}");
-    tools.end_step(&run, 0).await.unwrap();
+    // The exec step is still open. A second writer changes an unrelated path;
+    // the closing whole-tree snapshot must never claim that writer's content.
+    std::fs::write(root.join("human.txt"), "human-a").unwrap();
     monitor.scan_now().await.unwrap();
     let changes = seen.0.lock().unwrap().clone();
-    assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].0.path, PathBuf::from("agent.txt"));
+    assert_eq!(changes.len(), 2, "{changes:?}");
+    for (change, _) in &changes {
+        assert!(
+            change.external,
+            "shared observation needs revalidation: {change:?}"
+        );
+        assert_eq!(
+            change.origin,
+            excalibur_tools::monitor::ChangeOrigin::Unattributed
+        );
+    }
     assert!(
-        !changes[0].0.external,
-        "the agent's own exec output is not an outside change: {changes:?}"
+        changes
+            .iter()
+            .any(|(c, _)| c.path == PathBuf::from("agent.txt"))
     );
+    assert!(
+        changes
+            .iter()
+            .any(|(c, _)| c.path == PathBuf::from("human.txt"))
+    );
+    tools.end_step(&run, 0).await.unwrap();
+    // An ABA edit returns to content captured by the closing exec snapshot.
+    // A historical postimage is content evidence, not writer identity.
+    for text in ["human-b", "human-a"] {
+        seen.0.lock().unwrap().clear();
+        std::fs::write(root.join("human.txt"), text).unwrap();
+        monitor.scan_now().await.unwrap();
+        let changes = seen.0.lock().unwrap().clone();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(changes[0].0.external, "ABA cannot prove exec authorship");
+        assert_eq!(
+            changes[0].0.origin,
+            excalibur_tools::monitor::ChangeOrigin::Unattributed
+        );
+    }
     monitor.stop().await;
     drop(monitor);
     drop(tools);

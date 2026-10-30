@@ -344,47 +344,14 @@ impl LocalTools {
             return Ok(Vec::new());
         }
         let entries = self.authorized_snapshot_entries()?;
-        let attribution = entries
-            .iter()
-            .map(|(path, entry)| (path.to_string_lossy().into_owned(), hash(&entry.content)))
-            .collect::<Vec<_>>();
         let (_, warnings) = self
             .workspace
             .shadow()
             .snapshot_entries(run, step, "after", entries)
             .await
             .map_err(|e| e.to_string())?;
-        // Attribute the closing content to the agent's own `exec` work so
-        // the project monitor does not report it as an outside change.
-        // Pending rows queued by a scan that raced the step close are
-        // corrected as well; only already-processed rows keep their verdict.
-        let project = self.root.to_string_lossy().into_owned();
-        self.db
-            .write(excalibur_store::Priority::Normal, move |c| {
-                c.execute_batch("CREATE TABLE IF NOT EXISTS project_exec_attribution(project TEXT NOT NULL,path TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(project,path))")?;
-                for (path, file_hash) in &attribution {
-                    c.execute(
-                        "INSERT INTO project_exec_attribution(project,path,hash) VALUES(?1,?2,?3) ON CONFLICT(project,path) DO UPDATE SET hash=excluded.hash",
-                        excalibur_store::rusqlite::params![project, path, file_hash],
-                    )?;
-                }
-                // `project_changes` only exists where a monitor ran; without
-                // it there is nothing to correct.
-                let has_changes: i64 = c.query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='project_changes'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                if has_changes > 0 {
-                    c.execute(
-                        "UPDATE project_changes SET external=0 WHERE state='pending' AND EXISTS(SELECT 1 FROM project_exec_attribution a WHERE a.project=project_changes.project AND a.path=project_changes.path AND a.hash=project_changes.current_hash)",
-                        [],
-                    )?;
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|e| e.to_string())?;
+        // A closing shared-workspace snapshot supports undo, not writer attribution.
+        // Never relabel queued observations using a whole-tree snapshot hash.
         self.mark_exec_step_closed(run);
         Ok(warnings)
     }
