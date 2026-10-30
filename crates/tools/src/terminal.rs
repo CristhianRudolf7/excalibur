@@ -131,6 +131,22 @@ struct Output {
     error: Option<String>,
     persisted_blob: Option<String>,
 }
+// Runtime status and wait futures take this mutex synchronously. A slow spool
+// fsync must not park their Tokio thread and prevent its deadlines from firing.
+// Readers have joined before this call; publish the exit only after the existing
+// best-effort durability barrier returns.
+fn finish_output(
+    output: &Mutex<Output>,
+    code: Option<i32>,
+    timed_out: bool,
+    synchronize: impl FnOnce(),
+) {
+    synchronize();
+    let mut output = output.lock().unwrap();
+    output.exited = true;
+    output.exit_code = code;
+    output.timed_out = timed_out;
+}
 impl Output {
     fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
@@ -964,6 +980,9 @@ impl TerminalManager {
         }
         let file = opts.open(&path).map_err(|e| e.to_string())?;
         fs2::FileExt::lock_exclusive(&file).map_err(|e| e.to_string())?;
+        // Keep a handle for durable exit publication without retaining the output
+        // mutex across filesystem I/O. Clone before launching any process.
+        let sync_file = file.try_clone().map_err(|e| e.to_string())?;
         let (sender, receiver) = std::sync::mpsc::channel();
         let manager = self.clone();
         let cmd = cmd.to_string();
@@ -1090,12 +1109,9 @@ impl TerminalManager {
                     drop(launched.guardian);
                     #[cfg(target_os = "linux")]
                     drop(launched.sandbox);
-                    let mut output = observed.output.lock().unwrap();
-                    output.exited = true;
-                    output.exit_code = code;
-                    output.timed_out = timed_out;
-                    let _ = output.file.sync_all();
-                    drop(output);
+                    finish_output(&observed.output, code, timed_out, || {
+                        let _ = sync_file.sync_all();
+                    });
                     observed.notify.notify_waiters();
                 }
 
@@ -2144,5 +2160,57 @@ fn process_group_rss(groups: &[u32]) -> Result<BTreeMap<u32, u64>, String> {
     {
         let _ = groups;
         Err("native process-tree RSS accounting unavailable".into())
+    }
+}
+
+#[cfg(test)]
+mod exit_publication_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_spool_sync_keeps_status_readable_and_exit_unpublished() {
+        let spool = tempfile::NamedTempFile::new().unwrap();
+        let output = Arc::new(Mutex::new(Output {
+            file: spool.reopen().unwrap(),
+            path: spool.path().into(),
+            head: Vec::new(),
+            tail: VecDeque::new(),
+            total: 0,
+            exited: false,
+            exit_code: None,
+            timed_out: false,
+            termination_reason: None,
+            error: None,
+            persisted_blob: None,
+        }));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let observed = output.clone();
+        let monitor = std::thread::spawn(move || {
+            finish_output(&observed, Some(23), true, || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+        });
+        started_rx.await.unwrap();
+        // The blocked durability barrier must neither monopolize the mutex used
+        // by async wait/status nor make the exit visible before it completes.
+        {
+            let state = output
+                .try_lock()
+                .expect("spool sync must release status mutex");
+            assert!(!state.exited);
+            assert_eq!(state.exit_code, None);
+            assert!(!state.timed_out);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        release_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || monitor.join().unwrap())
+            .await
+            .unwrap();
+        let state = output.lock().unwrap();
+        assert!(state.exited);
+        assert_eq!(state.exit_code, Some(23));
+        assert!(state.timed_out);
     }
 }
