@@ -10,7 +10,7 @@ use excalibur_browser_resources::budgets::{
     SOFT_GLOBAL_BYTES, SearchProfile, TABS_GLOBAL, TABS_PER_EXECUTION, WEBD_MAX_RSS_BYTES,
 };
 
-fn base_request() -> AdmissionRequest {
+fn base_request() -> AdmissionRequest<'static> {
     AdmissionRequest {
         origin: "example.com",
         estimated_bytes: 200 * MIB,

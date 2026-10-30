@@ -75,9 +75,9 @@ impl OriginEstimator {
 
 /// Inputs to one admission decision.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct AdmissionRequest {
+pub struct AdmissionRequest<'a> {
     /// Origin about to be opened (bare host, e.g. `example.com`).
-    pub origin: &'static str,
+    pub origin: &'a str,
     /// Estimated footprint in bytes (from [`OriginEstimator`]).
     pub estimated_bytes: u64,
     /// Current global working set in bytes.
@@ -94,6 +94,52 @@ pub struct AdmissionRequest {
     pub free_disk_bytes: u64,
     /// Disk the operation would newly consume (profile, download...).
     pub growth_bytes: u64,
+}
+
+/// Runtime readings for one admission check, wired by webd.
+///
+/// Bundling keeps constructor and gate signatures under the argument limit
+/// while every threshold stays in the shared core.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdmissionReadings {
+    /// Current global working set in bytes.
+    pub working_set_bytes: u64,
+    /// Soft global budget in bytes.
+    pub soft_budget_bytes: u64,
+    /// Current PSI `some avg10` in percent, when measured.
+    pub psi_some_avg10_pct: Option<f64>,
+    /// Tabs already open in this execution.
+    pub execution_tabs: u32,
+    /// Tabs already open globally.
+    pub global_tabs: u32,
+    /// Free disk in bytes before the operation.
+    pub free_disk_bytes: u64,
+    /// Disk the operation would newly consume (profile, download...).
+    pub growth_bytes: u64,
+}
+
+impl<'a> AdmissionRequest<'a> {
+    /// Build a request for a runtime `origin`, filling the estimate from
+    /// `estimator`. This keeps per-origin moving-average logic in the shared
+    /// core so webd wiring never hard-codes footprint defaults.
+    #[must_use]
+    pub fn with_estimator(
+        origin: &'a str,
+        estimator: &OriginEstimator,
+        readings: AdmissionReadings,
+    ) -> Self {
+        Self {
+            origin,
+            estimated_bytes: estimator.estimate(origin),
+            working_set_bytes: readings.working_set_bytes,
+            soft_budget_bytes: readings.soft_budget_bytes,
+            psi_some_avg10_pct: readings.psi_some_avg10_pct,
+            execution_tabs: readings.execution_tabs,
+            global_tabs: readings.global_tabs,
+            free_disk_bytes: readings.free_disk_bytes,
+            growth_bytes: readings.growth_bytes,
+        }
+    }
 }
 
 /// Memory breakdown attached to waits and denials.
@@ -160,7 +206,7 @@ pub enum DenyReason {
 /// room; the caller reports `capacity_exceeded` with the breakdown when the
 /// wait expires.
 #[must_use]
-pub fn decide(request: &AdmissionRequest) -> AdmissionDecision {
+pub fn decide(request: &AdmissionRequest<'_>) -> AdmissionDecision {
     if request.execution_tabs >= TABS_PER_EXECUTION || request.global_tabs >= TABS_GLOBAL {
         return AdmissionDecision::Deny(DenyReason::TabLimit {
             execution_tabs: request.execution_tabs,

@@ -78,6 +78,20 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
         rpc::{Protocol, Server},
         sessions::{Manager, Options},
     };
+    // B6 resource wiring (13.2-13.5): hold the shared-core gate for the
+    // service lifetime and refuse to grow when the free disk would breach
+    // the configured 5 GiB reserve. Decisions stay in
+    // `excalibur-browser-resources`; webd only enforces them.
+    let resources = excalibur_webd::resources::ResourceGate::new();
+    let free_disk = excalibur_webd::disk_available(&config.web.data_dir).unwrap_or(0);
+    if !excalibur_webd::resources::growth_allowed_with_reserve(
+        free_disk,
+        0,
+        config.web.disk_reserve_bytes,
+    ) {
+        return Err("disk_reserve: free disk below configured reserve".into());
+    }
+    let _resource_gate = resources;
     // Egress broker (12.3): HostProxy with pinned DNS, no private/loopback
     // answers and only web ports. The loopback listener below verifies the
     // peer UID so only the web user can reach the broker through Chrome's

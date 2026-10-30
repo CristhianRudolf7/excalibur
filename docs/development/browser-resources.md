@@ -24,8 +24,7 @@ and no deployment are involved.
 
 ## Verification
 
-Run the isolated backend suite for this scope (standalone workspace, own
-target directory):
+Run the isolated backend suite for this scope (own target directory):
 
 ```sh
 cargo fmt --check --manifest-path crates/browser-resources/Cargo.toml
@@ -46,10 +45,46 @@ start gates, LRU eviction order, telemetry peaks and three-repetition
 medians. The crate has no dependencies, so no lock or root manifest changes
 are needed.
 
-## Not implemented here
+## webd wiring (B6)
 
-Live `webd` wiring, cgroup scope management, real Chrome supervision, broker
-pressure signals, CDP GC/pressure/cache calls, profile directory walks with
+`excalibur-webd` enforces the foundation through
+`webd::resources::ResourceGate` (architecture 13.2-13.5): admission with the
+per-origin moving-average estimate, the ordered 1-7 eviction plan with LIVE
+protection, disk reserve gates, low-disk cleanup sparing listening origins
+and harness telemetry fields. `serve` refuses to grow when free disk would
+breach the configured reserve. `AdmissionRequest::with_estimator` fills the
+estimate from the shared-core estimator so webd never hard-codes footprint
+defaults. The crate ships without a `[workspace]` marker so it resolves as a
+`webd` path dependency inside the main workspace; the isolated suites above
+keep running with `--manifest-path` and a separate target directory.
+
+```sh
+cargo test -p excalibur-webd --test resources_gates -- --nocapture
+cargo test -p excalibur-webd --test resources_measure -- --nocapture
+```
+
+`resources_gates` covers architecture 13.6 over synthetic fixtures only:
+budget constants, moving-average admission gates, eviction order 1-7 with
+LIVE protection, disk gates, `listener_cannot_suspend` and telemetry peaks.
+
+## Measurements (18.3)
+
+`resources_measure` runs the reproducible procedure shape over synthetic
+fixtures only: blank instance, static local page, ten heavy ephemeral tabs,
+level A/B/C reads with PSS by process type, exactly 3 repetitions with
+median/min/max plus Chrome, kernel and flag metadata. Levels B and C
+enumerate synthetic `/proc`-shaped trees; one live self-read of
+`/proc/self/status` anchors level B to the real machine. The 30 s settle is
+recorded as the procedure constant without wall-clock sleeping so the suite
+stays fast; a real VPS run waits the full delay. The JSON report lands in
+`target/test-evidence/browser/resources/measure.json`. Logged-in
+WhatsApp/Teams figures (18.4, 1 h/24 h) stay pending-user and are never
+claimed here.
+
+## Still pending
+
+cgroup scope management, real Chrome supervision, broker pressure signals,
+CDP GC/pressure/cache calls, profile directory walks with
 `Storage.getUsageAndQuota`, VPS measurement runs and full B6 acceptance
 belong to the main lane. A resource decision remains an input to admission
 and eviction: only the wired service enforces it.

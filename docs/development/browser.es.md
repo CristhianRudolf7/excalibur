@@ -883,3 +883,41 @@ cookies). Quedan pendientes la salida completa por broker (resolución DNS,
 obtención/caché de `robots.txt`, encolado real al índice, registro de
 visor/RPC), los extractores de producción `dom_smoothie`/`htmd`, PDF/feeds/
 juegos de caracteres y render efímero real con contexto efímero (carril B9).
+
+## Recursos, presupuestos, admisión y medición
+
+`webd::resources::ResourceGate` conecta el fundamento de
+`excalibur-browser-resources` con el servicio (arquitectura 13.1-13.6, 18.3;
+NB-17, NB-18). La admisión usa la media móvil por origen (200 MiB por
+defecto, 400 MiB clase pesada) más 200 MiB de margen bajo el presupuesto
+blando de 1,5 GiB, con denegación inmediata por límites de pestañas (4 por
+ejecución, 12 globales), PSI `some avg10` desde 20 % y crecimientos que
+rompan la reserva de 5 GiB; sin sitio tras el desalojo, espera hasta 120 s
+antes de `capacity_exceeded` con el desglose. El desalojo sigue los pasos
+1-7 (cachés de webd, IDLE LRU, GC efímero más presión moderada solo en la
+instancia efímera, caché efímera, cierre de una pestaña ACTIVE efímera sobre
+su límite con `tab_evicted`, reinicio efímero, solo recarga tranquila LIVE);
+las pestañas en escucha nunca se congelan, descartan, presionan ni
+suspenden, y `browser_suspend_session` en escucha devuelve
+`listener_cannot_suspend` sin aprobación. Con disco bajo (menos de 7 GiB
+libres o presupuesto de webd excedido) solo se vacían cachés efímeras y
+`cache_storage`/`shader_cache` persistentes de orígenes no escuchados.
+`serve` rechaza crecer bajo la reserva configurada. La telemetría añade
+`browser_working_set_bytes`, `browser_pss_bytes`, `browser_instances` y
+`browser_tabs` con picos, aparte de la RAM del arnés y del contenedor.
+
+```sh
+cargo test -p excalibur-webd --test resources_gates -- --nocapture
+cargo test -p excalibur-webd --test resources_measure -- --nocapture
+```
+
+`resources_gates` verifica las filas 13.6 solo con fixtures sintéticas;
+`resources_measure` ejecuta la forma del procedimiento 18.3 (instancia en
+blanco, página estática local, diez pestañas efímeras pesadas, niveles A/B/C
+con PSS por tipo, 3 repeticiones con mediana/mínimo/máximo) con informe en
+`target/test-evidence/browser/resources/measure.json`. Las cifras con sesión
+de WhatsApp/Teams (18.4, 1 h/24 h) siguen pendientes del usuario y nunca se
+afirman. Pendientes: gestión del scope del cgroup, supervisión real de
+Chrome, señales del intermediario, llamadas CDP de GC/presión/caché,
+recorridos de perfiles con `Storage.getUsageAndQuota` y mediciones VPS. Ver
+[Fundamento de recursos](browser-resources.es.md).
