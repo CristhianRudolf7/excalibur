@@ -8,6 +8,7 @@ mod profiles;
 mod progress;
 mod projects;
 pub use profiles::CustomProfile;
+pub mod recovery;
 mod scheduling;
 mod tools;
 pub use gate::OrchestrationGate;
@@ -102,6 +103,7 @@ struct Inner {
     wake: Notify,
     fair_service: Mutex<BTreeMap<(u8, String), u64>>,
     incarnation: String,
+    recovery: recovery::RecoveryLedger,
     runtime: Mutex<Option<tokio::runtime::Handle>>,
     tasks: Mutex<Option<excalibur_tasks::TaskStore>>,
 }
@@ -177,6 +179,7 @@ impl Orchestrator {
             Ok(())
         })
         .await?;
+        let recovery = recovery::RecoveryLedger::open(db.clone()).await?;
         Ok(Self {
             inner: Arc::new(Inner {
                 db,
@@ -188,6 +191,7 @@ impl Orchestrator {
                 wake: Notify::new(),
                 fair_service: Mutex::new(BTreeMap::new()),
                 incarnation: AgentId::new().to_string(),
+                recovery,
                 runtime: Mutex::new(None),
                 tasks: Mutex::new(None),
             }),

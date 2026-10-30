@@ -211,6 +211,7 @@ pub struct DaemonHost {
     tools: Arc<WorkerTools>,
     db: Database,
     pub memory: Option<Arc<crate::memory::MemoryHost>>,
+    boot: excalibur_orchestrator::recovery::BootRecord,
 }
 impl DaemonHost {
     /// Call on the interactive runtime, passing a *different* work runtime handle.
@@ -223,6 +224,13 @@ impl DaemonHost {
         redactor: Redactor,
         work: tokio::runtime::Handle,
     ) -> Result<Self, String> {
+        let recovery = excalibur_orchestrator::recovery::RecoveryLedger::open(db.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+        let boot = recovery
+            .begin(excalibur_store::unix_seconds())
+            .await
+            .map_err(|e| e.to_string())?;
         db.write(excalibur_store::Priority::Interactive,|c|{let present:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='orchestration_activity')",[],|r|r.get(0))?;if present{c.execute("UPDATE orchestration_activity SET connected=0",[])?;}Ok(())}).await.map_err(|e|e.to_string())?;
         let root = options
             .root
@@ -450,6 +458,10 @@ impl DaemonHost {
             .rebind_master_at_startup("Master", ceiling)
             .await
             .map_err(|e| e.to_string())?;
+        orchestrator
+            .recover_startup(&boot, options.autonomy)
+            .await
+            .map_err(|e| e.to_string())?;
         let actions = Arc::new(
             DaemonActions::new(orchestrator.clone(), master_agent.id)
                 .with_security(security.clone())
@@ -505,6 +517,10 @@ impl DaemonHost {
         )
         .await
         .map_err(|e| e.to_string())?;
+        recovery
+            .publish_summary(&boot.id, excalibur_store::unix_seconds())
+            .await
+            .map_err(|e| e.to_string())?;
         master.set_context_runtime(context_runtime);
         if let Some(decider) = options.decider {
             master.set_decider(Some(decider));
@@ -547,6 +563,7 @@ impl DaemonHost {
             tools: workers,
             db,
             memory,
+            boot,
         })
     }
     pub fn control_actions(&self) -> Arc<DaemonActions> {
@@ -556,6 +573,9 @@ impl DaemonHost {
         self.actions.recover_task_directives().await
     }
     pub async fn close(self) -> Result<(), String> {
+        self.close_with_outcome(true).await
+    }
+    pub async fn close_with_outcome(self, orderly: bool) -> Result<(), String> {
         self.skills.stop();
         if let Some(memory) = &self.memory {
             memory.stop();
@@ -597,6 +617,16 @@ impl DaemonHost {
         }
         if let Err(error) = self.telemetry.shutdown().await {
             failure.get_or_insert_with(|| error.to_string());
+        }
+        if orderly && failure.is_none() {
+            if let Err(error) = self
+                .orchestrator
+                .recovery()
+                .clean_exit(&self.boot.id, excalibur_store::unix_seconds())
+                .await
+            {
+                failure.get_or_insert_with(|| error.to_string());
+            }
         }
         if let Err(error) = self.db.shutdown().await {
             failure.get_or_insert_with(|| error.to_string());

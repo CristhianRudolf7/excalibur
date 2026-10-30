@@ -130,3 +130,5 @@ A fourth cancellation request from the same human source produces a durable tool
 The integrated cancellation backend fixtures enable memory and exercise the real `MemoryFastActions` composition. Its host-only confirmation route delegates to the underlying durable human-decision guard and is never added to model tool definitions. This preserves cancellation after restart while retaining memory source/scope checks.
 
 The memory-enabled daemon composition also validates every declared fast memory tool against the master allowlist. `memory_propose`, `doc_edit` and `library_search` are admitted; ingestion remains a deferred worker operation. The composed cancellation fixture found and now covers the earlier startup rejection of these existing tools.
+
+Startup recovery now has a durable boot ledger, crash-loop safe mode, exact-step quarantine and a real worker admission guard. Conversation/status/control remain available in safe mode. See [Daemon startup and crash-loop admission](startup-recovery.md) for the implemented policy, RPC controls and remaining H9 work.

@@ -130,3 +130,5 @@ Una cuarta petición de cancelación desde la misma fuente humana produce un rec
 Las pruebas backend integradas de cancelación habilitan memoria y recorren la composición real `MemoryFastActions`. Su puerto de confirmación exclusivo del anfitrión delega en la guarda durable de decisión humana y nunca se añade a las definiciones de herramientas del modelo. Así conserva cancelación tras reinicio y controles de fuente/ámbito de memoria.
 
 La composición del daemon con memoria también valida cada herramienta rápida de memoria frente a la lista permitida del maestro. Se admiten `memory_propose`, `doc_edit` y `library_search`; la ingestión sigue como operación diferida de trabajadores. La prueba compuesta de cancelación detectó y cubre el rechazo anterior de estas herramientas existentes durante el arranque.
+
+La recuperación de arranque cuenta con registro durable, modo seguro ante bucles de caídas, cuarentena por paso y frontera real de admisión de workers. Conversación/estado/control siguen disponibles en modo seguro. Véase [Arranque y admisión ante bucles de caídas](startup-recovery.es.md) para política implementada, RPC y resto de H9.

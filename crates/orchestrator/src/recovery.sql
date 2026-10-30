@@ -1,0 +1,11 @@
+CREATE TABLE IF NOT EXISTS daemon_recovery_schema(version INTEGER PRIMARY KEY,checksum TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS daemon_boots(id TEXT PRIMARY KEY,started_at INTEGER NOT NULL,last_seen INTEGER NOT NULL,clean_exit INTEGER,crashed_at INTEGER,previous_boot TEXT,downtime_seconds INTEGER NOT NULL DEFAULT 0,summary TEXT NOT NULL DEFAULT '{}');
+CREATE INDEX IF NOT EXISTS daemon_boot_crashes ON daemon_boots(crashed_at);
+CREATE TABLE IF NOT EXISTS daemon_recovery_state(id INTEGER PRIMARY KEY CHECK(id=1),boot_id TEXT,safe_until INTEGER NOT NULL DEFAULT 0,recovering INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO daemon_recovery_state(id) VALUES(1);
+CREATE TABLE IF NOT EXISTS daemon_boot_runs(boot_id TEXT NOT NULL REFERENCES daemon_boots(id),run_id TEXT NOT NULL REFERENCES runs(id),PRIMARY KEY(boot_id,run_id));
+CREATE TABLE IF NOT EXISTS daemon_crash_positions(boot_id TEXT NOT NULL REFERENCES daemon_boots(id),run_id TEXT NOT NULL,step INTEGER NOT NULL,PRIMARY KEY(boot_id,run_id));
+CREATE TABLE IF NOT EXISTS daemon_quarantine(run_id TEXT PRIMARY KEY,step INTEGER NOT NULL,created_at INTEGER NOT NULL,released_at INTEGER);
+CREATE TABLE IF NOT EXISTS daemon_recovery_decisions(boot_id TEXT NOT NULL REFERENCES daemon_boots(id),run_id TEXT NOT NULL,decision TEXT NOT NULL,reason TEXT NOT NULL,resume_after_safe INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(boot_id,run_id));
+CREATE TABLE IF NOT EXISTS daemon_recovery_controls(operation TEXT PRIMARY KEY,kind TEXT NOT NULL,target TEXT NOT NULL,created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS daemon_recovery_notice_receipts(boot_id TEXT NOT NULL REFERENCES daemon_boots(id),conversation_id TEXT NOT NULL,PRIMARY KEY(boot_id,conversation_id));

@@ -69,6 +69,11 @@ impl Orchestrator {
         self.enforce_directive_deadlines(now()).await?;
         self.service_question_deadlines(now()).await?;
         let _gate = self.inner.gate.lock().await;
+        let recovery = self.recovery().status(now()).await?;
+        if recovery.recovering || recovery.safe_mode {
+            return Ok(vec![]);
+        }
+        self.resume_safe_mode_owned().await?;
         let high = self
             .inner
             .db
@@ -161,6 +166,9 @@ impl Orchestrator {
                 continue;
             }
             let run = a.run_id.clone().ok_or_else(|| invalid("run missing"))?;
+            if !self.recovery().track_admission(&run).await? {
+                continue;
+            }
             if let Err(error) = host.bind(&a).await {
                 self.inner
                     .engine
