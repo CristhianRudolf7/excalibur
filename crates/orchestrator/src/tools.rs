@@ -344,6 +344,10 @@ fn profile_allows(profile: &str, name: &str) -> bool {
     }
 }
 impl ToolRuntime for OrchestratorTools {
+    fn overrides_builtin<'a>(&'a self, run: &'a str, name: &'a str) -> BoxFuture<'a, bool> {
+        self.delegate.overrides_builtin(run, name)
+    }
+
     fn run_definitions<'a>(
         &'a self,
         run: &'a str,

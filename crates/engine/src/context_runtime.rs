@@ -377,7 +377,15 @@ impl Engine {
                 .await
                 .map_err(|_| Error::Invalid("per-run role tool catalog unavailable"))?
         {
-            definitions.extend(super::builtin_definitions());
+            for builtin in super::builtin_definitions() {
+                if definitions.iter().any(|tool| tool.name == builtin.name)
+                    && self.tools.overrides_builtin(run, &builtin.name).await
+                {
+                    continue;
+                }
+                definitions.retain(|tool| tool.name != builtin.name);
+                definitions.push(builtin);
+            }
             definitions.sort_by(|a, b| a.name.cmp(&b.name));
             initial_context.tools = definitions;
         }

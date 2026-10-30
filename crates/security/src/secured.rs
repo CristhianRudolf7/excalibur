@@ -320,6 +320,10 @@ impl SecuredTools {
     }
 }
 impl ToolRuntime for SecuredTools {
+    fn overrides_builtin<'a>(&'a self, run: &'a str, name: &'a str) -> BoxFuture<'a, bool> {
+        self.delegate.overrides_builtin(run, name)
+    }
+
     fn deferred_definitions<'a>(
         &'a self,
         run: &'a str,

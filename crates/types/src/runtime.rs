@@ -255,6 +255,11 @@ pub struct RunContext {
     pub updates: Vec<(String, String)>,
 }
 pub trait ToolRuntime: Send + Sync {
+    /// A trusted scoped adapter can own a same-named engine utility. The host
+    /// binding must keep this routing stable for the run, including restart.
+    fn overrides_builtin<'a>(&'a self, _run: &'a str, _name: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
     fn session_context<'a>(&'a self, _run: &'a str) -> BoxFuture<'a, Result<RunContext, String>> {
         Box::pin(async { Ok(RunContext::default()) })
     }

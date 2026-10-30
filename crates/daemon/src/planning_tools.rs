@@ -157,6 +157,10 @@ impl ScopedPlanning {
     }
 }
 impl ToolRuntime for ScopedPlanning {
+    fn overrides_builtin<'a>(&'a self, run: &'a str, name: &'a str) -> BoxFuture<'a, bool> {
+        self.delegate.overrides_builtin(run, name)
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition> {
         Self::catalog(None, &self.prototype)
     }

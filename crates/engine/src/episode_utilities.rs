@@ -8,11 +8,18 @@ use std::collections::BTreeMap;
 const PAGE: usize = 16;
 const SNIPPET_BYTES: usize = 512;
 pub(crate) fn is_builtin(name: &str) -> bool {
-    matches!(name, "history_search" | "pin_observation" | "ack_directive")
+    matches!(
+        name,
+        "history_search" | "run_history_search" | "pin_observation" | "ack_directive"
+    )
 }
 pub(crate) fn definitions() -> Vec<ToolDefinition> {
     let schema = |required: Vec<&str>, properties: Value| json!({"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":required,"properties":properties,"additionalProperties":false});
-    vec![ToolDefinition{name:"history_search".into(),description:"Search one bounded page of this run's confirmed journal, with sanitized snippets and a continuation cursor.".into(),input_schema:schema(vec![],json!({"query":{"type":"string","maxLength":256},"from_sequence":{"type":"integer","minimum":1},"to_sequence":{"type":"integer","minimum":1},"cursor":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":16}}))},ToolDefinition{name:"pin_observation".into(),description:"Pin or unpin a confirmed tool observation in this run by call ID and optional source sequence; retain its durable source reference.".into(),input_schema:schema(vec!["call_id"],json!({"call_id":{"type":"string","minLength":1,"maxLength":256},"source_sequence":{"type":"integer","minimum":1},"note":{"type":"string","maxLength":2048},"pinned":{"type":"boolean"}}))},ToolDefinition{name:"ack_directive".into(),description:"Acknowledge an existing directive received in this run. This cannot create a directive or approve permissions.".into(),input_schema:schema(vec!["id"],json!({"id":{"type":"string","minLength":1,"maxLength":256}}))}]
+    let mut definitions=vec![ToolDefinition{name:"history_search".into(),description:"Search one bounded page of this run's confirmed journal, with sanitized snippets and a continuation cursor.".into(),input_schema:schema(vec![],json!({"query":{"type":"string","maxLength":256},"from_sequence":{"type":"integer","minimum":1},"to_sequence":{"type":"integer","minimum":1},"cursor":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":16}}))},ToolDefinition{name:"pin_observation".into(),description:"Pin or unpin a confirmed tool observation in this run by call ID and optional source sequence; retain its durable source reference.".into(),input_schema:schema(vec!["call_id"],json!({"call_id":{"type":"string","minLength":1,"maxLength":256},"source_sequence":{"type":"integer","minimum":1},"note":{"type":"string","maxLength":2048},"pinned":{"type":"boolean"}}))},ToolDefinition{name:"ack_directive".into(),description:"Acknowledge an existing directive received in this run. This cannot create a directive or approve permissions.".into(),input_schema:schema(vec!["id"],json!({"id":{"type":"string","minLength":1,"maxLength":256}}))}];
+    let mut run_history = definitions[0].clone();
+    run_history.name = "run_history_search".into();
+    definitions.push(run_history);
+    definitions
 }
 pub(crate) fn prepare(call: ToolCall) -> Result<PreparedTool, String> {
     let definition = definitions()
@@ -74,7 +81,9 @@ pub(crate) async fn execute(
     prepared: &PreparedTool,
 ) -> ToolResult {
     let result = match prepared.call.name.as_str() {
-        "history_search" => history(journal, tools, run, &prepared.data).await,
+        "history_search" | "run_history_search" => {
+            history(journal, tools, run, &prepared.data).await
+        }
         "pin_observation" => pin(journal, run, &prepared.data).await,
         "ack_directive" => ack(journal, run, &prepared.data).await,
         _ => Err("unknown episode utility".into()),
@@ -325,6 +334,15 @@ mod tests {
         )
         .await;
         assert!(result.success);
+        let alias = execute(
+            &journal,
+            &Sanitizer,
+            &run,
+            "alias-search",
+            &call("run_history_search", json!({"query":"fixture","limit":2})),
+        )
+        .await;
+        assert_eq!(alias, result);
         assert_eq!(result.output["results"].as_array().unwrap().len(), 2);
         assert!(result.output["scanned"].as_u64().unwrap() <= 16);
         let text = result.output.to_string();
