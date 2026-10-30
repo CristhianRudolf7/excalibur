@@ -1,5 +1,5 @@
 //! Bounded context views over literal durable conversation sources.
-use crate::{Error, Master, Result};
+use crate::{Error, Master, MasterContextRequest, Result};
 use excalibur_context::{CompiledContext, ContextInput, TokenCounter, compile};
 use excalibur_models::{CacheIdentity, CacheStrategy};
 use excalibur_store::ReadLane;
@@ -82,8 +82,64 @@ impl Master {
             input.layers[2].push('\n');
             input.layers[2].push_str(&self.inner.redactor.redact_text(&scope_extra));
         }
+        let host_context = tokio::time::timeout(
+            self.inner.config.fast_tool_timeout,
+            self.inner.actions.session_context(MasterContextRequest {
+                principal: &self.inner.config.principal,
+                conversation,
+                original_scope: &scope,
+                source_message_id: &anchor,
+            }),
+        )
+        .await
+        .map_err(|_| Error::Invalid("master session context timed out".into()))?
+        .map_err(Error::Invalid)?;
+        if !host_context.identity.is_empty() {
+            input.layers[1].push('\n');
+            input.layers[1].push_str(&self.inner.redactor.redact_text(&host_context.identity));
+        }
+        input.suggested_skills = host_context
+            .suggested_skills
+            .into_iter()
+            .take(3)
+            .map(|s| self.inner.redactor.redact_text(&s))
+            .collect();
         input.tools = self.inner.actions.definitions();
         input.activity = messages.to_vec();
+        let principal = self.inner.config.principal.clone();
+        let conversation_owned = conversation.to_owned();
+        let scope_owned = scope.clone();
+        let source_owned = anchor.clone();
+        let updates = host_context
+            .updates
+            .into_iter()
+            .map(|(id, text)| {
+                (
+                    self.inner.redactor.redact_text(&id),
+                    self.inner.redactor.redact_text(&text),
+                )
+            })
+            .collect::<Vec<_>>();
+        let updates = self.inner.db.write(excalibur_store::Priority::Interactive, move |c| {
+            for (id, text) in updates {
+                c.execute("INSERT OR IGNORE INTO master_context_updates(principal,conversation,scope,source,update_id,body) VALUES(?1,?2,?3,?4,?5,?6)",
+                    (&principal,&conversation_owned,&scope_owned,&source_owned,&id,&text))?;
+                let old:String=c.query_row("SELECT body FROM master_context_updates WHERE principal=?1 AND conversation=?2 AND scope=?3 AND source=?4 AND update_id=?5",
+                    (&principal,&conversation_owned,&scope_owned,&source_owned,&id),|r|r.get(0))?;
+                if old != text {return Err(excalibur_store::Error::Invalid("master context update identity reused"));}
+            }
+            let mut query=c.prepare("SELECT sequence,update_id,body FROM master_context_updates WHERE principal=?1 AND conversation=?2 AND scope=?3 AND source=?4 ORDER BY sequence")?;
+            query.query_map((&principal,&conversation_owned,&scope_owned,&source_owned),|r|Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)
+        }).await?;
+        for (sequence, id, text) in updates {
+            input.append_delta(
+                sequence,
+                format!(
+                    "master-context-update:{sequence} [{id}] {}",
+                    self.inner.redactor.redact_text(&text)
+                ),
+            );
+        }
         input.token_budgets = [self.inner.config.prompt_token_budget; 6];
         input.volatile.master_jobs = jobs.to_string();
         input.volatile.budget_status = format!(
@@ -233,4 +289,32 @@ fn compile_bounded(
     }
     compiled.bytes = encoded;
     Ok(compiled)
+}
+
+pub(super) async fn migrate(db: &excalibur_store::Database) -> Result<()> {
+    let schema = include_str!("schema_v5.sql");
+    let checksum = format!("{:x}", Sha256::digest(schema.as_bytes()));
+    db.write(excalibur_store::Priority::Interactive, move |c| {
+        use excalibur_store::rusqlite::OptionalExtension;
+        let old: Option<String> = c
+            .query_row(
+                "SELECT checksum FROM master_schema WHERE version=5",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(old) = old {
+            if old != checksum {
+                return Err(excalibur_store::Error::Invalid(
+                    "master context schema checksum mismatch",
+                ));
+            }
+        } else {
+            c.execute_batch(schema)?;
+            c.execute("INSERT INTO master_schema VALUES(5,?1)", [checksum])?;
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(())
 }

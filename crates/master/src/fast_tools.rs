@@ -52,6 +52,13 @@ impl MasterFastTools {
     }
 }
 impl FastActions for MasterFastTools {
+    fn session_context<'a>(
+        &'a self,
+        request: crate::MasterContextRequest<'a>,
+    ) -> BoxFuture<'a, Result<RunContext, String>> {
+        self.core.session_context(request)
+    }
+
     fn confirm_cancel<'a>(
         &'a self,
         conversation: &'a str,

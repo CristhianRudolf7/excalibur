@@ -26,7 +26,9 @@ pub struct SkillsOptions {
 }
 pub struct SkillsHost {
     pub runtime: Arc<SkillRuntime>,
-    indexes: BTreeMap<String, Arc<SkillIndex>>,
+    pub(crate) indexes: BTreeMap<String, Arc<SkillIndex>>,
+    pub(crate) window: usize,
+    pub(crate) counter: TokenCounter,
     watchers: Mutex<Vec<SkillWatcher>>,
 }
 impl SkillsHost {
@@ -74,7 +76,7 @@ impl SkillsHost {
                 delegate,
                 indexes.clone(),
                 options.model_window.unwrap_or(policy.model_window),
-                counter,
+                counter.clone(),
             )
             .await?
             .with_core_tools(excalibur_engine::builtin_tool_definitions()),
@@ -95,6 +97,8 @@ impl SkillsHost {
         Ok(Arc::new(Self {
             runtime,
             indexes,
+            window: options.model_window.unwrap_or(policy.model_window),
+            counter,
             watchers: Mutex::new(watchers),
         }))
     }

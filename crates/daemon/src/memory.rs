@@ -494,6 +494,13 @@ impl MemoryFastActions {
     }
 }
 impl FastActions for MemoryFastActions {
+    fn session_context<'a>(
+        &'a self,
+        request: excalibur_master::MasterContextRequest<'a>,
+    ) -> BoxFuture<'a, Result<RunContext, String>> {
+        self.inner.session_context(request)
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = self.inner.definitions();
         definitions.retain(|d| !Self::own(&d.name));
