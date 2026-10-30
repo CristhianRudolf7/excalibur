@@ -410,6 +410,10 @@ impl Database {
             ReaderActivity(self.inner.readers.active.clone()),
         ))
     }
+    /// Physical database role; domain services reject unrelated database schemas.
+    pub fn kind(&self) -> DatabaseKind {
+        self.inner.kind
+    }
     pub fn path(&self) -> &Path {
         &self.inner.path
     }
