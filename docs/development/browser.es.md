@@ -787,10 +787,14 @@ como HTML ya esperado (contexto efímero más `observe.wait_ready` más
 `DOM.getOuterHTML`), así el servicio sigue determinista sin Chrome real.
 
 La validación acepta solo `http`/`https` sin userinfo y como máximo 2.048
-caracteres; los fragmentos se quitan para la identidad de caché. `fetch_http`
-usa plazos explícitos de 10 s de conexión y 30 s totales, como máximo cinco
-redirecciones con rechazo de bajada de HTTPS a HTTP, tope de cuerpo de 10 MiB
-y lista de tipos text/HTML/XML/feeds/JSON. `extract::extract_document`
+caracteres; los fragmentos se quitan para la identidad de caché. `fetch_http` (valor seguro por defecto) usa plazos explícitos de 10 s de
+conexión y 30 s totales, sigue como máximo cinco redirecciones de forma
+manual con revalidación por salto (loopback/rangos privados/IP de metadatos/
+sufijos sensibles) más rechazo de bajada HTTPS, consume el cuerpo por trozos
+con contador y aborta pasados 10 MiB (`body_too_large`), no guarda ni reenvía
+cookies (sin jar; `FetchPolicy::isolate_cookies`) y aplica la lista de tipos
+texto/HTML/XML/feed/JSON. `FetchPolicy::test_loopback` admite literales
+loopback solo para fixtures sintéticas locales. `extract::extract_document`
 produce título, Markdown y fragmentos `pN` con desplazamientos en bytes UTF-8
 y rutas de encabezados tras quitar bloques `script`, `style`, `nav`, `footer`
 y `aside`, con enlaces en línea como texto. La heurística HTTP-primero escala
@@ -805,15 +809,17 @@ La captura exige una espera `ready` vigente para la época de la pestaña
 `wait_required` o `wait_stale_epoch` antes de tocar el DOM. Las esperas no
 estrictas permiten degradaciones `network_busy` y `network_unobserved`; el
 modo estricto las convierte en `timeout`, como el contrato long-poll. Los
-resultados llevan `title`, Markdown en línea hasta 50 KiB con `truncated`,
+resultados llevan `title`, Markdown en línea hasta 50 KiB recortado en la frontera UTF-8 anterior con `truncated`,
 longitud total, `content_hash` (`sha256:`), `source_id` (`w_<16 hex>`), fecha,
 estado HTTP, `render` (`http`/`browser`), etiqueta del extractor y metadatos
 de fragmentos con `untrusted: true`. `slice_fragments` sirve rangos `pN` o
 `pA-pB` desde el Markdown completo por hash. La caché en memoria conserva 24 h
 con bypass `fresh` que preserva la fecha original.
 
-`cite::locate` busca primero la cita exacta y luego con normalización de
-espacios y mayúsculas, devolviendo desplazamientos y fragmento. `cite` crea
+`cite::locate` antepone la coincidencia exacta y, si no, usa búsqueda
+normalizada (espacios/mayúsculas) mapeada al tramo exacto de bytes originales
+que cubre las palabras (alineado a frontera de carácter); normalizar el tramo
+reproduce la cita normalizada. `cite` crea
 registros `Citation` (`source_id`, URL, título, fragmento, desplazamientos,
 enlace `#:~:text=`, fecha, hash) y `format_citation` los muestra sin inventar
 páginas. `webd::read::Service` guarda páginas por hash para fragmentos y
@@ -824,8 +830,12 @@ Ejecuta `cargo test -p excalibur-browser --test read_cite -- --nocapture`,
 `cargo test -p excalibur-webd --lib read`. Cubren extracción estática y
 desplazamientos, SPA con espera antes de capturar y render inyectado,
 long-poll degradado frente a timeout estricto, citas exactas/normalizadas/
-ausentes, corte de fragmentos con tope de 50 KiB, decisiones HTTP-primero,
-caché loopback local y caducidad TTL. Quedan pendientes el cableado del
-broker, los extractores de producción `dom_smoothie`/`htmd`, PDF/feeds/
-juegos de caracteres, encolado al índice por `robots.txt`, render vivo con
-contexto efímero y registro de métodos RPC.
+ausentes, corte de fragmentos con tope de 50 KiB en frontera de carácter,
+rechazo por trozos tras 50 MiB, decisiones HTTP-primero, caché loopback local
+y caducidad TTL, más las filas 14.4 del lado navegador (rechazo de
+loopback/privadas/metadatos, rechazo de redirección a privada, detección de
+bajada, robots permitir/denegar, gancho de índice meta-noindex, no reenvío de
+cookies). Quedan pendientes la salida completa por broker (resolución DNS,
+obtención/caché de `robots.txt`, encolado real al índice, registro de
+visor/RPC), los extractores de producción `dom_smoothie`/`htmd`, PDF/feeds/
+juegos de caracteres y render efímero real con contexto efímero (carril B9).

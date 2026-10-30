@@ -743,10 +743,15 @@ HTML (ephemeral context plus `observe.wait_ready` plus `DOM.getOuterHTML`),
 so the service stays deterministic without real Chrome.
 
 URL validation accepts only `http`/`https` without userinfo and at most
-2,048 characters; fragments are stripped for cache identity. `fetch_http`
-uses explicit 10 s connect and 30 s total timeouts, at most five redirects
-with an HTTPS downgrade refusal, a 10 MiB body cap and an allowlist of
-text/HTML/XML/feed/JSON content types. `extract::extract_document` produces
+2,048 characters; fragments are stripped for cache identity. `fetch_http` (secure default) uses explicit 10 s connect and 30 s total
+timeouts, follows at most five redirects manually with per-hop
+loopback/private-range/metadata-IP/sensitive-suffix re-validation plus an
+HTTPS downgrade refusal, consumes the body in chunks with a running counter
+aborting past 10 MiB (`body_too_large`), stores and replays no cookies (no
+jar; `FetchPolicy::isolate_cookies`), and enforces an allowlist of
+text/HTML/XML/feed/JSON content types. `FetchPolicy::test_loopback` admits
+loopback literals for local synthetic fixtures while keeping every other
+guard. `extract::extract_document` produces
 title, Markdown and `pN` fragments with UTF-8 byte offsets and heading paths
 after removing `script`, `style`, `nav`, `footer` and `aside` blocks, with
 inline links kept as text. The HTTP-first heuristic escalates to the browser
@@ -761,7 +766,7 @@ rule 7.4-1): non-ready or stale epochs return `wait_required` or
 `wait_stale_epoch` before any DOM is touched. Non-strict waits allow
 `network_busy` and `network_unobserved` degradations; strict network mode
 turns them into `timeout`, matching the long-poll contract. Results carry
-`title`, inline Markdown up to 50 KiB with `truncated`, full length,
+`title`, inline Markdown up to 50 KiB floored to the preceding UTF-8 char boundary with `truncated`, full length,
 `content_hash` (`sha256:`), `source_id` (`w_<16 hex>`), fetch time, HTTP
 status, `render` (`http`/`browser`), extractor label and fragment metadata
 with `untrusted: true`. `slice_fragments` serves `pN` or `pA-pB` ranges from
@@ -769,7 +774,9 @@ the stored full Markdown by hash. The in-memory cache keeps entries for 24 h
 with a `fresh` bypass preserving the original fetch date.
 
 `cite::locate` finds exact quotes first and falls back to whitespace- and
-case-normalized matching, returning byte offsets and the covering fragment.
+case-normalized matching, mapping the normalized hit back to the exact raw
+byte span covering the matched words (char-boundary aligned); normalizing the
+covered slice reproduces the normalized quote.
 `cite` builds `Citation` records (`source_id`, URL, title, fragment, offsets,
 `#:~:text=` link, fetch time, hash) and `format_citation` renders them
 without inventing page numbers. `webd::read::Service` stores pages by
@@ -779,8 +786,12 @@ Run `cargo test -p excalibur-browser --test read_cite -- --nocapture`,
 `cargo test -p excalibur-browser --lib` and
 `cargo test -p excalibur-webd --lib read`. These cover static extraction and
 fragment offsets, SPA wait-before-capture with injected render, long-poll
-degraded versus strict timeout, exact/normalized/missing quotes, fragment
-slicing with the 50 KiB cap, HTTP-first decisions, the local-loopback cache
-and TTL expiry. Broker fetch wiring, the `dom_smoothie`/`htmd` production
-extractors, PDF/feed/charset handling, `robots.txt` index enqueue, live
-ephemeral-context rendering and RPC method registration stay pending.
+degraded versus strict timeout, exact/normalized/missing quotes, fragment slicing with the char-boundary 50 KiB cap, the 50 MiB chunked-cap
+rejection, HTTP-first decisions, the local-loopback cache and TTL expiry,
+plus the browser-side 14.4 rows (loopback/private/metadata refusal,
+redirect-to-private refusal, downgrade detection, robots allow/deny,
+meta-noindex index hook, cookie non-replay). Full broker egress (DNS-bound
+host binding, `robots.txt` retrieval/caching, actual index-queue insertion,
+served-viewer/RPC registration), the `dom_smoothie`/`htmd` production
+extractors, PDF/feed/charset handling, live ephemeral-context rendering and
+RPC method registration stay pending (B9 broker lane).
