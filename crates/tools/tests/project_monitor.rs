@@ -462,3 +462,89 @@ async fn shared_exec_changes_retain_unverified_provenance() {
     drop(tools);
     db.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn legacy_pending_provenance_is_scoped_and_neutral_notice_replays_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("source.rs"), "current").unwrap();
+    let db = Database::open(
+        temp.path().join("main.db"),
+        DatabaseKind::Main,
+        StorageConfig::default(),
+    )
+    .unwrap();
+    let journal = excalibur_journal::Journal::new(db.clone()).await.unwrap();
+    let run = journal
+        .create_run("legacy-monitor", json!({"synthetic":true}))
+        .await
+        .unwrap();
+    let tools = LocalTools::new(db.clone(), root.clone(), ToolPolicy::default())
+        .await
+        .unwrap();
+    let initial = ProjectMonitor::start(tools.clone(), None, vec![])
+        .await
+        .unwrap();
+    initial.stop().await;
+    drop(initial);
+    let project = root.to_string_lossy().into_owned();
+    let path = root.join("source.rs").to_string_lossy().into_owned();
+    let owner = run.clone();
+    let ids = db.write(Priority::Journal, move |c| {
+        let hash:String=c.query_row("SELECT hash FROM project_observations WHERE project=?1 AND path='source.rs'",[&project],|r|r.get(0))?;
+        let mut ids=Vec::new();
+        for (scope,state) in [(&project,"pending"),(&"another-project".to_owned(),"pending"),(&project,"processed")] {
+            c.execute("INSERT INTO project_changes(project,path,previous_hash,current_hash,external,state) VALUES(?1,'source.rs','legacy',?2,0,?3)",excalibur_store::rusqlite::params![scope,hash,state])?;
+            ids.push(c.last_insert_rowid());
+        }
+        c.execute("INSERT INTO leases(path,holder_id,expires_at) VALUES(?1,?2,unixepoch()+600)",excalibur_store::rusqlite::params![path,owner])?;
+        Ok(ids)
+    }).await.unwrap();
+    let seen = Arc::new(Observed(Mutex::new(vec![])));
+    for _ in 0..2 {
+        let monitor = ProjectMonitor::start(tools.clone(), Some(seen.clone()), vec![])
+            .await
+            .unwrap();
+        monitor.scan_now().await.unwrap();
+        monitor.stop().await;
+    }
+    let rows = db
+        .read(ReadLane::Interactive, move |c| {
+            ids.into_iter()
+                .map(|id| {
+                    c.query_row(
+                        "SELECT external,state FROM project_changes WHERE id=?1",
+                        [id],
+                        |r| Ok((r.get::<_, bool>(0)?, r.get::<_, String>(1)?)),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (true, "processed".into()),
+            (false, "pending".into()),
+            (false, "processed".into())
+        ]
+    );
+    let observed = seen.0.lock().unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].0.origin, ChangeOrigin::Unattributed);
+    drop(observed);
+    let entries = journal.entries(&run, 0, 100).await.unwrap();
+    let notices = entries
+        .iter()
+        .filter(|e| e.kind == "directive_received")
+        .collect::<Vec<_>>();
+    assert_eq!(notices.len(), 1, "{entries:?}");
+    let text = notices[0].payload["text"].as_str().unwrap();
+    assert!(text.contains("unverified writer provenance"), "{text}");
+    assert!(!text.contains("outside Excalibur"));
+    drop(tools);
+    db.shutdown().await.unwrap();
+}
