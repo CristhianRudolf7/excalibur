@@ -107,6 +107,7 @@ struct Session {
     input: Mutex<Option<Box<dyn Write + Send>>>,
     notify: Notify,
     termination_requested: AtomicBool,
+    signals_closed: Mutex<bool>,
     monitor: Mutex<Option<std::thread::JoinHandle<()>>>,
     #[cfg(windows)]
     job: WindowsJob,
@@ -125,7 +126,6 @@ struct Output {
     tail: VecDeque<u8>,
     total: u64,
     exited: bool,
-    process_finished: bool,
     exit_code: Option<i32>,
     timed_out: bool,
     termination_reason: Option<TerminationReason>,
@@ -138,11 +138,12 @@ struct Output {
 // best-effort durability barrier returns.
 fn finish_output(
     output: &Mutex<Output>,
+    signals_closed: &Mutex<bool>,
     code: Option<i32>,
     timed_out: bool,
     synchronize: impl FnOnce(),
 ) {
-    output.lock().unwrap().process_finished = true;
+    *signals_closed.lock().unwrap() = true;
     synchronize();
     let mut output = output.lock().unwrap();
     output.exited = true;
@@ -1010,7 +1011,6 @@ impl TerminalManager {
                         tail: VecDeque::new(),
                         total: 0,
                         exited: false,
-                        process_finished: false,
                         exit_code: None,
                         timed_out: false,
                         termination_reason: None,
@@ -1020,6 +1020,7 @@ impl TerminalManager {
                     input: Mutex::new(Some(launched.input)),
                     notify: Notify::new(),
                     termination_requested: AtomicBool::new(false),
+                    signals_closed: Mutex::new(false),
                     monitor: Mutex::new(None),
                     #[cfg(windows)]
                     job: launched.job,
@@ -1089,7 +1090,7 @@ impl TerminalManager {
                             Err(e) => {
                                 let mut output = observed.output.lock().unwrap();
                                 if output.termination_reason.is_none() {
-                                    output.error = Some(e.to_string());
+                                    self.output.lock().unwrap().error = Some(e.to_string());
                                 }
                                 break None;
                             }
@@ -1112,9 +1113,15 @@ impl TerminalManager {
                     drop(launched.guardian);
                     #[cfg(target_os = "linux")]
                     drop(launched.sandbox);
-                    finish_output(&observed.output, code, timed_out, || {
-                        let _ = sync_file.sync_all();
-                    });
+                    finish_output(
+                        &observed.output,
+                        &observed.signals_closed,
+                        code,
+                        timed_out,
+                        || {
+                            let _ = sync_file.sync_all();
+                        },
+                    );
                     observed.notify.notify_waiters();
                 }
 
@@ -1254,15 +1261,15 @@ impl Drop for KillOnDrop {
 }
 // Keep eligibility and the actual dispatch in one critical section so finalization
 // cannot close the process group between a status check and the signal syscall.
-fn signal_if_running(output: &Mutex<Output>, dispatch: impl FnOnce(&mut Output)) {
-    let mut output = output.lock().unwrap();
-    if !output.process_finished && !output.exited {
-        dispatch(&mut output);
+fn signal_if_running(signals_closed: &Mutex<bool>, dispatch: impl FnOnce()) {
+    let closed = signals_closed.lock().unwrap();
+    if !*closed {
+        dispatch();
     }
 }
 impl Session {
     fn signal(&self, signal: Signal) {
-        signal_if_running(&self.output, |output| {
+        signal_if_running(&self.signals_closed, || {
             #[cfg(unix)]
             unsafe {
                 let sig = match signal {
@@ -1288,7 +1295,7 @@ impl Session {
                                     CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent,
                                 };
                                 if GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.pid) == 0 {
-                                    output.error =
+                                    self.output.lock().unwrap().error =
                                         Some(std::io::Error::last_os_error().to_string());
                                 }
                             }
@@ -1296,8 +1303,6 @@ impl Session {
                     }
                 }
             }
-            // The argument is used by the Windows error path only.
-            let _ = output;
         });
     }
 }
@@ -2190,7 +2195,6 @@ mod exit_publication_tests {
             tail: VecDeque::new(),
             total: 0,
             exited: false,
-            process_finished: false,
             exit_code: None,
             timed_out: false,
             termination_reason: None,
@@ -2199,9 +2203,19 @@ mod exit_publication_tests {
         }));
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let signals_closed = Arc::new(Mutex::new(false));
+        // Dispatch may block on terminal input on Windows. Its gate must be
+        // independent from the state mutex used by output readers and status.
+        let mut dispatched = false;
+        signal_if_running(&signals_closed, || {
+            dispatched = true;
+            assert!(output.try_lock().is_ok());
+        });
+        assert!(dispatched);
+        let observed_signals = signals_closed.clone();
         let observed = output.clone();
         let monitor = std::thread::spawn(move || {
-            finish_output(&observed, Some(23), true, || {
+            finish_output(&observed, &observed_signals, Some(23), true, || {
                 started_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             });
@@ -2213,12 +2227,11 @@ mod exit_publication_tests {
             let state = output
                 .try_lock()
                 .expect("spool sync must release status mutex");
-            assert!(state.process_finished);
             assert!(!state.exited);
             assert_eq!(state.exit_code, None);
             assert!(!state.timed_out);
         }
-        signal_if_running(&output, |_| {
+        signal_if_running(&signals_closed, || {
             panic!("a finished process must not receive signals during spool sync")
         });
         tokio::time::sleep(Duration::from_secs(1)).await;
