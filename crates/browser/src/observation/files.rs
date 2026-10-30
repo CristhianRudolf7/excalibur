@@ -321,6 +321,10 @@ impl Manager {
         }
     }
 }
+/// Content sniffing shared with the `file_control` gate: PDF, PNG, JPEG,
+/// ZIP (`PK\x03\x04`) and UTF-8 text, otherwise opaque bytes.
+/// `file_control::content_type` remains the enforcing admission check for
+/// downloads; this mirror only labels the intermediate webd blob.
 fn magic(bytes: &[u8]) -> &'static str {
     if bytes.starts_with(b"%PDF-") {
         "application/pdf"
@@ -328,6 +332,8 @@ fn magic(bytes: &[u8]) -> &'static str {
         "image/png"
     } else if bytes.starts_with(b"\xff\xd8\xff") {
         "image/jpeg"
+    } else if bytes.starts_with(b"PK\x03\x04") {
+        "application/zip"
     } else if std::str::from_utf8(bytes).is_ok() {
         "text/plain"
     } else {
@@ -398,6 +404,7 @@ mod tests {
     fn types_come_from_content() {
         assert_eq!(magic(b"%PDF-1.4"), "application/pdf");
         assert_eq!(magic(b"\x89PNG\r\n\x1a\nrest"), "image/png");
+        assert_eq!(magic(b"PK\x03\x04rest"), "application/zip");
         assert_eq!(magic(&[0xff, 0xfe, 0x00, 0x80]), "application/octet-stream");
     }
 }

@@ -160,7 +160,20 @@ impl WebAdapter {
                 };
                 let mut fill = check;
                 fill["value"] = json!(text);
-                match runtime.block_on(backend.request("act.fill_secret", fill)) {
+                // Clone for the transport so the adapter copy can be zeroized
+                // explicitly after the request (matches actions/rpc practice).
+                // The transport also erases its own params copy.
+                let outcome = runtime.block_on(backend.request("act.fill_secret", fill.clone()));
+                {
+                    use zeroize::Zeroize;
+                    if let Value::String(s) = &mut fill["value"] {
+                        s.zeroize();
+                    }
+                    if let Some(map) = fill.as_object_mut() {
+                        map.remove("value");
+                    }
+                }
+                match outcome {
                     Ok(_) => ToolResult::ok(json!({"filled":true})),
                     Err(_) => ToolResult::error(
                         "credential target changed or receipt unavailable; reconcile",
