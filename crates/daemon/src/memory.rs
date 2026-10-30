@@ -11,7 +11,7 @@ use excalibur_memory::{
 use excalibur_models::ModelGateway;
 use excalibur_orchestrator::{Agent, Delegation, Orchestrator};
 use excalibur_store::{ReadLane, rusqlite::OptionalExtension};
-use excalibur_types::runtime::{BoxFuture, ToolDefinition, ToolRuntime};
+use excalibur_types::runtime::{BoxFuture, RunContext, ToolDefinition, ToolRuntime};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
