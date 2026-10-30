@@ -975,6 +975,7 @@ dependencies = [
  "excalibur-gateway",
  "excalibur-journal",
  "excalibur-master",
+ "excalibur-memory",
  "excalibur-models",
  "excalibur-orchestrator",
  "excalibur-providers",
@@ -1056,6 +1057,7 @@ dependencies = [
  "excalibur-engine",
  "excalibur-journal",
  "excalibur-master",
+ "excalibur-memory",
  "excalibur-models",
  "excalibur-orchestrator",
  "excalibur-security",
@@ -1113,6 +1115,27 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+]
+
+[[package]]
+name = "excalibur-memory"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "excalibur-models",
+ "excalibur-providers",
+ "excalibur-store",
+ "excalibur-types",
+ "excalibur-vault",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "ulid",
 ]
 
 [[package]]

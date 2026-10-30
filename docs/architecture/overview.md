@@ -26,4 +26,6 @@ Context compilation, durable sessions and provider caches are described in [Cont
 
 Project-domain tools and editing isolation are implemented in the shared libraries; see [Project tools and editing concurrency](../development/project-tools.md).
 
+Scoped memory, retrieval, consolidation and the document library are a shared library not yet connected to the master; see [Memory and documents](../development/memory.md).
+
 Daemon hosting, authenticated client transport, conversational turns and agent trees: [contract](../development/daemon.md).

@@ -1276,3 +1276,45 @@ async fn runpod_serverless_actions_keep_native_job_results() {
         );
     }
 }
+
+#[tokio::test]
+async fn openai_embeddings_send_dimensions_and_restore_input_order() {
+    let (url, task) = mock(
+        "200 OK",
+        r#"{"data":[{"index":1,"embedding":[0.0,1.0]},{"index":0,"embedding":[1.0,0.0]}],"model":"text-embedding-3-small"}"#,
+    )
+    .await;
+    let vectors = client(Provider::OpenAi, &url)
+        .embeddings(
+            "text-embedding-3-small",
+            &["first".to_string(), "second".to_string()],
+            Some(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(vectors, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+    let sent = task.await.unwrap();
+    assert!(sent.starts_with("POST /v1/embeddings "));
+    assert!(sent.contains("\"dimensions\":2"));
+    assert!(sent.contains("\"model\":\"text-embedding-3-small\""));
+    assert!(
+        sent.to_lowercase()
+            .contains("authorization: bearer test-secret")
+    );
+}
+
+#[tokio::test]
+async fn embeddings_reject_mismatched_responses_and_unsupported_providers() {
+    let (url, task) = mock("200 OK", r#"{"data":[{"index":0,"embedding":[1.0]}]}"#).await;
+    let error = client(Provider::OpenAi, &url)
+        .embeddings("m", &["a".to_string(), "b".to_string()], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidResponse));
+    task.await.unwrap();
+    let unsupported = client(Provider::Anthropic, "http://127.0.0.1:9/v1/")
+        .embeddings("m", &["a".to_string()], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(unsupported, Error::Unsupported));
+}

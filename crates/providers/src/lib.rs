@@ -615,6 +615,69 @@ impl ProviderClient {
             _ => Err(Error::Unsupported),
         }
     }
+    /// OpenAI-compatible `/embeddings`: one float vector per input, in input order.
+    /// `dimensions` asks models that support it (such as `text-embedding-3-small`) for
+    /// shortened vectors.
+    pub async fn embeddings(
+        &self,
+        model: &str,
+        inputs: &[String],
+        dimensions: Option<u32>,
+    ) -> Result<Vec<Vec<f32>>, Error> {
+        if !matches!(
+            self.provider,
+            Provider::OpenAi
+                | Provider::Mistral
+                | Provider::Together
+                | Provider::DeepInfra
+                | Provider::Fireworks
+                | Provider::Ollama
+        ) {
+            return Err(Error::Unsupported);
+        }
+        if model.trim().is_empty()
+            || inputs.is_empty()
+            || inputs.len() > 2048
+            || inputs.iter().any(|i| i.trim().is_empty())
+            || dimensions == Some(0)
+        {
+            return Err(Error::Configuration(
+                "model, 1 to 2048 non-empty inputs and positive dimensions required",
+            ));
+        }
+        let mut body = json!({"model": model, "input": inputs, "encoding_format": "float"});
+        if let Some(dimensions) = dimensions {
+            body["dimensions"] = json!(dimensions);
+        }
+        let value = self.send(Method::POST, "embeddings", Some(body)).await?;
+        let data = value["data"].as_array().ok_or(Error::InvalidResponse)?;
+        if data.len() != inputs.len() {
+            return Err(Error::InvalidResponse);
+        }
+        let mut out: Vec<Option<Vec<f32>>> = vec![None; inputs.len()];
+        for (position, item) in data.iter().enumerate() {
+            let index = item["index"]
+                .as_u64()
+                .map(|i| i as usize)
+                .unwrap_or(position);
+            let vector = item["embedding"]
+                .as_array()
+                .ok_or(Error::InvalidResponse)?
+                .iter()
+                .map(|v| v.as_f64().map(|v| v as f32).ok_or(Error::InvalidResponse))
+                .collect::<Result<Vec<f32>, Error>>()?;
+            if vector.is_empty()
+                || vector.iter().any(|v| !v.is_finite())
+                || out.get(index).is_none_or(Option::is_some)
+            {
+                return Err(Error::InvalidResponse);
+            }
+            out[index] = Some(vector);
+        }
+        out.into_iter()
+            .map(|v| v.ok_or(Error::InvalidResponse))
+            .collect()
+    }
     /// Send a provider-native request including tool definitions and tool-result history.
     /// The caller owns schema compatibility and replays the complete returned messages.
     pub async fn native_chat(&self, model: &str, mut body: Value) -> Result<Value, Error> {

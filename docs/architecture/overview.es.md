@@ -26,4 +26,6 @@ La compilación de contexto, las sesiones durables y la caché de proveedores se
 
 Las herramientas de proyecto y el aislamiento de edición se implementan en bibliotecas compartidas; consulta [Herramientas de proyecto y concurrencia de edición](../development/project-tools.es.md).
 
+La memoria por ámbitos, la recuperación, la consolidación y la biblioteca de documentos son una biblioteca compartida aún no conectada al maestro; consulta [Memoria y documentos](../development/memory.es.md).
+
 El daemon, la puerta autenticada, los turnos conversacionales y los árboles de agentes: [contrato](../development/daemon.es.md).

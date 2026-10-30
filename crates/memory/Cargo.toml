@@ -1,0 +1,24 @@
+[package]
+name = "excalibur-memory"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+excalibur-store = { path = "../store" }
+excalibur-providers = { path = "../providers" }
+excalibur-models = { path = "../models" }
+excalibur-vault = { path = "../vault" }
+excalibur-types = { path = "../types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+ulid = "1"
+chrono = "0.4"
+chrono-tz = "0.10"
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

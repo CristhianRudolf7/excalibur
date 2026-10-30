@@ -170,6 +170,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         .transpose()?;
     let work = runtimes.work();
     let mut hosting = HostOptions::project(options.root);
+    hosting.memory = Some(crate::MemoryOptions::default());
     hosting.context_runtime = Some(runtimes.cpu_handle());
     hosting.cgroup_root = options.cgroup_root;
     let host = runtimes.block_on(DaemonHost::open(

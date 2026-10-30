@@ -1011,3 +1011,107 @@ async fn a_new_user_pause_wins_over_an_in_flight_system_approval_response() {
     fixture.master.shutdown().await;
     fixture.db.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn memory_rpc_uses_shared_store_and_rejects_unknown_scopes() {
+    use excalibur_gateway::MemoryAccess;
+    use excalibur_memory::{BindingRole, MemoryBinding, MemoryStore};
+    let (_temp, db, master, orchestrator, backend) = fixture().await;
+    let store = MemoryStore::open(db.clone()).await.unwrap();
+    let backend = backend.with_memory(MemoryAccess {
+        store: store.clone(),
+        principal: "local".into(),
+        timezone: excalibur_memory::chrono_tz::UTC,
+    });
+    let written = backend.dispatch("memory.write",json!({"scope":"general","action":"add","kind":"preference","statement":"Prefers dark mode"})).await.unwrap();
+    let id = written["memory_id"].as_str().unwrap();
+    let record = backend
+        .dispatch("memory.get", json!({"scope":"general","id":id}))
+        .await
+        .unwrap();
+    assert_eq!(record["memory"]["statement"], "Prefers dark mode");
+    assert_eq!(record["memory"]["trust"], "user");
+    assert!(
+        backend
+            .dispatch(
+                "memory.search",
+                json!({"scope":"project:unknown","query":"dark"})
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        backend
+            .dispatch("memory.purge", json!({"id":id}))
+            .await
+            .is_err()
+    );
+    let doc = backend
+        .dispatch(
+            "memory.library_ingest",
+            json!({"scope":"general","title":"Reactor","text":"Molten salt cools the reactor."}),
+        )
+        .await
+        .unwrap();
+    let found = backend
+        .dispatch(
+            "memory.library_search",
+            json!({"scope":"general","query":"reactor salt"}),
+        )
+        .await
+        .unwrap();
+    // Reading from the client is not a retrieval by the responding master task tree.
+    let answer = format!("Salt [[doc:{}#c1]].", doc["document_id"].as_str().unwrap());
+    let unchecked = backend
+        .dispatch(
+            "memory.citations",
+            json!({"scope":"general","conversation":"chat","text":answer}),
+        )
+        .await
+        .unwrap();
+    assert!(unchecked["text"].as_str().unwrap().contains("[unsourced]"));
+    store
+        .bind_run(
+            &MemoryBinding {
+                run: "master:chat:general".into(),
+                principal: "local".into(),
+                scopes: ["general".to_string()].into(),
+                primary_scope: "general".into(),
+                conversation: Some("chat".into()),
+                task: None,
+                parent_run: None,
+                role: BindingRole::Master,
+                timezone: excalibur_memory::chrono_tz::UTC,
+            },
+            100,
+        )
+        .await
+        .unwrap();
+    let grant =
+        excalibur_memory::MemoryGrant::new("local", ["general"]).with_run("master:chat:general");
+    store
+        .library_search(&grant, "reactor salt", 1, 100)
+        .await
+        .unwrap();
+    let checked = backend
+        .dispatch(
+            "memory.citations",
+            json!({"scope":"general","conversation":"chat","text":answer}),
+        )
+        .await
+        .unwrap();
+    assert!(checked["text"].as_str().unwrap().contains("Reactor"));
+    assert!(!found["chunks"].as_array().unwrap().is_empty());
+    backend
+        .dispatch("memory.purge", json!({"id":id,"confirmed":true}))
+        .await
+        .unwrap();
+    assert!(
+        backend
+            .dispatch("memory.get", json!({"id":id}))
+            .await
+            .is_err()
+    );
+    master.shutdown().await;
+    orchestrator.shutdown().await.unwrap();
+}

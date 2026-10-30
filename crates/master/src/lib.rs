@@ -119,6 +119,33 @@ pub trait FastActions: Send + Sync {
     ) -> BoxFuture<'a, std::result::Result<Value, String>> {
         Box::pin(async { Ok(json!({})) })
     }
+    /// Stable host blocks for the conversation scope: an identity addition for L1 and a
+    /// scope addition for L2. They must only change when the underlying records change.
+    fn stable_context<'a>(
+        &'a self,
+        _conversation: &'a str,
+        _scope: &'a str,
+    ) -> BoxFuture<'a, (String, String)> {
+        Box::pin(async { (String::new(), String::new()) })
+    }
+    /// Last host check on a final answer before it is stored and published (for example
+    /// citation validation). Implementations return the text to send.
+    /// The immutable scope of the source turn, even if the active conversation changed.
+    fn finalize_response_scoped<'a>(
+        &'a self,
+        conversation: &'a str,
+        _scope: &'a str,
+        text: &'a str,
+    ) -> BoxFuture<'a, String> {
+        self.finalize_response(conversation, text)
+    }
+    fn finalize_response<'a>(
+        &'a self,
+        _conversation: &'a str,
+        text: &'a str,
+    ) -> BoxFuture<'a, String> {
+        Box::pin(async move { text.to_owned() })
+    }
 }
 pub struct NoActions;
 impl FastActions for NoActions {
@@ -879,8 +906,28 @@ impl Master {
         Ok(())
     }
     async fn respond(&self, conversation: &str, text: &str, ids: &[String]) -> Result<()> {
+        let source = ids
+            .first()
+            .ok_or_else(|| Error::Invalid("response has no source turn".into()))?
+            .clone();
+        let scope: String = self
+            .inner
+            .db
+            .read(ReadLane::Interactive, move |c| {
+                Ok(c.query_row(
+                    "SELECT COALESCE(scope_id,'general') FROM messages WHERE id=?1",
+                    [&source],
+                    |r| r.get(0),
+                )?)
+            })
+            .await?;
+        let text = self
+            .inner
+            .actions
+            .finalize_response_scoped(conversation, &scope, text)
+            .await;
         let conversation = conversation.to_string();
-        let text = self.inner.redactor.redact_text(text);
+        let text = self.inner.redactor.redact_text(&text);
         let id = MessageId::new().to_string();
         let ids = ids.to_vec();
         let principal = self.inner.config.principal.clone();
