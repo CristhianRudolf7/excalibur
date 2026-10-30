@@ -50,15 +50,15 @@ manifiesto raíz.
 ## Cableado en webd (B6)
 
 `excalibur-webd` aplica el fundamento mediante
-`webd::resources::ResourceGate` (arquitectura 13.2-13.5): admisión con la
+`webd::resources::ResourceGate` (arquitectura 13.2-13.6): admisión con la
 media móvil por origen bajo el presupuesto blando de la puerta, plan de
 desalojo 1-7 con protección LIVE, puertas de reserva de disco, limpieza con
 disco bajo que respeta los orígenes en escucha y campos de telemetría.
-`serve` retiene la puerta y rechaza crecer en disco en los directorios de
+`serve` retiene la puerta, rechaza crecer en disco en los directorios de
 datos y ejecución al arrancar cuando el libre rompería la reserva
-configurada, con telemetría de arranque/cierre; la admisión de memoria por
-operación queda pendiente del carril principal (serve no media la creación
-de pestañas). `AdmissionRequest::with_estimator` rellena la estimación desde
+configurada, admite la operación de arranque contra lecturas vivas de
+memoria/PSI/disco (`admit_live`) y pliega muestras vivas en la telemetría de
+arranque/cierre. `AdmissionRequest::with_estimator` rellena la estimación desde
 el estimador del núcleo y toma el presupuesto blando explícito de la puerta
 para no fijar valores en webd y no ignorar ningún campo en silencio. La
 espera informa `capacity_exceeded` solo tras expirar los 120 s de desalojo. El crate no trae marcador `[workspace]` y se resuelve como
@@ -70,15 +70,18 @@ cargo test -p excalibur-webd --test resources_gates -- --nocapture
 cargo test -p excalibur-webd --test resources_measure -- --nocapture
 ```
 
-`resources_gates` cubre solo el subconjunto de decisión de la arquitectura
-13.6 con fixtures sintéticas: constantes, puertas de admisión con media
-móvil, orden de desalojo 1-7 con protección LIVE, puertas de disco,
-`listener_cannot_suspend` y picos de telemetría. El cierre completo de 13.6
-queda ABIERTO para el carril principal (cgroup real con `memory.high`,
-llenado con pestañas pesadas y continuidad LIVE, espera real hasta
-`capacity_exceeded`, suspensión por la vía de sesión, LIVE con más de 1 GiB
-y `logged_in`, puerta con sistema de archivos pequeño, microbench de coste;
-nunca afirmados).
+`resources_gates` cierra la arquitectura 13.6: constantes, puertas de
+admisión con media móvil, orden de desalojo 1-7 con protección LIVE, puertas
+de disco, `listener_cannot_suspend` y picos de telemetría, más las filas
+vivas — cgroup real nivel A con `memory.high` escriturable probado solo en
+lectura (forzado aislado en fixtures sintéticas), subida no privilegiada de
+`oom_score_adj` en proceso hijo, llenado con pestañas pesadas y continuidad
+del temporizador LIVE en Chrome real (conjuntos reducidos con la misma orden
+13.3), espera real de 120 s hasta `capacity_exceeded` con desglose,
+suspensión por la vía de sesión, LIVE con más de 1 GiB y `logged_in`
+preservado, puerta con sistema de archivos pequeño (`statvfs` real más
+comprobaciones sintéticas), microbench de coste y admisión viva por operación
+en la ruta serve.
 
 ## Mediciones (18.3)
 
@@ -97,11 +100,12 @@ afirman aquí.
 
 ## Aún pendiente
 
-La gestión del scope del cgroup, la supervisión real de Chrome, las señales
-de presión del intermediario, las llamadas CDP de GC/presión/caché, los
-recorridos de perfiles con `Storage.getUsageAndQuota`, las mediciones en la
-VPS y la aceptación completa de B6 pertenecen al carril principal. Una
+Las señales de presión del intermediario, las llamadas CDP de
+GC/presión/caché, los recorridos de perfiles con
+`Storage.getUsageAndQuota`, las mediciones en la VPS y la aceptación completa
+de B6 más allá de las filas cerradas pertenecen al carril principal. Una
 decisión de recursos sigue siendo una entrada de admisión y desalojo: solo
-el servicio cableado la aplica, con `serve` exigiendo hoy las puertas de
-reserva de disco que le son propias y la admisión de memoria por operación
-pendiente.
+el servicio cableado la aplica, con `serve` exigiendo las puertas de reserva
+de disco que le son propias más la admisión viva por operación al arrancar.
+Las cifras de sesión de WhatsApp/Teams de 1 h/24 h (18.4) siguen pendientes
+del usuario y nunca se afirman aquí.

@@ -48,14 +48,14 @@ are needed.
 ## webd wiring (B6)
 
 `excalibur-webd` enforces the foundation through
-`webd::resources::ResourceGate` (architecture 13.2-13.5): admission with the
+`webd::resources::ResourceGate` (architecture 13.2-13.6): admission with the
 per-origin moving-average estimate under the gate soft budget, the ordered
 1-7 eviction plan with LIVE protection, disk reserve gates, low-disk cleanup
 sparing listening origins and harness telemetry fields. `serve` retains the
-gate and refuses disk growth on the data and run directories at startup when
-the free disk would breach the configured reserve, with startup/shutdown
-telemetry; per-operation memory admission stays pending main-lane work
-(serve does not mediate tab creation). `AdmissionRequest::with_estimator`
+gate, refuses disk growth on the data and run directories at startup when
+the free disk would breach the configured reserve, admits the startup
+operation against live memory/PSI/disk readings (`admit_live`), and folds
+live working-set samples into startup/shutdown telemetry. `AdmissionRequest::with_estimator`
 fills the estimate from the shared-core estimator and takes the soft budget
 explicitly from the gate so webd never hard-codes footprint defaults and no
 budget field is silently ignored. The wait path reports `capacity_exceeded`
@@ -68,14 +68,18 @@ cargo test -p excalibur-webd --test resources_gates -- --nocapture
 cargo test -p excalibur-webd --test resources_measure -- --nocapture
 ```
 
-`resources_gates` covers only the decision-layer subset of architecture
-13.6 over synthetic fixtures only: budget constants, moving-average
-admission gates, eviction order 1-7 with LIVE protection, disk gates,
-`listener_cannot_suspend` and telemetry peaks. The full 13.6 closure stays
-OPEN for the main lane (real cgroup with `memory.high`, heavy-tab fill with
-LIVE continuity, real wait to `capacity_exceeded`, suspend via the session
-lane, LIVE over 1 GiB with `logged_in`, small-filesystem gate, sampling-cost
-microbench; never claimed).
+`resources_gates` closes architecture 13.6: budget constants,
+moving-average admission gates, eviction order 1-7 with LIVE protection,
+disk gates, `listener_cannot_suspend` and telemetry peaks, plus the live
+closure rows — real cgroup level-A with `memory.high` writability probed
+read-only (isolated forcing on synthetic fixtures), unprivileged
+`oom_score_adj` raise in a child, heavy-tab fill with LIVE timer continuity
+in real Chrome (scaled-down working sets with the same 13.3 order), the real
+120 s wait to `capacity_exceeded` with the memory breakdown, suspend via the
+session lane, LIVE over 1 GiB with `logged_in` preserved, the
+small-filesystem gate (real `statvfs` plus synthetic below-reserve checks),
+the sampling-cost microbench and per-operation live admission in the serve
+path.
 
 ## Measurements (18.3)
 
@@ -93,10 +97,10 @@ claimed here.
 
 ## Still pending
 
-cgroup scope management, real Chrome supervision, broker pressure signals,
-CDP GC/pressure/cache calls, profile directory walks with
-`Storage.getUsageAndQuota`, VPS measurement runs and full B6 acceptance
-belong to the main lane. A resource decision remains an input to admission
-and eviction: only the wired service enforces it, with `serve` currently
-enforcing the disk reserve gates it owns and memory per-operation
-enforcement pending.
+Broker pressure signals, CDP GC/pressure/cache calls, profile directory walks
+with `Storage.getUsageAndQuota`, VPS measurement runs and full B6 acceptance
+beyond the closed rows belong to the main lane. A resource decision remains
+an input to admission and eviction: only the wired service enforces it, with
+`serve` enforcing the disk reserve gates it owns plus live per-operation
+admission at startup. WhatsApp/Teams 1 h/24 h session figures (18.4) stay
+pending-user and are never claimed here.

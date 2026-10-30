@@ -1,7 +1,7 @@
-//! Deterministic block detectors (9.1). Detection only, never resolution.
+//! Deterministic block detectors (9.1 plus cookie-wall/geo-block extensions). Detection only, never resolution.
 //!
 //! DOM facts come from the isolated-world readiness probe; document headers
-//! and status come from CDP network events. No model judgement is involved:
+//! and live document HTTP status come from CDP network events (`EventState::document_statuses`, wired into `wait`). No model judgement is involved:
 //! every result is `{kind, vendor, signals, confidence, url, frame_id}` with
 //! a fixed vocabulary. Low-confidence signals are reported as `degraded`,
 //! never as a block.
@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 pub const KINDS: &[&str] = &[
     "blocked_captcha",
     "blocked_by_site",
+    "blocked_cookie_wall",
+    "blocked_geo",
     "needs_login",
     "needs_2fa",
 ];
@@ -64,23 +66,34 @@ pub fn classify_probe_blocked(raw: &Value, frame_id: &str) -> Option<Value> {
     Some(blocked)
 }
 
-/// Elevate a document-status block when the HTTP status corroborates it.
+/// Elevate a document block when the live document HTTP status corroborates it.
 ///
-/// `status` is the top-level document response status; `blocked` is the probe
-/// classification above. A 403/429/503 alongside block text raises medium to
-/// high without inventing new kinds.
+/// `status` is the live top-level document response status tracked from CDP
+/// `Network.responseReceived` (`EventState::document_statuses`) for the frame
+/// that reported the block; `blocked` is the probe classification above.
+/// A 403/429/451/503 alongside site or geo block text raises medium to high
+/// and records the `document_status` signal without inventing new kinds.
+/// Cookie-wall pages (usually HTTP 200) never elevate on status alone.
 pub fn elevate_with_status(mut blocked: Value, status: Option<i64>) -> Value {
-    let corroborated = matches!(status, Some(403) | Some(429) | Some(503));
+    let corroborated = matches!(status, Some(403) | Some(429) | Some(451) | Some(503));
     if corroborated
-        && blocked["kind"] == json!("blocked_by_site")
+        && (blocked["kind"] == json!("blocked_by_site") || blocked["kind"] == json!("blocked_geo"))
         && blocked["confidence"] == json!("medium")
     {
         blocked["confidence"] = json!("high");
         let mut signals = blocked["signals"].as_array().cloned().unwrap_or_default();
-        signals.push(json!("document_status"));
+        if !signals.iter().any(|s| s == "document_status") {
+            signals.push(json!("document_status"));
+        }
         blocked["signals"] = json!(signals);
     }
     blocked
+}
+
+/// Live document HTTP statuses that corroborate a site or geo block.
+#[must_use]
+pub fn corroborating_status(status: Option<i64>) -> bool {
+    matches!(status, Some(403) | Some(429) | Some(451) | Some(503))
 }
 
 /// Normalize a block report that bypasses probe classification (9.1).
@@ -172,6 +185,30 @@ mod tests {
         let site = probe("blocked_by_site", "medium", vec!["block_page_text"]);
         let elevated = elevate_with_status(classify_probe_blocked(&site, "f").unwrap(), Some(403));
         assert_eq!(elevated["confidence"], json!("high"));
+        assert!(
+            elevated["signals"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("document_status"))
+        );
+        // Geo blocks elevate on 451 as well as the 403/429/503 site set.
+        let geo = probe("blocked_geo", "medium", vec!["geo_block_text"]);
+        let geo_elevated =
+            elevate_with_status(classify_probe_blocked(&geo, "f").unwrap(), Some(451));
+        assert_eq!(geo_elevated["confidence"], json!("high"));
+        assert!(corroborating_status(Some(451)));
+        assert!(!corroborating_status(Some(200)));
+        // Elevating twice never duplicates the document_status signal.
+        let twice = elevate_with_status(geo_elevated, Some(451));
+        assert_eq!(
+            twice["signals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|s| *s == "document_status")
+                .count(),
+            1
+        );
         let captcha = probe(
             "blocked_captcha",
             "medium",
@@ -181,6 +218,29 @@ mod tests {
         assert_eq!(kept["confidence"], json!("medium"));
         let ok = elevate_with_status(classify_probe_blocked(&site, "f").unwrap(), Some(200));
         assert_eq!(ok["confidence"], json!("medium"));
+        // Cookie walls stay medium on a plain 200 document status.
+        let wall = probe("blocked_cookie_wall", "medium", vec!["cookie_wall_block"]);
+        let wall_kept = elevate_with_status(classify_probe_blocked(&wall, "f").unwrap(), Some(200));
+        assert_eq!(wall_kept["confidence"], json!("medium"));
+    }
+
+    #[test]
+    fn accepts_cookie_wall_and_geo_kinds() {
+        let frame = "frame-1";
+        assert!(
+            classify_probe_blocked(
+                &probe("blocked_cookie_wall", "medium", vec!["cookie_wall_block"]),
+                frame
+            )
+            .is_some()
+        );
+        assert!(
+            classify_probe_blocked(
+                &probe("blocked_geo", "medium", vec!["geo_block_text"]),
+                frame
+            )
+            .is_some()
+        );
     }
 
     #[test]

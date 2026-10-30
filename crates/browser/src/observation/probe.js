@@ -25,6 +25,8 @@ function(selector,text,loggedIn){
  if(!blocked&&[...document.querySelectorAll('input[autocomplete=one-time-code]')].some(e=>visible(e)&&!e.value))blocked={kind:'needs_2fa',vendor:location.hostname,signals:['empty_verification_field'],confidence:'medium',url:location.href};
  if(!blocked){const boxes=[...document.querySelectorAll('input[maxlength="1"][inputmode=numeric]')].filter(e=>visible(e)&&!e.value);if(boxes.length>=4)blocked={kind:'needs_2fa',vendor:location.hostname,signals:['otp_group'],confidence:'medium',url:location.href}}
  if(!blocked&&loggedIn&&[...document.querySelectorAll('input[type=password]')].some(visible))blocked={kind:'needs_login',vendor:location.hostname,signals:['password_on_logged_in_site'],confidence:'medium',url:location.href};
+ if(!blocked){const wall=[...document.querySelectorAll('#cookie-wall,.cookie-wall,#consent-wall,.consent-wall,#consent-gate,.consent-gate,[data-cookie-wall]')].find(visible);if(wall&&/we value your privacy|we use cookies|accept.*cookies|cookie.*consent|consent.*cookies/i.test((wall.innerText||'')+'\n'+content))blocked={kind:'blocked_cookie_wall',vendor:location.hostname,signals:['cookie_wall_block'],confidence:'medium',url:location.href}}
+ if(!blocked&&/not available in your (country|region)|blocked in your (country|region)|access[^.]{0,40}not available[^.]{0,40}region|geo-block|error 451|451 unavailable/i.test(content))blocked={kind:'blocked_geo',vendor:location.hostname,signals:['geo_block_text'],confidence:'medium',url:location.href};
  blocked=addCorroboration(blocked);
  return {url:location.href,ready:document.readyState,dom_age:performance.now()-s.mutation,beat_age:performance.now()-s.beat,condition,blocked};
 }

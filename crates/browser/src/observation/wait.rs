@@ -113,8 +113,12 @@ impl Observation {
         let tracker = self.tracker(ctx);
         let mut state = tracker.state.lock().unwrap();
         state.response_blocked = None;
+        // Drop the previous document's live HTTP status with its header
+        // block so the next document cannot inherit a stale elevation.
+        state.document_statuses.clear();
         state.navigation_pending = true;
     }
+
     pub(crate) async fn initialize(&self, ctx: &Context, frames: &[Frame]) -> Result<NetworkScope> {
         let tracker = self.tracker(ctx);
         tracker
@@ -304,6 +308,18 @@ impl Observation {
                     {
                         // Attach the frame that reported the block; detection only.
                         block["frame_id"] = json!(frame.id);
+                        // Corroborate against the live document HTTP status
+                        // observed for this frame (B5): a 403/429/451/503
+                        // alongside site or geo block text elevates medium to
+                        // high with a `document_status` signal.
+                        let status = tracker
+                            .state
+                            .lock()
+                            .unwrap()
+                            .document_statuses
+                            .get(&frame.id)
+                            .copied();
+                        block = super::detectors::elevate_with_status(block, status);
                         report.blocked = Some(block);
                     }
                 }

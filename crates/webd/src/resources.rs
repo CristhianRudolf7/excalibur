@@ -7,9 +7,7 @@
 //! host accounting lives here; every budget constant and decision rule stays
 //! in the shared core.
 
-use excalibur_browser_resources::admission::{
-    AdmissionDecision, AdmissionReadings, AdmissionRequest, DenyReason, OriginEstimator, decide,
-};
+use excalibur_browser_resources::admission::{AdmissionRequest, OriginEstimator, decide};
 use excalibur_browser_resources::budgets::{DiskBudgets, MemoryBudgets, SearchProfile};
 use excalibur_browser_resources::disk::{
     LowDiskAction, WebdDataUsage, low_disk_action, search_start_allowed,
@@ -17,6 +15,10 @@ use excalibur_browser_resources::disk::{
 use excalibur_browser_resources::error::{ResourceError, Result};
 use excalibur_browser_resources::eviction::{EvictionStep, TabInfo, suspend_session};
 use excalibur_browser_resources::telemetry::BrowserResourceSample;
+
+pub use excalibur_browser_resources::admission::{
+    AdmissionDecision, AdmissionReadings, DenyReason,
+};
 
 /// Wired resource gate held by the webd service.
 ///
@@ -147,6 +149,74 @@ impl ResourceGate {
     ) {
         self.sample
             .observe(working_set_bytes, pss_bytes, instances, tabs);
+    }
+
+    /// Gather live admission readings for `data_dir` from the running machine.
+    ///
+    /// Working set prefers the private level-A cgroup (`memory.current -
+    /// `inactive_file`) and falls back to the level-B `/proc` self-read when
+    /// the cgroup is shared or lacks the memory controller; PSI comes from
+    /// `/proc/pressure/memory` when exposed, free disk from `disk_available`.
+    /// Tab counts come from the caller because only the service model knows
+    /// them. No budget field is carried: `admit_live` always applies the
+    /// wired [`MemoryBudgets`].
+    #[must_use]
+    pub fn live_readings(
+        execution_tabs: u32,
+        global_tabs: u32,
+        growth_bytes: u64,
+        data_dir: &std::path::Path,
+    ) -> AdmissionReadings {
+        let working_set_bytes = excalibur_browser_resources::sampling::cgroup_dir_from_self()
+            .and_then(|dir| excalibur_browser_resources::sampling::read_cgroup_working_set(&dir))
+            .or_else(excalibur_browser_resources::sampling::current_process_working_set)
+            .unwrap_or(0);
+        let psi_some_avg10_pct = excalibur_browser_resources::sampling::live_psi_some_avg10();
+        let free_disk_bytes = crate::disk_available(data_dir).unwrap_or(0);
+        AdmissionReadings {
+            working_set_bytes,
+            psi_some_avg10_pct,
+            execution_tabs,
+            global_tabs,
+            free_disk_bytes,
+            growth_bytes,
+        }
+    }
+
+    /// Decide admission for `origin` using live machine readings.
+    ///
+    /// Per-operation memory admission in the serve path (13.3): the estimate
+    /// comes from the shared-core moving average, the soft budget from the
+    /// wired [`MemoryBudgets`], and every other reading from
+    /// [`Self::live_readings`]. Over-budget outcomes return the 120 s
+    /// `WaitWithTimeout` so eviction (steps 1-6) can run before the caller
+    /// reports `capacity_exceeded`. Disk, tab-limit and PSI denials fail
+    /// immediately without waiting.
+    #[must_use]
+    pub fn admit_live(
+        &self,
+        origin: &str,
+        execution_tabs: u32,
+        global_tabs: u32,
+        growth_bytes: u64,
+        data_dir: &std::path::Path,
+    ) -> AdmissionDecision {
+        let readings = Self::live_readings(execution_tabs, global_tabs, growth_bytes, data_dir);
+        self.admit(origin, readings)
+    }
+
+    /// Fold one live working-set reading into the telemetry sample.
+    ///
+    /// Prefers level-A cgroup state and falls back to the level-B self-read;
+    /// instance/tab counts come from the caller. Used at serve startup and
+    /// shutdown so the emitted telemetry reflects the real machine instead
+    /// of a zero placeholder.
+    pub fn note_live_sample(&mut self, instances: u32, tabs: u32) {
+        let working = excalibur_browser_resources::sampling::cgroup_dir_from_self()
+            .and_then(|dir| excalibur_browser_resources::sampling::read_cgroup_working_set(&dir))
+            .or_else(excalibur_browser_resources::sampling::current_process_working_set)
+            .unwrap_or(0);
+        self.note_sample(working, None, instances, tabs);
     }
 
     /// Current telemetry sample with peaks.

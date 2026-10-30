@@ -113,6 +113,12 @@ struct EventState {
     dropped: u64,
     dialog: Option<Value>,
     response_blocked: Option<Value>,
+    /// Live top-level document HTTP status per frame (`Network.responseReceived`
+    /// with `type == "Document"`). Wired into `wait` so `elevate_with_status`
+    /// corroborates probe blocks against the real network state instead of
+    /// staying unit-only. Cleared when a new navigation starts so a stale
+    /// status never elevates the next document.
+    document_statuses: std::collections::HashMap<String, i64>,
     file_chooser: bool,
     tainted: bool,
     lagged: bool,
@@ -268,6 +274,7 @@ impl Observation {
             dropped: 0,
             dialog: None,
             response_blocked: None,
+            document_statuses: Default::default(),
             file_chooser: false,
             tainted: false,
             lagged: false,
@@ -656,16 +663,21 @@ fn event_record(s: &mut EventState, e: excalibur_cdp::Event, r: &Redactor) {
             s.inflight.retain(|(_, id), _| id != request);
         }
         "Network.responseReceived" => {
-            if p["type"] == "Document"
-                && p["response"]["headers"].as_object().is_some_and(|h| {
+            if p["type"] == "Document" {
+                if let Some(status) = p["response"]["status"].as_i64()
+                    && let Some(frame_id) = p["frameId"].as_str()
+                {
+                    s.document_statuses.insert(frame_id.to_owned(), status);
+                }
+                if p["response"]["headers"].as_object().is_some_and(|h| {
                     h.iter().any(|(k, v)| {
                         k.eq_ignore_ascii_case("cf-mitigated") && v.as_str() == Some("challenge")
                     })
-                })
-            {
-                s.response_blocked = Some(
-                    json!({"kind":"captcha","vendor":"cloudflare","signals":["cf-mitigated"],"confidence":"high","url":clean_url(p["response"]["url"].as_str().unwrap_or(""),s.tainted),"frame_id":p["frameId"]}),
-                );
+                }) {
+                    s.response_blocked = Some(
+                        json!({"kind":"captcha","vendor":"cloudflare","signals":["cf-mitigated"],"confidence":"high","url":clean_url(p["response"]["url"].as_str().unwrap_or(""),s.tainted),"frame_id":p["frameId"]}),
+                    );
+                }
             }
             ring(
                 s,

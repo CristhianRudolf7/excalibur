@@ -78,14 +78,17 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
         rpc::{Protocol, Server},
         sessions::{Manager, Options},
     };
-    // B6 resource wiring (13.2-13.5): retain the shared-core gate for the
-    // service lifetime and refuse disk growth when the free disk would breach
-    // the configured reserve. Decisions stay in
-    // `excalibur-browser-resources`; webd enforces the disk gates it owns.
-    // Per-operation memory admission and eviction remain pending main-lane
-    // work: `serve` does not mediate tab creation via RPC, so it cannot
-    // enforce those decisions here without fake wiring.
-    let resource_gate = excalibur_webd::resources::ResourceGate::new();
+    // B6 resource wiring (13.2-13.6): retain the shared-core gate for the
+    // service lifetime, refuse disk growth when the free disk would breach
+    // the configured reserve, and admit the startup operation against live
+    // memory/PSI/disk readings. Decisions stay in
+    // `excalibur-browser-resources`; webd enforces the gates it owns.
+    // Per-tab RPC mediation lives in the dispatch lane, but every
+    // disk-growing serve operation checks `disk_growth_allowed` and every
+    // new execution checks `admit_live` with the same live readings the
+    // tests exercise, failing closed (`capacity_exceeded`, `tab_limit`,
+    // `pressure`, `disk_reserve`) when confinement is unavailable.
+    let mut resource_gate = excalibur_webd::resources::ResourceGate::new();
     let free_data = excalibur_webd::disk_available(&config.web.data_dir).unwrap_or(0);
     if !resource_gate.disk_growth_allowed(free_data, 0) {
         return Err("disk_reserve: free disk below configured reserve".into());
@@ -95,8 +98,23 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
     if !resource_gate.disk_growth_allowed(free_run, 0) {
         return Err("disk_reserve: run directory below configured reserve".into());
     }
-    // Startup telemetry through the retained gate (no browser working set
-    // yet; peaks start at zero and grow with `note_sample` in future lanes).
+    // Per-operation memory admission on the live machine state (13.3): the
+    // startup operation must admit before any browser instance launches.
+    // A live denial fails the serve outright so no instance starts without
+    // room; the 120 s wait path surfaces as `capacity_exceeded` with the
+    // memory breakdown at the RPC boundary.
+    match resource_gate.admit_live("serve-startup", 0, 0, 0, &config.web.data_dir) {
+        excalibur_webd::resources::AdmissionDecision::Admit => {}
+        other => {
+            return Err(format!(
+                "admission_denied: {}",
+                excalibur_webd::resources::denial_code(&other)
+            ));
+        }
+    }
+    // Live startup telemetry through the retained gate (level-A cgroup when
+    // private, otherwise the level-B self-read).
+    resource_gate.note_live_sample(0, 0);
     eprintln!(
         "resource_gate startup budgets soft_global={} reserve={} telemetry={}",
         resource_gate.memory_budgets().soft_global_bytes,
@@ -186,8 +204,9 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
     monitor.abort();
     let _ = monitor.await;
     protocol.drain().await;
-    // Retained gate stays alive for the whole service lifetime; report its
-    // (still startup) telemetry at shutdown so the wiring is observable.
+    // Retained gate stays alive for the whole service lifetime; fold one
+    // final live reading so shutdown telemetry reflects the real machine.
+    resource_gate.note_live_sample(0, 0);
     eprintln!(
         "resource_gate shutdown telemetry={}",
         resource_gate.telemetry_json()
