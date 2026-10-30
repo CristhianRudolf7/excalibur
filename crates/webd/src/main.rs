@@ -113,6 +113,13 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
             }
         }
     });
+    let viewer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| e.to_string())?;
+    let viewer_origin = match viewer_listener.local_addr().map_err(|e| e.to_string())? {
+        std::net::SocketAddr::V4(v) => format!("http://127.0.0.1:{}", v.port()),
+        _ => return Err("IPv4 loopback required".into()),
+    };
     let manager = Manager::open(Options {
         data_dir: config.web.data_dir.clone(),
         binary,
@@ -124,6 +131,11 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
     })
     .await
     .map_err(|e| e.to_string())?;
+    let viewer_server = tokio::spawn(excalibur_webd::viewer::serve_viewer(
+        viewer_listener,
+        std::sync::Arc::new(manager.clone()),
+        viewer_origin.clone(),
+    ));
     let protocol = Protocol::new(manager.clone());
     let server = Server::bind(
         &config.web.run_dir.join("webd.sock"),
@@ -142,7 +154,7 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
     });
     println!(
         "{}",
-        serde_json::json!({"ready":true,"socket":config.web.run_dir.join("webd.sock"),"network":"host_proxy_full_80_443_uid_checked_loopback"})
+        serde_json::json!({"ready":true,"socket":config.web.run_dir.join("webd.sock"),"network":"host_proxy_full_80_443_uid_checked_loopback","viewer":viewer_origin})
     );
     let result = server.run(rx).await;
     signals.abort();
@@ -151,6 +163,7 @@ async fn serve(config: Config, binary: std::path::PathBuf) -> Result<bool, Strin
     protocol.drain().await;
     let closed = manager.shutdown().await;
     forward.abort();
+    viewer_server.abort();
     result.and(closed).map_err(|e| e.to_string())?;
     Ok(true)
 }

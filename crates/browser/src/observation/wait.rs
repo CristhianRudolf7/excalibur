@@ -103,6 +103,18 @@ impl Drop for NetworkScope {
     }
 }
 impl Observation {
+    /// Drop the previous document's header-block signal when a new navigation
+    /// starts (9.5). `wait` returns a stored `response_blocked` immediately,
+    /// so without this reset a `nav.go` issued right after a header-blocked
+    /// page would report the stale block for the new document. The reset runs
+    /// before the navigation commits, so the fresh document's own header
+    /// signal still lands; the `Page.frameNavigated` clear stays as backstop.
+    pub(crate) fn note_navigation_started(&self, ctx: &Context) {
+        let tracker = self.tracker(ctx);
+        let mut state = tracker.state.lock().unwrap();
+        state.response_blocked = None;
+        state.navigation_pending = true;
+    }
     pub(crate) async fn initialize(&self, ctx: &Context, frames: &[Frame]) -> Result<NetworkScope> {
         let tracker = self.tracker(ctx);
         tracker
@@ -201,6 +213,7 @@ impl Observation {
                 .dialog
                 .clone()
                 .or(state.response_blocked.clone())
+                .map(super::detectors::normalize_reported_blocked)
                 .or_else(|| {
                     state
                         .file_chooser
@@ -318,7 +331,7 @@ impl Observation {
                 )
             };
             if let Some(dialog) = dialog {
-                report.blocked = Some(dialog)
+                report.blocked = Some(super::detectors::normalize_reported_blocked(dialog))
             }
             if file {
                 report.blocked = Some(json!({"kind":"file_chooser","confidence":"high"}))

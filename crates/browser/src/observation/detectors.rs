@@ -83,6 +83,20 @@ pub fn elevate_with_status(mut blocked: Value, status: Option<i64>) -> Value {
     blocked
 }
 
+/// Normalize a block report that bypasses probe classification (9.1).
+///
+/// Header (`cf-mitigated`) and dialog/file-chooser signals are produced by
+/// the network/dialog trackers with legacy or UI kinds; map the legacy
+/// `captcha` kind onto the fixed `blocked_captcha` vocabulary so every wait
+/// report uses one deterministic set. Unknown shapes pass through unchanged
+/// for the caller to decide.
+pub fn normalize_reported_blocked(mut blocked: Value) -> Value {
+    if blocked["kind"] == serde_json::json!("captcha") {
+        blocked["kind"] = serde_json::json!("blocked_captcha");
+    }
+    blocked
+}
+
 /// Whether a probe payload is a control page that must not block.
 ///
 /// Invisible reCAPTCHA v3 badges and injected `/cdn-cgi/challenge-platform/`
@@ -167,6 +181,23 @@ mod tests {
         assert_eq!(kept["confidence"], json!("medium"));
         let ok = elevate_with_status(classify_probe_blocked(&site, "f").unwrap(), Some(200));
         assert_eq!(ok["confidence"], json!("medium"));
+    }
+
+    #[test]
+    fn legacy_header_blocks_normalize_to_the_fixed_vocabulary() {
+        let legacy = json!({
+            "kind": "captcha",
+            "vendor": "cloudflare",
+            "signals": ["cf-mitigated"],
+            "confidence": "high",
+            "url": "https://example.com/",
+        });
+        assert_eq!(
+            normalize_reported_blocked(legacy)["kind"],
+            json!("blocked_captcha")
+        );
+        let dialog = json!({"kind": "dialog", "confidence": "high"});
+        assert_eq!(normalize_reported_blocked(dialog.clone()), dialog);
     }
 
     #[test]
