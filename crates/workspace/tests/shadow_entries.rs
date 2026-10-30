@@ -484,7 +484,18 @@ async fn active_run_history_survives_object_collection_without_a_snapshot_count_
 
     let winner = workspace
         .shadow()
-        .plan_between_entries(&left.id, &kept[34].id, BTreeMap::new(), false)
+        .plan_between_entries(
+            &left.id,
+            &kept[34].id,
+            BTreeMap::from([
+                (
+                    PathBuf::from("file.txt"),
+                    Some(SnapshotEntry::file(b"revision 34\n".to_vec(), false)),
+                ),
+                (PathBuf::from("race.txt"), None),
+            ]),
+            false,
+        )
         .await
         .unwrap();
     let content = winner
