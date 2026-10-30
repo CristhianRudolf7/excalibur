@@ -2,9 +2,9 @@
 
 `excalibur-cdp` implements asynchronous CDP over native pipes. `excalibur-browser`
 launches and supervises Chrome instances, verifies renderer sandbox state and
-applies version policy. `excalibur-webd` exposes one-shot environment and instance
-diagnostics. `excalibur-search` and `excalibur-web-adapter` remain empty boundaries.
-There are no application sessions, RPC server, browser tools or viewer frontend.
+applies version policy, and manages durable profiles, sessions and tabs.
+`excalibur-webd` provides environment diagnostics and a local Unix JSON-RPC service. `excalibur-search` and `excalibur-web-adapter` remain empty boundaries.
+The host adapter, agent browser tools and viewer frontend are not implemented.
 
 Install a stable Rust toolchain with rustfmt and clippy, a C/C++ compiler,
 `pkg-config`, OpenSSL development headers and a verified bubblewrap build (at
@@ -46,7 +46,7 @@ cannot be reduced below 5 GiB; the default search budget includes a 1.5 GiB inde
 and 0.5 GiB state. Data and runtime directories must already be writable by the
 final identity, owned by its UID and mode 0700. Symlinks at these directory
 paths are rejected. JSON `directories` entries report the path, owner UID, numeric
-permission mode, privacy and write access. No profiles or sockets are created by
+permission mode, privacy, configured shared socket access and write access. No profiles or sockets are created by
 the check.
 
 ```sh
@@ -223,3 +223,142 @@ for direct invocation but are executed by their parent tests. Missing Chrome or
 confinement fails the suite; only explicit `EXCALIBUR_BROWSER_TESTS=skip` opts out
 of real Chrome tests and must be recorded in the delivery report. No model API,
 real account or paid benchmark is used.
+
+
+## Sessions and local protocol
+
+Run `target/debug/excalibur-webd --serve /absolute/path/web.toml` in the foreground
+under a supervisor, or let a trusted host use `setsid`. The process drops privileges
+before creating its runtime, database, socket or Chrome profiles. SIGTERM/SIGINT
+stop accepting clients, drain dispatched operations and close Chrome. This command
+does not install or deploy a service. Its owned proxy denies all network access;
+the network broker and host adapter are separate capabilities. Tests inject a
+local synthetic proxy through the Rust manager options.
+
+The service binds `<run_dir>/webd.sock` with mode `0660`, and authenticates every
+connection using `SO_PEERCRED`. Only `web.host_uid` (default `0`) and root are
+accepted; rejected connections receive no response. `web.socket_gid` defaults to
+the final primary GID. A different host UID needs membership in that shared group
+and traversal of the runtime directory: an administrator may provision it as
+`0710`, owned by the web UID and configured socket GID. The preflight reports this
+exception as `shared_socket_directory`, not as a private directory. Data and
+profiles remain `0700`; the socket group must be a group available to the final
+identity. Neither socket access nor a run ID authorizes an untrusted program to
+act as the host.
+
+Example trusted profile configuration (origins are exact HTTP(S) origins):
+
+```toml
+[web.profiles.personal]
+class = "persistent"
+isolation = "shared_instance" # alternatively per_site
+
+[[web.profiles.personal.sites]]
+name = "chat"
+rw = ["https://chat.example.org"]
+login = ["https://login.example.org"]
+listen = true
+listen_probe = { unread_selector = "" } # empty: title changes only
+```
+
+The implicit `ephemeral` profile creates a new disposable BrowserContext per run,
+with at most three live contexts, and shares one ephemeral Chrome instance. Closing
+or suspending disposes the context; its cookies and storage are not reused.
+The instance stops after ten minutes without live contexts and its profile is
+removed. `web.compact = true` puts these isolated contexts in a configured shared
+persistent instance instead; it deliberately shares the browser process.
+Persistent profiles use the default context and reuse one instance per profile,
+or one per configured site with `per_site`. Profile names cannot contain paths or
+the reserved `--` separator. Profiles enable Chrome session restoration; the
+installed-Chrome contract records whether session cookies actually survive a
+restart. Persistent cookies, localStorage, IndexedDB and host-reported site login
+state are preserved. The manager probes the user’s Secret Service without retrieving secrets (a two-second
+deadline); a responding service selects `gnome-libsecret`. Otherwise it selects
+`basic`, explicitly warned in status: filesystem permissions are its protection,
+not encryption against someone who can read the profile. There is no arbitrary CDP or cookie RPC.
+
+Sessions have an owner run, profile, site, mode, credential references and lifecycle
+state. Tabs retain their owner/subtask label, URL/title, document epoch and stable
+logical ID. Every tab is created with `newWindow: true`. Limits are four live tabs
+per run and twelve globally; failed admission returns `tab_limit` or
+`capacity_exceeded`. A listening site shares a single tab across its sessions;
+operations acquire the same exclusive tab lease, wait up to thirty seconds and
+then return `tab_busy`. Other tabs can hold independent leases. Logical active
+selection is per run, and switching calls `Page.bringToFront`. Suspension saves
+URLs/titles, closes live targets and resumes on the next tab operation. Listening
+sessions return `listener_cannot_suspend`.
+
+The manager represents opening, ready, busy, blocked, human_control, suspended,
+recovering, lost, closing and closed states and validates lifecycle transitions.
+Headless is the default. Native `headed` requires DISPLAY or WAYLAND_DISPLAY;
+an instance already in another mode returns `mode_unavailable`. Without a
+display, `headed` also returns that error until intervention support is available. Agent document admission accepts only
+configured read/write origins; login origins are human-only. The input lease
+checks the actual current frame URL under exclusion and returns
+`denied(human_only_origin)` for a login origin. Observation, action dispatch,
+login detection and human takeover are not yet exposed by RPC.
+
+Listening instances use the three background throttling flags and focus emulation.
+No suspend, freeze, discard or memory pressure command is sent to a listener.
+Target metadata is reconciled periodically; title changes produce
+`listener_activity` with no message content, at most once per five seconds per
+site. A configured unread selector runs a MutationObserver in an isolated world
+and emits only an unread count through a scoped binding. A separate lifecycle
+channel and periodic health/count probes reconcile ordinary event backpressure. A crashed listener
+renderer is replaced with a new target, its URL restored, focus/probe reinstalled
+and document epoch advanced; its logical tab ID remains unchanged. Persistent
+browser crashes enter recovering, with delays of 1, 5 and 30 seconds and at most
+five relaunches in ten minutes; exhaustion produces `instance_failed` and lost
+sessions. Restarting the service explicitly clears that retry circuit. Ephemeral
+sessions become lost. Recovery waits up to thirty seconds for tab operations.
+
+`webd.db` is private SQLite in WAL with FULL synchronization and one serialized
+writer on the blocking pool. It stores profiles, site state, sessions, tabs,
+operations and cursor events. A filesystem lock prevents concurrent managers for
+one data directory; another lock protects socket replacement. Restart marks
+surviving ephemeral sessions lost, restores persistent URLs immediately, and
+advances document epochs (`stale_ref(browser_restarted)`). It removes only a
+profile SingletonLock whose recorded PID is demonstrably absent. No old CDP
+session or in-memory snapshot remains valid.
+
+JSON-RPC 2.0 uses newline-delimited UTF-8 objects, at most 4 MiB per frame. Invalid
+or oversized frames return typed errors and leave the connection usable. Requests
+include `run_id`, `deadline_ms` (1–300000), and an `op_key` for effects. Implemented
+methods are `session.open/close/suspend/list`, `tab.new/list/switch/close`,
+`status.get`, `events.list`, `op.get`, and the trusted-host metadata operation
+`site.set_login_state`. The latter records an assertion by the host, not a login
+verification. The service binds run ownership at every session/tab operation.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"session.open","params":{"op_key":"run:step:call","run_id":"run","deadline_ms":30000,"profile":"ephemeral"}}
+```
+
+Effects are durably recorded as received, then dispatched before manager execution,
+then completed/failed with their result. Requests with the same key/hash attach to
+a live operation or replay its saved result; different payloads return
+`idempotency_conflict`. The deadline is excluded from the hash so polling can use
+a new wait budget. After two seconds (or the shorter request wait), a live effect
+returns `working{op_key}` and continues independently of client disconnection.
+`op.get` reports live work, saved outcomes or `uncertain` for dispatched work from
+a previous service lifetime. Uncertain effects are never re-executed. Terminal
+operation records and events have a 24-hour retention window, pruned on startup.
+Events are streamed as `event` notifications with durable monotonic cursors;
+`events.list{after}` replays up to 256 records per page. Slow socket clients are
+closed after a ten-second write deadline and can reconnect/replay. A cursor is
+not an acknowledgement of processing by the host.
+
+```sh
+cargo test -p excalibur-browser --test sessions -- --nocapture
+cargo test -p excalibur-webd --test webd_boundary -- --nocapture
+```
+
+These real-Chrome suites exercise persistent cookies/IndexedDB, session cookie
+restoration, isolated ephemeral contexts, compact/per-site instances, ownership,
+tab/context limits, exclusive queues, durable replay/uncertainty, socket framing
+and peer rejection, service restart and SIGKILL with two Chrome instances. The
+listening contract runs a synthetic long-polling page for ten minutes while other
+windows are active, verifies title events and live timers, and kills its renderer
+to verify recovery. `EXCALIBUR_LISTEN_TEST_SECONDS` can shorten a development run;
+only the default 600-second run satisfies the prolonged listening check. Evidence
+is in `target/test-evidence/browser/{sessions,webd_boundary}/`. There is no viewer
+frontend to validate visually.

@@ -2,9 +2,9 @@
 
 `excalibur-cdp` implementa CDP asíncrono por tuberías nativas. `excalibur-browser`
 lanza y supervisa instancias de Chrome, verifica el sandbox de renderizadores y
-aplica la política de versiones. `excalibur-webd` ofrece diagnósticos puntuales de
-entorno e instancia. `excalibur-search` y `excalibur-web-adapter` siguen vacíos.
-No hay sesiones de aplicación, servidor RPC, herramientas web ni frontend visor.
+aplica la política de versiones y gestiona perfiles, sesiones y pestañas durables.
+`excalibur-webd` ofrece diagnósticos de entorno y un servicio JSON-RPC Unix local. `excalibur-search` y `excalibur-web-adapter` siguen vacíos.
+El adaptador del arnés, las herramientas web del agente y el frontend visor no están implementados.
 
 Instala Rust estable con rustfmt y clippy, un compilador C/C++, `pkg-config`,
 cabeceras de desarrollo de OpenSSL y una compilación verificada de bubblewrap
@@ -48,7 +48,7 @@ libre no puede reducirse por debajo de 5 GiB; el presupuesto del buscador incluy
 los directorios de datos y ejecución ya existentes, que deben pertenecer a su UID
 y tener modo 0700. Se rechazan enlaces simbólicos en esas rutas de directorio. Las
 entradas JSON `directories` informan ruta, UID propietario, modo numérico,
-privacidad y acceso de escritura. No se crean perfiles ni sockets.
+privacidad, acceso compartido configurado del socket y acceso de escritura. No se crean perfiles ni sockets.
 
 ```sh
 cargo build -p excalibur-webd
@@ -235,3 +235,148 @@ marcados como ignorados para la invocación directa, pero los ejecutan sus prueb
 padre. La falta de Chrome o confinamiento hace fallar la suite; solo
 `EXCALIBUR_BROWSER_TESTS=skip` explícito excluye Chrome real y debe constar en el
 informe. No se usan APIs de modelos, cuentas reales ni benchmarks pagados.
+
+
+## Sesiones y protocolo local
+
+Ejecuta `target/debug/excalibur-webd --serve /ruta/absoluta/web.toml` en primer plano
+bajo un supervisor, o permite que un host confiable use `setsid`. El proceso cambia
+de usuario antes de crear runtime, base de datos, socket o perfiles. SIGTERM/SIGINT
+cierran la admisión de clientes, esperan las operaciones despachadas y cierran
+Chrome. La orden no instala ni despliega un servicio. Su proxy propio deniega toda
+la red; el broker de red y el adaptador del arnés son capacidades separadas. Las
+pruebas inyectan un proxy sintético local mediante las opciones Rust del gestor.
+
+El servicio abre `<run_dir>/webd.sock` en modo `0660` y autentica cada conexión con
+`SO_PEERCRED`. Solo admite `web.host_uid` (por defecto `0`) y root; cierra sin
+respuesta las conexiones rechazadas. `web.socket_gid` usa por defecto el GID
+primario final. Un host con otro UID necesita pertenecer al grupo compartido y
+atravesar el directorio de ejecución: un administrador puede prepararlo en modo
+`0710`, del UID web y del GID configurado del socket. La comprobación previa lo
+informa como `shared_socket_directory`, no como directorio privado. Datos y
+perfiles siguen en `0700`; el grupo del socket debe estar disponible para la
+identidad final. Ni acceder al socket ni un run ID autorizan a un programa no
+confiable a actuar como host.
+
+Ejemplo de configuración confiable (orígenes HTTP(S) exactos):
+
+```toml
+[web.profiles.personal]
+class = "persistent"
+isolation = "shared_instance" # alternativa: per_site
+
+[[web.profiles.personal.sites]]
+name = "chat"
+rw = ["https://chat.example.org"]
+login = ["https://login.example.org"]
+listen = true
+listen_probe = { unread_selector = "" } # vacío: solo cambios de título
+```
+
+El perfil implícito `ephemeral` crea un BrowserContext desechable por ejecución,
+con un máximo de tres contextos vivos y una instancia efímera compartida. Cerrar
+o suspender destruye el contexto; sus cookies y almacenamiento no se reutilizan.
+La instancia se detiene tras diez minutos sin contextos vivos y borra su perfil.
+`web.compact = true` coloca esos contextos aislados en una instancia persistente
+compartida configurada; comparte deliberadamente el proceso del navegador.
+Los perfiles persistentes usan el contexto por defecto y una instancia por perfil,
+o una por sitio con `per_site`. Los nombres no admiten rutas ni el separador
+reservado `--`. Se activa la restauración de sesión de Chrome; el contrato contra
+el Chrome instalado registra si conserva las cookies de sesión al reiniciar.
+Se conservan cookies persistentes, localStorage, IndexedDB y el estado de inicio
+de sesión comunicado por el host. El gestor consulta el Secret Service del usuario sin recuperar secretos, con un
+plazo de dos segundos; si responde usa `gnome-libsecret`. En otro caso usa `basic`,
+con aviso en el estado: lo protegen los permisos, no un cifrado frente a quien
+pueda leer el perfil.
+No existe RPC de CDP arbitrario ni de cookies.
+
+Las sesiones tienen ejecución propietaria, perfil, sitio, modo, referencias a
+credenciales y estado. Las pestañas conservan propietario/etiqueta de subtarea,
+URL/título, época de documento e ID lógico estable. Cada pestaña usa
+`newWindow: true`. Los límites son cuatro pestañas vivas por ejecución y doce
+globales; la admisión devuelve `tab_limit` o `capacity_exceeded` cuando se exceden.
+Un sitio en escucha comparte una sola pestaña entre sus sesiones. Sus operaciones
+usan la misma exclusión por pestaña, esperan hasta treinta segundos y después
+devuelven `tab_busy`. Otras pestañas pueden mantener exclusiones independientes.
+La selección activa lógica pertenece a cada ejecución; cambiarla llama a
+`Page.bringToFront`. Suspender guarda URL/título, cierra targets vivos y reabre en
+la siguiente operación de pestañas. Una sesión en escucha devuelve
+`listener_cannot_suspend`.
+
+El gestor representa opening, ready, busy, blocked, human_control, suspended,
+recovering, lost, closing y closed, y valida las transiciones. Headless es el modo por defecto. `headed` nativo requiere DISPLAY o
+WAYLAND_DISPLAY; una instancia que ya vive en otro modo devuelve
+`mode_unavailable`. Sin pantalla, `headed` también devuelve ese error hasta
+disponer de intervención. La admisión de documentos del agente acepta solo los orígenes de
+lectura/escritura configurados; los de login son exclusivos de personas. La
+exclusión para entrada comprueba la URL real del frame y devuelve
+`denied(human_only_origin)` en un origen de login. Observación, envío de acciones,
+detección de login e intervención humana todavía no se exponen por RPC.
+
+Las instancias en escucha usan los tres flags contra la retención en segundo
+plano y emulación de foco. No reciben suspensión, congelación, descarte ni presión
+de memoria. El gestor reconcilia periódicamente los metadatos de targets; los
+cambios de título producen `listener_activity` sin contenido de mensajes, como
+máximo una vez cada cinco segundos por sitio. Un selector opcional instala un
+MutationObserver en un mundo aislado y comunica solo el número de no leídos por
+un binding limitado a ese mundo. Un canal de ciclo de vida separado y sondas
+periódicas de salud/conteo reconcilian la contrapresión de eventos generales. Tras caer un renderizador en escucha, se sustituye
+el target, restaura su URL, foco y sonda y aumenta la época; conserva el ID lógico.
+Las caídas de una instancia persistente pasan a recovering con esperas de 1, 5 y
+30 segundos y hasta cinco relanzamientos en diez minutos. Agotarlos produce
+`instance_failed` y sesiones lost. Reiniciar explícitamente el servicio limpia
+ese circuito. Las sesiones efímeras pasan a lost. Las operaciones de pestañas
+esperan hasta treinta segundos a que termine la recuperación.
+
+`webd.db` es SQLite privado en WAL, sincronización FULL y un escritor serializado
+en el pool de bloqueo. Guarda perfiles, estado de sitios, sesiones, pestañas,
+operaciones y eventos con cursor. Un bloqueo de archivo impide gestores simultáneos
+en los mismos datos; otro protege la sustitución del socket. Reiniciar marca lost
+las sesiones efímeras, restaura inmediatamente las URL persistentes y aumenta las
+épocas (`stale_ref(browser_restarted)`). Solo retira un SingletonLock de perfil si
+su PID está inequívocamente ausente. Las sesiones CDP y las instantáneas previas
+en memoria dejan de ser válidas.
+
+JSON-RPC 2.0 usa objetos UTF-8 delimitados por salto de línea, de hasta 4 MiB.
+Los mensajes inválidos o demasiado grandes producen errores tipados sin cerrar
+la conexión. Las peticiones incluyen `run_id`, `deadline_ms` (1–300000) y `op_key`
+para efectos. Métodos implementados: `session.open/close/suspend/list`,
+`tab.new/list/switch/close`, `status.get`, `events.list`, `op.get` y la operación
+de metadatos del host `site.set_login_state`. Esta última registra una afirmación
+del host, no verifica un inicio de sesión. Cada operación comprueba el propietario
+de su sesión/pestaña.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"session.open","params":{"op_key":"run:step:call","run_id":"run","deadline_ms":30000,"profile":"ephemeral"}}
+```
+
+Los efectos se registran como received, dispatched antes de ejecutar el gestor y
+completed/failed con su resultado. Repetir clave y hash se une al trabajo vivo o
+reproduce el resultado guardado; cambiar la petición da `idempotency_conflict`.
+El hash excluye el plazo para poder consultar con otro presupuesto de espera.
+Tras dos segundos (o la espera menor solicitada), un efecto vivo devuelve
+`working{op_key}` y continúa aunque se desconecte el cliente. `op.get` informa de
+trabajo vivo, resultados o `uncertain` para trabajo despachado en una vida anterior
+del servicio. Los efectos inciertos nunca se repiten. Operaciones terminadas y
+eventos tienen una retención de 24 horas, depurada al arrancar. Los eventos llegan
+como notificaciones `event` con cursores monótonos durables; `events.list{after}`
+reproduce hasta 256 por página. Un cliente que no lee se cierra tras diez segundos
+de espera de escritura y puede reconectar/reproducir. Un cursor no confirma que
+el host haya procesado el evento.
+
+```sh
+cargo test -p excalibur-browser --test sessions -- --nocapture
+cargo test -p excalibur-webd --test webd_boundary -- --nocapture
+```
+
+Estas suites con Chrome real prueban cookies persistentes/IndexedDB, cookies de
+sesión, contextos aislados, instancias compactas/por sitio, propietarios, límites,
+colas exclusivas, reproducción/incertidumbre durable, mensajes y permisos del
+socket, reinicio del servicio y SIGKILL con dos instancias. El contrato de escucha
+mantiene una página sintética de long-polling durante diez minutos con otras
+ventanas activas, comprueba eventos de título y temporizadores y mata su
+renderizador para verificar recuperación. `EXCALIBUR_LISTEN_TEST_SECONDS` permite
+acortar una ejecución de desarrollo; solo los 600 segundos por defecto satisfacen
+la escucha prolongada. Evidencias en
+`target/test-evidence/browser/{sessions,webd_boundary}/`. No hay frontend visor
+para revisión visual.

@@ -328,6 +328,7 @@ async fn contract(root: &Path) {
                 .await;
                 json!({"sessionId":result["sessionId"]})
             }
+            Method::TargetSetDiscoverTargets => json!({"discover":true}),
             Method::TargetSetAutoAttach => {
                 json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true})
             }

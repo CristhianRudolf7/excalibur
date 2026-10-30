@@ -1,0 +1,10 @@
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=FULL;
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS web_profiles(name TEXT PRIMARY KEY,class TEXT NOT NULL CHECK(class IN('persistent','ephemeral')),dir TEXT NOT NULL,config TEXT NOT NULL CHECK(json_valid(config)),chrome_version TEXT,size_bytes INTEGER,updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS web_site_state(profile TEXT NOT NULL REFERENCES web_profiles(name),site TEXT NOT NULL,login_state TEXT NOT NULL CHECK(login_state IN('unknown','logged_in','needs_login')),changed_at INTEGER NOT NULL,PRIMARY KEY(profile,site));
+CREATE TABLE IF NOT EXISTS web_sessions(id TEXT PRIMARY KEY,owner_run TEXT,profile TEXT NOT NULL,context_id TEXT,mode TEXT NOT NULL,site TEXT,listen INTEGER NOT NULL,state TEXT NOT NULL,origins TEXT NOT NULL CHECK(json_valid(origins)),credentials TEXT NOT NULL CHECK(json_valid(credentials)),created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,instance_id TEXT NOT NULL,record TEXT NOT NULL CHECK(json_valid(record)));
+CREATE TABLE IF NOT EXISTS web_tabs(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES web_sessions(id),target_id TEXT,owner_run TEXT,label TEXT,url TEXT,title TEXT,state TEXT NOT NULL,document_epoch INTEGER NOT NULL,updated_at INTEGER NOT NULL,record TEXT NOT NULL CHECK(json_valid(record)));
+CREATE TABLE IF NOT EXISTS web_ops(op_key TEXT PRIMARY KEY,run_id TEXT NOT NULL,tool TEXT NOT NULL,request_hash TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN('received','dispatched','completed','failed')),result TEXT CHECK(result IS NULL OR json_valid(result)),created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS web_events(cursor INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT NOT NULL,data TEXT NOT NULL CHECK(json_valid(data)),at INTEGER NOT NULL);
+PRAGMA user_version=1;

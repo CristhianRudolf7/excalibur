@@ -120,3 +120,52 @@ fn probe_version(binary: &Path) -> Result<(std::process::ExitStatus, Vec<u8>), S
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+/// Ask only whether the user's Secret Service responds. No secret is requested.
+pub fn secret_service_available() -> bool {
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        return false;
+    }
+    let Ok(mut child) = std::process::Command::new("/usr/bin/gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.secrets",
+            "--object-path",
+            "/org/freedesktop/secrets",
+            "--method",
+            "org.freedesktop.DBus.Peer.Ping",
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            std::env::var_os("DBUS_SESSION_BUS_ADDRESS").unwrap_or_default(),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let ready = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Err(_) => break false,
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.wait();
+    ready
+}

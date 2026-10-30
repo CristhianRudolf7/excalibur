@@ -17,6 +17,10 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct WebConfig {
     pub os_user: String,
+    pub host_uid: u32,
+    pub socket_gid: Option<u32>,
+    pub profiles: std::collections::BTreeMap<String, excalibur_browser::sessions::Profile>,
+    pub compact: bool,
     pub chrome_args: Vec<String>,
     pub instance_class: excalibur_browser::Class,
     pub version: excalibur_browser::version::VersionPolicy,
@@ -30,6 +34,10 @@ impl Default for WebConfig {
     fn default() -> Self {
         Self {
             os_user: "excalibur-web".into(),
+            host_uid: 0,
+            socket_gid: None,
+            profiles: Default::default(),
+            compact: false,
             chrome_args: Vec::new(),
             instance_class: Default::default(),
             version: Default::default(),
@@ -45,6 +53,7 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
         let config: Self = toml::from_str(text).map_err(|e| e.to_string())?;
         let w = &config.web;
+        excalibur_browser::sessions::validate_profiles(&w.profiles).map_err(|e| e.to_string())?;
         excalibur_browser::validate_args(&w.chrome_args).map_err(|e| e.to_string())?;
         if w.os_user.is_empty()
             || !w.data_dir.is_absolute()
@@ -137,6 +146,7 @@ pub struct DirectoryCheck {
     pub mode: Option<u32>,
     pub private: bool,
     pub writable: bool,
+    pub shared_socket_directory: bool,
 }
 fn check_directory(path: &Path, uid: u32) -> DirectoryCheck {
     use std::os::unix::ffi::OsStrExt;
@@ -156,6 +166,7 @@ fn check_directory(path: &Path, uid: u32) -> DirectoryCheck {
         mode: metadata.as_ref().map(|m| m.mode() & 0o7777),
         private,
         writable,
+        shared_socket_directory: false,
     }
 }
 
@@ -252,14 +263,24 @@ pub fn preflight(config: &WebConfig, identity: Identity) -> Preflight {
         errors.push("insufficient or unavailable disk for search budget plus reserve".into());
     }
     // Require private, owned directories under the final identity; create nothing.
-    let directories: Vec<_> = [&config.data_dir, &config.run_dir]
+    let mut directories: Vec<_> = [&config.data_dir, &config.run_dir]
         .into_iter()
         .map(|path| check_directory(path, identity.euid))
         .collect();
+    if config.host_uid != 0 && config.host_uid != identity.euid {
+        let runtime = &mut directories[1];
+        runtime.shared_socket_directory =
+            fs::symlink_metadata(&config.run_dir).ok().is_some_and(|m| {
+                m.is_dir()
+                    && m.uid() == identity.euid
+                    && m.gid() == config.socket_gid.unwrap_or(identity.egid)
+                    && m.mode() & 0o7777 == 0o710
+            });
+    }
     for directory in &directories {
-        if !directory.private || !directory.writable {
+        if (!directory.private && !directory.shared_socket_directory) || !directory.writable {
             errors.push(format!(
-                "directory must be owned by the final UID, mode 0700 and writable: {}",
+                "directory must be owned by the final UID, private 0700 (or configured shared runtime 0710) and writable: {}",
                 directory.path.display()
             ));
         }

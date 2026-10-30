@@ -1,6 +1,8 @@
-//! Linux Chrome instance boundary. No sessions, RPC service or agent tools.
+//! Chrome instances, durable browser sessions and the local webd protocol.
 pub mod installation;
 pub mod process;
+pub mod rpc;
+pub mod sessions;
 pub mod version;
 use excalibur_cdp::{
     Client,
