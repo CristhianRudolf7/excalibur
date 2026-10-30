@@ -6,29 +6,34 @@ use serde_json::{Value, json};
 
 pub(super) async fn migrate(db: &Database) -> Result<()> {
     db.write(Priority::Interactive, |conn| {
-        let checksum = format!(
-            "{:x}",
-            <sha2::Sha256 as sha2::Digest>::digest(include_str!("schema_v3.sql").as_bytes())
-        );
-        let previous: Option<String> = conn
-            .query_row(
-                "SELECT checksum FROM master_schema WHERE version=3",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(previous) = previous {
-            if previous != checksum {
-                return Err(excalibur_store::Error::Configuration(
-                    "master schema checksum mismatch".into(),
-                ));
+        for (version, schema) in [
+            (3, include_str!("schema_v3.sql")),
+            (4, include_str!("schema_v4.sql")),
+        ] {
+            let checksum = format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(schema.as_bytes())
+            );
+            let previous: Option<String> = conn
+                .query_row(
+                    "SELECT checksum FROM master_schema WHERE version=?1",
+                    [version],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(previous) = previous {
+                if previous != checksum {
+                    return Err(excalibur_store::Error::Configuration(
+                        "master schema checksum mismatch".into(),
+                    ));
+                }
+            } else {
+                conn.execute_batch(schema)?;
+                conn.execute(
+                    "INSERT INTO master_schema(version,checksum) VALUES(?1,?2)",
+                    (version, checksum),
+                )?;
             }
-        } else {
-            conn.execute_batch(include_str!("schema_v3.sql"))?;
-            conn.execute(
-                "INSERT INTO master_schema(version,checksum) VALUES(3,?1)",
-                [checksum],
-            )?;
         }
         Ok(())
     })
@@ -85,6 +90,7 @@ impl Master {
         &self,
         conversation: &str,
         source: &str,
+        request_key: &str,
         result: &Value,
     ) -> Result<()> {
         let target = result["target"]
@@ -98,16 +104,19 @@ impl Master {
         let conversation = conversation.to_owned();
         let source = source.to_owned();
         let principal = self.inner.config.principal.clone();
+        let request_key = request_key.to_owned();
         self.inner.db.write(Priority::Interactive,move|c| {
             let scope:Option<String>=c.query_row("SELECT m.scope_id FROM messages m JOIN master_client_receipts r ON r.message_id=m.id JOIN conversations v ON v.id=m.conversation_id WHERE m.id=?1 AND m.conversation_id=?2 AND v.principal_id=?3",(&source,&conversation,&principal),|r|r.get(0)).optional()?;
             let Some(scope)=scope else {return Err(excalibur_store::Error::Invalid("cancellation needs a client source"));};
             if scope!=target_scope {return Err(excalibur_store::Error::Invalid("cancellation target is outside the source scope"));}
-            let exists:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM master_cancel_confirmations WHERE source_message_id=?1 OR (conversation_id=?2 AND principal_id=?3 AND scope_id=?4 AND target=?5 AND state='pending'))",(&source,&conversation,&principal,&scope,&target),|r|r.get(0))?;
+            let exists:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM master_cancel_confirmations WHERE request_key=?1 OR (conversation_id=?2 AND principal_id=?3 AND scope_id=?4 AND target=?5 AND state='pending'))",(&request_key,&conversation,&principal,&scope,&target),|r|r.get(0))?;
             if exists {return Ok(());}
+            let count:u64=c.query_row("SELECT COUNT(*) FROM master_question_sources WHERE source_message_id=?1",[&source],|r|r.get(0))?;
+            if count>=3 {return Err(excalibur_store::Error::Invalid("at most three questions per source message"));}
             let id=MessageId::new().to_string();let text=format!("Cancel {target} and its descendants? Reply yes or no to this question. No work has been cancelled.");
             c.execute("INSERT INTO master_questions(id,conversation_id,scope_id,text,blocking,created_at) VALUES(?1,?2,?3,?4,1,unixepoch())",(&id,&conversation,&scope,&text))?;
             c.execute("INSERT INTO master_question_sources(question_id,source_message_id) VALUES(?1,?2)",(&id,&source))?;
-            c.execute("INSERT INTO master_cancel_confirmations(question_id,conversation_id,principal_id,scope_id,target,source_message_id) VALUES(?1,?2,?3,?4,?5,?6)",(&id,&conversation,&principal,&scope,&target,&source))?;
+            c.execute("INSERT INTO master_cancel_confirmations(question_id,conversation_id,principal_id,scope_id,target,source_message_id,request_key) VALUES(?1,?2,?3,?4,?5,?6,?7)",(&id,&conversation,&principal,&scope,&target,&source,&request_key))?;
             c.execute("INSERT INTO master_events(conversation_id,kind,payload) VALUES(?1,'question',?2)",(&conversation,json!({"id":id,"text":text,"scope":scope,"blocking":true,"action":"cancel","target":target}).to_string()))?;
             Ok(())
         }).await?;

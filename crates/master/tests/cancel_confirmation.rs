@@ -345,3 +345,37 @@ async fn interrupted_pure_cancel_resolution_reopens_its_question() {
     assert_eq!(actions.effects.lock().unwrap().len(), 1);
     master.shutdown().await;
 }
+
+#[tokio::test]
+async fn version_three_pending_question_migrates_without_losing_authorization() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(
+        dir.path().join("main.db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let actions = Arc::new(Actions::default());
+    let master = open(db.clone(), actions.clone(), "owner").await;
+    master
+        .receive(incoming("command", "/cancel worker", None))
+        .await
+        .unwrap();
+    let id = master.questions("origin").await.unwrap()[0].id.clone();
+    master.shutdown().await;
+    // Recreate the actual v3 layout with its original checksum and data.
+    db.write(Priority::Interactive, |c| {
+        c.execute_batch("DROP INDEX master_cancel_pending_target; ALTER TABLE master_cancel_confirmations RENAME TO saved_v4;")?;
+        c.execute_batch(include_str!("../src/schema_v3.sql"))?;
+        c.execute_batch("INSERT INTO master_cancel_confirmations SELECT question_id,conversation_id,principal_id,scope_id,target,source_message_id,answer_message_id,state,result FROM saved_v4; DROP TABLE saved_v4; DELETE FROM master_schema WHERE version=4;")?;
+        Ok(())
+    }).await.unwrap();
+    let master = open(db.clone(), actions.clone(), "owner").await;
+    assert_eq!(master.questions("origin").await.unwrap()[0].id, id);
+    master
+        .receive(incoming("affirm-migrated", "yes", Some(&id)))
+        .await
+        .unwrap();
+    assert_eq!(actions.effects.lock().unwrap().len(), 1);
+    master.shutdown().await;
+}
