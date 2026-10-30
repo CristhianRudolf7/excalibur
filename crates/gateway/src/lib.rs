@@ -1,5 +1,7 @@
 //! Authenticated client transport. Agent decisions and control remain in shared services.
 mod backend;
+mod memory;
+pub use memory::MemoryAccess;
 use axum::{
     Router,
     body::{Body, Bytes, to_bytes},

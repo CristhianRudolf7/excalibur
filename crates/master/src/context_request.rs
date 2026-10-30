@@ -51,7 +51,17 @@ impl Master {
             ),
             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         );
+        let (identity_extra, scope_extra) = tokio::time::timeout(
+            self.inner.config.fast_tool_timeout,
+            self.inner.actions.stable_context(conversation, &scope),
+        )
+        .await
+        .unwrap_or_default();
         input.layers[1] = self.inner.redactor.redact_text(&self.inner.config.identity);
+        if !identity_extra.is_empty() {
+            input.layers[1].push('\n');
+            input.layers[1].push_str(&self.inner.redactor.redact_text(&identity_extra));
+        }
         input.layers[2] = format!(
             "Authorized conversation scope: {scope}\n{}",
             self.inner.redactor.redact_text(
@@ -63,6 +73,10 @@ impl Master {
                     .unwrap_or("")
             )
         );
+        if !scope_extra.is_empty() {
+            input.layers[2].push('\n');
+            input.layers[2].push_str(&self.inner.redactor.redact_text(&scope_extra));
+        }
         input.tools = self.inner.actions.definitions();
         input.activity = messages.to_vec();
         input.token_budgets = [self.inner.config.prompt_token_budget; 6];

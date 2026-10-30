@@ -14,6 +14,7 @@ use excalibur_vault::Redactor;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 struct Authority {
+    memory: Option<Arc<crate::memory::MemoryHost>>,
     security: Security,
     tools: Arc<WorkerTools>,
     db: Database,
@@ -79,7 +80,23 @@ impl RunAuthority for Authority {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-            self.planning.bind_agent(&effective, workspace).await
+            self.planning.bind_agent(&effective, workspace).await?;
+            if let Some(memory) = &self.memory {
+                memory.bind_agent(&effective, parent).await?;
+            }
+            Ok(())
+        })
+    }
+    fn prepare_context<'a>(
+        &'a self,
+        _parent: &'a Agent,
+        delegation: &'a mut excalibur_orchestrator::Delegation,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            match &self.memory {
+                Some(memory) => memory.prepare_context(delegation).await,
+                None => Ok(()),
+            }
         })
     }
     fn live_status(&self, run: &str) -> Vec<serde_json::Value> {
@@ -112,6 +129,8 @@ pub struct HostOptions {
     pub context_runtime: Option<tokio::runtime::Handle>,
     pub autonomy: Autonomy,
     pub full_acknowledged: bool,
+    /// Long-term memory and documents; `None` keeps the host without memory tools.
+    pub memory: Option<crate::memory::MemoryOptions>,
 }
 impl HostOptions {
     pub fn project(root: PathBuf) -> Self {
@@ -137,6 +156,7 @@ impl HostOptions {
             context_runtime: None,
             autonomy: Autonomy::Autonomous,
             full_acknowledged: false,
+            memory: None,
         }
     }
 }
@@ -150,6 +170,7 @@ pub struct DaemonHost {
     actions: Arc<DaemonActions>,
     tools: Arc<WorkerTools>,
     db: Database,
+    pub memory: Option<Arc<crate::memory::MemoryHost>>,
 }
 impl DaemonHost {
     /// Call on the interactive runtime, passing a *different* work runtime handle.
@@ -178,6 +199,7 @@ impl DaemonHost {
             }
             scopes.insert(format!("project:{}", project.id));
         }
+        let memory_scopes: Vec<String> = scopes.iter().cloned().collect();
         let mut master_config = options.master_config.clone();
         for project in &options.projects {
             master_config.scope_context.entry(format!("project:{}",project.id)).or_insert_with(||serde_json::json!({"name":project.name,"description":project.description,"state":project.status}).to_string());
@@ -244,11 +266,29 @@ impl DaemonHost {
             Arc::new(SecuredTools::new(workers.clone(), security.clone()));
         let planning =
             Arc::new(ScopedPlanning::new(secured.clone(), db.clone(), redactor.clone()).await?);
+        let memory = match options.memory.clone() {
+            Some(memory_options) => {
+                let store = excalibur_memory::MemoryStore::open(db.clone())
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .with_redactor(redactor.clone());
+                Some(crate::memory::MemoryHost::open(store, planning.clone(), memory_options).await?)
+            }
+            None => None,
+        };
+        let coordination_delegate: Arc<dyn ToolRuntime> = match &memory {
+            Some(memory) => memory.tools.clone(),
+            None => planning.clone(),
+        };
         let coordination = Arc::new(excalibur_orchestrator::OrchestratorTools::new(
-            planning.clone(),
+            coordination_delegate,
         ));
+        let mut deferred_entries = excalibur_tools::project::deferred_catalog();
+        if memory.is_some() {
+            deferred_entries.push(crate::memory::library_ingest_entry());
+        }
         let catalog = Arc::new(excalibur_tools::deferred::ToolCatalog::new(
-            excalibur_tools::project::deferred_catalog(),
+            deferred_entries,
         )?);
         let deferred = Arc::new(excalibur_tools::deferred::DeferredTools::new(
             coordination.clone(),
@@ -307,6 +347,7 @@ impl DaemonHost {
             .with_runtime(work.clone())
             .with_tasks(tasks.clone())
             .with_authority(Arc::new(Authority {
+                memory: memory.clone(),
                 security: security.clone(),
                 tools: workers.clone(),
                 db: db.clone(),
@@ -316,6 +357,9 @@ impl DaemonHost {
                 full_acknowledged: options.full_acknowledged,
             }));
         gate.attach(&orchestrator).map_err(|e| e.to_string())?;
+        if let Some(memory) = &memory {
+            memory.attach(&orchestrator);
+        }
         coordination
             .attach(&orchestrator)
             .map_err(|e| e.to_string())?;
@@ -353,6 +397,20 @@ impl DaemonHost {
             } else {
                 actions.clone()
             };
+        let fast_actions: Arc<dyn excalibur_master::FastActions> = match &memory {
+            Some(memory) => Arc::new(crate::memory::MemoryFastActions::new(
+                fast_actions,
+                memory.clone(),
+            )),
+            None => fast_actions,
+        };
+        if let Some(memory) = &memory {
+            memory.spawn_maintenance(
+                &work,
+                Some(lanes.gateway(Lane::Maintenance, model.clone())),
+                memory_scopes.clone(),
+            );
+        }
         let fallback = if let Some(gateway) = fallback {
             let same_provider = model.metadata().provider.is_some()
                 && model.metadata().provider == gateway.metadata().provider;
@@ -394,6 +452,14 @@ impl DaemonHost {
             .with_configuration(configuration)
             .with_task_actions(actions.clone())
             .with_shutdown(shutdown.clone());
+        let backend = match &memory {
+            Some(memory) => backend.with_memory(excalibur_gateway::MemoryAccess {
+                store: memory.store.clone(),
+                principal: memory.options.principal.clone(),
+                timezone: memory.options.timezone,
+            }),
+            None => backend,
+        };
         let policy =
             AccessPolicy::new(token, options.origins, 16 * 1024 * 1024).map_err(|e| e.message)?;
         let gateway = Gateway::new(Arc::new(backend), db.clone(), policy);
@@ -407,6 +473,7 @@ impl DaemonHost {
             actions,
             tools: workers,
             db,
+            memory,
         })
     }
     pub fn control_actions(&self) -> Arc<DaemonActions> {
@@ -416,6 +483,9 @@ impl DaemonHost {
         self.actions.recover_task_directives().await
     }
     pub async fn close(self) -> Result<(), String> {
+        if let Some(memory) = &self.memory {
+            memory.stop();
+        }
         self.gateway.close_connections();
         self.master.shutdown().await;
         self.actions.detach();

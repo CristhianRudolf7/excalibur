@@ -25,11 +25,23 @@ pub fn memory_tool_definitions() -> Vec<ToolDefinition> {
         description: description.into(),
         input_schema: schema,
     };
+    let mut write = input.clone();
+    write["required"] = json!(["action"]);
+    for (name, schema) in [
+        ("action", json!({"enum":["add","supersede","retire","resolve_dispute","merge_entities","define_relation_type"]})),
+        ("target", json!({"type":"string","description":"Memory id for supersede, retire and resolve_dispute"})),
+        ("reason", json!({"type":"string","maxLength":1024})),
+        ("keep_entity", json!({"type":"string"})),
+        ("merge_entity", json!({"type":"string"})),
+        ("relation", json!({"type":"object","required":["name"],"properties":{"name":{"type":"string"},"description":{"type":"string"},"domain":{"type":"string"},"range":{"type":"string"},"inverse":{"type":"string"}},"additionalProperties":false})),
+    ] {
+        write["properties"][name] = schema;
+    }
     vec![
         def(
             "memory_write",
-            "Store an explicit user memory now; admission merges duplicates, supersedes refinements and flags contradictions.",
-            input.clone(),
+            "Write memory with admission. action=add stores an explicit memory (duplicates merge, refinements supersede, contradictions are flagged); supersede, retire and resolve_dispute act on a memory id; merge_entities and define_relation_type curate the graph. Records are never destroyed.",
+            write,
         ),
         def(
             "memory_propose",
@@ -43,8 +55,8 @@ pub fn memory_tool_definitions() -> Vec<ToolDefinition> {
         ),
         def(
             "history_search",
-            "Search past messages by text, dates, conversation and role inside granted scopes.",
-            json!({"type":"object","properties":{"text":{"type":"string"},"scopes":{"type":"array","items":{"type":"string"}},"from":{"type":"integer"},"to":{"type":"integer"},"conversation":{"type":"string"},"role":{"type":"string"},"cursor":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":20}},"additionalProperties":false}),
+            "Search past messages and past actions (tool calls with results) by text, dates, conversation, scope, role, tool or status inside granted scopes.",
+            json!({"type":"object","properties":{"text":{"type":"string"},"scopes":{"type":"array","items":{"type":"string"}},"from":{"type":"integer"},"to":{"type":"integer"},"conversation":{"type":"string"},"role":{"type":"string"},"tool":{"type":"string"},"status":{"enum":["ok","error"]},"include":{"enum":["messages","actions","both"]},"cursor":{"type":"integer"},"action_cursor":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":20}},"additionalProperties":false}),
         ),
         def(
             "doc_read",
@@ -75,6 +87,33 @@ fn str_field<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
         .ok_or_else(|| invalid(format!("{name} required")))
 }
 
+/// Memory fields of a write; the caller's trust always comes from the grant.
+fn memory_input(args: &Value, grant: &MemoryGrant) -> Result<MemoryInput> {
+    let mut fields = serde_json::Map::new();
+    for key in [
+        "scope",
+        "kind",
+        "statement",
+        "entities",
+        "attribute",
+        "valid_from",
+        "valid_to",
+        "expires_at",
+        "confidence",
+        "importance",
+        "sources",
+        "temporal_change",
+    ] {
+        if let Some(value) = args.get(key) {
+            fields.insert(key.into(), value.clone());
+        }
+    }
+    let mut input: MemoryInput =
+        serde_json::from_value(Value::Object(fields)).map_err(|e| invalid(e.to_string()))?;
+    input.trust = grant.max_trust;
+    Ok(input)
+}
+
 /// Dispatch one model tool call. `explicit_user_request` is supplied by the host (never by the model).
 pub async fn call_memory_tool(
     store: &MemoryStore,
@@ -85,18 +124,61 @@ pub async fn call_memory_tool(
     now: i64,
 ) -> Result<Value> {
     match name {
-        "memory_write" | "memory_propose" => {
-            let input: MemoryInput =
-                serde_json::from_value(args).map_err(|e| invalid(e.to_string()))?;
-            let mut input = input;
-            input.trust = grant.max_trust;
-            if name == "memory_write" {
-                Ok(serde_json::to_value(
-                    store.memory_write(grant, input, now).await?,
-                )?)
-            } else {
-                Ok(json!({"candidate": store.memory_propose(grant, input, now).await?}))
+        "memory_write" => {
+            let action = args["action"].as_str().unwrap_or("add").to_string();
+            let target = || str_field(&args, "target").map(str::to_string);
+            match action.as_str() {
+                "add" => Ok(serde_json::to_value(
+                    store.memory_write(grant, memory_input(&args, grant)?, now).await?,
+                )?),
+                "supersede" => Ok(serde_json::to_value(
+                    store
+                        .supersede(grant, &target()?, memory_input(&args, grant)?, now)
+                        .await?,
+                )?),
+                "retire" => Ok(serde_json::to_value(
+                    store
+                        .retire(grant, &target()?, str_field(&args, "reason")?, now)
+                        .await?,
+                )?),
+                "resolve_dispute" => Ok(serde_json::to_value(
+                    store.resolve_dispute(grant, &target()?, now).await?,
+                )?),
+                "merge_entities" => Ok(serde_json::to_value(
+                    store
+                        .merge_entities(
+                            grant,
+                            str_field(&args, "keep_entity")?,
+                            str_field(&args, "merge_entity")?,
+                            now,
+                        )
+                        .await?,
+                )?),
+                "define_relation_type" => {
+                    let relation = &args["relation"];
+                    let name = relation["name"]
+                        .as_str()
+                        .ok_or_else(|| invalid("relation.name required"))?;
+                    Ok(serde_json::to_value(
+                        store
+                            .define_relation_type(
+                                grant,
+                                name,
+                                relation["description"].as_str().unwrap_or(""),
+                                relation["domain"].as_str(),
+                                relation["range"].as_str(),
+                                relation["inverse"].as_str(),
+                                now,
+                            )
+                            .await?,
+                    )?)
+                }
+                other => Err(invalid(format!("unknown memory_write action {other}"))),
             }
+        }
+        "memory_propose" => {
+            let input = memory_input(&args, grant)?;
+            Ok(json!({"candidate": store.memory_propose(grant, input, now).await?}))
         }
         "memory_search" => {
             let mut query = RetrievalQuery::new(str_field(&args, "query")?);

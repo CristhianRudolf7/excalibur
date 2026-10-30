@@ -51,6 +51,15 @@ pub trait RunAuthority: Send + Sync {
         Ok(value.clone())
     }
     fn bind<'a>(&'a self, agent: &'a Agent) -> BoxFuture<'a, std::result::Result<(), String>>;
+    /// Host context blocks (for example memory) added once while a delegation is prepared.
+    /// The prepared delegation is stored durably, so replays reuse the same bytes.
+    fn prepare_context<'a>(
+        &'a self,
+        _parent: &'a Agent,
+        _delegation: &'a mut Delegation,
+    ) -> BoxFuture<'a, std::result::Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
     fn live_status(&self, _run: &str) -> Vec<Value> {
         Vec::new()
     }
@@ -490,6 +499,12 @@ impl Orchestrator {
             ));
         }
         delegation.spec.context.suggested_skills = delegation.suggested_skills.clone();
+        if let Some(authority) = self.authority() {
+            authority
+                .prepare_context(&parent, &mut delegation)
+                .await
+                .map_err(Error::Authority)?;
+        }
         for lane in 0..=3 {
             delegation.spec.context.layers[0] = delegation.spec.context.layers[0]
                 .replace(&format!("\n[excalibur-host-lane:{lane}]\n"), "\n");

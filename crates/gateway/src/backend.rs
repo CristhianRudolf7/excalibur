@@ -27,6 +27,7 @@ pub struct SharedBackend {
     security: Option<excalibur_security::Security>,
     telemetry: Option<Arc<excalibur_telemetry::Telemetry>>,
     configuration: Option<Value>,
+    pub(crate) memory: Option<crate::memory::MemoryAccess>,
 }
 impl SharedBackend {
     pub fn new(master: Master, orchestrator: Orchestrator) -> Self {
@@ -41,7 +42,13 @@ impl SharedBackend {
             security: None,
             telemetry: None,
             configuration: None,
+            memory: None,
         }
+    }
+    /// Expose `memory.*` over the shared memory store for one principal.
+    pub fn with_memory(mut self, access: crate::memory::MemoryAccess) -> Self {
+        self.memory = Some(access);
+        self
     }
     /// Only the trusted host supplies this ceiling, never a JSON-RPC parameter.
     pub fn with_project_roots(mut self, roots: Vec<PathBuf>) -> Result<Self, RpcError> {
@@ -129,7 +136,7 @@ impl SharedBackend {
         }
         Ok(project)
     }
-    async fn validate_scope(&self, scope: &str) -> Result<(), RpcError> {
+    pub(crate) async fn validate_scope(&self, scope: &str) -> Result<(), RpcError> {
         if scope == "general" {
             return Ok(());
         }
@@ -648,7 +655,8 @@ impl SharedBackend {
                 });
                 Ok(json!({"stopping":true}))
             }
-            // No interfaces to unbuilt memory/skills/agenda or arbitrary configuration mutation.
+            method if method.starts_with("memory.") => self.memory_method(method, params).await,
+            // No interfaces to unbuilt skills/agenda or arbitrary configuration mutation.
             _ => Err(RpcError::not_found()),
         }
     }
@@ -787,14 +795,14 @@ fn sensitive_path(path: &Path) -> bool {
             || name.ends_with(".key")
     })
 }
-fn text<'a>(params: &'a Value, key: &str) -> Result<&'a str, RpcError> {
+pub(crate) fn text<'a>(params: &'a Value, key: &str) -> Result<&'a str, RpcError> {
     params
         .get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty() && value.len() <= 4096)
         .ok_or_else(|| RpcError::invalid(format!("{key} is required")))
 }
-fn limit(params: &Value, default: u32, max: u32) -> Result<u32, RpcError> {
+pub(crate) fn limit(params: &Value, default: u32, max: u32) -> Result<u32, RpcError> {
     let n = params
         .get("limit")
         .map_or(Some(default as u64), Value::as_u64)

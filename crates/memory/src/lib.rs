@@ -4,22 +4,34 @@
 //! decide when its entry points run. No model, network or daemon is started here.
 pub mod admission;
 pub mod consolidation;
+pub mod context;
+pub mod curation;
 pub mod embeddings;
 pub mod graph;
 pub mod identity;
 pub mod library;
+pub mod maintenance;
+pub mod model_roles;
+pub mod remote_embeddings;
 pub mod retrieval;
+pub mod runtime;
 pub mod testing;
 mod text;
 pub mod tools;
 
 pub use admission::*;
 pub use consolidation::*;
+pub use context::*;
+pub use curation::*;
 pub use embeddings::*;
 pub use graph::*;
 pub use identity::*;
 pub use library::*;
+pub use maintenance::*;
+pub use model_roles::*;
+pub use remote_embeddings::*;
 pub use retrieval::*;
+pub use runtime::*;
 pub use tools::*;
 
 use excalibur_store::{
@@ -30,6 +42,7 @@ use excalibur_vault::Redactor;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc};
 
+pub use chrono_tz;
 pub use excalibur_types::runtime::BoxFuture;
 
 #[derive(Debug, thiserror::Error)]
@@ -384,33 +397,41 @@ impl std::fmt::Debug for MemoryStore {
     }
 }
 
-const SCHEMA_VERSION: i64 = 1;
+/// Ordered, checksummed additive migrations. Installed versions are never rewritten.
+const SCHEMA: &[(i64, &str)] = &[
+    (1, include_str!("schema.sql")),
+    (2, include_str!("schema2.sql")),
+];
 
 impl MemoryStore {
     /// Install the checksummed additive schema on the principal database.
     pub async fn open(db: Database) -> Result<Self> {
-        let sql = include_str!("schema.sql");
-        let hash = digest(sql.as_bytes());
         db.write(Priority::Journal, move |c| {
             c.execute_batch("CREATE TABLE IF NOT EXISTS memory_schema(version INTEGER PRIMARY KEY,checksum TEXT NOT NULL)")?;
-            let old: Option<String> = c
-                .query_row(
-                    "SELECT checksum FROM memory_schema WHERE version=?1",
-                    [SCHEMA_VERSION],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            match old {
-                Some(old) if old != hash => {
-                    return Err(excalibur_store::Error::Invalid("memory schema checksum mismatch"));
-                }
-                Some(_) => {}
-                None => {
-                    c.execute_batch(sql)?;
-                    c.execute(
-                        "INSERT INTO memory_schema(version,checksum) VALUES(?1,?2)",
-                        rusqlite::params![SCHEMA_VERSION, hash],
-                    )?;
+            for (version, sql) in SCHEMA {
+                let hash = digest(sql.as_bytes());
+                let old: Option<String> = c
+                    .query_row(
+                        "SELECT checksum FROM memory_schema WHERE version=?1",
+                        [version],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match old {
+                    Some(old) if old != hash => {
+                        return Err(excalibur_store::Error::Invalid(
+                            "memory schema checksum mismatch",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        // The writer runs every command inside one savepoint.
+                        c.execute_batch(sql)?;
+                        c.execute(
+                            "INSERT INTO memory_schema(version,checksum) VALUES(?1,?2)",
+                            rusqlite::params![version, hash],
+                        )?;
+                    }
                 }
             }
             Ok(())

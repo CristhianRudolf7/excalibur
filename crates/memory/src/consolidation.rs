@@ -909,6 +909,38 @@ impl MemoryStore {
                     let all = s2.query_map([&id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
                     c.execute("UPDATE memories SET entities=?2 WHERE id=?1", rusqlite::params![id, serde_json::to_string(&all).unwrap()])?;
                 }
+                // Contextual graph: each memory points to the messages, tool calls and
+                // documents it was recorded from, and decisions point to the entities
+                // they mention. Edge ids are deterministic, so repeated reviews add nothing.
+                let edge_id = |parts: &[&str]| format!("edge_{}", &digest(parts.join("\0").as_bytes())[..32]);
+                let mut s = c.prepare("SELECT id,sources FROM memories WHERE principal_id=?1 AND scope_id=?2 AND state IN ('active','disputed','candidate')")?;
+                let rows = s.query_map(rusqlite::params![principal, scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                for (id, sources) in rows {
+                    let sources: Vec<SourceRef> = serde_json::from_str(&sources).unwrap_or_default();
+                    for source in sources {
+                        let kind = match source.kind {
+                            SourceKind::Message => "message",
+                            SourceKind::ToolCall => "tool_call",
+                            SourceKind::Document => "document",
+                            SourceKind::Page => "page",
+                            SourceKind::Memory => "memory",
+                        };
+                        added += c.execute(
+                            "INSERT OR IGNORE INTO edges(id,layer,source_type,source_id,relation_type,destination_type,destination_id,provenance,principal_id,scope_id) VALUES(?1,'action','memory',?2,'recorded_from',?3,?4,'consolidation',?5,?6)",
+                            rusqlite::params![edge_id(&["recorded_from", &id, kind, &source.id]), id, kind, source.id, principal, scope],
+                        )?;
+                    }
+                }
+                let mut s = c.prepare("SELECT id,statement FROM decisions WHERE principal_id=?1 AND scope_id=?2 AND state='active'")?;
+                let decisions = s.query_map(rusqlite::params![principal, scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                for (id, statement) in decisions {
+                    for entity in mentioned_entities(&entities, &statement) {
+                        added += c.execute(
+                            "INSERT OR IGNORE INTO edges(id,layer,source_type,source_id,relation_type,destination_type,destination_id,provenance,principal_id,scope_id) VALUES(?1,'memory','decision',?2,'decided','entity',?3,'consolidation',?4,?5)",
+                            rusqlite::params![edge_id(&["decided", &id, &entity]), id, entity, principal, scope],
+                        )?;
+                    }
+                }
                 Ok(added)
             })
             .await?)

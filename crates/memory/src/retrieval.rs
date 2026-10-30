@@ -1028,6 +1028,18 @@ pub struct HistoryQuery {
     pub cursor: Option<i64>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Search past actions (tool calls with their results) by tool name.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// Action outcome filter: `ok` or `error`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// `messages` (default), `actions` or `both`.
+    #[serde(default)]
+    pub include: Option<String>,
+    /// Cursor for the action list.
+    #[serde(default)]
+    pub action_cursor: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1040,15 +1052,158 @@ pub struct HistoryEntry {
     pub sent_at: i64,
 }
 
+/// A past tool call with its outcome, from a run the host bound to memory scopes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActionEntry {
+    pub run_id: String,
+    pub sequence: i64,
+    pub scope: String,
+    pub conversation: Option<String>,
+    pub task: Option<String>,
+    pub tool: String,
+    pub success: bool,
+    pub summary: String,
+    pub at: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryPage {
     pub entries: Vec<HistoryEntry>,
     pub next_cursor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action_cursor: Option<i64>,
 }
 
 impl MemoryStore {
     /// Past messages with date, conversation, scope and role filters, newest first.
     pub async fn history_search(
+        &self,
+        grant: &MemoryGrant,
+        query: HistoryQuery,
+    ) -> Result<HistoryPage> {
+        let include = match query.include.as_deref() {
+            None if query.tool.is_some() || query.status.is_some() => "actions",
+            None => "messages",
+            Some(v @ ("messages" | "actions" | "both")) => v,
+            Some(_) => return Err(invalid("include must be messages, actions or both")),
+        }
+        .to_string();
+        if let Some(status) = &query.status
+            && !matches!(status.as_str(), "ok" | "error")
+        {
+            return Err(invalid("status must be ok or error"));
+        }
+        let mut page = if include == "actions" {
+            grant.select(&query.scopes)?;
+            HistoryPage {
+                entries: Vec::new(),
+                next_cursor: None,
+                actions: Vec::new(),
+                next_action_cursor: None,
+            }
+        } else {
+            self.message_history(grant, query.clone()).await?
+        };
+        if include != "messages" {
+            let (actions, cursor) = self.action_history(grant, &query).await?;
+            page.actions = actions;
+            page.next_action_cursor = cursor;
+        }
+        Ok(page)
+    }
+
+    async fn action_history(
+        &self,
+        grant: &MemoryGrant,
+        query: &HistoryQuery,
+    ) -> Result<(Vec<ActionEntry>, Option<i64>)> {
+        let scopes = grant.select(&query.scopes)?;
+        let limit = query.limit.unwrap_or(10).clamp(1, 20) as i64;
+        let principal = grant.principal.clone();
+        let query = query.clone();
+        let redactor = self.redactor.clone();
+        Ok(self
+            .db
+            .read(ReadLane::Interactive, move |c| {
+                let mut sql = format!("SELECT j.rowid,j.run_id,j.sequence,b.primary_scope,b.conversation_id,b.task_id,COALESCE(json_extract(j.payload,'$.name'),''),COALESCE(json_extract(j.payload,'$.result.success'),0),j.payload,j.created_at FROM journal j JOIN memory_run_bindings b ON b.run_id=j.run_id WHERE j.kind='tool_result' AND j.payload IS NOT NULL AND json_valid(j.payload) AND b.principal_id=?1 AND b.primary_scope IN ({})", placeholders(2, scopes.len()));
+                let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(principal)];
+                for s in scopes {
+                    values.push(Box::new(s));
+                }
+                let mut add = |clause: &str, value: Box<dyn rusqlite::ToSql>, values: &mut Vec<Box<dyn rusqlite::ToSql>>| {
+                    values.push(value);
+                    sql.push_str(&clause.replace('?', &format!("?{}", values.len())));
+                };
+                if let Some(tool) = query.tool.clone() {
+                    add(" AND json_extract(j.payload,'$.name')=?", Box::new(tool), &mut values);
+                }
+                if let Some(status) = query.status.as_deref() {
+                    add(" AND COALESCE(json_extract(j.payload,'$.result.success'),0)=?", Box::new(i64::from(status == "ok")), &mut values);
+                }
+                if let Some(text) = query.text.clone().filter(|t| !t.trim().is_empty()) {
+                    add(" AND instr(lower(j.payload),lower(?))>0", Box::new(text), &mut values);
+                }
+                if let Some(conversation) = query.conversation.clone() {
+                    add(" AND b.conversation_id=?", Box::new(conversation), &mut values);
+                }
+                if let Some(from) = query.from {
+                    add(" AND j.created_at>=?", Box::new(from), &mut values);
+                }
+                if let Some(to) = query.to {
+                    add(" AND j.created_at<?", Box::new(to), &mut values);
+                }
+                if let Some(cursor) = query.action_cursor {
+                    add(" AND j.rowid<?", Box::new(cursor), &mut values);
+                }
+                values.push(Box::new(limit + 1));
+                sql.push_str(&format!(" ORDER BY j.rowid DESC LIMIT ?{}", values.len()));
+                let mut s = c.prepare(&sql)?;
+                let params: Vec<&dyn rusqlite::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+                let mut rows = s
+                    .query_map(params.as_slice(), |r| {
+                        let payload: String = r.get(8)?;
+                        let output = serde_json::from_str::<serde_json::Value>(&payload)
+                            .map(|v| v["result"]["output"].to_string())
+                            .unwrap_or_default();
+                        let summary: String = output.chars().take(600).collect();
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            ActionEntry {
+                                run_id: r.get(1)?,
+                                sequence: r.get(2)?,
+                                scope: r.get(3)?,
+                                conversation: r.get(4)?,
+                                task: r.get(5)?,
+                                tool: r.get(6)?,
+                                success: r.get::<_, i64>(7)? != 0,
+                                summary,
+                                at: r.get(9)?,
+                            },
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let next = if rows.len() as i64 > limit {
+                    rows.truncate(limit as usize);
+                    rows.last().map(|(rowid, _)| *rowid)
+                } else {
+                    None
+                };
+                Ok((
+                    rows.into_iter()
+                        .map(|(_, mut e)| {
+                            e.summary = redactor.redact_text(&e.summary);
+                            e
+                        })
+                        .collect(),
+                    next,
+                ))
+            })
+            .await?)
+    }
+
+    async fn message_history(
         &self,
         grant: &MemoryGrant,
         query: HistoryQuery,
@@ -1103,7 +1258,7 @@ impl MemoryStore {
                 } else {
                     None
                 };
-                Ok(HistoryPage { entries: rows.into_iter().map(|(_, e)| e).collect(), next_cursor })
+                Ok(HistoryPage { entries: rows.into_iter().map(|(_, e)| e).collect(), next_cursor, actions: Vec::new(), next_action_cursor: None })
             })
             .await?)
     }

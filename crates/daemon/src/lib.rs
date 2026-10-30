@@ -22,3 +22,6 @@ pub use planning_tools::ScopedPlanning;
 pub mod projection;
 
 mod project_scope;
+
+pub mod memory;
+pub use memory::{MemoryFastActions, MemoryHost, MemoryOptions};
