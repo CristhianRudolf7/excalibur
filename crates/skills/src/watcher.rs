@@ -21,8 +21,12 @@ impl SkillWatcher {
         }
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let mut watcher =
-            notify::recommended_watcher(move |_event: notify::Result<notify::Event>| {
-                let _ = tx.try_send(());
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if event.is_ok_and(|event| {
+                    event.kind.is_create() || event.kind.is_modify() || event.kind.is_remove()
+                }) {
+                    let _ = tx.try_send(());
+                }
             })
             .map_err(|e| e.to_string())?;
         for root in index.roots() {
@@ -58,7 +62,7 @@ impl SkillWatcher {
                         watched.insert(path.clone());
                     }
                 }
-                index.refresh().await;
+                let _ = index.refresh_background().await;
             }
         });
         Ok(Self { task })

@@ -246,11 +246,22 @@ pub struct FilesystemConfinement {
     pub read_roots: Vec<std::path::PathBuf>,
     pub snapshot_owner: String,
 }
+/// Host-owned frozen session context and append-only updates. No tool arguments
+/// can provide this authority or mutate an existing stable prefix.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunContext {
+    pub identity: String,
+    pub suggested_skills: Vec<String>,
+    pub updates: Vec<(String, String)>,
+}
 pub trait ToolRuntime: Send + Sync {
     /// A trusted scoped adapter can own a same-named engine utility. The host
     /// binding must keep this routing stable for the run, including restart.
     fn overrides_builtin<'a>(&'a self, _run: &'a str, _name: &'a str) -> BoxFuture<'a, bool> {
         Box::pin(async { false })
+    }
+    fn session_context<'a>(&'a self, _run: &'a str) -> BoxFuture<'a, Result<RunContext, String>> {
+        Box::pin(async { Ok(RunContext::default()) })
     }
     /// A positively confined filesystem and run-owned snapshot namespace.
     /// Generic runtimes deliberately provide no attestation.

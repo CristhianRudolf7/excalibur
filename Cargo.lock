@@ -1011,6 +1011,7 @@ dependencies = [
  "excalibur-orchestrator",
  "excalibur-providers",
  "excalibur-security",
+ "excalibur-skills",
  "excalibur-store",
  "excalibur-tasks",
  "excalibur-telemetry",
@@ -1303,7 +1304,10 @@ name = "excalibur-skills"
 version = "0.1.0"
 dependencies = [
  "cap-std",
+ "excalibur-context",
+ "excalibur-store",
  "excalibur-types",
+ "jsonschema",
  "notify",
  "serde",
  "serde_json",

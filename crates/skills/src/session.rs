@@ -3,6 +3,7 @@ use crate::{
     groups::{CatalogScope, relevant_groups},
     index::{IndexSnapshot, SkillEntry, SkillIndex, search_snapshot},
 };
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -13,14 +14,14 @@ pub struct SkillSession {
     loaded: BTreeMap<String, SkillEntry>,
     pub catalog: String,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoadedSkill {
     pub name: String,
     pub body: String,
     pub tools: Vec<String>,
     pub resources: Vec<String>,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillDelta {
     pub name: String,
     pub previous_hash: String,
@@ -151,5 +152,63 @@ impl SkillSession {
                 })
             })
             .collect()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedSession {
+    snapshot: IndexSnapshot,
+    bodies: BTreeMap<String, String>,
+    catalog: String,
+    loaded: Vec<String>,
+}
+impl SkillSession {
+    pub fn save(&self) -> Result<String, String> {
+        serde_json::to_string(&SavedSession {
+            snapshot: (*self.snapshot).clone(),
+            bodies: self
+                .snapshot
+                .entries
+                .iter()
+                .map(|(name, e)| (name.clone(), e.body.clone()))
+                .collect(),
+            catalog: self.catalog.clone(),
+            loaded: self.loaded.keys().cloned().collect(),
+        })
+        .map_err(|e| e.to_string())
+    }
+    pub fn restore(saved: &str) -> Result<Self, String> {
+        let mut saved: SavedSession = serde_json::from_str(saved).map_err(|e| e.to_string())?;
+        for (name, entry) in &mut saved.snapshot.entries {
+            entry.body = saved
+                .bodies
+                .remove(name)
+                .ok_or("skill session body missing")?;
+        }
+        let mut loaded = BTreeMap::new();
+        for name in saved.loaded {
+            let entry = saved
+                .snapshot
+                .entries
+                .get(&name)
+                .filter(|e| e.usable())
+                .ok_or("invalid loaded skill")?;
+            loaded.insert(name, entry.clone());
+        }
+        Ok(Self {
+            snapshot: Arc::new(saved.snapshot),
+            catalog: saved.catalog,
+            loaded,
+        })
+    }
+    pub fn search(
+        &self,
+        query: &str,
+        group: Option<&str>,
+    ) -> Result<Vec<crate::index::SearchHit>, String> {
+        if query.trim().is_empty() || query.len() > 8192 {
+            return Err("search query requires 1..8192 bytes".into());
+        }
+        Ok(search_snapshot(&self.snapshot, query, group, 20, None))
     }
 }
