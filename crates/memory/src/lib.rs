@@ -401,6 +401,7 @@ impl std::fmt::Debug for MemoryStore {
 const SCHEMA: &[(i64, &str)] = &[
     (1, include_str!("schema.sql")),
     (2, include_str!("schema2.sql")),
+    (3, include_str!("schema3.sql")),
 ];
 
 impl MemoryStore {

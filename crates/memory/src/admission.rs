@@ -458,6 +458,17 @@ impl MemoryStore {
             against = Some(&n.memory);
             similarity = Some(n.similarity);
         }
+        // A lower-trust assertion cannot replace or invalidate a user assertion merely
+        // by claiming that a temporal change happened. Keep it pending for review.
+        if against.is_some_and(|other| candidate.trust < other.trust)
+            && matches!(
+                decision,
+                AdmissionDecision::Refinement | AdmissionDecision::Contradiction
+            )
+        {
+            decision = AdmissionDecision::Deferred;
+            classifier = "trust_ceiling".into();
+        }
         let against = against.cloned();
         let mut question_id = None;
         let candidate2 = candidate.clone();

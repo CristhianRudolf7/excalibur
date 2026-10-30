@@ -22,6 +22,7 @@ pub struct CurationResult {
     pub admission: Option<AdmissionResult>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log(
     c: &rusqlite::Connection,
     principal: &str,
@@ -60,7 +61,9 @@ impl MemoryStore {
             return Err(invalid("only current records can be superseded"));
         }
         if input.scope != old.scope {
-            return Err(invalid("a replacement must stay in the scope of the record"));
+            return Err(invalid(
+                "a replacement must stay in the scope of the record",
+            ));
         }
         if old.trust > grant.max_trust {
             return Err(Error::Scope(
@@ -135,18 +138,40 @@ impl MemoryStore {
         }
         let reason = self.redactor.redact_text(reason.trim());
         if reason.is_empty() || reason.len() > 1024 {
-            return Err(invalid("a retirement reason of 1 to 1024 bytes is required"));
+            return Err(invalid(
+                "a retirement reason of 1 to 1024 bytes is required",
+            ));
         }
-        let (principal, m, run) = (grant.principal.clone(), memory.clone(), grant.run_id.clone());
+        let (principal, m, run) = (
+            grant.principal.clone(),
+            memory.clone(),
+            grant.run_id.clone(),
+        );
         self.db
             .write(Priority::Normal, move |c| {
                 c.execute(
                     "UPDATE memories SET invalidated_at=COALESCE(invalidated_at,?2) WHERE id=?1",
                     rusqlite::params![m.id, now],
                 )?;
-                transition(c, &m.id, Some(m.status), MemoryStatus::Retired, &format!("retired: {reason}"), now)?;
+                transition(
+                    c,
+                    &m.id,
+                    Some(m.status),
+                    MemoryStatus::Retired,
+                    &format!("retired: {reason}"),
+                    now,
+                )?;
                 close_questions(c, &principal, &m.id, now)?;
-                log(c, &principal, &m.scope, "retire", &m.id, json!({"reason": reason}), run.as_deref(), now)?;
+                log(
+                    c,
+                    &principal,
+                    &m.scope,
+                    "retire",
+                    &m.id,
+                    json!({"reason": reason}),
+                    run.as_deref(),
+                    now,
+                )?;
                 Ok(())
             })
             .await?;
@@ -173,7 +198,17 @@ impl MemoryStore {
         if memory.status != MemoryStatus::Disputed {
             return Err(invalid("only a disputed record can settle a dispute"));
         }
-        let (principal, m, run) = (grant.principal.clone(), memory.clone(), grant.run_id.clone());
+        if memory.trust > grant.max_trust {
+            return Err(Error::Scope(
+                "this caller cannot resolve a higher-trust dispute".into(),
+            ));
+        }
+        let max_trust = grant.max_trust;
+        let (principal, m, run) = (
+            grant.principal.clone(),
+            memory.clone(),
+            grant.run_id.clone(),
+        );
         let changed = self
             .db
             .write(Priority::Normal, move |c| {
@@ -197,6 +232,9 @@ impl MemoryStore {
                         && o.scope == m.scope
                         && o.status == MemoryStatus::Disputed
                     {
+                        if o.trust > max_trust {
+                            return Err(excalibur_store::Error::Invalid("cannot resolve a higher-trust dispute"));
+                        }
                         c.execute(
                             "UPDATE memories SET superseded_by=?2,valid_to=COALESCE(valid_to,?3),invalidated_at=?3 WHERE id=?1",
                             rusqlite::params![o.id, m.id, now],
@@ -308,7 +346,9 @@ impl MemoryStore {
             || name.len() > 64
             || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
-            return Err(invalid("relation names use 1 to 64 letters, digits or underscores"));
+            return Err(invalid(
+                "relation names use 1 to 64 letters, digits or underscores",
+            ));
         }
         self.ensure_principal(&grant.principal).await?;
         let state = if grant.max_trust == Trust::User {

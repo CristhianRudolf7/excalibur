@@ -28,12 +28,21 @@ pub fn memory_tool_definitions() -> Vec<ToolDefinition> {
     let mut write = input.clone();
     write["required"] = json!(["action"]);
     for (name, schema) in [
-        ("action", json!({"enum":["add","supersede","retire","resolve_dispute","merge_entities","define_relation_type"]})),
-        ("target", json!({"type":"string","description":"Memory id for supersede, retire and resolve_dispute"})),
+        (
+            "action",
+            json!({"enum":["add","supersede","retire","resolve_dispute","merge_entities","define_relation_type"]}),
+        ),
+        (
+            "target",
+            json!({"type":"string","description":"Memory id for supersede, retire and resolve_dispute"}),
+        ),
         ("reason", json!({"type":"string","maxLength":1024})),
         ("keep_entity", json!({"type":"string"})),
         ("merge_entity", json!({"type":"string"})),
-        ("relation", json!({"type":"object","required":["name"],"properties":{"name":{"type":"string"},"description":{"type":"string"},"domain":{"type":"string"},"range":{"type":"string"},"inverse":{"type":"string"}},"additionalProperties":false})),
+        (
+            "relation",
+            json!({"type":"object","required":["name"],"properties":{"name":{"type":"string"},"description":{"type":"string"},"domain":{"type":"string"},"range":{"type":"string"},"inverse":{"type":"string"}},"additionalProperties":false}),
+        ),
     ] {
         write["properties"][name] = schema;
     }
@@ -129,7 +138,9 @@ pub async fn call_memory_tool(
             let target = || str_field(&args, "target").map(str::to_string);
             match action.as_str() {
                 "add" => Ok(serde_json::to_value(
-                    store.memory_write(grant, memory_input(&args, grant)?, now).await?,
+                    store
+                        .memory_write(grant, memory_input(&args, grant)?, now)
+                        .await?,
                 )?),
                 "supersede" => Ok(serde_json::to_value(
                     store

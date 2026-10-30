@@ -4,7 +4,7 @@
 
 `excalibur-memory` is a shared library for scoped long-term memory, the Retriever, background consolidation, embedding spaces, identity documents and the document library with deterministic citations. It installs a checksummed additive schema over the principal SQLite database and keeps every query inside explicit scopes. Model-backed roles (extractor, decider, cheap classifier, reranker, query rewriter, note compactor, vision extraction, transcription, context sentences) are traits supplied by the host; the library starts no model, network service or daemon.
 
-The library is not yet wired into the conversational master, the engine tool runtime or the context compiler. Those connection points are listed at the end of this page.
+The daemon connects this library to its conversational master, worker tool runtime and context preparation through `MemoryHost`. The foreground daemon enables it with lexical, temporal and relational retrieval; embedding providers remain an explicit host option. Embedded hosts opt in through `HostOptions.memory`. The configured memory principal must match the master principal.
 
 ## Grants and scopes
 
@@ -16,7 +16,7 @@ A memory has kind (`fact`, `preference`, `event`, `commitment`, `belief`, `relat
 
 - `memory_write` stores an explicit memory and admits it immediately.
 - `memory_propose` stores a candidate with its source; it is retrievable only in the originating conversation or task until consolidation admits it.
-- Admission compares a candidate with records of the same scope that share an entity, match lexically or are vector neighbours. Similarity ≥ 0.95 with a shared entity merges provenance into the existing record. Between 0.80 and 0.95 the decider classifies, then the cheap classifier; with neither available the record stays a candidate. A refinement supersedes the previous record and closes its validity. Same entity and attribute with a different statement is a contradiction: with an explicit temporal change (flag or wording such as "now" or "ya no") the new record supersedes the old one; otherwise both become disputed and a low-priority question is queued.
+- Admission compares a candidate with records of the same scope that share an entity, match lexically or are vector neighbours. Similarity ≥ 0.95 with a shared entity merges provenance into the existing record. Between 0.80 and 0.95 the decider classifies, then the cheap classifier; with neither available the record stays a candidate. A refinement supersedes the previous record and closes its validity. A lower-trust refinement or contradiction remains a candidate rather than invalidating a higher-trust assertion. Same entity and attribute with a different statement is a contradiction: with an explicit temporal change (flag or wording such as "now" or "ya no") the new record supersedes the old one; otherwise both become disputed and a low-priority question is queued.
 - Content from external pages is marked `untrusted_external`; a preference from such a source is stored as a fact and is never proposed for the user profile.
 - Updates never destroy records; every status change is kept. `purge_memory` is the only destructive operation and removes content, keys, vectors and admission detail at the user's request.
 
@@ -24,7 +24,7 @@ A memory has kind (`fact`, `preference`, `event`, `commitment`, `belief`, `relat
 
 `retrieve` performs deterministic query analysis: dates and relative expressions in English and Spanish resolved in the user's time zone, known entity names and aliases as relational seeds, quoted phrases and identifiers as mandatory matches, and historical cues. "What was true on X" uses valid time; "what did we believe on X" uses record time. Four candidate lists of up to 50 items are produced: lexical (FTS5 BM25 with diacritic folding, plus trigram indexes for identifiers, over memories, messages, enriched keys and document chunks), semantic (KNN over every live embedding space), relational (one or two hops) and temporal. Reciprocal Rank Fusion uses k = 60. Expiry is enforced at read time; superseded, expired and retired records appear only in historical queries. Decay half-lives are 7 days for events, 90 for preferences and commitments and 365 for the rest; importance, confidence and trust adjust the score. An optional reranker reorders close leaders and its order is used directly. Notices report insufficient evidence, contradictions, disputes, scope ambiguity, unavailable semantic search and a query rewrite. A single cheap rewrite happens only when there are no results. Packing groups results by scope with id, statement, validity and source within a token budget. Extracted facts are indexed as additional keys pointing to their original turn.
 
-`history_search` pages past messages by text, dates, conversation, scope and role.
+`history_search` pages past messages and journaled tool results by text, dates, conversation, scope, role, tool and success/error status. Action visibility comes from durable host run bindings, rather than model-supplied run ids.
 
 ## Embeddings
 
@@ -46,10 +46,22 @@ The agent profile, user profile, notebook and personas are stored as fragments w
 
 `memory_tool_definitions` and `call_memory_tool` expose `memory_write`, `memory_propose`, `memory_search`, `history_search`, `doc_read`, `doc_edit`, `library_ingest` and `library_search`. Arguments may narrow scopes but never widen them, trust is capped by the grant and whether a profile edit was explicitly requested is supplied by the host.
 
+## Host integration and recovery
+
+`MemoryTools` exposes the core memory tools only to host-bound worker runs. The durable binding fixes principal, scopes, primary scope, conversation, task, parent run, worker/master role and time zone; rebinding may not change any of them. A restarted runtime reloads that binding. Worker writes have at most agent trust. Master writes get user trust only for the current durable human source; a generated report cannot borrow an older human message to authorize an explicit profile edit. Agent profile suggestions require user confirmation even after repeated suggestions; only user-trust evidence is eligible for automatic consolidation. The master uses scoped tools, and `library_ingest` is a deferred worker domain tool.
+
+Before a keyed write, the runtime commits a pending receipt. A completed receipt returns its original result on replay. If a process stops between the receipt and effect completion, reconciliation returns `Uncertain` and blocks automatic replay, because an effect may already exist. This prevents duplicate effects but does not promise transparent recovery of that interruption: the host must inspect and resolve the uncertain operation. Concurrent calls with the same key cannot both perform the effect; changed arguments or tool names are rejected.
+
+Task context preparation replaces inherited memory blocks with blocks for the child's own grant: the bounded agent core in L1, user preferences in L2 and automatic task recall in L3. Empty grants remove inherited memory from all three layers. The stored task context remains stable after preparation. The master's final response uses the admitted source turn's scope even after a conversation switches projects. Citation validation follows durable run bindings, includes descendants and the master's conversation workers, and filters by principal and granted scope. A validation failure replaces citation tokens with an unsourced marker.
+
+The work runtime periodically runs expiry, embedding queues/migrations, idle segment extraction and daily review in the maintenance model lane. Activity is refreshed while a pass runs so review can yield between batches. Stopping the host aborts its maintenance task. Admission can use calibrated roles from `MemoryOptions.services`, with a cheap fallback on the user model lane so active user turns do not stall behind paused maintenance. `memory.*` RPC methods query and curate the same store, inspect provenance, confirm proposals and relation types, and require explicit confirmation for destructive memory purging.
+
 ## Verification
 
 ```sh
 cargo test -p excalibur-memory
+cargo test -p excalibur-daemon --test memory_host
+cargo test -p excalibur-gateway --test shared_backend
 cargo test -p excalibur-memory --test mem_scope --test mem_time --test mem_conflict --test mem_cite
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -57,11 +69,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 `mem_scope`, `mem_time`, `mem_conflict` and `mem_cite` cover isolation, bitemporal answers and expiry, admission and conflict handling, and citations. Further suites cover retrieval, embeddings, identity documents and consolidation. Tests use temporary SQLite databases and deterministic local doubles from `excalibur_memory::testing`; they make no model or network calls. LongMemEval-S and the MemoryAgentBench conflict subset have not been run.
 
+The 2026-10-30 integration checkpoint passed the complete memory crate suite: 45 tests, no failures, and one ignored child fixture that the process-interruption test launches explicitly. The initial runtime run failed the pinned-preference validity regression; a stable-tree rerun with the validity filter passed. Host/gateway integration tests and directed Clippy remain pending at this checkpoint; these results do not establish full H10 completion or external benchmark performance.
+
 ## Pending connections and limits
 
-- Master and engine: registering the memory tools in the tool runtime, binding grants to conversations, runs and tasks, closing segments from the master and calling `validate_citations` before a response is sent.
-- Context compiler: the agent-profile core in layer 1, relevant preferences and project context in layer 2 and automatic retrieval at task start.
-- Scheduler: running `plan_review` and `run_review` in the background P3 lane with live user activity, provider batch APIs and model roles from the router.
-- Security: the full file inspection of the security layer behind `IngestGuard`; the built-in guard only checks size, type signature and UTF-8.
-- Run tree: `TaskRunLinkTree` reads task parent links; the daemon's agent-tree view still has to be adapted to `RunTree`.
-- Not implemented: local ONNX/candle model runtimes, an external HNSW index above 500 000 vectors per scope, Office and video extraction, and tool/status filters in `history_search`.
+- The maintenance scope list is currently captured at host startup; automatically enrolling projects registered later remains pending. The noninteractive `exec` host does not yet enable long-term memory.
+- Provider batch APIs, local ONNX/candle model runtimes and an external HNSW index above 500 000 vectors per scope remain unimplemented. The foreground daemon defaults to degraded retrieval until an embedder is supplied; `RemoteEmbedder` adapts the shared provider client and `text-embedding-3-small`.
+- Full security-layer file inspection behind `IngestGuard` remains pending; the built-in guard checks size, type signature and UTF-8. The model-facing ingest tool currently accepts text and Markdown, not arbitrary paths.
+- Vision/transcription/context-sentence roles are contracts that hosts must supply. Office and video extraction are unsupported.
+- The fixed memory-model adapters and curation/maintenance entry points are backend building blocks; no memory management UI or measured external benchmark score is claimed.

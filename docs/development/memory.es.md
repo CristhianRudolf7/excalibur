@@ -4,7 +4,7 @@
 
 `excalibur-memory` es una biblioteca compartida para la memoria a largo plazo por ámbitos, el Recuperador, la consolidación en segundo plano, los espacios de embeddings, los documentos de identidad y la biblioteca de documentos con citas deterministas. Instala un esquema aditivo con suma de comprobación sobre la base SQLite principal y mantiene cada consulta dentro de ámbitos explícitos. Los roles que usan modelos (extractor, decisor, clasificador barato, reordenador, reescritor de consultas, compactador de notas, extracción con visión, transcripción, frases de contexto) son traits que aporta el anfitrión; la biblioteca no inicia ningún modelo, servicio de red ni daemon.
 
-La biblioteca todavía no está conectada al maestro conversacional, al runtime de herramientas del motor ni al compilador de contexto. Esos puntos de conexión se enumeran al final de esta página.
+El daemon conecta esta biblioteca con el maestro conversacional, el runtime de herramientas de los trabajadores y la preparación del contexto mediante `MemoryHost`. El daemon en primer plano la activa con recuperación léxica, temporal y relacional; los proveedores de embeddings siguen siendo una opción explícita del anfitrión. Los anfitriones embebidos la activan mediante `HostOptions.memory`. El principal de memoria configurado debe coincidir con el del maestro.
 
 ## Concesiones y ámbitos
 
@@ -16,7 +16,7 @@ Un recuerdo tiene tipo (`fact`, `preference`, `event`, `commitment`, `belief`, `
 
 - `memory_write` guarda un recuerdo explícito y lo admite de inmediato.
 - `memory_propose` guarda un candidato con su fuente; solo es recuperable en la conversación o tarea de origen hasta que la consolidación lo admite.
-- La admisión compara un candidato con los registros del mismo ámbito que comparten entidad, coinciden léxicamente o son vecinos vectoriales. Una similitud ≥ 0,95 con entidad compartida fusiona la procedencia en el registro existente. Entre 0,80 y 0,95 clasifica el decisor y después el clasificador barato; si no hay ninguno, el registro queda como candidato. Un refinamiento reemplaza al registro anterior y cierra su validez. Misma entidad y atributo con otro enunciado es una contradicción: con un cambio temporal explícito (indicador o expresiones como "ahora" o "ya no") el nuevo reemplaza al anterior; si no, ambos quedan en disputa y se encola una pregunta de baja prioridad.
+- La admisión compara un candidato con los registros del mismo ámbito que comparten entidad, coinciden léxicamente o son vecinos vectoriales. Una similitud ≥ 0,95 con entidad compartida fusiona la procedencia en el registro existente. Entre 0,80 y 0,95 clasifica el decisor y después el clasificador barato; si no hay ninguno, el registro queda como candidato. Un refinamiento reemplaza al registro anterior y cierra su validez. Un refinamiento o contradicción de menor confianza permanece como candidato en lugar de invalidar una afirmación de mayor confianza. Misma entidad y atributo con otro enunciado es una contradicción: con un cambio temporal explícito (indicador o expresiones como "ahora" o "ya no") el nuevo reemplaza al anterior; si no, ambos quedan en disputa y se encola una pregunta de baja prioridad.
 - El contenido de páginas externas se marca `untrusted_external`; una preferencia de esa fuente se guarda como hecho y nunca se propone para el perfil del usuario.
 - Las actualizaciones nunca destruyen registros; se conserva cada cambio de estado. `purge_memory` es la única operación destructiva y elimina contenido, claves, vectores y detalle de admisión a petición del usuario.
 
@@ -24,7 +24,7 @@ Un recuerdo tiene tipo (`fact`, `preference`, `event`, `commitment`, `belief`, `
 
 `retrieve` hace un análisis determinista de la consulta: fechas y expresiones relativas en inglés y español resueltas en la zona horaria del usuario, nombres y alias de entidades conocidas como semillas relacionales, frases entre comillas e identificadores como coincidencias obligatorias y señales de consulta histórica. "Qué era cierto en X" usa el tiempo de validez; "qué creíamos en X", el de registro. Se generan cuatro listas de hasta 50 candidatos: léxica (BM25 de FTS5 con plegado de tildes, más índices trigram para identificadores, sobre recuerdos, mensajes, claves enriquecidas y fragmentos de documentos), semántica (KNN en cada espacio de embeddings vivo), relacional (uno o dos saltos) y temporal. La fusión Reciprocal Rank Fusion usa k = 60. La caducidad se aplica en la lectura; los registros reemplazados, caducados y retirados solo aparecen en consultas históricas. Las vidas medias de decaimiento son 7 días para eventos, 90 para preferencias y compromisos y 365 para el resto; importancia, confianza y fuente ajustan la puntuación. Un reordenador opcional reordena líderes muy próximos y se usa su orden directamente. Los avisos indican evidencia insuficiente, contradicciones, disputas, ambigüedad entre ámbitos, búsqueda semántica no disponible y reescritura de la consulta. Solo hay una reescritura barata cuando no hay resultados. El empaquetado agrupa por ámbito con id, enunciado, validez y fuente dentro de un presupuesto de tokens. Los hechos extraídos se indexan como claves adicionales que apuntan a su turno original.
 
-`history_search` pagina mensajes pasados por texto, fechas, conversación, ámbito y rol.
+`history_search` pagina mensajes pasados y resultados de herramientas del diario por texto, fechas, conversación, ámbito, rol, herramienta y estado de éxito/error. La visibilidad de acciones proviene de las vinculaciones durables del anfitrión, no de identificadores de ejecución aportados por el modelo.
 
 ## Embeddings
 
@@ -46,10 +46,22 @@ El perfil del agente, el perfil del usuario, el bloc de notas y las personas se 
 
 `memory_tool_definitions` y `call_memory_tool` exponen `memory_write`, `memory_propose`, `memory_search`, `history_search`, `doc_read`, `doc_edit`, `library_ingest` y `library_search`. Los argumentos pueden restringir los ámbitos pero nunca ampliarlos, la confianza está limitada por la concesión y es el anfitrión quien indica si una edición de perfil fue pedida explícitamente.
 
+## Integración con el anfitrión y recuperación
+
+`MemoryTools` expone las herramientas núcleo de memoria solo a trabajadores vinculados por el anfitrión. La vinculación durable fija principal, ámbitos, ámbito principal, conversación, tarea, ejecución padre, rol de trabajador/maestro y zona horaria; una nueva vinculación no puede modificarlos. Un runtime reiniciado los recupera. Las escrituras de trabajadores tienen como máximo confianza de agente. Las escrituras del maestro reciben confianza de usuario solo para la fuente humana durable actual; un informe generado no puede tomar prestado un mensaje humano anterior para autorizar una edición explícita de perfil. Las sugerencias de perfil del agente requieren confirmación del usuario aunque se repitan; solo la evidencia con confianza de usuario admite consolidación automática. El maestro usa herramientas con ámbito y `library_ingest` es una herramienta de dominio diferida para trabajadores.
+
+Antes de una escritura con clave, el runtime guarda un recibo pendiente. Un recibo completado devuelve su resultado original al repetirse. Si el proceso se detiene entre el recibo y la finalización del efecto, la reconciliación devuelve `Uncertain` y bloquea la repetición automática, porque el efecto podría existir. Esto evita efectos duplicados, pero no garantiza recuperación transparente de esa interrupción: el anfitrión debe inspeccionar y resolver la operación incierta. Dos llamadas concurrentes con la misma clave no pueden ejecutar ambas el efecto; se rechazan argumentos o nombres de herramienta cambiados.
+
+La preparación del contexto sustituye los bloques heredados por bloques de la concesión del hijo: núcleo acotado del agente en L1, preferencias del usuario en L2 y recuperación automática de la tarea en L3. Una concesión vacía elimina la memoria heredada de las tres capas. El contexto almacenado permanece estable tras prepararlo. La respuesta final del maestro usa el ámbito del turno original admitido aunque la conversación cambie de proyecto. La validación de citas sigue las vinculaciones durables, incluye descendientes y trabajadores de la conversación del maestro y filtra por principal y ámbito concedido. Un fallo de validación sustituye las citas por una marca sin fuente.
+
+El runtime de trabajo ejecuta periódicamente caducidades, colas/migraciones de embeddings, extracción de segmentos inactivos y revisión diaria en el carril de modelos de mantenimiento. La actividad se actualiza durante la pasada para que la revisión ceda entre lotes. Al detener el anfitrión se aborta su tarea de mantenimiento. La admisión puede usar roles calibrados de `MemoryOptions.services`, con un modelo barato de respaldo en el carril de usuario para que los turnos activos no queden esperando detrás del mantenimiento pausado. Los métodos RPC `memory.*` consultan y corrigen el mismo almacén, inspeccionan procedencia, confirman propuestas y tipos de relación y exigen confirmación explícita para purgar contenido de memoria.
+
 ## Verificación
 
 ```sh
 cargo test -p excalibur-memory
+cargo test -p excalibur-daemon --test memory_host
+cargo test -p excalibur-gateway --test shared_backend
 cargo test -p excalibur-memory --test mem_scope --test mem_time --test mem_conflict --test mem_cite
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -57,11 +69,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 `mem_scope`, `mem_time`, `mem_conflict` y `mem_cite` cubren el aislamiento, las respuestas bitemporales y la caducidad, la admisión y los conflictos, y las citas. Otras suites cubren recuperación, embeddings, documentos de identidad y consolidación. Las pruebas usan bases SQLite temporales y dobles locales deterministas de `excalibur_memory::testing`; no llaman a modelos ni a la red. No se han ejecutado LongMemEval-S ni el subconjunto de conflictos de MemoryAgentBench.
 
+El punto de integración del 2026-10-30 pasó la suite completa del crate de memoria: 45 pruebas, sin fallos y una prueba auxiliar ignorada que la prueba de interrupción de proceso lanza explícitamente. La ejecución inicial falló la regresión de validez de preferencias fijadas; la repetición con árbol estable y el filtro de validez pasó. Las pruebas de integración del anfitrión/gateway y Clippy dirigido siguen pendientes en este punto; estos resultados no demuestran completar H10 ni rendimiento en bancos externos.
+
 ## Conexiones pendientes y límites
 
-- Maestro y motor: registrar las herramientas de memoria en el runtime de herramientas, vincular concesiones a conversaciones, ejecuciones y tareas, cerrar segmentos desde el maestro y llamar a `validate_citations` antes de enviar una respuesta.
-- Compilador de contexto: el núcleo del perfil del agente en la capa 1, las preferencias pertinentes y el contexto del proyecto en la capa 2 y la recuperación automática al iniciar una tarea.
-- Planificador: ejecutar `plan_review` y `run_review` en el carril P3 en segundo plano con la actividad real del usuario, las API por lotes de los proveedores y los roles de modelo del enrutador.
-- Seguridad: la inspección completa de archivos de la capa de seguridad detrás de `IngestGuard`; el guardián incluido solo comprueba tamaño, firma de tipo y UTF-8.
-- Árbol de ejecuciones: `TaskRunLinkTree` lee los enlaces padre de las tareas; la vista del árbol de agentes del daemon aún debe adaptarse a `RunTree`.
-- No implementado: runtimes locales ONNX/candle, índice HNSW externo por encima de 500 000 vectores por ámbito, extracción de Office y vídeo, y filtros de herramienta y estado en `history_search`.
+- La lista de ámbitos de mantenimiento se captura al iniciar el anfitrión; falta incorporar automáticamente los proyectos registrados después. El anfitrión no interactivo `exec` todavía no activa memoria a largo plazo.
+- Siguen sin implementarse las API por lotes de proveedores, los runtimes locales ONNX/candle y el índice HNSW externo por encima de 500 000 vectores por ámbito. El daemon en primer plano usa recuperación degradada hasta recibir un proveedor de embeddings; `RemoteEmbedder` adapta el cliente compartido y `text-embedding-3-small`.
+- Falta la inspección completa de archivos de la capa de seguridad detrás de `IngestGuard`; el guardián incluido comprueba tamaño, firma de tipo y UTF-8. La herramienta de ingesta para el modelo admite texto y Markdown, no rutas arbitrarias.
+- Los roles de visión, transcripción y frases de contexto son contratos que debe aportar el anfitrión. La extracción de Office y vídeo no está soportada.
+- Los adaptadores fijos de modelos de memoria y las operaciones de corrección/mantenimiento son componentes backend; no se afirma una interfaz de gestión de memoria ni una puntuación medida en bancos externos.

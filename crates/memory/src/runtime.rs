@@ -18,7 +18,12 @@ use std::{
 };
 
 /// Tools that change memory, documents or the library.
-pub const MEMORY_WRITE_TOOLS: &[&str] = &["memory_write", "memory_propose", "doc_edit", "library_ingest"];
+pub const MEMORY_WRITE_TOOLS: &[&str] = &[
+    "memory_write",
+    "memory_propose",
+    "doc_edit",
+    "library_ingest",
+];
 /// Tools the context layer exposes as core memory tools; `library_ingest` is a deferred tool.
 pub const MEMORY_CORE_TOOLS: &[&str] = &[
     "doc_edit",
@@ -76,10 +81,24 @@ pub trait MemoryEscalation: Send + Sync {
     ) -> BoxFuture<'a, std::result::Result<(), String>>;
 }
 
+type StoredBinding = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
 impl MemoryStore {
     /// Persist a run binding. A run keeps the contract it was first bound to.
     pub async fn bind_run(&self, binding: &MemoryBinding, now: i64) -> Result<()> {
         binding.grant().validate()?;
+        if binding.run.trim().is_empty() || binding.run.len() > 512 {
+            return Err(invalid("run id must contain 1 to 512 bytes"));
+        }
         if !binding.scopes.contains(&binding.primary_scope) {
             return Err(Error::Scope("primary scope must be granted".into()));
         }
@@ -92,15 +111,17 @@ impl MemoryStore {
         };
         self.db
             .write(Priority::Journal, move |c| {
-                let existing: Option<(String, String, String)> = c
+                let existing: Option<StoredBinding> = c
                     .query_row(
-                        "SELECT principal_id,scopes,primary_scope FROM memory_run_bindings WHERE run_id=?1",
+                        "SELECT principal_id,scopes,primary_scope,conversation_id,task_id,parent_run_id,role,timezone FROM memory_run_bindings WHERE run_id=?1",
                         [&b.run],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
                     )
                     .optional()?;
-                if let Some((principal, old_scopes, primary)) = existing {
-                    if principal != b.principal || old_scopes != scopes || primary != b.primary_scope {
+                if let Some((principal, old_scopes, primary, conversation, task, parent, old_role, timezone)) = existing {
+                    if principal != b.principal || old_scopes != scopes || primary != b.primary_scope
+                        || conversation != b.conversation || task != b.task || parent != b.parent_run
+                        || old_role != role || timezone != b.timezone.name() {
                         return Err(excalibur_store::Error::Invalid(
                             "run is already bound to another memory contract",
                         ));
@@ -108,8 +129,8 @@ impl MemoryStore {
                     return Ok(());
                 }
                 c.execute(
-                    "INSERT INTO memory_run_bindings(run_id,principal_id,scopes,primary_scope,conversation_id,task_id,parent_run_id,role,bound_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                    rusqlite::params![b.run, b.principal, scopes, b.primary_scope, b.conversation, b.task, b.parent_run, role, now],
+                    "INSERT INTO memory_run_bindings(run_id,principal_id,scopes,primary_scope,conversation_id,task_id,parent_run_id,role,bound_at,timezone) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    rusqlite::params![b.run, b.principal, scopes, b.primary_scope, b.conversation, b.task, b.parent_run, role, now, b.timezone.name()],
                 )?;
                 Ok(())
             })
@@ -123,7 +144,7 @@ impl MemoryStore {
             .db
             .read(ReadLane::Interactive, move |c| {
                 Ok(c.query_row(
-                    "SELECT principal_id,scopes,primary_scope,conversation_id,task_id,parent_run_id,role FROM memory_run_bindings WHERE run_id=?1",
+                    "SELECT principal_id,scopes,primary_scope,conversation_id,task_id,parent_run_id,role,timezone FROM memory_run_bindings WHERE run_id=?1",
                     [&run],
                     |r| {
                         Ok((
@@ -135,6 +156,7 @@ impl MemoryStore {
                             r.get::<_, Option<String>>(4)?,
                             r.get::<_, Option<String>>(5)?,
                             r.get::<_, String>(6)?,
+                            r.get::<_, String>(7)?,
                         ))
                     },
                 )
@@ -142,7 +164,17 @@ impl MemoryStore {
             })
             .await?;
         Ok(row.map(
-            |(run, principal, scopes, primary_scope, conversation, task, parent_run, role)| {
+            |(
+                run,
+                principal,
+                scopes,
+                primary_scope,
+                conversation,
+                task,
+                parent_run,
+                role,
+                timezone,
+            )| {
                 MemoryBinding {
                     run,
                     principal,
@@ -156,7 +188,7 @@ impl MemoryStore {
                     } else {
                         BindingRole::Worker
                     },
-                    timezone: chrono_tz::UTC,
+                    timezone: timezone.parse().unwrap_or(chrono_tz::UTC),
                 }
             },
         ))
@@ -171,12 +203,37 @@ impl MemoryStore {
         explicit_user_request: bool,
         now: i64,
     ) -> Result<Value> {
+        if key.trim().is_empty() || key.len() > 512 {
+            return Err(invalid("tool key must contain 1 to 512 bytes"));
+        }
+        self.bind_run(binding, now).await?;
         let write = MEMORY_WRITE_TOOLS.contains(&name);
         let request_hash = digest(&serde_json::to_vec(&json!([name, &args]))?);
         if write && let Some(receipt) = self.receipt(&binding.run, key, &request_hash).await? {
             return Ok(receipt);
         }
-        let grant = binding.grant();
+        if write {
+            let (run, receipt_key, tool, hash) = (
+                binding.run.clone(),
+                key.to_string(),
+                name.to_string(),
+                request_hash.clone(),
+            );
+            let claimed = self.db.write(Priority::Journal, move |c| {
+                Ok(c.execute("INSERT OR IGNORE INTO memory_tool_receipts(run_id,key,tool,request_hash,result,at,state) VALUES(?1,?2,?3,?4,'null',?5,'pending')",
+                    rusqlite::params![run, receipt_key, tool, hash, now])? == 1)
+            }).await?;
+            if !claimed {
+                return self
+                    .receipt(&binding.run, key, &request_hash)
+                    .await?
+                    .ok_or_else(|| invalid("memory receipt disappeared"));
+            }
+        }
+        let mut grant = binding.grant();
+        if binding.role == BindingRole::Master && !explicit_user_request {
+            grant.max_trust = Trust::Agent;
+        }
         let mut args = args;
         if matches!(name, "memory_write" | "memory_propose")
             && args.get("scope").is_none()
@@ -184,8 +241,7 @@ impl MemoryStore {
         {
             object.insert("scope".into(), json!(binding.primary_scope));
         }
-        let result =
-            call_memory_tool(self, &grant, name, args, explicit_user_request, now).await?;
+        let result = call_memory_tool(self, &grant, name, args, explicit_user_request, now).await?;
         if write {
             let (run, key, tool, encoded) = (
                 binding.run.clone(),
@@ -196,7 +252,7 @@ impl MemoryStore {
             self.db
                 .write(Priority::Journal, move |c| {
                     c.execute(
-                        "INSERT OR IGNORE INTO memory_tool_receipts(run_id,key,tool,request_hash,result,at) VALUES(?1,?2,?3,?4,?5,?6)",
+                        "UPDATE memory_tool_receipts SET result=?5,at=?6,state='completed' WHERE run_id=?1 AND key=?2 AND tool=?3 AND request_hash=?4 AND state='pending'",
                         rusqlite::params![run, key, tool, request_hash, encoded, now],
                     )?;
                     Ok(())
@@ -207,22 +263,26 @@ impl MemoryStore {
     }
     async fn receipt(&self, run: &str, key: &str, request_hash: &str) -> Result<Option<Value>> {
         let (run, key) = (run.to_string(), key.to_string());
-        let row: Option<(String, String)> = self
+        let row: Option<(String, String, String)> = self
             .db
             .read(ReadLane::Interactive, move |c| {
                 Ok(c.query_row(
-                    "SELECT request_hash,result FROM memory_tool_receipts WHERE run_id=?1 AND key=?2",
+                    "SELECT request_hash,result,state FROM memory_tool_receipts WHERE run_id=?1 AND key=?2",
                     rusqlite::params![run, key],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?)
             })
             .await?;
         match row {
-            Some((hash, _)) if hash != request_hash => {
+            Some((hash, _, _)) if hash != request_hash => {
                 Err(invalid("tool key was reused for a different request"))
             }
-            Some((_, result)) => Ok(Some(serde_json::from_str(&result)?)),
+            Some((_, _, state)) if state != "completed" => Err(Error::Unavailable(
+                "memory effect was interrupted or is still running; reconcile before retrying"
+                    .into(),
+            )),
+            Some((_, result, _)) => Ok(Some(serde_json::from_str(&result)?)),
             None => Ok(None),
         }
     }
@@ -244,25 +304,28 @@ impl RunTree for BindingRunTree {
                 .db
                 .read(ReadLane::Interactive, move |c| {
                     let mut out = BTreeSet::from([root.clone()]);
-                    let master: Option<(String, Option<String>)> = c
+                    let master: Option<(String, Option<String>, String)> = c
                         .query_row(
-                            "SELECT role,conversation_id FROM memory_run_bindings WHERE run_id=?1",
+                            "SELECT role,conversation_id,principal_id FROM memory_run_bindings WHERE run_id=?1",
                             [&root],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                         )
                         .optional()?;
-                    if let Some((role, Some(conversation))) = master
+                    let Some((role, conversation, principal)) = master else {
+                        return Ok(out);
+                    };
+                    if let Some(conversation) = conversation
                         && role == "master"
                     {
-                        let mut s = c.prepare("SELECT run_id FROM memory_run_bindings WHERE conversation_id=?1 AND role='worker'")?;
-                        for run in s.query_map([&conversation], |r| r.get::<_, String>(0))? {
+                        let mut s = c.prepare("SELECT run_id FROM memory_run_bindings WHERE conversation_id=?1 AND principal_id=?2 AND role='worker'")?;
+                        for run in s.query_map(rusqlite::params![conversation, principal], |r| r.get::<_, String>(0))? {
                             out.insert(run?);
                         }
                     }
-                    let mut s = c.prepare("SELECT run_id FROM memory_run_bindings WHERE parent_run_id=?1")?;
+                    let mut s = c.prepare("SELECT run_id FROM memory_run_bindings WHERE parent_run_id=?1 AND principal_id=?2")?;
                     let mut stack: Vec<String> = out.iter().cloned().collect();
                     while let Some(node) = stack.pop() {
-                        for child in s.query_map([&node], |r| r.get::<_, String>(0))? {
+                        for child in s.query_map(rusqlite::params![node, principal], |r| r.get::<_, String>(0))? {
                             let child = child?;
                             if out.insert(child.clone()) {
                                 stack.push(child);
@@ -421,7 +484,7 @@ impl ToolRuntime for MemoryTools {
                 },
                 resources: vec![],
                 exclusive: false,
-                data: json!({"memory_version":1,"run":run,"args_hash":digest(&serde_json::to_vec(&args).unwrap_or_default())}),
+                data: json!({"memory_version":1,"run":run,"args_hash":digest(&serde_json::to_vec(&json!([call.name, args])).unwrap_or_default())}),
                 call,
             })
         })
@@ -446,7 +509,9 @@ impl ToolRuntime for MemoryTools {
                 Ok(args) => args,
                 Err(e) => return ToolResult::error(e),
             };
-            if tool.data["args_hash"] != digest(&serde_json::to_vec(&args).unwrap_or_default()) {
+            if tool.data["args_hash"]
+                != digest(&serde_json::to_vec(&json!([tool.call.name, args])).unwrap_or_default())
+            {
                 return ToolResult::error("memory tool preparation changed");
             }
             let result = self
@@ -504,12 +569,22 @@ impl ToolRuntime for MemoryTools {
             if !Self::own(&tool.call.name) {
                 return self.delegate.reconcile(run, key, tool).await;
             }
+            if tool.data["memory_version"] != 1
+                || tool.data["run"] != run
+                || self.binding(run).await.is_none()
+            {
+                return Reconcile::Uncertain("invalid memory tool preparation owner".into());
+            }
             let Ok(args) = Self::parse(&tool.call) else {
                 return Reconcile::Uncertain("memory tool arguments changed".into());
             };
-            let hash = digest(
-                &serde_json::to_vec(&json!([tool.call.name, &args])).unwrap_or_default(),
-            );
+            if tool.data["args_hash"]
+                != digest(&serde_json::to_vec(&json!([tool.call.name, args])).unwrap_or_default())
+            {
+                return Reconcile::Uncertain("memory tool preparation changed".into());
+            }
+            let hash =
+                digest(&serde_json::to_vec(&json!([tool.call.name, &args])).unwrap_or_default());
             match self.store.receipt(run, key, &hash).await {
                 Ok(Some(result)) => Reconcile::Done(ToolResult::ok(result)),
                 Ok(None) => Reconcile::Retry,
@@ -525,10 +600,18 @@ impl ToolRuntime for MemoryTools {
     ) -> BoxFuture<'a, std::result::Result<(), String>> {
         self.delegate.execution_state(run, state, reason)
     }
-    fn begin_step<'a>(&'a self, run: &'a str, step: u64) -> BoxFuture<'a, std::result::Result<(), String>> {
+    fn begin_step<'a>(
+        &'a self,
+        run: &'a str,
+        step: u64,
+    ) -> BoxFuture<'a, std::result::Result<(), String>> {
         self.delegate.begin_step(run, step)
     }
-    fn end_step<'a>(&'a self, run: &'a str, step: u64) -> BoxFuture<'a, std::result::Result<(), String>> {
+    fn end_step<'a>(
+        &'a self,
+        run: &'a str,
+        step: u64,
+    ) -> BoxFuture<'a, std::result::Result<(), String>> {
         self.delegate.end_step(run, step)
     }
     fn interrupt_execution<'a>(

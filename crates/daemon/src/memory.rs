@@ -5,8 +5,8 @@ use excalibur_master::FastActions;
 use excalibur_memory::{
     BindingRole, BindingRunTree, ConsolidationRoles, ContextBudget, EmbeddingProvider,
     IDENTITY_MARKER, MEMORY_CORE_TOOLS, MaintenanceConfig, MemoryBinding, MemoryEscalation,
-    MemoryGrant, MemoryStore, MemoryTools, ModelRole, PREFERENCES_MARKER, ReviewBudget,
-    TASK_MEMORY_MARKER, UserActivity, memory_tool_definitions, replace_block,
+    MemoryGrant, MemoryServices, MemoryStore, MemoryTools, ModelRole, PREFERENCES_MARKER,
+    ReviewBudget, TASK_MEMORY_MARKER, UserActivity, memory_tool_definitions, replace_block,
 };
 use excalibur_models::ModelGateway;
 use excalibur_orchestrator::{Agent, Delegation, Orchestrator};
@@ -48,6 +48,8 @@ pub struct MemoryOptions {
     /// Embedding provider for the active space; without one, retrieval is lexical,
     /// temporal and relational and says so.
     pub embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// Optional calibrated roles; the daemon supplies its user-lane cheap fallback.
+    pub services: MemoryServices,
     /// Background maintenance period; `None` leaves maintenance to explicit calls.
     pub maintenance_interval: Option<Duration>,
     pub review_budget: ReviewBudget,
@@ -59,6 +61,7 @@ impl Default for MemoryOptions {
             principal: "local".into(),
             timezone: excalibur_memory::chrono_tz::UTC,
             embedder: None,
+            services: MemoryServices::default(),
             maintenance_interval: Some(Duration::from_secs(300)),
             review_budget: ReviewBudget::default(),
             context_budget: ContextBudget::default(),
@@ -72,6 +75,7 @@ pub struct MemoryHost {
     pub options: MemoryOptions,
     orchestrator: Arc<Mutex<Option<Orchestrator>>>,
     stop: Arc<AtomicBool>,
+    maintenance: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 fn scopes_for(token_scopes: &BTreeSet<String>, scope: &str) -> BTreeSet<String> {
@@ -91,6 +95,12 @@ impl MemoryHost {
         delegate: Arc<dyn ToolRuntime>,
         options: MemoryOptions,
     ) -> Result<Arc<Self>, String> {
+        if options
+            .maintenance_interval
+            .is_some_and(|period| period.is_zero())
+        {
+            return Err("memory maintenance interval must be positive".into());
+        }
         if let Some(embedder) = &options.embedder {
             store
                 .embeddings()
@@ -98,16 +108,19 @@ impl MemoryHost {
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        let store = store.with_services(options.services.clone());
         let orchestrator = Arc::new(Mutex::new(None));
-        let tools = MemoryTools::new(delegate, store.clone()).with_escalation(Arc::new(Escalation {
-            orchestrator: orchestrator.clone(),
-        }));
+        let tools =
+            MemoryTools::new(delegate, store.clone()).with_escalation(Arc::new(Escalation {
+                orchestrator: orchestrator.clone(),
+            }));
         Ok(Arc::new(Self {
             tools: Arc::new(tools),
             store,
             options,
             orchestrator,
             stop: Arc::new(AtomicBool::new(false)),
+            maintenance: Mutex::new(None),
         }))
     }
     /// Escalation needs the orchestrator, which is created after the tool runtime.
@@ -115,7 +128,11 @@ impl MemoryHost {
         *self.orchestrator.lock().unwrap_or_else(|e| e.into_inner()) = Some(orchestrator.clone());
     }
     /// Bind a worker run to the data scopes of its capability token.
-    pub async fn bind_agent(&self, agent: &Agent, parent_run: Option<String>) -> Result<(), String> {
+    pub async fn bind_agent(
+        &self,
+        agent: &Agent,
+        parent_run: Option<String>,
+    ) -> Result<(), String> {
         let Some(run) = &agent.run_id else {
             return Ok(());
         };
@@ -143,7 +160,9 @@ impl MemoryHost {
         let scopes = scopes_for(&delegation.token.data_scopes, &delegation.scope);
         let context = &mut delegation.spec.context;
         if scopes.is_empty() {
+            replace_block(&mut context.layers[1], IDENTITY_MARKER, "");
             replace_block(&mut context.layers[2], PREFERENCES_MARKER, "");
+            replace_block(&mut context.layers[3], TASK_MEMORY_MARKER, "");
             return Ok(());
         }
         let grant = MemoryGrant::new(self.options.principal.clone(), scopes)
@@ -162,7 +181,11 @@ impl MemoryHost {
             .await
             .map_err(|e| e.to_string())?;
         replace_block(&mut context.layers[1], IDENTITY_MARKER, &memory.identity);
-        replace_block(&mut context.layers[2], PREFERENCES_MARKER, &memory.preferences);
+        replace_block(
+            &mut context.layers[2],
+            PREFERENCES_MARKER,
+            &memory.preferences,
+        );
         replace_block(&mut context.layers[3], TASK_MEMORY_MARKER, &memory.recall);
         Ok(())
     }
@@ -182,7 +205,11 @@ impl MemoryHost {
             .await
             .map_err(|e| e.to_string())
     }
-    async fn master_binding(&self, conversation: &str, scope: &str) -> Result<MemoryBinding, String> {
+    async fn master_binding(
+        &self,
+        conversation: &str,
+        scope: &str,
+    ) -> Result<MemoryBinding, String> {
         let mut scopes = BTreeSet::from(["general".to_string()]);
         scopes.insert(scope.to_string());
         let binding = MemoryBinding {
@@ -208,13 +235,17 @@ impl MemoryHost {
         let Some(message) = message else {
             return false;
         };
-        let (conversation, message) = (conversation.to_string(), message.to_string());
+        let (conversation, message, principal) = (
+            conversation.to_string(),
+            message.to_string(),
+            self.options.principal.clone(),
+        );
         self.store
             .database()
             .read(ReadLane::Interactive, move |c| {
                 Ok(c.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM messages WHERE id=?1 AND conversation_id=?2 AND role='user')",
-                    [&message, &conversation],
+                    "SELECT EXISTS(SELECT 1 FROM messages m JOIN master_user_sources s ON s.id=m.id WHERE m.id=?1 AND m.conversation_id=?2 AND m.principal_id=?3 AND m.role='user')",
+                    [&message, &conversation, &principal],
                     |r| r.get::<_, bool>(0),
                 )?)
             })
@@ -229,26 +260,42 @@ impl MemoryHost {
         args: Value,
         key: &str,
     ) -> Result<Value, String> {
+        self.master_tool_from_source(conversation, scope, None, name, args, key)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn master_tool_from_source(
+        &self,
+        conversation: &str,
+        scope: &str,
+        source: Option<&str>,
+        name: &str,
+        args: Value,
+        key: &str,
+    ) -> Result<Value, String> {
         let binding = self.master_binding(conversation, scope).await?;
-        let explicit = name == "doc_edit"
-            && self
-                .user_message_in(conversation, args.get("provenance").and_then(Value::as_str))
-                .await;
+        let human = self.user_message_in(conversation, source).await;
+        let explicit = human
+            && (name != "doc_edit" || args.get("provenance").and_then(Value::as_str) == source);
         self.store
-            .call_bound(&binding, name, args, key, explicit, excalibur_store::unix_seconds())
+            .call_bound(
+                &binding,
+                name,
+                args,
+                key,
+                explicit,
+                excalibur_store::unix_seconds(),
+            )
             .await
             .map_err(|e| e.to_string())
     }
-    async fn finalize(&self, conversation: &str, text: &str) -> String {
+    async fn finalize(&self, conversation: &str, scope: &str, text: &str) -> String {
         if !text.contains("[[") {
             return text.to_owned();
         }
-        let Ok(scope) = self.conversation_scope(conversation).await else {
-            return text.to_owned();
-        };
-        let binding = match self.master_binding(conversation, &scope).await {
+        let binding = match self.master_binding(conversation, scope).await {
             Ok(binding) => binding,
-            Err(_) => return text.to_owned(),
+            Err(_) => return strip_citations(text),
         };
         let tree = BindingRunTree {
             store: self.store.clone(),
@@ -259,7 +306,10 @@ impl MemoryHost {
             .await
         {
             Ok(cited) => cited.text,
-            Err(_) => text.to_owned(),
+            Err(_) => {
+                // Never publish unchecked citation tokens when storage/tree lookup fails.
+                strip_citations(text)
+            }
         }
     }
     async fn stable(&self, conversation: &str, scope: &str) -> (String, String) {
@@ -291,8 +341,12 @@ impl MemoryHost {
         let Some(interval) = self.options.maintenance_interval else {
             return;
         };
+        let mut maintenance = self.maintenance.lock().unwrap_or_else(|e| e.into_inner());
+        if maintenance.is_some() {
+            return;
+        }
         let host = self.clone();
-        handle.spawn(async move {
+        let task = handle.spawn(async move {
             let roles = model.map(|model| {
                 let role = Arc::new(ModelRole::new("memory-maintenance", model));
                 ConsolidationRoles {
@@ -317,15 +371,36 @@ impl MemoryHost {
                     return;
                 }
                 activity.refresh().await;
-                let _ = host
-                    .store
-                    .maintenance_tick(&config, roles.as_ref(), &activity, excalibur_store::unix_seconds())
-                    .await;
+                let tick = host.store.maintenance_tick(
+                    &config,
+                    roles.as_ref(),
+                    &activity,
+                    excalibur_store::unix_seconds(),
+                );
+                tokio::pin!(tick);
+                loop {
+                    tokio::select! {
+                        _ = &mut tick => break,
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                            if host.stop.load(Ordering::SeqCst) { return; }
+                            activity.refresh().await;
+                        }
+                    }
+                }
             }
         });
+        *maintenance = Some(task.abort_handle());
     }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        if let Some(task) = self
+            .maintenance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            task.abort();
+        }
     }
 }
 
@@ -447,6 +522,38 @@ impl FastActions for MemoryFastActions {
                 .await
         })
     }
+    fn invoke_source_scoped<'a>(
+        &'a self,
+        conversation: &'a str,
+        scope: &'a str,
+        source_message_id: &'a str,
+        name: &'a str,
+        arguments: Value,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Value, String>> {
+        if !Self::own(name) {
+            return self.inner.invoke_source_scoped(
+                conversation,
+                scope,
+                source_message_id,
+                name,
+                arguments,
+                key,
+            );
+        }
+        Box::pin(async move {
+            self.host
+                .master_tool_from_source(
+                    conversation,
+                    scope,
+                    Some(source_message_id),
+                    name,
+                    arguments,
+                    key,
+                )
+                .await
+        })
+    }
     fn invoke_scoped<'a>(
         &'a self,
         conversation: &'a str,
@@ -475,14 +582,32 @@ impl FastActions for MemoryFastActions {
         scope: &'a str,
     ) -> BoxFuture<'a, (String, String)> {
         Box::pin(async move {
-            let (inner_identity, inner_scope) = self.inner.stable_context(conversation, scope).await;
+            let (inner_identity, inner_scope) =
+                self.inner.stable_context(conversation, scope).await;
             let (identity, preferences) = self.host.stable(conversation, scope).await;
             let join = |a: String, b: String| match (a.is_empty(), b.is_empty()) {
                 (true, _) => b,
                 (_, true) => a,
                 _ => format!("{a}\n{b}"),
             };
-            (join(inner_identity, identity), join(inner_scope, preferences))
+            (
+                join(inner_identity, identity),
+                join(inner_scope, preferences),
+            )
+        })
+    }
+    fn finalize_response_scoped<'a>(
+        &'a self,
+        conversation: &'a str,
+        scope: &'a str,
+        text: &'a str,
+    ) -> BoxFuture<'a, String> {
+        Box::pin(async move {
+            let text = self
+                .inner
+                .finalize_response_scoped(conversation, scope, text)
+                .await;
+            self.host.finalize(conversation, scope, &text).await
         })
     }
     fn finalize_response<'a>(
@@ -491,8 +616,37 @@ impl FastActions for MemoryFastActions {
         text: &'a str,
     ) -> BoxFuture<'a, String> {
         Box::pin(async move {
-            let text = self.inner.finalize_response(conversation, text).await;
-            self.host.finalize(conversation, &text).await
+            match self.host.conversation_scope(conversation).await {
+                Ok(scope) => {
+                    self.finalize_response_scoped(conversation, &scope, text)
+                        .await
+                }
+                Err(_) => strip_citations(text),
+            }
         })
     }
+}
+
+/// Conservative fallback when the citation database is unavailable.
+fn strip_citations(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[[") {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        if let Some(end) = tail.find("]]") {
+            let token = &tail[..end + 2];
+            if token.starts_with("[[doc:") || token.starts_with("[[web:") {
+                out.push_str("[unsourced]");
+            } else {
+                out.push_str(token);
+            }
+            rest = &tail[end + 2..];
+        } else {
+            out.push_str(tail);
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
 }

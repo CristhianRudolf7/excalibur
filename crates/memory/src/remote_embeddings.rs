@@ -27,7 +27,12 @@ impl RemoteEmbedder {
     pub fn openai_small(api_key: Secret) -> Result<Self, String> {
         let client =
             ProviderClient::new(Provider::OpenAi, api_key).map_err(|error| error.to_string())?;
-        Ok(Self::with_client(client, OPENAI_SMALL_MODEL, Some(512), 512))
+        Ok(Self::with_client(
+            client,
+            OPENAI_SMALL_MODEL,
+            Some(512),
+            512,
+        ))
     }
     /// Any OpenAI-compatible client (tests use a loopback mock base URL).
     pub fn with_client(

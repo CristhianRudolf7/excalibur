@@ -975,6 +975,7 @@ dependencies = [
  "excalibur-gateway",
  "excalibur-journal",
  "excalibur-master",
+ "excalibur-memory",
  "excalibur-models",
  "excalibur-orchestrator",
  "excalibur-providers",

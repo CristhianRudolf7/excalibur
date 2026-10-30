@@ -4,8 +4,8 @@
 //! `activity-histogram` come from `plan_review`). A tick does bounded work and records when
 //! each job last ran; the review itself checkpoints and yields to the user.
 use crate::{
-    ConsolidationRoles, MemoryStore, Result, ReviewBudget, ReviewOutcome, ScheduleDecision,
-    UserActivity, MemoryGrant, placeholders,
+    ConsolidationRoles, MemoryGrant, MemoryStore, Result, ReviewBudget, ReviewOutcome,
+    ScheduleDecision, UserActivity, placeholders,
 };
 use excalibur_store::{
     Priority, ReadLane,
@@ -101,7 +101,12 @@ impl MemoryStore {
     }
     /// Scopes whose newest message is older than the segment idle time and that have turns
     /// after their extraction watermark.
-    async fn idle_segments(&self, principal: &str, scopes: &[String], now: i64) -> Result<Vec<String>> {
+    async fn idle_segments(
+        &self,
+        principal: &str,
+        scopes: &[String],
+        now: i64,
+    ) -> Result<Vec<String>> {
         let (principal, scopes, idle) = (
             principal.to_string(),
             scopes.to_vec(),
@@ -153,8 +158,13 @@ impl MemoryStore {
         for scope in &config.scopes {
             report.expired += self.expire(&config.principal, scope, now).await?;
         }
-        self.job_mark(&config.principal, "memory-expiry", json!({"expired": report.expired}), now)
-            .await?;
+        self.job_mark(
+            &config.principal,
+            "memory-expiry",
+            json!({"expired": report.expired}),
+            now,
+        )
+        .await?;
         let queue = self
             .embeddings
             .process_queue(config.queue_batch.max(1), now)
@@ -164,7 +174,11 @@ impl MemoryStore {
         if queue.remaining == 0 {
             for space in self.embeddings.spaces().await? {
                 if space.state == "migrating"
-                    && self.embeddings.finish_migration(&space.id, now).await.is_ok()
+                    && self
+                        .embeddings
+                        .finish_migration(&space.id, now)
+                        .await
+                        .is_ok()
                 {
                     report.migrations_finished.push(space.id);
                 }
@@ -208,7 +222,9 @@ impl MemoryStore {
         let schedule = self
             .plan_review(&config.principal, config.timezone, &config.budget, now)
             .await?;
-        let last = self.job_last_run(&config.principal, "daily-memory-review").await?;
+        let last = self
+            .job_last_run(&config.principal, "daily-memory-review")
+            .await?;
         let finished_recently = last.is_some_and(|t| now - t < 20 * 3600);
         if schedule.due_now && !finished_recently && !activity.active() {
             let outcome = self

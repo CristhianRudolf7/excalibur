@@ -73,7 +73,7 @@ impl RunAuthority for Authority {
                 .register_run(
                     run,
                     RunSecurity {
-                        parent,
+                        parent: parent.clone(),
                         project: agent.scope.clone(),
                         workspace: binding.workspace,
                         token: binding.token,
@@ -303,13 +303,28 @@ impl DaemonHost {
             Arc::new(SecuredTools::new(workers.clone(), security.clone()));
         let planning =
             Arc::new(ScopedPlanning::new(secured.clone(), db.clone(), redactor.clone()).await?);
+        let fallback_limits = options.lane_limits.clone();
+        let lanes = LaneScheduler::new(options.lane_limits).map_err(String::from)?;
         let memory = match options.memory.clone() {
-            Some(memory_options) => {
+            Some(mut memory_options) => {
+                if memory_options.principal != options.master_config.principal {
+                    return Err("memory and master must use the same principal".into());
+                }
+                if memory_options.services.cheap_classifier.is_none() {
+                    memory_options.services.cheap_classifier =
+                        Some(Arc::new(excalibur_memory::ModelRole::new(
+                            "memory-admission",
+                            lanes.gateway(Lane::User, model.clone()),
+                        )));
+                }
                 let store = excalibur_memory::MemoryStore::open(db.clone())
                     .await
                     .map_err(|e| e.to_string())?
                     .with_redactor(redactor.clone());
-                Some(crate::memory::MemoryHost::open(store, planning.clone(), memory_options).await?)
+                Some(
+                    crate::memory::MemoryHost::open(store, planning.clone(), memory_options)
+                        .await?,
+                )
             }
             None => None,
         };
@@ -332,8 +347,6 @@ impl DaemonHost {
             catalog,
             excalibur_tools::deferred::CallerRole::Worker,
         )?);
-        let fallback_limits = options.lane_limits.clone();
-        let lanes = LaneScheduler::new(options.lane_limits).map_err(String::from)?;
         let journal = excalibur_journal::Journal::new(db.clone())
             .await
             .map_err(|e| e.to_string())?;

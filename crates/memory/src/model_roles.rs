@@ -83,13 +83,17 @@ impl Extractor for ModelRole {
                     schema,
                 )
                 .await?;
-            let mut output: ExtractionOutput = serde_json::from_value(json!({"facts": value["facts"], "tokens_used": tokens}))
-                .map_err(|e| format!("invalid extraction: {e}"))?;
-            let known: std::collections::BTreeSet<&str> =
-                request.turns.iter().map(|t| t.message_id.as_str()).collect();
-            output
-                .facts
-                .retain(|f| known.contains(f.message_id.as_str()) && !f.statement.trim().is_empty());
+            let mut output: ExtractionOutput =
+                serde_json::from_value(json!({"facts": value["facts"], "tokens_used": tokens}))
+                    .map_err(|e| format!("invalid extraction: {e}"))?;
+            let known: std::collections::BTreeSet<&str> = request
+                .turns
+                .iter()
+                .map(|t| t.message_id.as_str())
+                .collect();
+            output.facts.retain(|f| {
+                known.contains(f.message_id.as_str()) && !f.statement.trim().is_empty()
+            });
             Ok(output)
         })
     }

@@ -1,6 +1,6 @@
 //! Identity documents and notebook stored as hashed, versioned fragments (architecture 10.2).
 use crate::{
-    Error, MemoryGrant, MemoryStore, Result, digest, invalid, new_id,
+    Error, MemoryGrant, MemoryStore, Result, Trust, digest, invalid, new_id,
     text::{fts_or, normalize, query_terms},
 };
 use excalibur_store::{
@@ -571,6 +571,7 @@ impl MemoryStore {
         ctx: EditContext,
         now: i64,
     ) -> Result<EditOutcome> {
+        let allow_auto = grant.max_trust == Trust::User;
         let (principal, document, scopes) = (
             grant.principal.clone(),
             document.to_string(),
@@ -631,6 +632,7 @@ impl MemoryStore {
                     operation,
                     &text,
                     ctx.provenance.as_deref().unwrap_or_default(),
+                    allow_auto,
                     now,
                 )?)
             })
@@ -664,6 +666,7 @@ impl MemoryStore {
                     "append",
                     &text,
                     &provenance,
+                    true,
                     now,
                 )?)
             })
@@ -696,6 +699,12 @@ impl MemoryStore {
         only: Option<&str>,
         now: i64,
     ) -> Result<Vec<String>> {
+        grant.validate()?;
+        if only.is_some() && grant.max_trust != Trust::User {
+            return Err(Error::Scope(
+                "only the user can confirm a profile proposal".into(),
+            ));
+        }
         let min = if only.is_some() {
             1
         } else {
@@ -705,7 +714,7 @@ impl MemoryStore {
         Ok(self
             .db
             .write(Priority::Normal, move |c| {
-                let mut s = c.prepare("SELECT id,document_id,fragment_id,heading_path,operation,text,provenance FROM profile_proposals WHERE principal_id=?1 AND state='proposed' AND evidence_count>=?2 AND (?3 IS NULL OR id=?3) ORDER BY created_at,id")?;
+                let mut s = c.prepare("SELECT id,document_id,fragment_id,heading_path,operation,text,provenance FROM profile_proposals WHERE principal_id=?1 AND state='proposed' AND evidence_count>=?2 AND (?3 IS NULL OR id=?3) AND (?3 IS NOT NULL OR auto_confirmable=1) ORDER BY created_at,id")?;
                 let rows = s
                     .query_map(rusqlite::params![principal, min, only], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?, r.get::<_, String>(6)?)))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -963,11 +972,12 @@ fn upsert_proposal(
     operation: &str,
     text: &str,
     provenance: &str,
+    allow_auto: bool,
     now: i64,
 ) -> rusqlite::Result<EditOutcome> {
     let normalized = normalize(text);
     let existing: Option<(String, String)> = c
-        .query_row("SELECT id,provenance FROM profile_proposals WHERE principal_id=?1 AND document_id=?2 AND normalized=?3 AND operation=?4 AND state='proposed'", rusqlite::params![principal, document, normalized, operation], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row("SELECT id,provenance FROM profile_proposals WHERE principal_id=?1 AND document_id=?2 AND normalized=?3 AND operation=?4 AND state='proposed' AND auto_confirmable=?5", rusqlite::params![principal, document, normalized, operation, allow_auto], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     match existing {
         Some((id, sources)) => {
@@ -983,7 +993,7 @@ fn upsert_proposal(
         }
         None => {
             let id = new_id("prop");
-            c.execute("INSERT INTO profile_proposals(id,principal_id,document_id,fragment_id,heading_path,operation,text,normalized,provenance,evidence_count,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'proposed',?10,?10)", rusqlite::params![id, principal, document, fragment, serde_json::to_string(path).unwrap(), operation, text, normalized, json!([provenance]).to_string(), now])?;
+            c.execute("INSERT INTO profile_proposals(id,principal_id,document_id,fragment_id,heading_path,operation,text,normalized,provenance,evidence_count,state,created_at,updated_at,auto_confirmable) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'proposed',?10,?10,?11)", rusqlite::params![id, principal, document, fragment, serde_json::to_string(path).unwrap(), operation, text, normalized, json!([provenance]).to_string(), now, allow_auto])?;
             Ok(EditOutcome::Proposed {
                 proposal_id: id,
                 evidence_count: 1,

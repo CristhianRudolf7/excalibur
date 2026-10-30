@@ -130,6 +130,15 @@ pub trait FastActions: Send + Sync {
     }
     /// Last host check on a final answer before it is stored and published (for example
     /// citation validation). Implementations return the text to send.
+    /// The immutable scope of the source turn, even if the active conversation changed.
+    fn finalize_response_scoped<'a>(
+        &'a self,
+        conversation: &'a str,
+        _scope: &'a str,
+        text: &'a str,
+    ) -> BoxFuture<'a, String> {
+        self.finalize_response(conversation, text)
+    }
     fn finalize_response<'a>(
         &'a self,
         _conversation: &'a str,
@@ -897,10 +906,25 @@ impl Master {
         Ok(())
     }
     async fn respond(&self, conversation: &str, text: &str, ids: &[String]) -> Result<()> {
+        let source = ids
+            .first()
+            .ok_or_else(|| Error::Invalid("response has no source turn".into()))?
+            .clone();
+        let scope: String = self
+            .inner
+            .db
+            .read(ReadLane::Interactive, move |c| {
+                Ok(c.query_row(
+                    "SELECT COALESCE(scope_id,'general') FROM messages WHERE id=?1",
+                    [&source],
+                    |r| r.get(0),
+                )?)
+            })
+            .await?;
         let text = self
             .inner
             .actions
-            .finalize_response(conversation, text)
+            .finalize_response_scoped(conversation, &scope, text)
             .await;
         let conversation = conversation.to_string();
         let text = self.inner.redactor.redact_text(&text);

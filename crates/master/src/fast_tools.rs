@@ -84,6 +84,15 @@ impl FastActions for MasterFastTools {
     ) -> BoxFuture<'a, (String, String)> {
         self.core.stable_context(conversation, scope)
     }
+    fn finalize_response_scoped<'a>(
+        &'a self,
+        conversation: &'a str,
+        scope: &'a str,
+        text: &'a str,
+    ) -> BoxFuture<'a, String> {
+        self.core
+            .finalize_response_scoped(conversation, scope, text)
+    }
     fn finalize_response<'a>(
         &'a self,
         conversation: &'a str,

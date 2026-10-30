@@ -1,7 +1,6 @@
 //! Authenticated client transport. Agent decisions and control remain in shared services.
 mod backend;
 mod memory;
-pub use memory::MemoryAccess;
 use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
@@ -18,6 +17,7 @@ pub use backend::SharedBackend;
 use excalibur_store::{BlobHash, BlobOwner, Database, Priority, ReadLane, Store};
 use excalibur_types::runtime::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
+pub use memory::MemoryAccess;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
