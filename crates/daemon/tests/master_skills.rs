@@ -158,16 +158,19 @@ fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopeni
     write(&a, "worker-only", "terminal", "NO_WORKER_SCHEMA");
     write(&a, "core-only", "run_history_search", "NO_ENGINE_SCHEMA");
     write(&b, "private-b", "status", "B_PRIVATE_BODY");
-    let mut options = HostOptions::project(a.clone());
-    let mut project = options.projects[0].clone();
-    project.id = "b".into();
-    project.name = "B".into();
-    project.roots = vec![b];
-    options.projects.push(project);
-    options.memory = Some(MemoryOptions {
-        maintenance_interval: None,
-        ..Default::default()
-    });
+    let make_options = || {
+        let mut options = HostOptions::project(a.clone());
+        let mut project = options.projects[0].clone();
+        project.id = "b".into();
+        project.name = "B".into();
+        project.roots = vec![b.clone()];
+        options.projects.push(project);
+        options.memory = Some(MemoryOptions {
+            maintenance_interval: None,
+            ..Default::default()
+        });
+        options
+    };
     let path = dir.path().join("main.db");
     let db = Database::open(&path, DatabaseKind::Main, Default::default()).unwrap();
     let runtimes = RuntimeSet::new(2, 1).unwrap();
@@ -176,7 +179,7 @@ fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopeni
     let host = runtimes
         .block_on(DaemonHost::open(
             db.clone(),
-            options.clone(),
+            make_options(),
             model.clone(),
             None,
             "synthetic-master-skills-token-000000",
@@ -184,7 +187,7 @@ fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopeni
             runtimes.work(),
         ))
         .unwrap();
-    let (source, load_key, original_identity) = runtimes.block_on(async {
+    let (source, load_key, original_identity, durable_delta) = runtimes.block_on(async {
         let memory = &host.memory.as_ref().unwrap().store;
         for (scope, text) in [
             ("project:default", "A_MEMORY_MARKER"),
@@ -264,6 +267,33 @@ fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopeni
                 .any(|m| m.content.contains("master-context-update:")
                     && m.content.contains("Skill context update:"))
         );
+        let delta = fourth
+            .messages
+            .iter()
+            .find(|m| m.content.contains("master-context-update:"))
+            .unwrap()
+            .clone();
+        answer
+            .send(reply(
+                Some("history_search"),
+                json!({"text":"fixture","include":"messages"}),
+                "history-again",
+            ))
+            .unwrap();
+        let (fifth, answer) = next(&mut rx).await;
+        assert_eq!(first.messages[..4], fifth.messages[..4]);
+        assert_eq!(
+            fourth.cache.as_ref().unwrap().stable_prefix_hash,
+            fifth.cache.as_ref().unwrap().stable_prefix_hash
+        );
+        assert_eq!(
+            fifth
+                .messages
+                .iter()
+                .filter(|m| m.content.contains("master-context-update:"))
+                .collect::<Vec<_>>(),
+            vec![&delta]
+        );
         answer.send(reply(None, json!({}), "")).unwrap();
         done(&db, &receipt.message_id).await;
         // New sources in A start with no loaded restriction, but the original catalog.
@@ -305,6 +335,7 @@ fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopeni
             receipt.message_id.clone(),
             format!("master:skills-chat:{}:load-call", receipt.message_id),
             first.messages[1].clone(),
+            delta,
         )
     });
     runtimes.block_on(host.close()).unwrap();
@@ -314,7 +345,7 @@ fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopeni
     let host = runtimes
         .block_on(DaemonHost::open(
             db.clone(),
-            options,
+            make_options(),
             model,
             None,
             "synthetic-master-skills-token-000000",
@@ -347,6 +378,21 @@ fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopeni
             .unwrap();
         assert!(original_identity.content.contains(context.identity.trim()));
         assert_eq!(context.updates.len(), 1);
+        let row: (u64, String, String) = db
+            .read(ReadLane::Interactive, |c| {
+                Ok(c.query_row(
+                    "SELECT sequence,update_id,body FROM master_context_updates",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(context.updates[0], (row.1.clone(), row.2.clone()));
+        assert!(durable_delta.content.contains(&format!(
+            "master-context-update:{} [{}] {}",
+            row.0, row.1, row.2
+        )));
         assert!(context.suggested_skills.len() <= 3);
         assert!(
             actions
@@ -469,6 +515,198 @@ fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopeni
             .await
             .unwrap();
         assert_eq!(updates, 1);
+    });
+    runtimes.block_on(host.close()).unwrap();
+}
+
+struct QuickRuntime;
+impl ToolRuntime for QuickRuntime {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        ["quick_lookup", "other_lookup", "slow_research"]
+            .into_iter()
+            .map(|name| ToolDefinition {
+                name: name.into(),
+                description: format!("reactor {name}"),
+                input_schema: json!({"type":"object","additionalProperties":false}),
+            })
+            .collect()
+    }
+    fn prepare<'a>(
+        &'a self,
+        run: &'a str,
+        call: ToolCall,
+    ) -> BoxFuture<'a, Result<PreparedTool, String>> {
+        Box::pin(async move {
+            if run != "authorized-fast-master" {
+                return Err("missing run capability".into());
+            }
+            Ok(PreparedTool {
+                call,
+                effect: Effect::Pure,
+                resources: vec![],
+                exclusive: false,
+                data: Value::Null,
+            })
+        })
+    }
+    fn execute<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        tool: &'a PreparedTool,
+    ) -> BoxFuture<'a, ToolResult> {
+        Box::pin(async move { ToolResult::ok(json!({"actual_tool":tool.call.name})) })
+    }
+    fn reconcile<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: &'a PreparedTool,
+    ) -> BoxFuture<'a, Reconcile> {
+        Box::pin(async { Reconcile::Retry })
+    }
+}
+#[test]
+fn master_loads_authorized_deferred_fast_schema_through_memory_without_granting_other_targets() {
+    use excalibur_daemon::MasterToolOptions;
+    use excalibur_tools::deferred::{CatalogTool, ToolCatalog};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    write(&root, "quick-skill", "quick_lookup", "QUICK_SKILL_BODY");
+    let path = root.join(".agents/skills/quick-skill/SKILL.md");
+    let body = std::fs::read_to_string(&path).unwrap().replace(
+        "allowed-tools: search_skills load_skill history_search",
+        "allowed-tools: search_skills load_skill search_tools quick_lookup",
+    );
+    std::fs::write(path, body).unwrap();
+    let runtime = Arc::new(QuickRuntime);
+    let defs = runtime.definitions();
+    let tools = defs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let mut tool = CatalogTool::from_definition(d.clone());
+            if i < 2 {
+                tool.fast = true;
+                tool.timeout_ms = 1000;
+            }
+            tool
+        })
+        .collect();
+    let mut options = HostOptions::project(root);
+    options.memory = Some(MemoryOptions {
+        maintenance_interval: None,
+        ..Default::default()
+    });
+    options.master_tools = Some(MasterToolOptions {
+        secured_delegate: runtime,
+        catalog: Arc::new(ToolCatalog::new(tools).unwrap()),
+        authorized_run: "authorized-fast-master".into(),
+        scopes: ["project:default".into()].into(),
+    });
+    let db = Database::open(
+        dir.path().join("main.db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let runtimes = RuntimeSet::new(2, 1).unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let host = runtimes
+        .block_on(DaemonHost::open(
+            db.clone(),
+            options,
+            Arc::new(Model(tx)),
+            None,
+            "synthetic-master-skills-token-000000",
+            Redactor::default(),
+            runtimes.work(),
+        ))
+        .unwrap();
+    runtimes.block_on(async {
+        let source = host
+            .master
+            .receive(incoming("deferred-fast", "project:default"))
+            .await
+            .unwrap();
+        let (first, answer) = next(&mut rx).await;
+        assert!(!first.tools.iter().any(|d| d.name == "quick_lookup"));
+        assert!(!first.messages[0].content.contains("quick_lookup"));
+        answer
+            .send(reply(
+                Some("load_skill"),
+                json!({"name":"quick-skill"}),
+                "load-quick",
+            ))
+            .unwrap();
+        let (second, answer) = next(&mut rx).await;
+        let loaded: Value = serde_json::from_str(
+            &second
+                .messages
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some("load-quick"))
+                .unwrap()
+                .content,
+        )
+        .unwrap();
+        assert!(loaded.to_string().contains("QUICK_SKILL_BODY"), "{loaded}");
+        assert!(
+            loaded
+                .to_string()
+                .contains(&serde_json::to_string(&defs[0].input_schema).unwrap()),
+            "{loaded}"
+        );
+        answer
+            .send(reply(
+                Some("search_tools"),
+                json!({"query":"reactor lookup research"}),
+                "search-fast",
+            ))
+            .unwrap();
+        let (third, answer) = next(&mut rx).await;
+        let search = &third
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("search-fast"))
+            .unwrap()
+            .content;
+        assert!(search.contains("quick_lookup"));
+        assert!(!search.contains("slow_research"));
+        answer
+            .send(reply(
+                Some("call_tool"),
+                json!({"name":"quick_lookup","args":{}}),
+                "execute-quick",
+            ))
+            .unwrap();
+        let (fourth, answer) = next(&mut rx).await;
+        let executed = &fourth
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("execute-quick"))
+            .unwrap()
+            .content;
+        assert!(executed.contains("actual_tool"), "{executed}");
+        assert!(executed.contains("quick_lookup"));
+        answer
+            .send(reply(
+                Some("call_tool"),
+                json!({"name":"other_lookup","args":{}}),
+                "deny-other",
+            ))
+            .unwrap();
+        let (fifth, answer) = next(&mut rx).await;
+        let denied = &fifth
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("deny-other"))
+            .unwrap()
+            .content;
+        assert!(denied.contains("active skill allowed-tools"), "{denied}");
+        assert_eq!(first.messages[1], fifth.messages[1]);
+        assert!(!fifth.tools.iter().any(|d| d.name == "quick_lookup"));
+        answer.send(reply(None, json!({}), "")).unwrap();
+        done(&db, &source.message_id).await;
     });
     runtimes.block_on(host.close()).unwrap();
 }

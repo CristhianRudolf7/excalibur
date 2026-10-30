@@ -89,6 +89,16 @@ pub trait FastActions: Send + Sync {
         Box::pin(async { Ok(RunContext::default()) })
     }
 
+    /// Trusted metadata only: associated deferred schemas available to this
+    /// original source under the host's existing fast-role/run/scope boundary.
+    /// Returned schemas do not authorize an effect or become eager L0 tools.
+    fn deferred_schemas<'a>(
+        &'a self,
+        _request: MasterContextRequest<'a>,
+    ) -> BoxFuture<'a, std::result::Result<Vec<ToolDefinition>, String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition> {
         Vec::new()
     }

@@ -14,8 +14,43 @@ use std::sync::Arc;
 struct AdapterSchemas {
     inner: Arc<dyn FastActions>,
     redactor: Redactor,
+    db: Database,
+    principal: String,
 }
 impl ToolRuntime for AdapterSchemas {
+    fn deferred_definitions<'a>(
+        &'a self,
+        run: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ToolDefinition>, String>> {
+        Box::pin(async move {
+            let lookup = run.to_owned();
+            let encoded: String = self
+                .db
+                .read(ReadLane::Interactive, move |c| {
+                    Ok(c.query_row(
+                        "SELECT binding FROM skill_conversation_bindings WHERE run=?1",
+                        [lookup],
+                        |r| r.get(0),
+                    )?)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            let binding: ConversationBinding =
+                serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+            if binding.run_key() != run || binding.principal != self.principal {
+                return Err("master deferred schema binding mismatch".into());
+            }
+            self.inner
+                .deferred_schemas(MasterContextRequest {
+                    principal: &binding.principal,
+                    conversation: &binding.conversation,
+                    original_scope: &binding.scope,
+                    source_message_id: &binding.source,
+                })
+                .await
+        })
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition> {
         self.inner.definitions()
     }
@@ -74,6 +109,8 @@ impl MasterSkillFastActions {
                 Arc::new(AdapterSchemas {
                     inner: inner.clone(),
                     redactor,
+                    db: db.clone(),
+                    principal: principal.clone(),
                 }),
                 host.indexes.clone(),
                 host.window,
@@ -114,6 +151,16 @@ impl MasterSkillFastActions {
     }
 }
 impl FastActions for MasterSkillFastActions {
+    fn deferred_schemas<'a>(
+        &'a self,
+        request: MasterContextRequest<'a>,
+    ) -> BoxFuture<'a, Result<Vec<ToolDefinition>, String>> {
+        Box::pin(async move {
+            self.bind(request.clone()).await?;
+            self.inner.deferred_schemas(request).await
+        })
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut all = self.inner.definitions();
         all.retain(|d| !matches!(d.name.as_str(), "search_skills" | "load_skill"));

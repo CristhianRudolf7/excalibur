@@ -494,6 +494,13 @@ impl MemoryFastActions {
     }
 }
 impl FastActions for MemoryFastActions {
+    fn deferred_schemas<'a>(
+        &'a self,
+        request: excalibur_master::MasterContextRequest<'a>,
+    ) -> BoxFuture<'a, Result<Vec<ToolDefinition>, String>> {
+        self.inner.deferred_schemas(request)
+    }
+
     fn session_context<'a>(
         &'a self,
         request: excalibur_master::MasterContextRequest<'a>,
