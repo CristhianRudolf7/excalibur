@@ -12,6 +12,7 @@ mod projects;
 #[cfg(test)]
 #[path = "../tests/support/mod.rs"]
 mod recovery_test_support;
+pub use notifications::{HostNotificationBinding, HostNotificationTarget};
 pub use profiles::CustomProfile;
 pub mod recovery;
 mod scheduling;
@@ -180,6 +181,29 @@ impl Orchestrator {
             c.execute(
                 "INSERT OR IGNORE INTO orchestration_schema VALUES(2,?1)",
                 [next_hash],
+            )?;
+            Ok(())
+        })
+        .await?;
+        db.write(Priority::Journal, |c| {
+            let sql = include_str!("host_notifications.sql");
+            let hash = digest(sql.as_bytes());
+            let known: Option<String> = c
+                .query_row(
+                    "SELECT checksum FROM orchestration_schema WHERE version=3",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if known.as_ref().is_some_and(|old| old != &hash) {
+                return Err(excalibur_store::Error::Invalid(
+                    "host notification schema checksum mismatch",
+                ));
+            }
+            c.execute_batch(sql)?;
+            c.execute(
+                "INSERT OR IGNORE INTO orchestration_schema VALUES(3,?1)",
+                [hash],
             )?;
             Ok(())
         })

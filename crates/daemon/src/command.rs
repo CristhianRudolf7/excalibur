@@ -374,12 +374,18 @@ pub async fn deliver_notifications(
             .cross_conversation
             .as_ref()
             .unwrap_or(&delivery.notification.conversation);
+        let host_origin = orchestrator
+            .host_notification_origin(&delivery.notification.id)
+            .await
+            .map_err(|e| e.to_string())?;
         let host_scope = orchestrator
             .recovery()
             .notification_scope(&delivery.notification.id)
             .await
             .map_err(|e| e.to_string())?;
-        let (scope, identity) = if let Some(scope) = host_scope {
+        let (scope, identity) = if let Some(origin) = host_origin {
+            (origin.scope, json!({"host":true,"source_kind":"host"}))
+        } else if let Some(scope) = host_scope {
             (scope, json!({"host":true}))
         } else {
             let Ok(agent) = orchestrator.agent(&delivery.notification.agent_id).await else {
