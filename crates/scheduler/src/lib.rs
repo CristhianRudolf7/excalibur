@@ -109,7 +109,8 @@ impl Scheduler {
                 let schedule: Schedule = serde_json::from_str(&definition).map_err(json_error)?;
                 let interval = match schedule.timing { Timing::At(_) => None, Timing::Every { seconds, .. } if seconds>0 => Some(i64::from(seconds)), _=>return Err(invalid()) };
                 // Skip only genuinely missed times: a fire exactly at startup is due.
-                let skip = recovering && schedule.missed == MissedPolicy::Skip && due < now;
+                let skip = recovering && schedule.missed == MissedPolicy::Skip && due < now
+                    && interval.is_none_or(|seconds| (now - due) % seconds != 0);
                 let coalesce = recovering && schedule.missed != MissedPolicy::RunAll;
                 if coalesce && let Some(seconds) = interval {
                         let latest = due + ((now - due) / seconds) * seconds;
