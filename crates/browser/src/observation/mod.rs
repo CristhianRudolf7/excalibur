@@ -1,6 +1,7 @@
 //! Read-only browser observation, readiness, reference validation and private blobs.
 mod access;
 pub mod actions;
+pub mod detectors;
 mod files;
 mod tree;
 mod wait;

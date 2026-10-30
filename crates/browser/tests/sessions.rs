@@ -193,6 +193,7 @@ async fn contract(root: PathBuf) {
                 Site {
                     name: "chat".into(),
                     rw: vec!["http://chat.test".into()],
+                    ro: vec![],
                     login: vec!["http://login.test".into()],
                     listen: true,
                     wait: None,
@@ -1065,6 +1066,7 @@ async fn reconciliation_contract(root: PathBuf) {
             sites: vec![Site {
                 name: "chat".into(),
                 rw: vec!["http://chat.test".into()],
+                ro: vec![],
                 login: vec!["http://login.test".into()],
                 listen: true,
                 wait: None,

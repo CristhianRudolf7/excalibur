@@ -184,6 +184,8 @@ impl Protocol {
                 | "session.list"
                 | "status.get"
                 | "events.list"
+                | "takeover.start"
+                | "takeover.end"
                 | "observe.wait_ready"
                 | "observe.snapshot"
                 | "observe.subtree"
@@ -465,6 +467,15 @@ impl Protocol {
             }
             "tab.switch" => self.manager.switch(run, sid()?, tid()?).await,
             "tab.close" => self.manager.close_tab(run, sid()?, tid()?).await,
+            "takeover.start" => {
+                let now = crate::sessions::now();
+                self.manager.takeover_start(run, sid()?, now).await
+            }
+            "takeover.end" => {
+                let now = crate::sessions::now();
+                let resolved = p["resolved"].as_bool().unwrap_or(true);
+                self.manager.takeover_end(run, sid()?, resolved, now).await
+            }
             "site.set_login_state" => {
                 self.manager
                     .site_state(run, sid()?, string(p, "login_state")?)

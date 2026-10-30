@@ -285,8 +285,11 @@ impl Observation {
                     dom &= s["dom_age"].as_f64().unwrap_or(0.) >= criteria.dom_stable_ms as f64
                         && s["beat_age"].as_f64().unwrap_or(99999.) < 1000.;
                     condition |= has_condition && s["condition"] == true;
-                    if !s["blocked"].is_null() {
-                        let mut block = s["blocked"].clone();
+                    if !s["blocked"].is_null()
+                        && let Some(mut block) =
+                            super::detectors::classify_probe_blocked(&s["blocked"], &frame.id)
+                    {
+                        // Attach the frame that reported the block; detection only.
                         block["frame_id"] = json!(frame.id);
                         report.blocked = Some(block);
                     }
