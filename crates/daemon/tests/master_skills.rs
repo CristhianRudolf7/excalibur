@@ -339,7 +339,6 @@ fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopeni
         )
     });
     runtimes.block_on(host.close()).unwrap();
-    drop(host);
     drop(db);
     let db = Database::open(&path, DatabaseKind::Main, Default::default()).unwrap();
     let host = runtimes
