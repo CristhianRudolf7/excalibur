@@ -1,9 +1,12 @@
 //! Chrome instances, durable browser sessions and the local webd protocol.
+pub mod cite;
+pub mod extract;
 pub mod installation;
 pub mod net;
 pub mod observation;
 pub mod permissions;
 pub mod process;
+pub mod read;
 pub mod rpc;
 pub mod sessions;
 pub mod takeover;

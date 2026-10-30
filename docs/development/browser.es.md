@@ -777,3 +777,55 @@ matrices 9.5 con Chrome real y páginas de control, la caducidad de 15 minutos,
 los rechazos del visor, el flujo `input_required` del arnés,
 `blocked_requires_human` no interactivo y la revisión del visor servido quedan
 pendientes.
+
+## Lectura ligera y citas
+
+`excalibur_browser::{extract, read, cite}` con `excalibur_webd::read::Service`
+forman la ruta backend de `web_read` y el almacén de `cite`. No se registra
+ninguna herramienta de agente; el render de respaldo del navegador se inyecta
+como HTML ya esperado (contexto efímero más `observe.wait_ready` más
+`DOM.getOuterHTML`), así el servicio sigue determinista sin Chrome real.
+
+La validación acepta solo `http`/`https` sin userinfo y como máximo 2.048
+caracteres; los fragmentos se quitan para la identidad de caché. `fetch_http`
+usa plazos explícitos de 10 s de conexión y 30 s totales, como máximo cinco
+redirecciones con rechazo de bajada de HTTPS a HTTP, tope de cuerpo de 10 MiB
+y lista de tipos text/HTML/XML/feeds/JSON. `extract::extract_document`
+produce título, Markdown y fragmentos `pN` con desplazamientos en bytes UTF-8
+y rutas de encabezados tras quitar bloques `script`, `style`, `nav`, `footer`
+y `aside`, con enlaces en línea como texto. La heurística HTTP-primero escala
+al navegador con cáscaras SPA (poco texto visible y varios scripts),
+proporción texto/marcado bajo 0,02, montajes vacíos (`#root`, `#app`,
+`__next`, `ng-app`) o `<noscript>` que pide JavaScript; `__NEXT_DATA__`,
+`__NUXT__` o JSON-LD incrustados evitan la escalada. Sin render inyectado se
+devuelve `needs_browser:<motivo>`.
+
+La captura exige una espera `ready` vigente para la época de la pestaña
+(`WaitGate::check`, regla 7.4-1): épocas no listas o caducadas devuelven
+`wait_required` o `wait_stale_epoch` antes de tocar el DOM. Las esperas no
+estrictas permiten degradaciones `network_busy` y `network_unobserved`; el
+modo estricto las convierte en `timeout`, como el contrato long-poll. Los
+resultados llevan `title`, Markdown en línea hasta 50 KiB con `truncated`,
+longitud total, `content_hash` (`sha256:`), `source_id` (`w_<16 hex>`), fecha,
+estado HTTP, `render` (`http`/`browser`), etiqueta del extractor y metadatos
+de fragmentos con `untrusted: true`. `slice_fragments` sirve rangos `pN` o
+`pA-pB` desde el Markdown completo por hash. La caché en memoria conserva 24 h
+con bypass `fresh` que preserva la fecha original.
+
+`cite::locate` busca primero la cita exacta y luego con normalización de
+espacios y mayúsculas, devolviendo desplazamientos y fragmento. `cite` crea
+registros `Citation` (`source_id`, URL, título, fragmento, desplazamientos,
+enlace `#:~:text=`, fecha, hash) y `format_citation` los muestra sin inventar
+páginas. `webd::read::Service` guarda páginas por hash para fragmentos y
+validación de citas.
+
+Ejecuta `cargo test -p excalibur-browser --test read_cite -- --nocapture`,
+`cargo test -p excalibur-browser --lib` y
+`cargo test -p excalibur-webd --lib read`. Cubren extracción estática y
+desplazamientos, SPA con espera antes de capturar y render inyectado,
+long-poll degradado frente a timeout estricto, citas exactas/normalizadas/
+ausentes, corte de fragmentos con tope de 50 KiB, decisiones HTTP-primero,
+caché loopback local y caducidad TTL. Quedan pendientes el cableado del
+broker, los extractores de producción `dom_smoothie`/`htmd`, PDF/feeds/
+juegos de caracteres, encolado al índice por `robots.txt`, render vivo con
+contexto efímero y registro de métodos RPC.
