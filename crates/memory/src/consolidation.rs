@@ -29,6 +29,9 @@ pub struct Turn {
     pub role: String,
     pub text: String,
     pub sent_at: i64,
+    /// Set only by the durable intake authority, never inferred from role alone.
+    #[serde(default)]
+    pub human_source: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractionRequest {
@@ -172,9 +175,10 @@ const STEPS: &[&str] = &[
     "skills",
 ];
 
-fn trust_for(role: &str) -> Trust {
+fn trust_for(role: &str, human_source: bool) -> Trust {
     match role {
-        "user" => Trust::User,
+        "user" if human_source => Trust::User,
+        "user" => Trust::Agent,
         "assistant" | "agent" => Trust::Agent,
         _ => Trust::UntrustedExternal,
     }
@@ -356,13 +360,21 @@ impl MemoryStore {
         limit: usize,
     ) -> Result<Vec<(i64, Turn)>> {
         let (principal, scope) = (principal.to_string(), scope.to_string());
+        let redactor = self.redactor.clone();
         Ok(self
             .db
             .read(ReadLane::Background, move |c| {
-                let mut s = c.prepare("SELECT rowid,id,conversation_id,role,text,sent_at FROM messages WHERE principal_id=?1 AND scope_id=?2 AND rowid>?3 ORDER BY rowid LIMIT ?4")?;
-                let rows = s
-                    .query_map(rusqlite::params![principal, scope, after, limit as i64], |r| Ok((r.get(0)?, Turn { message_id: r.get(1)?, conversation: r.get(2)?, role: r.get(3)?, text: r.get(4)?, sent_at: r.get(5)? })))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let authority: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='master_user_sources' AND type IN ('view','table'))", [], |r| r.get(0))?;
+                let sql = if authority {
+                    "SELECT m.rowid,m.id,m.conversation_id,m.role,COALESCE(s.text,m.text),m.sent_at,s.id IS NOT NULL FROM messages m LEFT JOIN master_user_sources s ON s.id=m.id WHERE m.principal_id=?1 AND m.scope_id=?2 AND m.rowid>?3 ORDER BY m.rowid LIMIT ?4"
+                } else {
+                    "SELECT rowid,id,conversation_id,role,text,sent_at,0 FROM messages WHERE principal_id=?1 AND scope_id=?2 AND rowid>?3 ORDER BY rowid LIMIT ?4"
+                };
+                let mut s = c.prepare(sql)?;
+                let rows = s.query_map(rusqlite::params![principal, scope, after, limit as i64], |r| Ok((r.get(0)?, Turn {
+                    message_id:r.get(1)?, conversation:r.get(2)?, role:r.get(3)?,
+                    text:redactor.redact_text(&r.get::<_,String>(4)?), sent_at:r.get(5)?, human_source:r.get(6)?,
+                })))?.collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             })
             .await?)
@@ -431,7 +443,7 @@ impl MemoryStore {
             input.temporal_change = fact.temporal_change;
             input.confidence = fact.confidence;
             input.importance = fact.importance;
-            input.trust = trust_for(&turn.role);
+            input.trust = trust_for(&turn.role, turn.human_source);
             input.sources = vec![SourceRef {
                 kind: if input.trust == Trust::UntrustedExternal {
                     SourceKind::Page
@@ -855,7 +867,7 @@ impl MemoryStore {
                         continue;
                     }
                     let latest = members.iter().filter(|m| m.valid_from.is_some()).max_by_key(|m| (m.valid_from, m.recorded_at));
-                    let unique_latest = latest.filter(|l| members.iter().filter(|m| m.valid_from == l.valid_from).count() == 1);
+                    let unique_latest = latest.filter(|l| members.iter().filter(|m| m.valid_from == l.valid_from).count() == 1 && members.iter().all(|m| l.trust >= m.trust));
                     if let Some(winner) = unique_latest.cloned() {
                         for m in members.iter().filter(|m| m.id != winner.id) {
                             c.execute("UPDATE memories SET superseded_by=?2,valid_to=COALESCE(valid_to,?3),invalidated_at=?4 WHERE id=?1", rusqlite::params![m.id, winner.id, winner.valid_from, now])?;

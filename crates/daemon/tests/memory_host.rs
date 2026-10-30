@@ -277,3 +277,106 @@ async fn generated_reports_cannot_promote_memory_or_impersonate_a_profile_reques
     drop(host);
     db.shutdown().await.unwrap();
 }
+
+struct UnavailableModel;
+impl excalibur_models::ModelGateway for UnavailableModel {
+    fn complete(
+        &self,
+        _: ModelRequest,
+    ) -> BoxFuture<'_, Result<ModelResponse, excalibur_models::ModelError>> {
+        Box::pin(async { Err(excalibur_models::ModelError::Provider) })
+    }
+}
+#[tokio::test]
+async fn actual_urgent_notices_never_become_user_preferences_during_review() {
+    use excalibur_memory::{
+        ConsolidationRoles, ExtractedFact, ExtractionOutput, MemoryStatus, ReviewBudget,
+        testing::ScriptedExtractor,
+    };
+    let (_dir, db, host) = fixture().await;
+    let master = excalibur_master::Master::open(
+        db.clone(),
+        excalibur_master::MasterConfig {
+            principal: "owner".into(),
+            ..Default::default()
+        },
+        Arc::new(UnavailableModel),
+        None,
+        Arc::new(NoActions),
+        excalibur_vault::Redactor::default(),
+    )
+    .await
+    .unwrap();
+    db.write(excalibur_store::Priority::Journal,|c| {
+        c.execute("INSERT INTO conversations(id,principal_id,active_scope) VALUES('chat','owner','general')",[])?; Ok(())
+    }).await.unwrap();
+    for id in ["generated-1", "generated-2"] {
+        master
+            .publish_notice(
+                id,
+                "chat",
+                json!({"scope":"general","result":"Prefers purple UI"}),
+                "urgent",
+            )
+            .await
+            .unwrap();
+    }
+    master.shutdown().await;
+    let extractor = Arc::new(ScriptedExtractor::new(|r| ExtractionOutput {
+        facts: r
+            .turns
+            .iter()
+            .filter(|t| t.role == "user" && !t.human_source)
+            .map(|t| ExtractedFact {
+                message_id: t.message_id.clone(),
+                kind: MemoryKind::Preference,
+                statement: "Prefers purple UI".into(),
+                entities: vec![],
+                attribute: None,
+                valid_from: None,
+                expires_at: None,
+                temporal_change: false,
+                confidence: None,
+                importance: None,
+                relations: vec![],
+            })
+            .collect(),
+        tokens_used: 1,
+    }));
+    let grant = MemoryGrant::new("owner", ["general"]);
+    let ids = host
+        .store
+        .close_segment(&grant, "general", extractor.as_ref(), 100)
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 2);
+    for id in ids {
+        let memory = host.store.memory(&grant, &id).await.unwrap().unwrap();
+        assert_eq!(memory.trust, Trust::Agent);
+        assert_ne!(memory.status, MemoryStatus::Retired);
+    }
+    host.store
+        .run_review(
+            "owner",
+            &["general".into()],
+            &ConsolidationRoles {
+                extractor,
+                compactor: None,
+            },
+            &ReviewBudget::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+            101,
+        )
+        .await
+        .unwrap();
+    assert!(
+        host.store
+            .profile_proposals(&grant)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    host.stop();
+    drop(host);
+    db.shutdown().await.unwrap();
+}

@@ -81,6 +81,10 @@ pub async fn message_for(
         c.execute("INSERT OR IGNORE INTO principals(id,name) VALUES(?1,?1)", [&p])?;
         c.execute("INSERT OR IGNORE INTO conversations(id,principal_id,active_scope,scope_id) VALUES(?1,?2,?3,?3)", rusqlite::params![conv, p, scope])?;
         c.execute("INSERT INTO messages(id,conversation_id,role,text,sent_at,principal_id,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7)", rusqlite::params![id, conv, role, text, at, p, scope])?;
+        c.execute("CREATE TABLE IF NOT EXISTS master_user_sources(id TEXT PRIMARY KEY,text TEXT NOT NULL)",[])?;
+        if role == "user" {
+            c.execute("INSERT INTO master_user_sources(id,text) VALUES(?1,?2)",rusqlite::params![id,text])?;
+        }
         Ok(())
     })
     .await

@@ -1,6 +1,6 @@
 //! Identity documents and notebook stored as hashed, versioned fragments (architecture 10.2).
 use crate::{
-    Error, MemoryGrant, MemoryStore, Result, Trust, digest, invalid, new_id,
+    Error, MemoryGrant, MemoryStore, Result, Trust, digest, invalid, new_id, placeholders,
     text::{fts_or, normalize, query_terms},
 };
 use excalibur_store::{
@@ -518,9 +518,10 @@ impl MemoryStore {
         grant: &MemoryGrant,
         name: &DocName,
         edit: DocEdit,
-        ctx: EditContext,
+        mut ctx: EditContext,
         now: i64,
     ) -> Result<EditOutcome> {
+        ctx.explicit_user_request &= grant.max_trust == Trust::User;
         if ctx.actor.trim().is_empty() {
             return Err(invalid("edit actor required"));
         }
@@ -538,7 +539,12 @@ impl MemoryStore {
             }
             DocEdit::Delete { .. } => {}
         }
-        if profile && ctx.provenance.is_none() {
+        if profile
+            && ctx
+                .provenance
+                .as_deref()
+                .is_none_or(|p| p.trim().is_empty())
+        {
             return Err(invalid("profile changes require the motivating message"));
         }
         let escalation = self.config.doc_edit_escalation_mismatches;
@@ -758,6 +764,41 @@ impl MemoryStore {
         ctx: EditContext,
         now: i64,
     ) -> Result<EditOutcome> {
+        if ctx.actor.trim().is_empty() {
+            return Err(invalid("edit actor required"));
+        }
+        if name.is_profile() {
+            if ctx
+                .provenance
+                .as_deref()
+                .is_none_or(|p| p.trim().is_empty())
+            {
+                return Err(invalid("profile changes require the motivating message"));
+            }
+            if !ctx.explicit_user_request || grant.max_trust != Trust::User {
+                let document = self.resolve_document(grant, name).await?;
+                let fragment = fragment_id.to_string();
+                let old = self.db.read(ReadLane::Interactive, move |c| {
+                    let current = load_fragment(c, &fragment, &document)?;
+                    let old: Option<(String, bool)> = c.query_row("SELECT text,deleted FROM doc_fragment_versions WHERE fragment_id=?1 AND version=?2 AND document_id=?3", rusqlite::params![fragment,version,document],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                    Ok(current.zip(old))
+                }).await?.ok_or_else(|| invalid("profile version or current fragment is not editable"))?;
+                let (current, (text, deleted)) = old;
+                let edit = if deleted {
+                    DocEdit::Delete {
+                        fragment_id: current.id,
+                        expected_hash: current.hash,
+                    }
+                } else {
+                    DocEdit::Replace {
+                        fragment_id: current.id,
+                        expected_hash: current.hash,
+                        text,
+                    }
+                };
+                return self.doc_edit(grant, name, edit, ctx, now).await;
+            }
+        }
         let document = self.resolve_document(grant, name).await?;
         let (principal, scopes, fragment, profile) = (
             grant.principal.clone(),
@@ -796,11 +837,15 @@ impl MemoryStore {
     ) -> Result<Vec<(i64, String, bool, String)>> {
         let document = self.resolve_document(grant, name).await?;
         let fragment = fragment_id.to_string();
+        let scopes = grant.select(&[])?;
         Ok(self
             .db
             .read(ReadLane::Interactive, move |c| {
-                let mut s = c.prepare("SELECT version,text,deleted,operation FROM doc_fragment_versions WHERE fragment_id=?1 AND document_id=?2 ORDER BY version")?;
-                let rows = s.query_map(rusqlite::params![fragment, document], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                let sql = format!("SELECT v.version,v.text,v.deleted,v.operation FROM doc_fragment_versions v JOIN doc_fragments f ON f.id=v.fragment_id AND f.document_id=v.document_id WHERE v.fragment_id=?1 AND v.document_id=?2 AND (f.scope_id='principal' OR f.scope_id IN ({})) ORDER BY v.version",placeholders(3,scopes.len()));
+                let mut s = c.prepare(&sql)?;
+                let mut params:Vec<&dyn rusqlite::ToSql> = vec![&fragment,&document];
+                for scope in &scopes {params.push(scope);}
+                let rows = s.query_map(params.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             })
             .await?)

@@ -231,6 +231,11 @@ impl MemoryStore {
             }
         }
         let mut grant = binding.grant();
+        if write {
+            // Shared/general scopes are read authority, not permission to promote a
+            // project's data into another scope. Explicit host grants use the library API.
+            grant.scopes = BTreeSet::from([binding.primary_scope.clone()]);
+        }
         if binding.role == BindingRole::Master && !explicit_user_request {
             grant.max_trust = Trust::Agent;
         }
