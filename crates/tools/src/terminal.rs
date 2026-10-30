@@ -125,6 +125,7 @@ struct Output {
     tail: VecDeque<u8>,
     total: u64,
     exited: bool,
+    process_finished: bool,
     exit_code: Option<i32>,
     timed_out: bool,
     termination_reason: Option<TerminationReason>,
@@ -141,6 +142,7 @@ fn finish_output(
     timed_out: bool,
     synchronize: impl FnOnce(),
 ) {
+    output.lock().unwrap().process_finished = true;
     synchronize();
     let mut output = output.lock().unwrap();
     output.exited = true;
@@ -1008,6 +1010,7 @@ impl TerminalManager {
                         tail: VecDeque::new(),
                         total: 0,
                         exited: false,
+                        process_finished: false,
                         exit_code: None,
                         timed_out: false,
                         termination_reason: None,
@@ -1249,46 +1252,56 @@ impl Drop for KillOnDrop {
         self.0.signal(Signal::Kill);
     }
 }
+// Keep eligibility and the actual dispatch in one critical section so finalization
+// cannot close the process group between a status check and the signal syscall.
+fn signal_if_running(output: &Mutex<Output>, dispatch: impl FnOnce(&mut Output)) {
+    let mut output = output.lock().unwrap();
+    if !output.process_finished && !output.exited {
+        dispatch(&mut output);
+    }
+}
 impl Session {
     fn signal(&self, signal: Signal) {
-        if self.output.lock().unwrap().exited {
-            return;
-        }
-        #[cfg(unix)]
-        unsafe {
-            let sig = match signal {
-                Signal::Interrupt => libc::SIGINT,
-                Signal::Terminate => libc::SIGTERM,
-                Signal::Kill => libc::SIGKILL,
-            };
-            libc::kill(-(self.pid as i32), sig);
-        }
-        #[cfg(windows)]
-        {
-            match signal {
-                Signal::Kill => self.job.terminate(),
-                Signal::Interrupt | Signal::Terminate => {
-                    if self.tty {
-                        if let Some(input) = self.input.lock().unwrap().as_mut() {
-                            let _ = input.write_all(b"\x03");
-                            let _ = input.flush();
-                        }
-                    } else {
-                        unsafe {
-                            use windows_sys::Win32::System::Console::{
-                                CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent,
-                            };
-                            if GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.pid) == 0 {
-                                self.output.lock().unwrap().error =
-                                    Some(std::io::Error::last_os_error().to_string());
+        signal_if_running(&self.output, |output| {
+            #[cfg(unix)]
+            unsafe {
+                let sig = match signal {
+                    Signal::Interrupt => libc::SIGINT,
+                    Signal::Terminate => libc::SIGTERM,
+                    Signal::Kill => libc::SIGKILL,
+                };
+                libc::kill(-(self.pid as i32), sig);
+            }
+            #[cfg(windows)]
+            {
+                match signal {
+                    Signal::Kill => self.job.terminate(),
+                    Signal::Interrupt | Signal::Terminate => {
+                        if self.tty {
+                            if let Some(input) = self.input.lock().unwrap().as_mut() {
+                                let _ = input.write_all(b"\x03");
+                                let _ = input.flush();
+                            }
+                        } else {
+                            unsafe {
+                                use windows_sys::Win32::System::Console::{
+                                    CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent,
+                                };
+                                if GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.pid) == 0 {
+                                    output.error =
+                                        Some(std::io::Error::last_os_error().to_string());
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+            // The argument is used by the Windows error path only.
+            let _ = output;
+        });
     }
 }
+
 fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
     #[cfg(unix)]
     {
@@ -2177,6 +2190,7 @@ mod exit_publication_tests {
             tail: VecDeque::new(),
             total: 0,
             exited: false,
+            process_finished: false,
             exit_code: None,
             timed_out: false,
             termination_reason: None,
@@ -2199,10 +2213,14 @@ mod exit_publication_tests {
             let state = output
                 .try_lock()
                 .expect("spool sync must release status mutex");
+            assert!(state.process_finished);
             assert!(!state.exited);
             assert_eq!(state.exit_code, None);
             assert!(!state.timed_out);
         }
+        signal_if_running(&output, |_| {
+            panic!("a finished process must not receive signals during spool sync")
+        });
         tokio::time::sleep(Duration::from_secs(1)).await;
         release_tx.send(()).unwrap();
         tokio::task::spawn_blocking(move || monitor.join().unwrap())
