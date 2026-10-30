@@ -1,31 +1,259 @@
+//! Durable run-stall watchdog (17.6/22.5) with real hung engine drivers, mock
+//! model/tools, real temporary SQLite and an injected watchdog clock.
 mod support;
-use excalibur_engine::{Engine, Status};
+use excalibur_engine::{Engine, Status, WATCHDOG_BLOCK_REASON, WATCHDOG_PAUSE_REASON};
 use excalibur_journal::Journal;
-use excalibur_orchestrator::{Control, Limits, Orchestrator};
-use excalibur_store::{Database, DatabaseKind, ReadLane, StorageConfig};
-use excalibur_types::runtime::{Effect, PreparedTool, ToolCall};
-use serde_json::json;
-use std::sync::Arc;
+use excalibur_models::{ModelError, ModelGateway};
+use excalibur_orchestrator::{
+    Agent, Control, Limits, Orchestrator, RunAuthority, WATCHDOG_PROGRESS_KINDS,
+};
+use excalibur_security::{Autonomy, Redactor, RunSecurity, Security};
+use excalibur_store::{Database, DatabaseKind, Priority, ReadLane, StorageConfig};
+use excalibur_types::runtime::*;
+use serde_json::{Value, json};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
-async fn running(f: &support::Fixture, name: &str) -> (String, String, i64) {
-    let a = f
-        .host
-        .spawn(&f.master.id, support::delegation(name, "general", 2000))
-        .await
-        .unwrap();
-    let run = a.run_id.unwrap();
-    let j = Journal::new(f.db.clone()).await.unwrap();
-    j.set_state(&run, "running", None, "test-running")
-        .await
-        .unwrap();
-    let at = progress(&f.db, &run).await;
-    (a.id, run, at)
+#[derive(Clone, Copy)]
+enum Reply {
+    Hang,
+    Call(&'static str),
+    Done,
 }
-async fn progress(db: &Database, run: &str) -> i64 {
+#[derive(Default)]
+struct Script {
+    replies: Mutex<VecDeque<Reply>>,
+    model_entered: AtomicBool,
+    hang_prepare_once: AtomicBool,
+    prepare_entered: AtomicBool,
+    executions: AtomicUsize,
+    execute_entered: AtomicBool,
+}
+struct Model(Arc<Script>);
+impl ModelGateway for Model {
+    fn complete<'a>(
+        &'a self,
+        _: ModelRequest,
+    ) -> BoxFuture<'a, std::result::Result<ModelResponse, ModelError>> {
+        let reply = self
+            .0
+            .replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Reply::Done);
+        self.0.model_entered.store(true, Ordering::SeqCst);
+        Box::pin(async move {
+            let message = match reply {
+                Reply::Hang => std::future::pending().await,
+                Reply::Done => Message::text("assistant", "Synthetic done"),
+                Reply::Call(name) => Message {
+                    tool_calls: vec![ToolCall {
+                        id: format!("call-{name}"),
+                        name: name.into(),
+                        arguments: "{}".into(),
+                    }],
+                    ..Message::text("assistant", "")
+                },
+            };
+            Ok(ModelResponse {
+                message,
+                usage: Usage::default(),
+            })
+        })
+    }
+}
+struct Tools(Arc<Script>);
+impl ToolRuntime for Tools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        ["probe", "write"]
+            .into_iter()
+            .map(|name| ToolDefinition {
+                name: name.into(),
+                description: format!("Synthetic {name}"),
+                input_schema: json!({"type":"object"}),
+            })
+            .collect()
+    }
+    fn scheduling<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a ToolCall,
+    ) -> BoxFuture<'a, Option<ToolScheduling>> {
+        Box::pin(async {
+            Some(ToolScheduling {
+                resources: vec![],
+                exclusive: false,
+            })
+        })
+    }
+    fn prepare<'a>(
+        &'a self,
+        _: &'a str,
+        call: ToolCall,
+    ) -> BoxFuture<'a, std::result::Result<PreparedTool, String>> {
+        Box::pin(async move {
+            self.0.prepare_entered.store(true, Ordering::SeqCst);
+            if self.0.hang_prepare_once.swap(false, Ordering::SeqCst) {
+                // Outside any control select: only an abort can stop this driver.
+                std::future::pending::<()>().await;
+            }
+            let effect = if call.name == "write" {
+                Effect::NonIdempotent
+            } else {
+                Effect::Pure
+            };
+            Ok(PreparedTool {
+                call,
+                effect,
+                resources: vec![],
+                exclusive: false,
+                data: json!({}),
+            })
+        })
+    }
+    fn execute<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        prepared: &'a PreparedTool,
+    ) -> BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            self.0.executions.fetch_add(1, Ordering::SeqCst);
+            self.0.execute_entered.store(true, Ordering::SeqCst);
+            if prepared.call.name == "write" {
+                std::future::pending::<()>().await;
+            }
+            ToolResult {
+                success: true,
+                output: json!("synthetic probe"),
+                full_output_blob: None,
+            }
+        })
+    }
+    fn reconcile<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: &'a PreparedTool,
+    ) -> BoxFuture<'a, Reconcile> {
+        Box::pin(async { Reconcile::Uncertain("synthetic external effect".into()) })
+    }
+}
+struct Authority;
+impl RunAuthority for Authority {
+    fn bind<'a>(&'a self, _: &'a Agent) -> BoxFuture<'a, std::result::Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct Fixture {
+    dir: tempfile::TempDir,
+    db: Database,
+    host: Orchestrator,
+    master: Agent,
+    script: Arc<Script>,
+}
+async fn open(dir: tempfile::TempDir, script: Arc<Script>) -> Fixture {
+    let db = Database::open(
+        dir.path().join("main.db"),
+        DatabaseKind::Main,
+        StorageConfig::default(),
+    )
+    .unwrap();
+    let journal = Journal::new(db.clone()).await.unwrap();
+    let engine = Arc::new(Engine::new(
+        journal,
+        Arc::new(Model(script.clone())),
+        Arc::new(Tools(script.clone())),
+    ));
+    let host = Orchestrator::open(
+        db.clone(),
+        engine,
+        Limits {
+            running: 4,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+    .with_authority(Arc::new(Authority));
+    let master = host
+        .rebind_master_at_startup("Excalibur", support::token())
+        .await
+        .unwrap();
+    let boot = host
+        .recovery()
+        .begin(excalibur_store::unix_seconds())
+        .await
+        .unwrap();
+    host.recover_startup(&boot, Autonomy::Autonomous)
+        .await
+        .unwrap();
+    Fixture {
+        dir,
+        db,
+        host,
+        master,
+        script,
+    }
+}
+async fn fixture(replies: Vec<Reply>) -> Fixture {
+    let script = Arc::new(Script {
+        replies: Mutex::new(replies.into()),
+        ..Default::default()
+    });
+    open(tempfile::tempdir().unwrap(), script).await
+}
+async fn authorize(f: &Fixture, run: &str) {
+    Security::new(f.db.clone(), support::token(), Redactor::default())
+        .await
+        .unwrap()
+        .register_run(
+            run,
+            RunSecurity {
+                parent: None,
+                project: "general".into(),
+                workspace: f.dir.path().canonicalize().unwrap(),
+                token: support::token(),
+                autonomy: vec![Autonomy::Autonomous],
+                full_acknowledged: false,
+                user_requested: true,
+            },
+            excalibur_store::unix_seconds(),
+        )
+        .await
+        .unwrap();
+}
+async fn spawn(f: &Fixture, name: &str) -> (String, String) {
+    let mut task = support::delegation(name, "general", 2000);
+    task.profile = "coordinator".into();
+    let agent = f.host.spawn(&f.master.id, task).await.unwrap();
+    let run = agent.run_id.clone().unwrap();
+    authorize(f, &run).await;
+    (agent.id, run)
+}
+async fn until(flag: impl Fn() -> bool) {
+    for _ in 0..1000 {
+        if flag() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("condition was not reached");
+}
+/// The latest heartbeat or confirmed driver-progress timestamp of the run.
+async fn base(db: &Database, run: &str) -> i64 {
     let r = run.to_owned();
     db.read(ReadLane::Interactive, move |c| {
         Ok(c.query_row(
-            "SELECT MAX(created_at) FROM journal WHERE run_id=?1",
+            &format!("SELECT max(COALESCE((SELECT heartbeat_at FROM runs WHERE id=?1),0),COALESCE((SELECT MAX(created_at) FROM journal WHERE run_id=?1 AND (kind IN ({WATCHDOG_PROGRESS_KINDS}) OR (kind='state_change' AND json_extract(payload,'$.state')='running'))),0))"),
             [r],
             |row| row.get(0),
         )?)
@@ -33,90 +261,308 @@ async fn progress(db: &Database, run: &str) -> i64 {
     .await
     .unwrap()
 }
+async fn last_intent(db: &Database, run: &str) -> i64 {
+    let r = run.to_owned();
+    db.read(ReadLane::Interactive, move |c| {
+        Ok(c.query_row(
+            "SELECT MAX(created_at) FROM journal WHERE run_id=?1 AND kind='tool_intent'",
+            [r],
+            |row| row.get(0),
+        )?)
+    })
+    .await
+    .unwrap()
+}
+async fn count(db: &Database, run: &str, kind: &str) -> u64 {
+    let (r, k) = (run.to_owned(), kind.to_owned());
+    db.read(ReadLane::Interactive, move |c| {
+        Ok(c.query_row(
+            "SELECT count(*) FROM journal WHERE run_id=?1 AND kind=?2",
+            [r, k],
+            |row| row.get(0),
+        )?)
+    })
+    .await
+    .unwrap()
+}
+async fn alerts(host: &Orchestrator, run: &str) -> Vec<(String, Value)> {
+    host.notifications("conversation:test")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|n| {
+            let content: Value = serde_json::from_str(&n.content).ok()?;
+            (content["kind"] == "run_watchdog" && content["run_id"] == run)
+                .then_some((n.class, content))
+        })
+        .collect()
+}
+async fn settle(
+    host: &Orchestrator,
+    run: &str,
+    at: i64,
+) -> excalibur_orchestrator::WatchdogIncident {
+    for _ in 0..1000 {
+        host.watchdog_runs(at).await.unwrap();
+        let incidents = host.watchdog_incidents(Some(run)).await.unwrap();
+        if incidents.first().is_some_and(|i| i.notified) {
+            return incidents[0].clone();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("watchdog incident was not settled");
+}
 
 #[tokio::test]
-async fn boundary_replay_and_registered_notice_survive_reopen() {
-    let f = support::fixture().await;
-    let (agent, run, at) = running(&f, "stalled").await;
+async fn hung_model_is_interrupted_at_the_boundary_paused_and_alerted_once_across_reopen() {
+    let f = fixture(vec![Reply::Hang]).await;
+    let (agent, run) = spawn(&f, "hung-model").await;
+    assert_eq!(f.host.tick().await.unwrap(), vec![agent.clone()]);
+    until(|| f.script.model_entered.load(Ordering::SeqCst)).await;
+    // The driver renewed the run heartbeat at its step boundary.
+    let r = run.clone();
+    let heartbeat: Option<i64> =
+        f.db.read(ReadLane::Interactive, move |c| {
+            Ok(
+                c.query_row("SELECT heartbeat_at FROM runs WHERE id=?1", [r], |row| {
+                    row.get(0)
+                })?,
+            )
+        })
+        .await
+        .unwrap();
+    assert!(heartbeat.is_some());
+    let at = base(&f.db, &run).await;
     assert!(f.host.watchdog_runs(at + 599).await.unwrap().is_empty());
+    assert!(f.host.watchdog_incidents(None).await.unwrap().is_empty());
     assert_eq!(
         f.host.watchdog_runs(at + 600).await.unwrap(),
         vec![agent.clone()]
     );
-    let j = Journal::new(f.db.clone()).await.unwrap();
-    assert_eq!(
-        j.state(&run).await.unwrap(),
-        ("paused".into(), Some("watchdog_stalled".into()))
-    );
-    let reopened = Orchestrator::open(
-        f.db.clone(),
-        Arc::new(Engine::new(j, support::model(), support::no_tools())),
-        Limits::default(),
-    )
-    .await
-    .unwrap();
-    reopened.watchdog_runs(at + 900).await.unwrap();
-    assert_eq!(
-        reopened
-            .notifications("conversation:test")
-            .await
+    let incident = settle(&f.host, &run, at + 601).await;
+    assert_eq!(incident.action.as_deref(), Some("paused"));
+    assert_eq!(incident.decision.as_deref(), Some("paused"));
+    // The unknown provider charge is reserved conservatively; with no declared
+    // call bound it exhausts the token budget, so the 17.3 assessment pauses.
+    assert!(
+        incident
+            .reason
+            .as_deref()
             .unwrap()
-            .len(),
-        1
+            .contains("remaining budget is insufficient")
     );
+    // The live driver observed the durable pause and recorded the interruption.
+    assert!(!incident.aborted);
+    assert_eq!(count(&f.db, &run, "model_interrupted").await, 1);
+    let state = f.host.engine().load(&run).await.unwrap();
+    assert_eq!(state.status, Status::Paused);
+    assert_eq!(state.reason.as_deref(), Some(WATCHDOG_PAUSE_REASON));
+    assert!(state.recovery_note.unwrap().contains("run_watchdog"));
+    // Concurrent passes and later passes neither interrupt nor alert again.
+    let (a, b) = tokio::join!(
+        f.host.watchdog_runs(at + 2000),
+        f.host.watchdog_runs(at + 2000)
+    );
+    assert!(a.unwrap().is_empty() && b.unwrap().is_empty());
+    let found = alerts(&f.host, &run).await;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].0, "urgent");
+    assert_eq!(found[0].1["decision"], "paused");
+    assert_eq!(found[0].1["scope"], "general");
+    let state_changes = count(&f.db, &run, "state_change").await;
+    f.host.shutdown().await.unwrap();
+    let Fixture { dir, db, host, .. } = f;
+    drop(host);
+    db.shutdown().await.unwrap();
+    drop(db);
+    let f = open(dir, Arc::new(Script::default())).await;
+    f.host.watchdog_runs(at + 3000).await.unwrap();
+    assert_eq!(alerts(&f.host, &run).await.len(), 1);
+    assert_eq!(f.host.watchdog_incidents(None).await.unwrap().len(), 1);
+    // Startup preserved the watchdog-owned pause instead of resuming it.
+    assert_eq!(count(&f.db, &run, "state_change").await, state_changes);
     assert_eq!(
-        reopened.notifications("conversation:test").await.unwrap()[0].class,
-        "urgent"
+        f.host.engine().load(&run).await.unwrap().reason.as_deref(),
+        Some(WATCHDOG_PAUSE_REASON)
     );
+    f.host.shutdown().await.unwrap();
+    f.db.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn waiting_user_pause_and_pending_tool_are_excluded() {
-    let f = support::fixture().await;
-    let (agent, run, at) = running(&f, "user-pause").await;
-    f.host.control(&agent, Control::Pause).await.unwrap();
-    let (_, waiting, _) = running(&f, "waiting").await;
-    let j = Journal::new(f.db.clone()).await.unwrap();
-    j.set_state(&waiting, "waiting", Some("children".into()), "wait-child")
-        .await
-        .unwrap();
-    let (_, tool, _) = running(&f, "long-tool").await;
-    j.append(&tool,"tool_intent","test:tool",json!({"index":0,"prepared":PreparedTool{call:ToolCall{id:"long".into(),name:"long".into(),arguments:json!({})},effect:Effect::Pure,resources:vec![],exclusive:false,data:json!({})}})).await.unwrap();
-    assert!(f.host.watchdog_runs(at + 900).await.unwrap().is_empty());
-    assert_eq!(j.state(&run).await.unwrap().1, Some("user".into()));
-    assert_eq!(j.state(&tool).await.unwrap().0, "running");
-    assert_eq!(j.state(&waiting).await.unwrap().0, "waiting");
+async fn non_cooperative_driver_is_aborted_reconciled_and_resumed_once_to_completion() {
+    let f = fixture(vec![Reply::Call("probe"), Reply::Done]).await;
+    f.script.hang_prepare_once.store(true, Ordering::SeqCst);
+    let (agent, run) = spawn(&f, "hung-prepare").await;
+    assert_eq!(f.host.tick().await.unwrap(), vec![agent.clone()]);
+    until(|| f.script.prepare_entered.load(Ordering::SeqCst)).await;
+    let at = base(&f.db, &run).await;
+    assert_eq!(
+        f.host.watchdog_runs(at + 600).await.unwrap(),
+        vec![agent.clone()]
+    );
+    // Inside the cooperative grace window the hung driver is not yet aborted.
+    f.host.watchdog_runs(at + 601).await.unwrap();
+    let pending = f.host.watchdog_incidents(Some(&run)).await.unwrap();
+    assert!(!pending[0].aborted && pending[0].decision.is_none());
+    let incident = settle(&f.host, &run, at + 606).await;
+    assert!(incident.aborted);
+    assert_eq!(incident.decision.as_deref(), Some("resumed"));
+    let found = alerts(&f.host, &run).await;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].0, "normal");
+    assert_eq!(
+        f.host.engine().load(&run).await.unwrap().status,
+        Status::Ready
+    );
+    // The aborted task was not converted into a failure; the resumed run
+    // reuses the recorded model response and completes.
+    for _ in 0..1000 {
+        f.host.tick().await.unwrap();
+        if f.host.engine().load(&run).await.unwrap().status == Status::Completed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let state = f.host.engine().load(&run).await.unwrap();
+    assert_eq!(state.status, Status::Completed);
+    assert_eq!(count(&f.db, &run, "model_response").await, 2);
+    assert_eq!(f.script.executions.load(Ordering::SeqCst), 1);
+    assert_eq!(count(&f.db, &run, "recovery_note").await, 1);
+    f.host.shutdown().await.unwrap();
+    f.db.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn stale_revision_and_forged_watchdog_event_cannot_claim_a_notice() {
-    let f = support::fixture().await;
-    let (_, run, at) = running(&f, "revision").await;
-    let j = Journal::new(f.db.clone()).await.unwrap();
-    let e = Engine::new(j.clone(), support::model(), support::no_tools());
-    let sequence = e.load(&run).await.unwrap().last_sequence;
-    j.append(&run, "step_heartbeat", "fresh", json!({"step":0}))
+async fn registered_tool_wait_is_exempt_then_uncertain_effect_blocks_without_retry() {
+    let f = fixture(vec![Reply::Call("write")]).await;
+    let (agent, run) = spawn(&f, "hung-write").await;
+    assert_eq!(f.host.tick().await.unwrap(), vec![agent.clone()]);
+    until(|| f.script.execute_entered.load(Ordering::SeqCst)).await;
+    let at = base(&f.db, &run).await;
+    let intent = last_intent(&f.db, &run).await;
+    let timeout = f
+        .host
+        .engine()
+        .load(&run)
         .await
-        .unwrap();
-    assert!(!e.pause_stalled_revision(&run, sequence).await.unwrap());
-    let seq = e.load(&run).await.unwrap().last_sequence;
-    j.set_state_if_revision(
-        &run,
-        &["running"],
-        seq,
-        "paused",
-        Some("watchdog_stalled".into()),
-        &format!("watchdog-stalled:{seq}"),
-    )
-    .await
-    .unwrap();
-    f.host.watchdog_runs(at + 900).await.unwrap();
+        .unwrap()
+        .spec
+        .budget
+        .tool_timeout_seconds as i64;
+    // Ten minutes after the last progress, but still inside the registered
+    // tool timeout plus ten minutes: not stalled.
+    assert!(at <= intent + timeout);
+    assert!(f.host.watchdog_runs(at + 600).await.unwrap().is_empty());
     assert!(
         f.host
-            .notifications("conversation:test")
+            .watchdog_runs(intent + timeout + 599)
             .await
             .unwrap()
             .is_empty()
     );
-    assert_eq!(e.load(&run).await.unwrap().status, Status::Paused);
+    assert_eq!(
+        f.host.watchdog_runs(intent + timeout + 600).await.unwrap(),
+        vec![agent.clone()]
+    );
+    let at = intent;
+    let state = f.host.engine().load(&run).await.unwrap();
+    assert_eq!(state.status, Status::Blocked);
+    assert_eq!(state.reason.as_deref(), Some(WATCHDOG_BLOCK_REASON));
+    let incident = settle(&f.host, &run, at + timeout + 606).await;
+    assert!(incident.aborted);
+    assert_eq!(incident.action.as_deref(), Some("blocked"));
+    assert_eq!(incident.decision.as_deref(), Some("blocked"));
+    let found = alerts(&f.host, &run).await;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].0, "urgent");
+    // The uncertain non-idempotent effect is neither retried nor resolved.
+    for _ in 0..3 {
+        f.host.tick().await.unwrap();
+    }
+    assert_eq!(f.script.executions.load(Ordering::SeqCst), 1);
+    assert_eq!(count(&f.db, &run, "tool_intent").await, 1);
+    assert_eq!(count(&f.db, &run, "tool_result").await, 0);
+    assert_eq!(
+        f.host.engine().load(&run).await.unwrap().status,
+        Status::Blocked
+    );
+    f.host.shutdown().await.unwrap();
+    f.db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn user_control_and_stale_revisions_win_over_the_watchdog() {
+    let f = fixture(vec![Reply::Hang]).await;
+    let (agent, run) = spawn(&f, "user-pause").await;
+    assert_eq!(f.host.tick().await.unwrap(), vec![agent.clone()]);
+    until(|| f.script.model_entered.load(Ordering::SeqCst)).await;
+    let state = f.host.engine().load(&run).await.unwrap();
+    // A newer journal fact makes an older observed revision stale.
+    f.host
+        .engine()
+        .journal()
+        .append(&run, "loop_detection", "fixture:newer-fact", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        f.host
+            .engine()
+            .interrupt_stalled_revision(&run, state.last_sequence)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    f.host.control(&agent, Control::Pause).await.unwrap();
+    let at = base(&f.db, &run).await;
+    for _ in 0..3 {
+        assert!(f.host.watchdog_runs(at + 5000).await.unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(f.host.watchdog_incidents(None).await.unwrap().is_empty());
+    assert!(alerts(&f.host, &run).await.is_empty());
+    assert_eq!(
+        f.host.engine().load(&run).await.unwrap().reason.as_deref(),
+        Some("user")
+    );
+    f.host.shutdown().await.unwrap();
+    f.db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn watchdog_schema_is_additive_and_tampering_fails_closed() {
+    let f = fixture(vec![]).await;
+    let columns: Vec<String> =
+        f.db.read(ReadLane::Interactive, |c| {
+            let mut q =
+                c.prepare("SELECT name FROM pragma_table_info('orchestration_run_watchdog')")?;
+            Ok(q.query_map([], |r| r.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .await
+        .unwrap();
+    for column in ["action", "decision", "reason", "aborted", "notified"] {
+        assert!(columns.iter().any(|c| c == column));
+    }
+    // Reopening applies nothing twice.
+    let engine = f.host.engine().clone();
+    Orchestrator::open(f.db.clone(), engine.clone(), Limits::default())
+        .await
+        .unwrap();
+    f.db.write(Priority::Journal, |c| {
+        c.execute(
+            "UPDATE orchestration_run_watchdog_schema SET checksum='tampered' WHERE version=2",
+            [],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(
+        Orchestrator::open(f.db.clone(), engine, Limits::default())
+            .await
+            .is_err()
+    );
+    f.host.shutdown().await.unwrap();
+    f.db.shutdown().await.unwrap();
 }

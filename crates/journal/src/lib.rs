@@ -250,6 +250,25 @@ impl Journal {
                 .await?)
         }
     }
+    /// Renew the run's liveness heartbeat in the `runs` projection. Only an
+    /// execution that is authoritatively `running` is renewed, so a stale driver
+    /// cannot refresh a paused, blocked or terminal run. This is not a journal
+    /// event and does not change the replayed revision.
+    pub async fn heartbeat(&self, run: &str) -> Result<bool> {
+        let run = run.to_owned();
+        Ok(self
+            .db
+            .write(Priority::Journal, move |c| {
+                if authoritative_state(c, &run)?.0 != "running" {
+                    return Ok(false);
+                }
+                Ok(c.execute(
+                    "UPDATE runs SET heartbeat_at=max(COALESCE(heartbeat_at,0),unixepoch()) WHERE id=?1",
+                    [&run],
+                )? > 0)
+            })
+            .await?)
+    }
     /// Cheap advisory read; effect admission must still use the writer-side guard.
     pub async fn is_running(&self, run: &str) -> Result<bool> {
         let run = run.to_owned();

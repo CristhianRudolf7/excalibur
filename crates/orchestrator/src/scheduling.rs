@@ -255,6 +255,9 @@ impl Orchestrator {
                         .fail(run, &format!("execution error: {e}"))
                         .await?;
                 }
+                // Only the stall watchdog aborts a live driver, after its
+                // durable pause/block CAS; cancellation is not a run failure.
+                Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     self.inner
                         .engine

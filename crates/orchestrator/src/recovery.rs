@@ -37,6 +37,43 @@ pub struct RecoveryStatus {
     pub decisions: Vec<RecoveryDecision>,
 }
 
+pub(crate) struct ResumeAssessment {
+    pub(crate) pending_effect: bool,
+    pub(crate) pending_approval: bool,
+    pub(crate) frozen: Autonomy,
+    pub(crate) healthy: bool,
+    pub(crate) edited: bool,
+    pub(crate) unanswered_request: bool,
+    pub(crate) open_children: bool,
+}
+impl ResumeAssessment {
+    /// Reasons that forbid an automatic resume; empty means eligible.
+    pub(crate) fn blockers(&self, host: Autonomy) -> Vec<&'static str> {
+        [
+            (
+                host < Autonomy::Autonomous,
+                "host autonomy is below autonomous",
+            ),
+            (
+                self.frozen < Autonomy::Autonomous,
+                "run autonomy is below autonomous or unknown",
+            ),
+            (!self.healthy, "remaining budget is insufficient"),
+            (self.pending_effect, "unresolved non-pure tool intention"),
+            (self.pending_approval, "approval pending"),
+            (self.edited, "recorded file edits require reconciliation"),
+            (
+                self.unanswered_request,
+                "model request without a durable response",
+            ),
+            (self.open_children, "outstanding child reservation"),
+        ]
+        .into_iter()
+        .filter_map(|(blocked, reason)| blocked.then_some(reason))
+        .collect()
+    }
+}
+
 impl RecoveryLedger {
     pub async fn open(db: Database) -> Result<Self> {
         let sql = include_str!("recovery.sql");
@@ -296,6 +333,7 @@ impl Orchestrator {
         autonomy: Autonomy,
         after_state: impl Fn(&str) -> Result<()>,
     ) -> Result<RecoveryStatus> {
+        *self.inner.host_autonomy.lock().unwrap() = Some(autonomy);
         let status = self.recovery().status(now()).await?;
         let mut agents = self.active_agents().await?;
         agents.sort_by_key(|a| {
@@ -318,31 +356,11 @@ impl Orchestrator {
                 state.status,
                 Status::Paused | Status::Waiting | Status::Blocked
             ) && !owned_pause;
-            let pending_effect = state.calls.values().any(|c| {
-                c.result.is_none()
-                    && c.prepared
-                        .as_ref()
-                        .is_some_and(|p| p.effect != Effect::Pure)
-            });
-            let pending_approval = self.pending_startup_approval(run).await?;
-            let frozen = self.frozen_startup_autonomy(run).await?;
-            let healthy = excalibur_engine::remaining_budget_for(self.inner.engine.journal(), run)
-                .await
-                .map(|b| b.max_steps > 1 && b.max_tokens > 0 && b.max_wall_seconds > 30)
-                .unwrap_or(false);
-            let edited = self.has_recorded_startup_edits(run).await?;
-            let eligible = autonomy >= Autonomy::Autonomous
-                && frozen >= Autonomy::Autonomous
-                && boot.downtime_seconds < MAX_DOWNTIME
-                && healthy
-                && !pending_effect
-                && !pending_approval
-                && !edited
-                && !(state.request.is_some() && state.response.is_none())
-                && !state
-                    .child_allocations
-                    .values()
-                    .any(|a| a.settled.is_none());
+            let assessment = self.assess_resume(run, &state).await?;
+            let pending_effect = assessment.pending_effect;
+            let pending_approval = assessment.pending_approval;
+            let eligible =
+                assessment.blockers(autonomy).is_empty() && boot.downtime_seconds < MAX_DOWNTIME;
             let (decision, reason, resume) = if quarantined && !preserved {
                 ("blocked", "possible crash cause: quarantined", false)
             } else if preserved {
@@ -435,6 +453,36 @@ impl Orchestrator {
         }
         self.recovery().finish(&boot.id).await?;
         self.recovery().status(now()).await
+    }
+    /// The 17.3 automatic-resume facts shared by startup recovery and the stall
+    /// watchdog. Any unresolved non-pure intention, approval wait, recorded edit,
+    /// unanswered model request, outstanding child reservation, insufficient
+    /// budget or non-autonomous host/frozen autonomy prevents automatic resume.
+    pub(crate) async fn assess_resume(
+        &self,
+        run: &str,
+        state: &excalibur_engine::Snapshot,
+    ) -> Result<ResumeAssessment> {
+        Ok(ResumeAssessment {
+            pending_effect: state.calls.values().any(|c| {
+                c.result.is_none()
+                    && c.prepared
+                        .as_ref()
+                        .is_some_and(|p| p.effect != Effect::Pure)
+            }),
+            pending_approval: self.pending_startup_approval(run).await?,
+            frozen: self.frozen_startup_autonomy(run).await?,
+            healthy: excalibur_engine::remaining_budget_for(self.inner.engine.journal(), run)
+                .await
+                .map(|b| b.max_steps > 1 && b.max_tokens > 0 && b.max_wall_seconds > 30)
+                .unwrap_or(false),
+            edited: self.has_recorded_startup_edits(run).await?,
+            unanswered_request: state.request.is_some() && state.response.is_none(),
+            open_children: state
+                .child_allocations
+                .values()
+                .any(|a| a.settled.is_none()),
+        })
     }
     async fn has_recorded_startup_edits(&self, run: &str) -> Result<bool> {
         let run = run.to_owned();

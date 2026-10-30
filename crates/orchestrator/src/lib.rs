@@ -18,6 +18,9 @@ pub use notifications::{
 pub use profiles::CustomProfile;
 pub mod recovery;
 mod run_watchdog;
+pub use run_watchdog::{
+    PROGRESS_KINDS as WATCHDOG_PROGRESS_KINDS, STALL_SECONDS, WatchdogIncident,
+};
 mod scheduling;
 mod tools;
 pub use gate::OrchestrationGate;
@@ -115,6 +118,11 @@ struct Inner {
     recovery: recovery::RecoveryLedger,
     runtime: Mutex<Option<tokio::runtime::Handle>>,
     tasks: Mutex<Option<excalibur_tasks::TaskStore>>,
+    /// Host autonomy supplied to startup recovery; absent means supervised.
+    host_autonomy: Mutex<Option<excalibur_security::Autonomy>>,
+    /// Serializes stall-watchdog passes of this process; durable CAS and keyed
+    /// rows make passes from different processes idempotent.
+    watchdog: AsyncMutex<()>,
 }
 fn digest(v: &[u8]) -> String {
     format!("{:x}", Sha256::digest(v))
@@ -227,6 +235,8 @@ impl Orchestrator {
                 recovery,
                 runtime: Mutex::new(None),
                 tasks: Mutex::new(None),
+                host_autonomy: Mutex::new(None),
+                watchdog: AsyncMutex::new(()),
             }),
         })
     }
