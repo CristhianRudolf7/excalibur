@@ -100,15 +100,24 @@ pub fn normalize_url(raw: &str) -> Result<NormalizedUrl> {
     })
 }
 
-/// Approximate the registrable domain as the last two DNS labels.
+/// Approximate the registrable domain as the last two DNS labels,
+/// except for common two-level public suffixes (e.g. `co.uk`) where three
+/// labels are kept. This is a local approximation, not a full PSL lookup.
 #[must_use]
 pub fn registrable_domain(host: &str) -> String {
-    let labels: Vec<&str> = host.split('.').filter(|part| !part.is_empty()).collect();
+    const TWO_LEVEL_SUFFIXES: &[&str] = &[
+        "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.jp", "com.br",
+    ];
+    let lower = host.to_ascii_lowercase();
+    let labels: Vec<&str> = lower.split('.').filter(|part| !part.is_empty()).collect();
     if labels.len() <= 2 {
-        host.to_owned()
-    } else {
-        labels[labels.len() - 2..].join(".")
+        return lower;
     }
+    let last_two = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
+    if TWO_LEVEL_SUFFIXES.contains(&last_two.as_str()) && labels.len() >= 3 {
+        return labels[labels.len() - 3..].join(".");
+    }
+    labels[labels.len() - 2..].join(".")
 }
 
 fn tokenize_url_parts(parsed: &url::Url) -> Vec<String> {

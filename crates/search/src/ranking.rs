@@ -87,7 +87,7 @@ pub struct RankedResult {
     pub fetched_at: i64,
     /// Source string.
     pub source: String,
-    /// Stable source id derived from the URL hash.
+    /// Stable source id derived from the document `content_hash`.
     pub source_id: String,
     /// Final blended score.
     pub score: f64,
@@ -161,6 +161,7 @@ pub fn rank_candidates(
             .score
             .partial_cmp(&left.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.url.cmp(&right.url))
     });
     diversify(ranked, k.clamp(1, MAX_K))
 }
@@ -211,6 +212,7 @@ pub fn fuse_rrf(first: &[RankedResult], second: &[RankedResult], k: usize) -> Ve
             .1
             .partial_cmp(&left.1)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.url.cmp(&right.0.url))
     });
     fused
         .into_iter()

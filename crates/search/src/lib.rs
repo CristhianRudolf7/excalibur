@@ -31,6 +31,7 @@ pub use frontier::{CrawlTask, FetchOutcome, Frontier, Priority, Source, UrlState
 pub use index::{BudgetState, DiskIndex, Doc, DocSource, ScoredDoc, StoredDoc};
 pub use ingest::{
     CirrusDoc, cirrus_admitted, parse_cirrus_pair, parse_feed_links, parse_sitemap_locs,
+    parse_sitemap_locs_for_sitemap,
 };
 pub use normalize::{NormalizedUrl, normalize_url, registrable_domain};
 pub use ranking::{

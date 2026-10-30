@@ -1,9 +1,10 @@
 //! RFC 9309 `robots.txt` parsing and crawl decisions.
 //!
 //! Pure parser with no network access. The caller enforces the 500 KiB cap,
-//! the 24 h cache, at most 5 redirects and the fetch-status mapping
-//! (4xx allows everything, 5xx/unreachable denies everything with a retry
-//! in one hour). `/robots.txt` itself is always allowed.
+//! the 24 h cache for reachable hosts (1 h retry for 5xx/unreachable), at
+//! most 5 redirects and the fetch-status mapping (4xx allows everything,
+//! 5xx/unreachable denies everything with a retry in one hour).
+//! `/robots.txt` itself is always allowed.
 
 use std::collections::BTreeMap;
 
@@ -31,12 +32,11 @@ pub enum RobotsFetch {
     Unavailable,
 }
 
-/// A single allow/disallow rule with its original order for tie-breaking.
+/// A single allow/disallow rule.
 #[derive(Debug, Clone)]
 struct Rule {
     pattern: String,
     allow: bool,
-    order: usize,
 }
 
 /// Parsed group of rules for one or more user-agent tokens.
@@ -63,7 +63,7 @@ impl RobotsRules {
         let mut groups: Vec<Group> = Vec::new();
         let mut current: Option<Group> = None;
         let mut seen_rule = false;
-        let mut order = 0_usize;
+        let mut top_sitemaps: Vec<String> = Vec::new();
 
         let flush = |groups: &mut Vec<Group>, current: &mut Option<Group>| {
             if let Some(group) = current.take()
@@ -104,9 +104,7 @@ impl RobotsRules {
                     group.rules.push(Rule {
                         pattern: value,
                         allow: field == "allow",
-                        order,
                     });
-                    order += 1;
                 }
                 "crawl-delay" => {
                     seen_rule = true;
@@ -115,21 +113,25 @@ impl RobotsRules {
                         group.crawl_delay_secs = Some(seconds.min(MAX_CRAWL_DELAY_SECS));
                     }
                 }
-                "sitemap" => {
-                    seen_rule = true;
-                    if !value.is_empty() {
-                        if let Some(group) = current.as_mut() {
+                "sitemap" if !value.is_empty() => {
+                    if let Some(group) = current.as_mut() {
+                        if seen_rule {
                             group.sitemaps.push(value.clone());
                         } else {
-                            groups_sitemaps_fallback(&mut groups, value);
+                            // Sitemap lines never belong to a group per
+                            // RFC 9309: keep them global even when a
+                            // User-agent block is open but has no rules.
+                            top_sitemaps.push(value.clone());
                         }
+                    } else {
+                        top_sitemaps.push(value);
                     }
                 }
                 _ => {}
             }
         }
         flush(&mut groups, &mut current);
-        let mut sitemaps = Vec::new();
+        let mut sitemaps = top_sitemaps;
         for group in &groups {
             sitemaps.extend(group.sitemaps.iter().cloned());
         }
@@ -142,24 +144,46 @@ impl RobotsRules {
         Self::default()
     }
 
-    /// Select the group matching `user_agent`: exact token match wins,
-    /// then prefix match, then the `*` group, else no group (allow).
-    fn matching_group(&self, user_agent: &str) -> Option<&Group> {
-        let agent = user_agent.to_ascii_lowercase();
-        let token = agent.split('/').next().unwrap_or(&agent).trim();
-        let mut star: Option<&Group> = None;
+    /// Product token of `user_agent` (lower-cased, before `/`).
+    fn product_token(user_agent: &str) -> String {
+        user_agent
+            .to_ascii_lowercase()
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_owned()
+    }
+
+    /// All groups whose agent matches `token`, with match length.
+    /// Exact token equality outranks prefix matches; `*` only applies when
+    /// no other group matches (RFC 9309 section 2.2.1 fallback).
+    fn matching_groups(&self, user_agent: &str) -> Vec<&Group> {
+        let token = Self::product_token(user_agent);
+        let mut matched: Vec<(&Group, usize)> = Vec::new();
+        let mut stars: Vec<&Group> = Vec::new();
         for group in &self.groups {
+            let mut best: Option<usize> = None;
             for name in &group.agents {
                 if name == "*" {
-                    if star.is_none() {
-                        star = Some(group);
+                    if !stars.iter().any(|existing| std::ptr::eq(*existing, group)) {
+                        stars.push(group);
                     }
-                } else if name == token || token.starts_with(name.as_str()) {
-                    return Some(group);
+                } else if *name == token {
+                    best = Some(best.map_or(name.len(), |b| b.max(name.len())));
+                } else if !name.is_empty() && token.starts_with(name.as_str()) {
+                    best = Some(best.map_or(name.len(), |b| b.max(name.len())));
                 }
             }
+            if let Some(len) = best {
+                matched.push((group, len));
+            }
         }
-        star
+        if matched.is_empty() {
+            return stars;
+        }
+        // RFC 9309 section 2.2.1: combine every matching group.
+        matched.into_iter().map(|(group, _)| group).collect()
     }
 
     /// Decide whether `path` (path + optional query) may be fetched.
@@ -169,36 +193,65 @@ impl RobotsRules {
         if path == "/robots.txt" || path.starts_with("/robots.txt?") {
             return true;
         }
-        let Some(group) = self.matching_group(user_agent) else {
+        let matched = self.matching_groups(user_agent);
+        if matched.is_empty() {
             return true;
-        };
-        let mut best: Option<(&Rule, usize)> = None;
-        for rule in &group.rules {
-            if rule_matches(&rule.pattern, path) {
-                let len = match_len(&rule.pattern);
-                let replace = match &best {
-                    None => true,
-                    Some((prev, _)) => {
-                        let prev_len = match_len(&prev.pattern);
-                        len > prev_len || (len == prev_len && rule.order > prev.order)
+        }
+        let mut best_len: Option<usize> = None;
+        let mut best_allow = true;
+        for group in matched {
+            for rule in &group.rules {
+                if rule_matches(&rule.pattern, path) {
+                    let len = match_len(&rule.pattern);
+                    match best_len {
+                        None => {
+                            best_len = Some(len);
+                            best_allow = rule.allow;
+                        }
+                        Some(prev) if len > prev => {
+                            best_len = Some(len);
+                            best_allow = rule.allow;
+                        }
+                        Some(prev) if len == prev && rule.allow => {
+                            // RFC 9309 and section 15.4: ties prefer Allow.
+                            best_allow = true;
+                        }
+                        _ => {}
                     }
-                };
-                if replace {
-                    best = Some((rule, rule.order));
                 }
             }
         }
-        match best {
-            None => true,
-            Some((rule, _)) => rule.allow,
-        }
+        best_allow
     }
 
     /// Effective `Crawl-delay` for `user_agent`, if any.
     #[must_use]
     pub fn crawl_delay_secs(&self, user_agent: &str) -> Option<u64> {
-        self.matching_group(user_agent)
-            .and_then(|group| group.crawl_delay_secs)
+        let matched = self.matching_groups(user_agent);
+        // Prefer the delay from the most specific matching group.
+        let mut best: Option<(usize, u64)> = None;
+        // Recompute specificity for delay selection.
+        let token = Self::product_token(user_agent);
+        for group in matched {
+            let Some(delay) = group.crawl_delay_secs else {
+                continue;
+            };
+            let mut specificity = 0_usize;
+            for name in &group.agents {
+                if name == "*" {
+                    continue;
+                } else if *name == token {
+                    specificity = specificity.max(name.len() + 1_000);
+                } else if token.starts_with(name.as_str()) {
+                    specificity = specificity.max(name.len());
+                }
+            }
+            // Star-only groups get specificity 0.
+            if best.is_none_or(|(prev, _)| specificity >= prev) {
+                best = Some((specificity, delay));
+            }
+        }
+        best.map(|(_, delay)| delay)
     }
 
     /// `Sitemap:` targets seen anywhere in the file.
@@ -206,11 +259,6 @@ impl RobotsRules {
     pub fn sitemaps(&self) -> &[String] {
         &self.sitemaps
     }
-}
-
-fn groups_sitemaps_fallback(groups: &mut Vec<Group>, value: String) -> bool {
-    let _ = (groups, value);
-    false
 }
 
 /// Parsed fetch outcome combining status mapping and optional rules.
@@ -355,9 +403,15 @@ pub struct RobotsCacheEntry {
 
 impl RobotsCacheEntry {
     /// Whether the cached entry is still fresh at `now_secs`.
+    /// Reachable entries live 24 h; unreachable/5xx entries retry after 1 h.
     #[must_use]
     pub fn fresh_at(&self, now_secs: u64) -> bool {
-        now_secs.saturating_sub(self.fetched_at_secs) < ROBOTS_TTL_SECS
+        let ttl = if self.reachable {
+            ROBOTS_TTL_SECS
+        } else {
+            ROBOTS_FAILURE_RETRY_SECS
+        };
+        now_secs.saturating_sub(self.fetched_at_secs) < ttl
     }
 
     /// Rebuild parsed rules from the cached body.

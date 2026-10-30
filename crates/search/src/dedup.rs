@@ -14,8 +14,8 @@ pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     hex_encode(hasher.finalize())
 }
 
-/// Normalize page Markdown before hashing: trim trailing whitespace per line,
-/// collapse blank runs and lower-case ASCII upper case.
+/// Normalize page Markdown before hashing: trim trailing whitespace per line
+/// and collapse blank runs (case is preserved).
 #[must_use]
 pub fn normalize_markdown(text: &str) -> String {
     let mut lines = Vec::new();

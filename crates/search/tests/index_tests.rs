@@ -310,16 +310,85 @@ fn tiny_budget_reports_budget_reached() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("index.db");
     let mut index = DiskIndex::open(&path, 1024).unwrap();
+    let mut rejected = 0;
     for i in 0..10 {
-        index
-            .insert(&doc(
-                i,
-                "big.example",
-                &format!("Title number {i}"),
-                &"body words ".repeat(50),
-            ))
-            .unwrap();
+        let res = index.insert(&doc(
+            i,
+            "big.example",
+            &format!("Title number {i}"),
+            &"body words ".repeat(50),
+        ));
+        if let Err(err) = res {
+            assert!(matches!(err, excalibur_search::SearchError::BudgetReached));
+            rejected += 1;
+        }
     }
     let state = index.commit().unwrap();
     assert!(state.budget_reached, "bytes={}", state.bytes);
+    assert!(rejected > 0, "low-priority ingestion must stop at 95%");
+    // High-priority sources stay admissible after the budget flag.
+    let high = Doc {
+        source: DocSource::Docs,
+        ..doc(
+            99,
+            "big.example",
+            "High priority title",
+            "high priority body words",
+        )
+    };
+    assert!(index.insert(&high).unwrap(), "docs source must still admit");
+}
+
+#[test]
+fn deterministic_tie_ordering_repeats() {
+    // BSF-10 / P12: identical queries must repeat identically.
+    let mut index = DiskIndex::open_memory(u64::MAX).unwrap();
+    for i in 0..40 {
+        index
+            .insert(&Doc {
+                url: format!("https://h{i:02}.example/p"),
+                host: format!("h{i:02}.example"),
+                domain: format!("h{i:02}.example"),
+                source: DocSource::Web,
+                lang: "en".to_owned(),
+                license: String::new(),
+                title: "Alpha".to_owned(),
+                body: format!("alpha z{i:02}"),
+                headings: vec![],
+                published_at: 0,
+                fetched_at: 1,
+                prior: 0.2,
+            })
+            .unwrap();
+    }
+    let service = excalibur_search::search::SearchService::new(&index, "minimo");
+    let first = service
+        .search(
+            "alpha",
+            &excalibur_search::search::SearchOptions {
+                k: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .results
+        .iter()
+        .map(|result| result.url.clone())
+        .collect::<Vec<_>>();
+    for _ in 0..30 {
+        let next = service
+            .search(
+                "alpha",
+                &excalibur_search::search::SearchOptions {
+                    k: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .results
+            .iter()
+            .map(|result| result.url.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(first, next, "tie ordering must be stable");
+    }
 }

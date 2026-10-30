@@ -1,7 +1,7 @@
 //! Deterministic disk-backed document index (section 15.5).
 //!
 //! The architecture selects tantivy 0.27 as the production store. This
-//! foundation ships an explicit storage trait plus a deterministic SQLite
+//! foundation ships a deterministic SQLite
 //! backend with the same document model, BM25 parameters and budget
 //! semantics, so the main lane can swap the backend without changing query
 //! or ingest call sites. Every behaviour is covered by local synthetic
@@ -266,13 +266,27 @@ impl DiskIndex {
         Ok(())
     }
 
-    /// Insert or replace `doc`, enforcing exact and near-duplicate rules.
+    /// Whether `source` is low priority for budget admission.
+    /// General web, news and HN rotative ingestion stops first at 95% of
+    /// budget; wiki, docs, arXiv and read pages remain admissible.
+    #[must_use]
+    pub fn is_low_priority_source(source: DocSource) -> bool {
+        matches!(source, DocSource::Web | DocSource::News | DocSource::Hn)
+    }
+
+    /// Insert or replace `doc`, enforcing exact and near-duplicate rules and
+    /// the 95%-of-budget admission policy.
     /// Returns `true` when the document was stored.
+    /// Returns [`SearchError::BudgetReached`] when usage already reached 95%
+    /// and `doc` carries a low-priority source.
     pub fn insert(&mut self, doc: &Doc) -> Result<bool> {
         if doc.url.trim().is_empty() || doc.title.trim().is_empty() {
             return Err(SearchError::Rejected(
                 "documents require url and title".to_owned(),
             ));
+        }
+        if Self::is_low_priority_source(doc.source) && self.budget_state().budget_reached {
+            return Err(SearchError::BudgetReached);
         }
         let content_hash = doc.content_hash();
         let simhash = doc.simhash();
@@ -436,11 +450,15 @@ impl DiskIndex {
     /// When `conjunctive` is set, only documents containing every query term
     /// are returned; callers fall back to disjunctive retrieval when fewer
     /// than 10 candidates match.
+    /// `lang` and `domains` are hard filters applied before truncation so
+    /// `site:`/language restrictions survive deep result sets.
     pub fn search_bm25(
         &self,
         query_terms: &[String],
         conjunctive: bool,
         limit: usize,
+        lang: Option<&str>,
+        domains: &[String],
     ) -> Result<Vec<ScoredDoc>> {
         if query_terms.is_empty() {
             return Ok(Vec::new());
@@ -493,11 +511,32 @@ impl DiskIndex {
         if conjunctive {
             urls.retain(|(url, _)| matched.get(url).copied().unwrap_or(0) >= query_terms.len());
         }
+        // Hard filters before truncation: keep only docs matching lang/domains.
+        if lang.is_some() || !domains.is_empty() {
+            let mut filtered = Vec::with_capacity(urls.len());
+            for (url, score) in urls {
+                if let Some(doc) = self.load(&url)? {
+                    if lang.is_some_and(|want| !doc.lang.eq_ignore_ascii_case(want)) {
+                        continue;
+                    }
+                    if !domains.is_empty()
+                        && !domains.iter().any(|domain| {
+                            doc.host == *domain || doc.host.ends_with(&format!(".{domain}"))
+                        })
+                    {
+                        continue;
+                    }
+                    filtered.push((url, score));
+                }
+            }
+            urls = filtered;
+        }
         urls.sort_by(|left, right| {
             right
                 .1
                 .partial_cmp(&left.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
         });
         urls.truncate(limit.max(1));
         let mut out = Vec::with_capacity(urls.len());

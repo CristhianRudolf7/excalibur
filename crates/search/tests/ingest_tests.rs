@@ -40,3 +40,35 @@ fn cirrus_pairs_filter_by_incoming_links() {
     assert!(!cirrus_admitted(&parsed, 100));
     assert!(parse_cirrus_pair(doc, doc).is_none());
 }
+
+#[test]
+fn sitemap_rejects_substring_hosts_and_decodes_entities() {
+    // P13: evil host rejected, `&amp;` decoded.
+    let xml = "<urlset><url><loc>https://evil.example/?next=docs.example</loc></url><url><loc>https://docs.example/a?x=1&amp;y=2</loc></url></urlset>";
+    assert_eq!(
+        parse_sitemap_locs(xml, "docs.example"),
+        vec!["https://docs.example/a?x=1&y=2"]
+    );
+}
+
+#[test]
+fn sitemap_path_restriction_uses_directory_prefix() {
+    let xml = "<urlset><url><loc>https://docs.example/guide/a</loc></url><url><loc>https://docs.example/other/b</loc></url></urlset>";
+    let locs = excalibur_search::ingest::parse_sitemap_locs_for_sitemap(
+        xml,
+        "https://docs.example/guide/sitemap.xml",
+    );
+    assert_eq!(locs, vec!["https://docs.example/guide/a"]);
+}
+
+#[test]
+fn cirrus_null_opening_text_is_admitted() {
+    // P14: real dumps carry explicit null.
+    let parsed = parse_cirrus_pair(
+        "{\"index\":{\"_id\":\"1\"}}",
+        "{\"title\":\"X\",\"opening_text\":null,\"incoming_links\":50}",
+    )
+    .expect("null opening_text must parse");
+    assert_eq!(parsed.opening_text, "");
+    assert!(cirrus_admitted(&parsed, 10));
+}

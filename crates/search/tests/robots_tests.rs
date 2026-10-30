@@ -83,3 +83,38 @@ fn meta_and_header_directives() {
     assert_eq!(parse_robots_directives("INDEX, NOFOLLOW"), (false, true));
     assert_eq!(parse_robots_directives("index, follow"), (false, false));
 }
+
+#[test]
+fn tie_break_prefers_allow_both_orders() {
+    // P01: Allow-then-Disallow must still allow.
+    let allow_first = RobotsRules::parse("User-agent: *\nAllow: /tie\nDisallow: /tie\n");
+    assert!(allow_first.is_allowed(AGENT, "/tie/page"));
+    // Existing order still allows.
+    let disallow_first = RobotsRules::parse("User-agent: *\nDisallow: /tie\nAllow: /tie\n");
+    assert!(disallow_first.is_allowed(AGENT, "/tie/page"));
+}
+
+#[test]
+fn repeated_star_groups_are_merged() {
+    // P02: two `*` blocks combine per RFC 9309 2.2.1.
+    let rules = RobotsRules::parse("User-agent: *\nDisallow: /a\n\nUser-agent: *\nDisallow: /b\n");
+    assert!(!rules.is_allowed(AGENT, "/a/x"));
+    assert!(!rules.is_allowed(AGENT, "/b/x"));
+    assert!(rules.is_allowed(AGENT, "/c"));
+}
+
+#[test]
+fn exact_token_beats_prefix_group() {
+    // P03: exact `excaliburbot` wins over earlier prefix `excalibur`.
+    let rules = RobotsRules::parse(
+        "User-agent: excalibur\nDisallow: /\n\nUser-agent: excaliburbot\nAllow: /\n",
+    );
+    assert!(rules.is_allowed(AGENT, "/page"));
+}
+
+#[test]
+fn top_level_sitemap_is_kept() {
+    // P04: Sitemap before any group is global.
+    let rules = RobotsRules::parse("Sitemap: https://x.example/s.xml\nUser-agent: *\nDisallow:\n");
+    assert_eq!(rules.sitemaps(), &["https://x.example/s.xml".to_owned()]);
+}

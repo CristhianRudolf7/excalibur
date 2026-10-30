@@ -12,8 +12,38 @@ pub const MAX_SITEMAP_URLS: usize = 50_000;
 /// Maximum uncompressed sitemap size accepted (50 MiB).
 pub const MAX_SITEMAP_BYTES: usize = 50 * 1024 * 1024;
 
+/// Decode the five predefined XML entities used inside `<loc>` text.
+fn decode_xml_entities(text: &str) -> String {
+    text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+/// Whether `target` belongs to `host_suffix`: exact host or a subdomain.
+fn host_matches_suffix(target: &str, host_suffix: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(target) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    let suffix = host_suffix.trim().to_ascii_lowercase();
+    if suffix.is_empty() {
+        return false;
+    }
+    host == suffix || host.ends_with(&format!(".{suffix}"))
+}
+
 /// Extract `<loc>` targets from a sitemap or sitemap index, bounded to
-/// [`MAX_SITEMAP_URLS`]. Only `http(s)` targets on `host_suffix` are kept.
+/// [`MAX_SITEMAP_URLS`]. Only `http(s)` targets whose host matches
+/// `host_suffix` are kept; XML entities are decoded. Path restriction
+/// against the sitemap URL needs [`parse_sitemap_locs_for_sitemap`].
 #[must_use]
 pub fn parse_sitemap_locs(xml: &str, host_suffix: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -29,13 +59,69 @@ pub fn parse_sitemap_locs(xml: &str, host_suffix: &str) -> Vec<String> {
         let Some(end) = rest.find("</loc>") else {
             break;
         };
-        let target = rest[..end].trim().to_owned();
+        let raw = rest[..end].trim();
         rest = &rest[end + 6..];
-        if (target.starts_with("http://") || target.starts_with("https://"))
-            && target.contains(host_suffix)
-        {
+        let target = decode_xml_entities(raw);
+        if host_matches_suffix(&target, host_suffix) {
             out.push(target);
         }
+    }
+    out
+}
+
+/// Extract `<loc>` targets restricted to the sitemap host and directory.
+/// `sitemap_url` is the URL the `xml` was fetched from: targets must share
+/// its host (or a subdomain when the sitemap host itself is a suffix) and
+/// live under its directory prefix per the sitemaps protocol.
+#[must_use]
+pub fn parse_sitemap_locs_for_sitemap(xml: &str, sitemap_url: &str) -> Vec<String> {
+    let Ok(base) = url::Url::parse(sitemap_url) else {
+        return Vec::new();
+    };
+    if !matches!(base.scheme(), "http" | "https") {
+        return Vec::new();
+    }
+    let Some(base_host) = base.host_str() else {
+        return Vec::new();
+    };
+    let base_host = base_host.to_ascii_lowercase();
+    let base_path = base.path();
+    let dir_prefix = match base_path.rfind('/') {
+        Some(idx) => base_path[..idx + 1].to_owned(),
+        None => "/".to_owned(),
+    };
+    let mut out = Vec::new();
+    if xml.len() > MAX_SITEMAP_BYTES {
+        return out;
+    }
+    let mut rest = xml;
+    while let Some(start) = rest.find("<loc>") {
+        if out.len() >= MAX_SITEMAP_URLS {
+            break;
+        }
+        rest = &rest[start + 5..];
+        let Some(end) = rest.find("</loc>") else {
+            break;
+        };
+        let raw = rest[..end].trim();
+        rest = &rest[end + 6..];
+        let target = decode_xml_entities(raw);
+        let Ok(parsed) = url::Url::parse(&target) else {
+            continue;
+        };
+        if !matches!(parsed.scheme(), "http" | "https") {
+            continue;
+        }
+        let Some(host) = parsed.host_str() else {
+            continue;
+        };
+        if host.to_ascii_lowercase() != base_host {
+            continue;
+        }
+        if !parsed.path().starts_with(&dir_prefix) {
+            continue;
+        }
+        out.push(target);
     }
     out
 }
@@ -108,12 +194,21 @@ fn take_attr(tag: &str, name: &str) -> Option<String> {
     Some(after[1..1 + end].to_owned())
 }
 
+fn null_to_default<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// Minimal CirrusSearch document projection used by the streaming ingest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CirrusDoc {
     /// Article title.
     pub title: String,
     /// Plain-text opening used as body and snippet seed.
+    /// Real dumps carry explicit `null`; it maps to an empty string.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub opening_text: String,
     /// Headings, if present.
     #[serde(default)]

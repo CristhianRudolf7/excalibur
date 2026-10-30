@@ -17,7 +17,7 @@ use crate::ranking::{self, RankedResult};
 use crate::tokenize;
 
 /// Query options for `web_search`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchOptions {
     /// Force the freshness term on.
     #[serde(default)]
@@ -34,6 +34,18 @@ pub struct SearchOptions {
     /// Caller clock (unix seconds) for freshness; 0 disables it.
     #[serde(default)]
     pub now_secs: i64,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            freshness: false,
+            domains: Vec::new(),
+            lang: None,
+            k: 10,
+            now_secs: 0,
+        }
+    }
 }
 
 /// Coverage block attached to every response.
@@ -88,12 +100,18 @@ impl<'index> SearchService<'index> {
         let mut domains = options.domains.clone();
         domains.extend(site_domains);
         let terms = tokenize(&text);
-        let k = options.k.clamp(1, crate::ranking::MAX_K);
-        let mut candidates = self.index.search_bm25(&terms, true, 200)?;
-        if candidates.len() < 10 {
-            candidates = self.index.search_bm25(&terms, false, 200)?;
-        }
+        // Default `k` is 10; a zero value from a default-constructed struct
+        // also maps to 10, while explicit values clamp to 1..=50.
+        let k = if options.k == 0 {
+            10
+        } else {
+            options.k.clamp(1, crate::ranking::MAX_K)
+        };
         let lang = options.lang.as_deref().filter(|value| !value.is_empty());
+        let mut candidates = self.index.search_bm25(&terms, true, 200, lang, &domains)?;
+        if candidates.len() < 10 {
+            candidates = self.index.search_bm25(&terms, false, 200, lang, &domains)?;
+        }
         let ranked = ranking::rank_candidates(
             &candidates,
             &text,
@@ -104,11 +122,14 @@ impl<'index> SearchService<'index> {
             options.now_secs,
         );
         let results = ranking::dedupe_results(ranked);
-        let max_score = results
+        // `insufficient` on raw BM25 avoids the normalized-score floor where
+        // the top blended score is always >= 1. Threshold pending calibration
+        // against the manual query set (section 15.10).
+        let max_bm25 = candidates
             .iter()
-            .map(|result| result.score)
+            .map(|candidate| candidate.bm25)
             .fold(0.0_f64, f64::max);
-        let insufficient = results.len() < 3 || max_score < 0.05;
+        let insufficient = results.len() < 3 || max_bm25 < 0.1;
         Ok(SearchResponse {
             results,
             coverage: Coverage {

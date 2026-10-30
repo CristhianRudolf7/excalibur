@@ -4,6 +4,21 @@
 //! is unix seconds supplied by the caller so tests run on a controlled
 //! clock. State transitions are atomic per call; crash recovery re-queues
 //! `fetching` and `pending_commit` URLs that never committed.
+//!
+//! Scheduling guarantees:
+//! - `robots.txt` is downloaded before any URL of a host; hosts without a
+//!   fresh entry (24 h reachable, 1 h retry for 5xx/unreachable) are never
+//!   dispatched and [`Frontier::robots_allowed`] fails closed.
+//! - Only seeded hosts are crawlable; cross-host links only register
+//!   candidates until explicitly seeded.
+//! - One URL in flight per host, at most `max_inflight` overall and at most
+//!   `max_pages_per_sec` dispatches per second.
+//! - Politeness delay `clamp(2 x duration, 1 s, 5 s)` plus deterministic
+//!   0-150 ms jitter, rounded up to whole seconds.
+//! - Refresh intervals persist explicitly (7 d start, halve on change,
+//!   double on stability, 1-60 d) and due `indexed` rows are redispatched.
+
+use std::collections::HashSet;
 
 use rusqlite::{OptionalExtension, params};
 
@@ -132,6 +147,9 @@ pub struct Frontier {
     contact_url: String,
     host_page_budget: u32,
     max_inflight: usize,
+    max_pages_per_sec: u32,
+    rate_window_sec: Option<i64>,
+    rate_count: usize,
 }
 
 impl Frontier {
@@ -149,11 +167,14 @@ impl Frontier {
             return Err(SearchError::MissingContactUrl);
         }
         let conn = rusqlite::Connection::open(path)?;
-        let frontier = Self {
+        let mut frontier = Self {
             conn,
             contact_url: contact_url.to_owned(),
             host_page_budget,
             max_inflight: max_inflight.max(1),
+            max_pages_per_sec: 16,
+            rate_window_sec: None,
+            rate_count: 0,
         };
         frontier.migrate()?;
         Ok(frontier)
@@ -165,17 +186,25 @@ impl Frontier {
             return Err(SearchError::MissingContactUrl);
         }
         let conn = rusqlite::Connection::open_in_memory()?;
-        let frontier = Self {
+        let mut frontier = Self {
             conn,
             contact_url: contact_url.to_owned(),
             host_page_budget: 30,
             max_inflight: 16,
+            max_pages_per_sec: 16,
+            rate_window_sec: None,
+            rate_count: 0,
         };
         frontier.migrate()?;
         Ok(frontier)
     }
 
-    fn migrate(&self) -> Result<()> {
+    /// Global pages-per-second cap (section 15.4). Defaults to 16.
+    pub fn set_max_pages_per_sec(&mut self, limit: u32) {
+        self.max_pages_per_sec = limit.max(1);
+    }
+
+    fn migrate(&mut self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS hosts(
                 host TEXT PRIMARY KEY,
@@ -185,12 +214,13 @@ impl Frontier {
                 delay_ms INTEGER NOT NULL DEFAULT 1000,
                 crawl_delay_ms INTEGER,
                 robots_blob TEXT NOT NULL DEFAULT '',
-                robots_fetched_at INTEGER NOT NULL DEFAULT 0,
+                robots_fetched_at INTEGER NOT NULL DEFAULT -1,
                 robots_reachable INTEGER NOT NULL DEFAULT 1,
                 err_count INTEGER NOT NULL DEFAULT 0,
                 parked_until INTEGER NOT NULL DEFAULT 0,
                 page_budget INTEGER NOT NULL DEFAULT 30,
-                pages_fetched INTEGER NOT NULL DEFAULT 0
+                pages_fetched INTEGER NOT NULL DEFAULT 0,
+                seeded INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS urls(
                 url_hash TEXT PRIMARY KEY,
@@ -208,11 +238,21 @@ impl Frontier {
                 n_change INTEGER NOT NULL DEFAULT 0,
                 simhash INTEGER,
                 content_hash TEXT,
-                opstamp INTEGER
+                opstamp INTEGER,
+                refresh_interval_secs INTEGER NOT NULL DEFAULT 604800
             );
             CREATE INDEX IF NOT EXISTS idx_urls_state_host ON urls(state, host, priority, next_fetch);
             CREATE INDEX IF NOT EXISTS idx_urls_host ON urls(host, state);",
         )?;
+        // Backfill for databases created before seeded/interval columns.
+        let _ = self.conn.execute(
+            "ALTER TABLE hosts ADD COLUMN seeded INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE urls ADD COLUMN refresh_interval_secs INTEGER NOT NULL DEFAULT 604800",
+            [],
+        );
         Ok(())
     }
 
@@ -222,14 +262,14 @@ impl Frontier {
         &self.contact_url
     }
 
-    /// Register a host seed. Idempotent.
+    /// Register a host seed. Idempotent; promotes candidates to seeds.
     pub fn add_host(&self, host: &str, prior: f64, page_budget: Option<u32>) -> Result<()> {
         let host = host.to_ascii_lowercase();
         let domain = normalize::registrable_domain(&host);
         self.conn.execute(
-            "INSERT INTO hosts(host, domain, prior, page_budget)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(host) DO UPDATE SET prior=excluded.prior",
+            "INSERT INTO hosts(host, domain, prior, page_budget, seeded)
+             VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT(host) DO UPDATE SET prior=excluded.prior, seeded=1",
             params![
                 host,
                 domain,
@@ -240,9 +280,32 @@ impl Frontier {
         Ok(())
     }
 
+    fn register_candidate(&self, host: &str) -> Result<()> {
+        let host = host.to_ascii_lowercase();
+        let domain = normalize::registrable_domain(&host);
+        self.conn.execute(
+            "INSERT INTO hosts(host, domain, seeded) VALUES (?1, ?2, 0)
+             ON CONFLICT(host) DO NOTHING",
+            params![host, domain],
+        )?;
+        Ok(())
+    }
+
+    fn is_seeded(&self, host: &str) -> Result<bool> {
+        let seeded: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT seeded FROM hosts WHERE host = ?1",
+                params![host],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(seeded.unwrap_or(0) == 1)
+    }
+
     /// Enqueue `raw_url` for crawling. Same-host links obey the depth and
-    /// host page budget; unknown cross-host links only register a candidate
-    /// host and are not crawled until seeded.
+    /// host page budget. Links to hosts that were never seeded only register
+    /// a candidate host row and are never crawled until `add_host` seeds it.
     pub fn enqueue(
         &self,
         raw_url: &str,
@@ -256,13 +319,16 @@ impl Frontier {
         let known: Option<i64> = self
             .conn
             .query_row(
-                "SELECT 1 FROM hosts WHERE host = ?1",
+                "SELECT seeded FROM hosts WHERE host = ?1",
                 params![normalized.host],
                 |row| row.get(0),
             )
             .optional()?;
-        if known.is_none() {
-            self.add_host(&normalized.host, 0.2, None)?;
+        let Some(seeded) = known else {
+            self.register_candidate(&normalized.host)?;
+            return Ok(false);
+        };
+        if seeded != 1 {
             return Ok(false);
         }
         if depth > max_depth {
@@ -299,7 +365,7 @@ impl Frontier {
         Ok(inserted == 1)
     }
 
-    /// Store a fetched `robots.txt` body for `host`.
+    /// Store a fetched `robots.txt` body for `host` (byte-capped).
     pub fn store_robots(
         &self,
         host: &str,
@@ -309,10 +375,14 @@ impl Frontier {
         crawl_delay_secs: Option<u64>,
     ) -> Result<()> {
         let host = host.to_ascii_lowercase();
-        let capped: String = body.chars().take(robots::MAX_ROBOTS_BYTES).collect();
+        let mut capped = body.to_owned();
+        if capped.len() > robots::MAX_ROBOTS_BYTES {
+            let boundary = capped.floor_char_boundary(robots::MAX_ROBOTS_BYTES);
+            capped.truncate(boundary);
+        }
         self.conn.execute(
-            "INSERT INTO hosts(host, robots_blob, robots_fetched_at, robots_reachable, crawl_delay_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO hosts(host, robots_blob, robots_fetched_at, robots_reachable, crawl_delay_ms, seeded)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)
              ON CONFLICT(host) DO UPDATE SET
                robots_blob=excluded.robots_blob,
                robots_fetched_at=excluded.robots_fetched_at,
@@ -329,7 +399,57 @@ impl Frontier {
         Ok(())
     }
 
+    /// Whether `host` has a fresh `robots.txt` at `now_secs`.
+    /// Reachable entries live 24 h; 5xx/unreachable entries retry after 1 h.
+    fn robots_fresh_for_host(robots_fetched_at: i64, robots_reachable: i64, now: i64) -> bool {
+        if robots_fetched_at < 0 || now < robots_fetched_at {
+            return false;
+        }
+        let ttl = if robots_reachable == 1 {
+            i64::try_from(robots::ROBOTS_TTL_SECS).unwrap_or(i64::MAX)
+        } else {
+            i64::try_from(robots::ROBOTS_FAILURE_RETRY_SECS).unwrap_or(3600)
+        };
+        now - robots_fetched_at < ttl
+    }
+
+    /// Whether `host` may be dispatched at `now_secs`: seeded, fresh
+    /// reachable robots, politeness and parking satisfied.
+    pub fn host_dispatchable(&self, host: &str, now_secs: u64) -> Result<bool> {
+        let host = host.to_ascii_lowercase();
+        let row: Option<(i64, i64, i64, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT seeded, next_fetch_at, parked_until, robots_fetched_at, robots_reachable
+                 FROM hosts WHERE host = ?1",
+                params![host],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((seeded, next_fetch_at, parked_until, fetched_at, reachable)) = row else {
+            return Ok(false);
+        };
+        let now = i64::try_from(now_secs).unwrap_or(0);
+        if seeded != 1 || next_fetch_at > now || parked_until > now {
+            return Ok(false);
+        }
+        if reachable != 1 {
+            return Ok(false);
+        }
+        Ok(Self::robots_fresh_for_host(fetched_at, reachable, now))
+    }
+
     /// Decide whether `raw_url` may be fetched under cached robots state.
+    /// Fails closed: unknown hosts, missing entries and expired entries
+    /// deny until a fresh `robots.txt` is stored.
     pub fn robots_allowed(&self, raw_url: &str, user_agent: &str, now_secs: u64) -> Result<bool> {
         let normalized: NormalizedUrl = normalize_url(raw_url)?;
         let row: Option<(String, i64, i64)> = self
@@ -341,11 +461,11 @@ impl Frontier {
             )
             .optional()?;
         let Some((blob, fetched_at, reachable)) = row else {
-            return Ok(true);
+            return Ok(false);
         };
         let now = i64::try_from(now_secs).unwrap_or(0);
-        if now - fetched_at > i64::try_from(robots::ROBOTS_TTL_SECS).unwrap_or(i64::MAX) {
-            return Ok(true);
+        if !Self::robots_fresh_for_host(fetched_at, reachable, now) {
+            return Ok(false);
         }
         if reachable == 0 {
             return Ok(false);
@@ -363,40 +483,57 @@ impl Frontier {
         Ok(decision.allowed)
     }
 
-    /// Select due URLs: at most one in flight per host and at most
-    /// `max_inflight` overall, ordered by priority. Selected rows move to
+    /// Select due URLs: due seeded hosts first (one URL each, ordered by
+    /// host prior then URL priority/depth/recency), at most one in flight
+    /// per host, `max_inflight` overall and the per-second page cap.
+    /// Both `queued` and due `indexed` (refresh) rows are eligible.
+    /// Hosts without fresh `robots.txt` are never dispatched and
+    /// robots-disallowed URLs are skipped. Selected rows move to
     /// `fetching` atomically.
     pub fn select_due(&mut self, now_secs: u64) -> Result<Vec<CrawlTask>> {
         let now = i64::try_from(now_secs).unwrap_or(0);
+        // Per-second page cap.
+        if self.rate_window_sec != Some(now) {
+            self.rate_window_sec = Some(now);
+            self.rate_count = 0;
+        }
+        let rate_remaining = (i64::from(self.max_pages_per_sec) - self.rate_count as i64).max(0);
+        if rate_remaining <= 0 {
+            return Ok(Vec::new());
+        }
         let tx = self.conn.transaction()?;
-        let mut stmt = tx.prepare(
-            "SELECT u.url_hash, u.url, u.host FROM urls u
-             JOIN hosts h ON h.host = u.host
-             WHERE u.state = 'queued' AND u.next_fetch <= ?1
-               AND h.next_fetch_at <= ?1 AND h.parked_until <= ?1
-             ORDER BY u.priority ASC, u.next_fetch ASC
-             LIMIT ?2",
-        )?;
-        let candidates: Vec<(String, String, String)> = stmt
-            .query_map(
-                params![now, i64::try_from(self.max_inflight * 4).unwrap_or(64)],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(stmt);
-        let mut tasks = Vec::new();
-        let mut hosts_used = std::collections::HashSet::new();
         let inflight: i64 = tx.query_row(
             "SELECT COUNT(*) FROM urls WHERE state = 'fetching'",
             [],
             |row| row.get(0),
         )?;
         let mut slots = (i64::try_from(self.max_inflight).unwrap_or(16) - inflight).max(0);
-        for (hash, url, host) in candidates {
-            if slots <= 0 {
+        slots = slots.min(rate_remaining);
+        if slots <= 0 {
+            tx.commit()?;
+            return Ok(Vec::new());
+        }
+        // Due hosts first: prior DESC for the 15.4 priority formula,
+        // host ASC as a stable tie-break.
+        let ttl: i64 = i64::try_from(robots::ROBOTS_TTL_SECS).unwrap_or(86_400);
+        let mut host_stmt = tx.prepare(
+            "SELECT host FROM hosts
+             WHERE seeded = 1 AND next_fetch_at <= ?1 AND parked_until <= ?1
+               AND robots_reachable = 1 AND robots_fetched_at >= 0
+               AND (?1 - robots_fetched_at) < ?2
+             ORDER BY prior DESC, host ASC",
+        )?;
+        let due_hosts: Vec<String> = host_stmt
+            .query_map(params![now, ttl], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(host_stmt);
+        let mut tasks = Vec::new();
+        let mut hosts_used = HashSet::new();
+        for host in due_hosts {
+            if (tasks.len() as i64) >= slots {
                 break;
             }
-            if hosts_used.contains(&host) {
+            if !hosts_used.insert(host.clone()) {
                 continue;
             }
             let busy: i64 = tx.query_row(
@@ -407,20 +544,74 @@ impl Frontier {
             if busy > 0 {
                 continue;
             }
+            // One URL per host: explicit priority, depth penalty,
+            // next_fetch recency and URL tie-break. last_modified recency
+            // applies when the field carries a unix timestamp; otherwise it
+            // is ignored (0).
+            let candidate: Option<(String, String, i64)> = tx
+                .query_row(
+                    "SELECT url_hash, url, depth FROM urls
+                     WHERE host = ?1
+                       AND ((state = 'queued' AND next_fetch <= ?2)
+                         OR (state = 'indexed' AND next_fetch <= ?2))
+                     ORDER BY priority ASC, depth ASC, next_fetch ASC, url ASC
+                     LIMIT 1",
+                    params![host, now],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((hash, url, depth)) = candidate else {
+                continue;
+            };
+            // Enforce per-URL robots decisions; skip disallowed without
+            // consuming a slot.
+            let allowed = {
+                let row: Option<(String, i64, i64)> = tx
+                    .query_row(
+                        "SELECT robots_blob, robots_fetched_at, robots_reachable FROM hosts WHERE host = ?1",
+                        params![host],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                match row {
+                    None => false,
+                    Some((blob, fetched_at, reachable)) => {
+                        if !Self::robots_fresh_for_host(fetched_at, reachable, now)
+                            || reachable != 1
+                        {
+                            false
+                        } else if blob.is_empty() {
+                            true
+                        } else {
+                            let normalized = normalize_url(&url)?;
+                            let rules = RobotsRules::parse(&blob);
+                            robots::decide(
+                                RobotsFetch::Ok,
+                                Some(&rules),
+                                "ExcaliburBot/0.1",
+                                &normalized.robots_path,
+                            )
+                            .allowed
+                        }
+                    }
+                }
+            };
+            if !allowed {
+                continue;
+            }
             tx.execute(
                 "UPDATE urls SET state = 'fetching', last_fetch = ?1 WHERE url_hash = ?2",
                 params![now, hash],
             )?;
-            let depth: u8 = tx.query_row(
-                "SELECT depth FROM urls WHERE url_hash = ?1",
-                params![hash],
-                |row| row.get::<_, i64>(0),
-            )? as u8;
             hosts_used.insert(host.clone());
-            tasks.push(CrawlTask { url, host, depth });
-            slots -= 1;
+            tasks.push(CrawlTask {
+                url,
+                host,
+                depth: depth as u8,
+            });
         }
         tx.commit()?;
+        self.rate_count += tasks.len();
         Ok(tasks)
     }
 
@@ -478,18 +669,42 @@ impl Frontier {
     }
 
     /// Mark a `pending_commit` URL as indexed after the writer commits.
-    /// `changed` drives the Cho/Garcia-Molina style refresh interval.
+    /// `changed` drives the Cho/Garcia-Molina style refresh interval stored
+    /// explicitly per URL.
     pub fn mark_indexed(&self, raw_url: &str, changed: bool, now_secs: u64) -> Result<()> {
         let normalized: NormalizedUrl = normalize_url(raw_url)?;
         let hash = NormalizedUrl::hash_key(&normalized);
-        let interval = refresh_interval_secs(&self.conn, &hash, changed)?;
+        let interval = self.next_refresh_interval(&hash, changed)?;
         let next = i64::try_from(now_secs).unwrap_or(0) + interval;
         self.conn.execute(
             "UPDATE urls SET state = 'indexed', next_fetch = ?1,
-               n_fetch = n_fetch + 1, n_change = n_change + ?2 WHERE url_hash = ?3",
-            params![next, i64::from(changed), hash],
+               n_fetch = n_fetch + 1, n_change = n_change + ?2,
+               refresh_interval_secs = ?3 WHERE url_hash = ?4",
+            params![next, i64::from(changed), interval, hash],
         )?;
         Ok(())
+    }
+
+    fn next_refresh_interval(&self, hash: &str, changed: bool) -> Result<i64> {
+        const DAY: i64 = 24 * 3600;
+        let row: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT n_fetch, refresh_interval_secs FROM urls WHERE url_hash = ?1",
+                params![hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (n_fetch, current) = row.unwrap_or((0, 7 * DAY));
+        if n_fetch == 0 {
+            return Ok(7 * DAY);
+        }
+        let baseline = current.clamp(DAY, 60 * DAY);
+        if changed {
+            Ok((baseline / 2).max(DAY))
+        } else {
+            Ok((baseline * 2).min(60 * DAY))
+        }
     }
 
     /// Re-queue `fetching` and `pending_commit` rows left behind by a crash
@@ -596,9 +811,11 @@ impl Frontier {
                 delay_ms = delay_ms.max(crawl);
             }
         }
+        // Ceil to whole seconds so the host never becomes due early.
+        let next_fetch_at = now + delay_ms.saturating_add(999) / 1000;
         self.conn.execute(
             "UPDATE hosts SET next_fetch_at = ?1, delay_ms = ?2, pages_fetched = pages_fetched + 1 WHERE host = ?3",
-            params![now + delay_ms / 1000, delay_ms, host],
+            params![next_fetch_at, delay_ms, host],
         )?;
         Ok(())
     }
@@ -637,6 +854,11 @@ impl Frontier {
         )?;
         Ok(())
     }
+
+    /// Whether `host` was explicitly seeded (vs a mere candidate).
+    pub fn is_host_seeded(&self, host: &str) -> Result<bool> {
+        self.is_seeded(&host.to_ascii_lowercase())
+    }
 }
 
 fn next_after_backoff(_host: &str, now: i64) -> i64 {
@@ -653,34 +875,4 @@ fn deterministic_jitter(host: &str, now: i64) -> u64 {
     hash ^= now as u64;
     hash = hash.wrapping_mul(0x0100_0000_01b3);
     (hash >> 11) % 151
-}
-
-/// Refresh interval per 15.6: start at 7 days, halve on change (min 1 day),
-/// double on stability (max 60 days).
-fn refresh_interval_secs(conn: &rusqlite::Connection, hash: &str, changed: bool) -> Result<i64> {
-    const DAY: i64 = 24 * 3600;
-    let row: Option<(i64, i64)> = conn
-        .query_row(
-            "SELECT n_fetch, n_change FROM urls WHERE url_hash = ?1",
-            params![hash],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let (n_fetch, _) = row.unwrap_or((0, 0));
-    if n_fetch == 0 {
-        return Ok(7 * DAY);
-    }
-    let current: i64 = conn
-        .query_row(
-            "SELECT next_fetch - COALESCE(last_fetch, next_fetch) FROM urls WHERE url_hash = ?1",
-            params![hash],
-            |row| row.get(0),
-        )
-        .unwrap_or(7 * DAY);
-    let baseline = current.clamp(DAY, 60 * DAY);
-    if changed {
-        Ok((baseline / 2).max(DAY))
-    } else {
-        Ok((baseline * 2).min(60 * DAY))
-    }
 }
