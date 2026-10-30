@@ -337,3 +337,50 @@ async fn version_one_timers_survive_additive_calendar_migration() {
     drop(a);
     db.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn last_supported_cron_occurrence_is_recorded_before_calendar_exhaustion() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(
+        dir.path().join("db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let at = utc("9996-02-29T00:00:00Z");
+    for (scope, policy) in [
+        ("all", MissedPolicy::RunAll),
+        ("once", MissedPolicy::RunOnceNow),
+        ("skip", MissedPolicy::Skip),
+    ] {
+        let scheduler = Scheduler::open(db.clone(), scope.into()).await.unwrap();
+        scheduler
+            .create(Schedule {
+                id: "last".into(),
+                scope: scope.into(),
+                timing: Timing::Cron {
+                    expression: "0 0 29 2 *".into(),
+                    timezone: "UTC".into(),
+                    not_before: at,
+                },
+                missed: policy,
+                payload: json!("last"),
+            })
+            .await
+            .unwrap();
+        scheduler
+            .create(Schedule {
+                id: "other".into(),
+                scope: scope.into(),
+                timing: Timing::At(at),
+                missed: policy,
+                payload: json!("other"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(scheduler.tick(at, true, 10).await.unwrap(), 2);
+        assert_eq!(scheduler.tick(at + 1, true, 10).await.unwrap(), 0);
+        assert_eq!(scheduler.pending(10).await.unwrap().len(), 2);
+    }
+    db.shutdown().await.unwrap();
+}

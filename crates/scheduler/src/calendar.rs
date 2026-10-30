@@ -169,16 +169,54 @@ impl Cron {
     /// Strictly after the supplied UTC second. Search is bounded to eight years;
     /// impossible expressions fail instead of monopolizing a daemon thread.
     pub fn next_after(&self, after: i64, timezone: &str) -> Result<i64> {
-        self.search(after, timezone, false)
+        self.next_occurrence(after, timezone)?.ok_or(Error::Invalid(
+            "no cron occurrence within eight years or supported date range",
+        ))
+    }
+    /// Calendar exhaustion is distinct from an invalid expression or zone.
+    pub fn next_occurrence(&self, after: i64, timezone: &str) -> Result<Option<i64>> {
+        self.search(after, timezone, false, &mut 0)
     }
     /// Latest occurrence at or before the supplied UTC second.
     pub fn latest_at(&self, before: i64, timezone: &str) -> Result<i64> {
-        self.search(before, timezone, true)
+        self.search(before, timezone, true, &mut 0)?
+            .ok_or(Error::Invalid(
+                "no cron occurrence within eight years or supported date range",
+            ))
     }
-    fn search(&self, bound: i64, timezone: &str, reverse: bool) -> Result<i64> {
+    fn search(
+        &self,
+        bound: i64,
+        timezone: &str,
+        reverse: bool,
+        candidates: &mut usize,
+    ) -> Result<Option<i64>> {
         let zone = zone(timezone)?;
-        let local = zone.to_datetime(timestamp(bound)?);
-        let mut date = local.date();
+        let bound_ts = timestamp(bound)?;
+        let local = zone.to_datetime(bound_ts);
+        let mut edge = local;
+        if reverse
+            && zone
+                .to_ambiguous_zoned(local)
+                .earlier()
+                .map_err(|_| invalid())?
+                .timestamp()
+                != bound_ts
+            && let Some(transition) = zone
+                .preceding(timestamp(bound.checked_add(1).ok_or_else(invalid)?)?)
+                .next()
+        {
+            edge = edge.max(
+                zone.to_datetime(timestamp(
+                    transition
+                        .timestamp()
+                        .as_second()
+                        .checked_sub(1)
+                        .ok_or_else(invalid)?,
+                )?),
+            );
+        }
+        let mut date = edge.date();
         for _ in 0..=366 * 8 {
             if self.matches_date(date) {
                 let hours: Box<dyn Iterator<Item = &u8>> = if reverse {
@@ -187,39 +225,91 @@ impl Cron {
                     Box::new(self.hours.values.iter())
                 };
                 for hour in hours {
+                    if date == edge.date()
+                        && ((!reverse && *hour < edge.hour() as u8)
+                            || (reverse && *hour > edge.hour() as u8))
+                    {
+                        continue;
+                    }
                     let minutes: Box<dyn Iterator<Item = &u8>> = if reverse {
                         Box::new(self.minutes.values.iter().rev())
                     } else {
                         Box::new(self.minutes.values.iter())
                     };
                     for minute in minutes {
+                        if date == edge.date()
+                            && *hour == edge.hour() as u8
+                            && ((!reverse && *minute < edge.minute() as u8)
+                                || (reverse && *minute > edge.minute() as u8))
+                        {
+                            continue;
+                        }
                         let seconds: Box<dyn Iterator<Item = &u8>> = if reverse {
                             Box::new(self.seconds.values.iter().rev())
                         } else {
                             Box::new(self.seconds.values.iter())
                         };
                         for second in seconds {
-                            let candidate = date.at(*hour as i8, *minute as i8, *second as i8, 0);
-                            // In a fold reverse search must still consider a later
-                            // civil minute in its FIRST occurrence before bound.
-                            if !reverse && candidate <= local {
+                            if date == edge.date()
+                                && *hour == edge.hour() as u8
+                                && *minute == edge.minute() as u8
+                                && ((!reverse && *second <= edge.second() as u8)
+                                    || (reverse && *second > edge.second() as u8))
+                            {
                                 continue;
                             }
-                            let value = resolve(candidate, &zone)?;
+                            *candidates += 1;
+                            let candidate = date.at(*hour as i8, *minute as i8, *second as i8, 0);
+                            let value = match resolve(candidate, &zone) {
+                                Ok(value) => value,
+                                Err(_)
+                                    if (!reverse && date.year() == 9999)
+                                        || (reverse && date.year() == -9999) =>
+                                {
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
                             if (reverse && value <= bound) || (!reverse && value > bound) {
-                                return Ok(value);
+                                return Ok(Some(value));
                             }
                         }
                     }
                 }
             }
-            date = if reverse {
+            let next = if reverse {
                 date.yesterday()
             } else {
                 date.tomorrow()
+            };
+            match next {
+                Ok(next) => date = next,
+                Err(_) => return Ok(None),
             }
-            .map_err(|_| invalid())?;
         }
-        Err(Error::Invalid("no cron occurrence within eight years"))
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn late_day_second_cron_advances_without_scanning_prior_seconds() {
+        let cron = Cron::parse("* * * * * *").unwrap();
+        let mut at = "2026-01-01T23:43:19Z"
+            .parse::<Timestamp>()
+            .unwrap()
+            .as_second();
+        let mut candidates = 0;
+        for _ in 0..1000 {
+            let next = cron
+                .search(at, "UTC", false, &mut candidates)
+                .unwrap()
+                .unwrap();
+            assert_eq!(next, at + 1);
+            at = next;
+        }
+        assert_eq!(candidates, 1000);
     }
 }

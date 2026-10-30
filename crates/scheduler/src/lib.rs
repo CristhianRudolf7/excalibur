@@ -49,6 +49,7 @@ pub struct Fire {
 pub struct Scheduler {
     db: Database,
     scope: String,
+    calendar_runtime: tokio::runtime::Handle,
 }
 fn invalid() -> Error {
     Error::Invalid("nonempty bounded schedule IDs, scope, payload and positive interval required")
@@ -59,6 +60,21 @@ fn json_error(_: serde_json::Error) -> Error {
 impl Scheduler {
     /// The caller obtains this scope from authenticated authority, never event content.
     pub async fn open(db: Database, scope: String) -> Result<Self> {
+        Self::open_with_calendar_runtime(
+            db,
+            scope,
+            tokio::runtime::Handle::try_current()
+                .map_err(|_| Error::Invalid("calendar requires a Tokio runtime"))?,
+        )
+        .await
+    }
+    /// Hosts can use their dedicated low-priority CPU runtime. Calendar jobs
+    /// are bounded to two concurrent workers across scheduler instances.
+    pub async fn open_with_calendar_runtime(
+        db: Database,
+        scope: String,
+        calendar_runtime: tokio::runtime::Handle,
+    ) -> Result<Self> {
         if scope.is_empty() || scope.len() > 512 {
             return Err(invalid());
         }
@@ -76,7 +92,31 @@ impl Scheduler {
             }
             Ok(())
         }).await?;
-        Ok(Self { db, scope })
+        Ok(Self {
+            db,
+            scope,
+            calendar_runtime,
+        })
+    }
+    async fn run_calendar<T: Send + 'static>(
+        &self,
+        job: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let permit = GATE
+            .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Closed)?;
+        self.calendar_runtime
+            .spawn_blocking(move || {
+                let _permit = permit;
+                job()
+            })
+            .await
+            .map_err(|_| Error::Closed)?
     }
     /// Creating an existing ID is idempotent only for the exact same definition.
     /// Replacing a timer needs a new ID so pending deliveries retain their meaning.
@@ -84,12 +124,13 @@ impl Scheduler {
         if schedule.scope != self.scope || schedule.id.is_empty() || schedule.id.len() > 256 {
             return Err(invalid());
         }
-        let first = first_at(&schedule.timing)?;
-        if first < 0 {
-            return Err(invalid());
-        }
         let definition = serde_json::to_string(&schedule).map_err(json_error)?;
         if definition.len() > 65536 {
+            return Err(invalid());
+        }
+        let timing = schedule.timing.clone();
+        let first = self.run_calendar(move || first_at(&timing)).await?;
+        if first < 0 {
             return Err(invalid());
         }
         self.db.write(Priority::Journal, move |c| {
@@ -113,25 +154,30 @@ impl Scheduler {
             let mut q = c.prepare("SELECT id,definition,next_at FROM scheduler_timers WHERE scope=?1 AND next_at<=?2 ORDER BY next_at,id LIMIT ?3")?;
             Ok(q.query_map(rusqlite::params![scope,now,limit],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?)
         }).await?;
-        // Calendar search does not retain the writer transaction or a read lease.
-        let mut plans = Vec::new();
-        let mut remaining = limit as usize;
-        for (id, definition, due) in rows {
-            let schedule: Schedule = serde_json::from_str(&definition).map_err(json_error)?;
-            let plan = plan_fires(
-                &schedule.timing,
-                schedule.missed,
-                due,
-                now,
-                recovering,
-                remaining,
-            )?;
-            remaining -= plan.0.len();
-            plans.push((id, definition, due, schedule.payload, plan));
-            if remaining == 0 {
-                break;
-            }
-        }
+        let plans = self
+            .run_calendar(move || {
+                let mut plans = Vec::new();
+                let mut remaining = limit as usize;
+                for (id, definition, due) in rows {
+                    let schedule: Schedule =
+                        serde_json::from_str(&definition).map_err(json_error)?;
+                    let plan = plan_fires(
+                        &schedule.timing,
+                        schedule.missed,
+                        due,
+                        now,
+                        recovering,
+                        remaining,
+                    )?;
+                    remaining -= plan.0.len();
+                    plans.push((id, definition, due, schedule.payload, plan));
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+                Ok(plans)
+            })
+            .await?;
         let scope = self.scope.clone();
         self.db.write(Priority::Journal, move |c| {
             let mut inserted = 0;
@@ -167,7 +213,6 @@ impl Scheduler {
         {
             return Err(invalid());
         }
-        calendar::validate_timezone(&timezone)?;
         let (scope, lookup_key) = (self.scope.clone(), key.clone());
         let previous = self
             .db
@@ -200,39 +245,49 @@ impl Scheduler {
         if old_next <= now {
             return Err(Error::Invalid("record due fires before changing time zone"));
         }
-        let mut schedule: Schedule = serde_json::from_str(&definition).map_err(json_error)?;
-        let (old_timezone, next) = match &mut schedule.timing {
-            Timing::LocalAt {
-                local,
-                timezone: old,
-            } => {
-                let previous = std::mem::replace(old, timezone.clone());
-                (previous, calendar::local_to_utc(local, &timezone)?)
-            }
-            Timing::Cron {
-                expression,
-                timezone: old,
-                not_before,
-            } => {
-                let previous = std::mem::replace(old, timezone.clone());
-                (
-                    previous,
-                    calendar::Cron::parse(expression)?.next_after(
-                        now.max(not_before.checked_sub(1).ok_or_else(invalid)?),
-                        &timezone,
-                    )?,
-                )
-            }
-            _ => {
-                return Err(Error::Invalid(
-                    "UTC timers do not change with user time zone",
-                ));
-            }
-        };
-        if next < 0 {
-            return Err(invalid());
-        }
-        let updated = serde_json::to_string(&schedule).map_err(json_error)?;
+        let plan_definition = definition.clone();
+        let plan_timezone = timezone.clone();
+        let (updated, old_timezone, next) = self
+            .run_calendar(move || {
+                let definition = plan_definition;
+                let timezone = plan_timezone;
+                let mut schedule: Schedule =
+                    serde_json::from_str(&definition).map_err(json_error)?;
+                let (old_timezone, next) = match &mut schedule.timing {
+                    Timing::LocalAt {
+                        local,
+                        timezone: old,
+                    } => {
+                        let previous = std::mem::replace(old, timezone.clone());
+                        (previous, calendar::local_to_utc(local, &timezone)?)
+                    }
+                    Timing::Cron {
+                        expression,
+                        timezone: old,
+                        not_before,
+                    } => {
+                        let previous = std::mem::replace(old, timezone.clone());
+                        (
+                            previous,
+                            calendar::Cron::parse(expression)?.next_after(
+                                now.max(not_before.checked_sub(1).ok_or_else(invalid)?),
+                                &timezone,
+                            )?,
+                        )
+                    }
+                    _ => {
+                        return Err(Error::Invalid(
+                            "UTC timers do not change with user time zone",
+                        ));
+                    }
+                };
+                if next < 0 {
+                    return Err(invalid());
+                }
+                let updated = serde_json::to_string(&schedule).map_err(json_error)?;
+                Ok((updated, old_timezone, next))
+            })
+            .await?;
         let note = TimezoneChange {
             key,
             schedule: id,
@@ -313,9 +368,7 @@ fn next_at(timing: &Timing, after: i64) -> Result<Option<i64>> {
             expression,
             timezone,
             ..
-        } => calendar::Cron::parse(expression)?
-            .next_after(after, timezone)
-            .map(Some),
+        } => calendar::Cron::parse(expression)?.next_occurrence(after, timezone),
     }
 }
 fn latest_due(timing: &Timing, first: i64, now: i64) -> Result<i64> {
@@ -379,4 +432,59 @@ fn replay_change(note: &str, id: &str, zone: &str) -> Result<TimezoneChange> {
         ));
     }
     Ok(note)
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use super::*;
+    #[tokio::test]
+    async fn calendar_worker_does_not_occupy_the_async_runtime_or_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            dir.path().join("db"),
+            DatabaseKind::Main,
+            Default::default(),
+        )
+        .unwrap();
+        let scheduler = Scheduler::open(db.clone(), "a".into()).await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (heartbeat_tx, heartbeat_rx) = std::sync::mpsc::channel();
+        let (control_started_tx, control_started_rx) = std::sync::mpsc::channel();
+        let controller = std::thread::spawn(move || {
+            control_started_rx.recv().unwrap();
+            let responsive = heartbeat_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok();
+            release_tx.send(()).unwrap();
+            responsive
+        });
+        let task = tokio::spawn(async move {
+            scheduler
+                .run_calendar(move || {
+                    let _ = started_tx.send(());
+                    control_started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        db.write(Priority::Interactive, |c| {
+            c.execute(
+                "INSERT INTO principals(id,name) VALUES('calendar-test','local fixture')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let _ = heartbeat_tx.send(());
+        task.await.unwrap().unwrap();
+        assert!(
+            controller.join().unwrap(),
+            "async runtime and writer must progress before calendar barrier is released"
+        );
+        db.shutdown().await.unwrap();
+    }
 }
