@@ -122,14 +122,21 @@ fn foreground_sigkill_boots_enter_safe_mode_keep_http_and_master_alive_and_recor
             use std::os::unix::process::ExitStatusExt;
             assert_eq!(status.signal(), Some(9));
         } else {
-            let events = result(address, "events.replay", json!({"limit":1024}));
+            let events = result(
+                address,
+                "notification.list",
+                json!({"conversation":"recovery-test"}),
+            );
             let notes = events
                 .as_array()
                 .unwrap()
                 .iter()
                 .filter(|event| {
-                    event["type"] == "recovery_summary"
-                        && event["payload"]["boot_id"] == status["boot_id"]
+                    serde_json::from_str::<Value>(event["content"].as_str().unwrap_or(""))
+                        .is_ok_and(|content| {
+                            content["kind"] == "recovery_summary"
+                                && content["boot_id"] == status["boot_id"]
+                        })
                 })
                 .count();
             assert_eq!(

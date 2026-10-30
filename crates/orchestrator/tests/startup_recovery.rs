@@ -50,6 +50,15 @@ async fn boot(f: &Fixture, at: i64, autonomy: Autonomy) -> BootRecord {
 async fn three_real_boot_receipts_gate_dispatch_and_quarantine_only_the_repeated_step() {
     let f = fixture().await;
     let at = excalibur_store::unix_seconds();
+    f.db.write(Priority::Journal, |c| {
+        c.execute(
+            "INSERT INTO conversations(id,active_scope) VALUES('conversation:test','general')",
+            [],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
     let a = f
         .host
         .spawn(&f.master.id, delegation("suspect", "general", 300))
@@ -76,6 +85,22 @@ async fn three_real_boot_receipts_gate_dispatch_and_quarantine_only_the_repeated
             .unwrap()
             .contains("quarantined")
     );
+    f.host
+        .recovery()
+        .publish_summary(&fourth.id, at + 3)
+        .await
+        .unwrap();
+    let notices = f.host.notifications("conversation:test").await.unwrap();
+    assert!(notices.iter().any(|notice| {
+        let value: serde_json::Value = serde_json::from_str(&notice.content).unwrap();
+        notice.class == "urgent"
+            && value["kind"] == "recovery_blocked"
+            && value["run_id"] == *run
+            && value["scope"] == "general"
+            && value["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("quarantined"))
+    }));
     assert!(f.host.tick().await.unwrap().is_empty());
     assert_eq!(f.host.status(&a.id).await.unwrap().state, "blocked");
     // Exiting global safe mode never clears a per-run quarantine.
@@ -342,4 +367,173 @@ async fn schema_checksum_is_additive_and_tampering_fails_closed() {
         .unwrap();
     assert!(n >= 2);
     f.db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn uncertain_recovery_emits_scoped_urgent_notice_and_deduplicates_after_database_reopen() {
+    let f = fixture().await;
+    let at = excalibur_store::unix_seconds();
+    boot(&f, at, Autonomy::Autonomous).await;
+    f.db.write(Priority::Journal,|c|{
+        c.execute("INSERT INTO conversations(id,active_scope) VALUES('origin','general'),('other','general')",[])?;
+        c.execute_batch("CREATE TABLE IF NOT EXISTS master_events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,conversation_id TEXT NOT NULL,kind TEXT NOT NULL,payload TEXT NOT NULL)")?;
+        Ok(())
+    }).await.unwrap();
+    let mut main = delegation("uncertain-notice", "general", 300);
+    main.origin_conversation = "origin".into();
+    let a = f.host.spawn(&f.master.id, main).await.unwrap();
+    let run = a.run_id.as_ref().unwrap().clone();
+    start(&f, &run, "notice:running").await;
+    let prepared = PreparedTool {
+        call: ToolCall {
+            id: "external".into(),
+            name: "irreversible".into(),
+            arguments: "{}".into(),
+        },
+        effect: Effect::NonIdempotent,
+        resources: vec![],
+        exclusive: true,
+        data: json!({}),
+    };
+    f.host
+        .engine()
+        .journal()
+        .append(
+            &run,
+            "tool_intent",
+            "notice:uncertain",
+            json!({"index":0,"prepared":prepared}),
+        )
+        .await
+        .unwrap();
+    let mut other = delegation("unrelated-notice", "general", 300);
+    other.origin_conversation = "other".into();
+    f.host.spawn(&f.master.id, other).await.unwrap();
+    let mut ceiling = token();
+    ceiling.data_scopes.insert("project:secret".into());
+    f.host
+        .rebind_master_at_startup("Excalibur", ceiling)
+        .await
+        .unwrap();
+    f.host
+        .register_project(excalibur_orchestrator::Project {
+            id: "secret".into(),
+            name: "Secret".into(),
+            aliases: vec![],
+            description: String::new(),
+            roots: vec![f.dir.path().to_owned()],
+            status: "active".into(),
+            vcs: None,
+            settings: json!({}),
+        })
+        .await
+        .unwrap();
+    let mut secret = delegation("secret-notice", "project:secret", 300);
+    secret.origin_conversation = "origin".into();
+    secret.token.data_scopes.insert("project:secret".into());
+    let secret = f.host.spawn(&f.master.id, secret).await.unwrap();
+    let secret_run = secret.run_id.unwrap();
+    let b = boot(&f, at + 1, Autonomy::Autonomous).await;
+    f.host
+        .recovery()
+        .publish_summary(&b.id, at + 1)
+        .await
+        .unwrap();
+    let notices = f.host.notifications("origin").await.unwrap();
+    let urgent = notices
+        .iter()
+        .find(|n| {
+            n.class == "urgent"
+                && serde_json::from_str::<serde_json::Value>(&n.content)
+                    .is_ok_and(|v| v["kind"] == "recovery_blocked")
+        })
+        .expect(
+            "uncertain effects need a real urgent notification, not just an on-demand status row",
+        );
+    let content: serde_json::Value = serde_json::from_str(&urgent.content).unwrap();
+    assert_eq!(content["run_id"], run);
+    assert_eq!(content["origin_conversation"], "origin");
+    assert_eq!(content["scope"], "general");
+    assert_eq!(content["decision"], "blocked");
+    assert!(
+        content["reason"]
+            .as_str()
+            .unwrap()
+            .contains("unresolved effect")
+    );
+    let summaries = notices
+        .iter()
+        .filter(|n| {
+            serde_json::from_str::<serde_json::Value>(&n.content)
+                .is_ok_and(|v| v["kind"] == "recovery_summary")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries[0].content.contains(&run));
+    assert!(
+        !summaries[0].content.contains(&secret_run),
+        "General summary must not disclose another project's run"
+    );
+    assert!(
+        f.host
+            .notifications("other")
+            .await
+            .unwrap()
+            .iter()
+            .all(|n| !n.content.contains(&run) && !n.content.contains(&secret_run))
+    );
+    assert_eq!(
+        f.host.engine().load(&run).await.unwrap().status,
+        Status::Blocked
+    );
+    let count = notices.len();
+    f.host
+        .recovery()
+        .publish_summary(&b.id, at + 2)
+        .await
+        .unwrap();
+    assert_eq!(f.host.notifications("origin").await.unwrap().len(), count);
+    let path = f.db.path().to_owned();
+    f.host.shutdown().await.unwrap();
+    drop(f.host);
+    f.db.shutdown().await.unwrap();
+    drop(f.db);
+    let reopened = excalibur_store::Database::open(
+        path,
+        excalibur_store::DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let ledger = excalibur_orchestrator::recovery::RecoveryLedger::open(reopened.clone())
+        .await
+        .unwrap();
+    ledger.publish_summary(&b.id, at + 3).await.unwrap();
+    let owner = run.clone();
+    let (count_after, intents, results): (usize, u64, u64) = reopened
+        .read(ReadLane::Interactive, move |c| {
+            Ok((
+                c.query_row(
+                    "SELECT count(*) FROM orchestration_notifications WHERE conversation='origin'",
+                    [],
+                    |r| r.get(0),
+                )?,
+                c.query_row(
+                    "SELECT count(*) FROM journal WHERE run_id=?1 AND kind='tool_intent'",
+                    [&owner],
+                    |r| r.get(0),
+                )?,
+                c.query_row(
+                    "SELECT count(*) FROM journal WHERE run_id=?1 AND kind='tool_result'",
+                    [owner],
+                    |r| r.get(0),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(count_after, count);
+    assert_eq!(intents, 1);
+    assert_eq!(results, 0, "recovery must not resend an uncertain effect");
+    reopened.shutdown().await.unwrap();
+    drop(f.dir);
 }

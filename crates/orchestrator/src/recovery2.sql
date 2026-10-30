@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS daemon_recovery_notification_receipts(boot_id TEXT NOT NULL REFERENCES daemon_boots(id),subject TEXT NOT NULL,notification_id TEXT NOT NULL UNIQUE,PRIMARY KEY(boot_id,subject));
