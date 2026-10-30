@@ -186,6 +186,7 @@ impl Protocol {
                 | "events.list"
                 | "takeover.start"
                 | "takeover.end"
+                | "viewer.issue"
                 | "observe.wait_ready"
                 | "observe.snapshot"
                 | "observe.subtree"
@@ -475,6 +476,10 @@ impl Protocol {
                 let now = crate::sessions::now();
                 let resolved = p["resolved"].as_bool().unwrap_or(true);
                 self.manager.takeover_end(run, sid()?, resolved, now).await
+            }
+            "viewer.issue" => {
+                let now = crate::sessions::now();
+                self.manager.viewer_issue(run, sid()?, tid()?, now).await
             }
             "site.set_login_state" => {
                 self.manager

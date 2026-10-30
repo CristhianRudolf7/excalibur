@@ -690,12 +690,14 @@ cross-origin POSTs and queries or fragments longer than 128 characters (or
 above 4.5 bits of Shannon entropy per character) sent to a new origin, so a
 contaminated run can require approval before committing.
 
-Every new browser context denies twelve sensitive permissions through
+Every new browser context denies fifteen sensitive permissions through
 `Browser.setPermission` before any navigation (`permissions::denial_params`:
-geolocation, notifications, camera, microphone, MIDI, clipboard, sensors,
-idle detection, local network access, display capture, window management and
-shared storage); a denial failure fails the session open, so no context runs
-without them. Site configuration may grant concrete permissions later.
+geolocation, notifications, camera, microphone, MIDI, clipboard-read,
+clipboard-write, accelerometer, gyroscope, magnetometer, idle detection,
+local network access, display capture, window management and NFC); a denial
+failure fails the session open, so no context runs without them (bare
+`clipboard`, `sensors` and `shared-storage` are rejected by current Chrome
+and are not used). Site configuration may grant concrete permissions later.
 
 Block detection is deterministic. The readiness probe runs in an isolated
 world and reports `{kind, vendor, signals, confidence, url}` for
@@ -703,36 +705,82 @@ world and reports `{kind, vendor, signals, confidence, url}` for
 challenge frames, invisible reCAPTCHA markers, perimeter block pages and
 identity origins, with corroborating title/text signals. `wait_ready` accepts
 the probe payload only through `observation::detectors::classify_probe_blocked`
-(unknown kinds, low confidence and empty signals never block) and can elevate
-medium confidence with a corroborating document status
-(`elevate_with_status`); low-confidence signals stay `degraded`.
+(unknown kinds, low confidence and empty signals never block) and elevates
+medium confidence with corroborating title/text signals; low-confidence
+signals stay `degraded`. Header and dialog signals that bypass the probe are
+normalized to the same vocabulary
+(`observation::detectors::normalize_reported_blocked`, so the legacy
+`captcha` kind surfaces as `blocked_captcha`). The header-block signal is
+scoped to its document: each navigation drops the previous page's stored
+header block before the new one commits, so `wait` neither reports a stale
+block nor misses the fresh one. Corroboration against the live
+document HTTP status (`elevate_with_status`) is unit-tested but not wired to
+network state yet.
 
 A blocked session can enter human intervention over RPC: `takeover.start`
 moves `Blocked` to `human_control` with a start timestamp, while
 `takeover.end{resolved}` returns a resolved intervention to `Ready`, advancing
 every live tab document epoch and invalidating prior references as
 `stale_ref(takeover)`; an unresolved or over-deadline (15 minutes)
-intervention returns to `Blocked` with `blocked_unresolved`. The viewer itself
-is a backend library (`webd::viewer`): an 8-character single-use code valid
-for 10 minutes, consumed by POST into an `HttpOnly; SameSite=Strict` cookie
-bound to the tab and deadline, required together with an exact `Origin` match
-for WebSocket upgrade; the code is never read from the URL. Responses carry
+intervention returns to `Blocked` with `blocked_unresolved`. Deterministic
+lifecycle tests pin the deadline boundary (899 s resolves, 901 s expires),
+the epoch bump and the `blocked_unresolved` state.
+
+The viewer is served by `--serve` on `127.0.0.1:<random>` (`webd::viewer`):
+`viewer.issue` mints an 8-character single-use code over the peer-credential
+Unix socket while the session is in `human_control`; `POST /auth` redeems it
+once into an `HttpOnly; SameSite=Strict` cookie bound to the tab and
+deadline, and `GET /`, `/viewer.js` and `/style.css` require that cookie. The
+WebSocket upgrade additionally requires an exact `Origin` match before
+answering `101`; every other case (unknown, reused or expired code, missing
+cookie, foreign origin) fails closed with `403`. The code is never read from
+the URL: query strings are ignored by construction. Responses carry
 `Content-Security-Policy: default-src 'none'; img-src data: blob:; script-src
 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none';
 base-uri 'none'; form-action 'self'; require-trusted-types-for 'script'` plus
-`nosniff`, no referrer and no-store headers, and page-controlled title and
-origin render through escaped text, `textContent` and canvas only. Serving the
-viewer endpoint and the 18.5 visual review remain pending.
+`nosniff`, no referrer and no-store headers; the client script only reaches
+the DOM through `textContent`, canvas images and `document.title`, and the
+stylesheet stacks ≥44 px controls on small viewports while keeping the canvas
+1:1 up to 1280 px on large ones. Screencast streaming past the `101` ready
+frame stays pending on harness integration.
+
+Blocked reports map onto the harness task outcome without model judgement
+(`browser::takeover::intervention_outcome`): interactive callers park the
+execution in `input_required` with the block and instructions, while
+non-interactive callers (`excalibur exec`, eval profile) fail immediately
+with `blocked_requires_human`. Ephemeral navigation keeps the C2 origin set:
+new origins are recorded on every committed navigation (`note_ephemeral_origin`
+in `nav.go` and `tab.new`), forbidden schemes stay denied, and the C4 risk
+(`navigation_risk`: long or entropic cross-origin payloads, cross-origin
+POSTs) is reported before committing; domain authorization itself belongs to
+the harness, which is outside this crate boundary.
 
 Run `cargo test -p excalibur-browser --lib` and
 `cargo test -p excalibur-webd --lib`. These cover proc-table parsing and UID
-matching, origin/entropy/exfiltration checks, the twelve default denials and
+matching, origin/entropy/exfiltration checks, the fifteen default denials and
 their CDP shape, detector classification and control pages, single-use and
-expiring takeover and viewer codes, cookie/origin socket checks, CSP headers
-and markup escaping. The real-Chrome 9.5 block matrices and control pages, the
-15-minute expiry fixture, the viewer rejection cases, the harness
-`input_required` flow, non-interactive `blocked_requires_human` and the served
-viewer review stay pending.
+expiring takeover and viewer codes, cookie/page/socket viewer checks, CSP
+headers and markup escaping, the takeover deadline boundary, the ephemeral
+document gate and the `input_required`/`blocked_requires_human` mapping.
+`cargo test -p excalibur-webd --test viewer_http` exercises the served
+endpoint over real TCP (redeem-once, expired/reused/unknown codes, code in
+URL ignored, missing cookie, foreign origin, upgrade handshake, strict
+headers). `cargo test -p excalibur-browser --test block_matrix -- --nocapture`
+runs the real-Chrome 9.5 matrices over local synthetic pages (captcha frame
+and markers, perimeter block pages, `cf-mitigated` header, password on a
+logged-in site, one-time-code fields and OTP groups, corroboration elevation,
+the human-only login-origin denial, plus invisible-badge, injected-path and
+plain control pages) with the matrix in
+`target/test-evidence/browser/block_matrix/`.
+`cargo test -p excalibur-webd --test viewer_viewport -- --nocapture` renders
+the served shell in real Chrome at the small (360×740) and large (1440×900)
+presets over synthetic pages only, asserting width, no horizontal overflow,
+touch targets and the committed origin header, with screenshots in
+`target/test-evidence/browser/viewer/`. Still pending: document-status
+elevation wired to live network state, detector kinds beyond the fixed 9.1
+vocabulary (cookie-wall/geo-block variants without 9.1 markers do not
+block), the F-B4-03 adapter fill-copy zeroization and the F-B4-04 ZIP magic
+unification, both outside the allowed B5 file set.
 
 ## Light reading and citations
 

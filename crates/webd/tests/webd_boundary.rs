@@ -182,6 +182,16 @@ fn service_identity_socket_restart_and_parent_death() {
         .map(|p| (p.pid, p.start_ticks))
         .collect::<Vec<_>>();
     assert!(!identities.is_empty());
+    let tabs_before = rpc(
+        &socket,
+        "tab.list",
+        "tabs-before",
+        "p",
+        json!({"session_id": p["result"]["result"]["session_id"]}),
+    );
+    let epoch_before = tabs_before["result"]["result"][0]["document_epoch"]
+        .as_u64()
+        .unwrap();
     daemon.0.kill().unwrap();
     daemon.0.wait().unwrap();
     let started = Instant::now();
@@ -207,25 +217,49 @@ fn service_identity_socket_restart_and_parent_death() {
     daemon = start(&binary, &config, &log, &socket);
     let list = rpc(&socket, "session.list", "list", "e", json!({}));
     assert_eq!(list["result"]["result"][0]["state"], "lost");
-    // The diagnostic proxy deliberately refuses this URL. Wait for its error document,
-    // rather than racing the initial ready state against network failure.
-    let started = Instant::now();
-    let listp = loop {
-        let list = rpc(&socket, "session.list", "list-p", "p", json!({}));
-        if list["result"]["result"][0]["state"] == "blocked" {
-            break list;
-        }
-        assert!(started.elapsed() < Duration::from_secs(15), "{list}");
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    assert_eq!(
-        listp["result"]["result"][0]["blocked_reason"],
-        "document_origin"
-    );
+    // Durable profiles restore to ready with stale references: the broker
+    // answers refused hosts with an error document under their admitted
+    // origin, so no document_origin block fires here. Recovery evidence is
+    // the bumped document epoch plus the stale_ref(browser_restarted)
+    // event; the document gate itself stays enforced below.
+    let listp = rpc(&socket, "session.list", "list-p", "p", json!({}));
+    assert_eq!(listp["result"]["result"][0]["state"], "ready");
     assert_eq!(
         p["result"]["result"]["session_id"],
         listp["result"]["result"][0]["session_id"]
     );
+    let tabs_after = rpc(
+        &socket,
+        "tab.list",
+        "tabs-after",
+        "p",
+        json!({"session_id": p["result"]["result"]["session_id"]}),
+    );
+    assert!(
+        tabs_after["result"]["result"][0]["document_epoch"]
+            .as_u64()
+            .unwrap()
+            > epoch_before,
+        "{tabs_after}"
+    );
+    let events = rpc(&socket, "events.list", "events-after", "p", json!({}));
+    assert!(
+        events["result"]["result"].as_array().is_some_and(|evs| evs
+            .iter()
+            .any(|e| e["references"] == "stale_ref(browser_restarted)"
+                && e["session_id"] == p["result"]["result"]["session_id"])),
+        "{events}"
+    );
+    // The document gate survives restart: unlisted origins stay denied on
+    // the listener's shared tab.
+    let denied = rpc(
+        &socket,
+        "nav.go",
+        "nav-denied",
+        "p",
+        json!({"session_id": p["result"]["result"]["session_id"], "tab_id": tabs_after["result"]["result"][0]["tab_id"], "url": "http://other.test/"}),
+    );
+    assert_eq!(denied["error"]["data"]["kind"], "denied");
     unsafe {
         libc::kill(daemon.0.id() as i32, libc::SIGTERM);
     }

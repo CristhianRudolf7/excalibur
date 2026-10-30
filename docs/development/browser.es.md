@@ -731,13 +731,15 @@ orígenes y consultas o fragmentos de más de 128 caracteres (o más de 4,5 bits
 de entropía de Shannon por carácter) hacia un origen nuevo, para que una
 ejecución contaminada pida aprobación antes de confirmar.
 
-Cada contexto nuevo deniega doce permisos sensibles con
+Cada contexto nuevo deniega quince permisos sensibles con
 `Browser.setPermission` antes de navegar (`permissions::denial_params`:
-geolocalización, notificaciones, cámara, micrófono, MIDI, portapapeles,
-sensores, detección de inactividad, acceso a red local, captura de pantalla,
-gestión de ventanas y almacenamiento compartido); si una denegación falla, la
-apertura falla y ningún contexto corre sin ellas. La configuración del sitio
-puede conceder permisos concretos después.
+geolocalización, notificaciones, cámara, micrófono, MIDI, lectura y escritura
+de portapapeles, acelerómetro, giroscopio, magnetómetro, detección de
+inactividad, acceso a red local, captura de pantalla, gestión de ventanas y
+NFC); si una denegación falla, la apertura falla y ningún contexto corre sin
+ellas (los nombres simples `clipboard`, `sensors` y `shared-storage` los
+rechaza el Chrome actual y no se usan). La configuración del sitio puede
+conceder permisos concretos después.
 
 La detección de bloqueos es determinista. La sonda de readiness corre en un
 mundo aislado e informa `{kind, vendor, signals, confidence, url}` para
@@ -748,35 +750,79 @@ título/texto. `wait_ready` solo acepta la sonda con
 `observation::detectors::classify_probe_blocked` (tipos desconocidos,
 confianza baja y señales vacías nunca bloquean) y puede elevar la confianza
 media con un estado de documento corroborante (`elevate_with_status`); las
-señales de baja confianza quedan como `degraded`.
+señales de baja confianza quedan como `degraded`. La señal de bloqueo por
+cabecera vive atada a su documento: cada navegación descarta el bloqueo de
+cabecera guardado de la página anterior antes de confirmar la nueva, así
+`wait` ni informa un bloqueo rancio ni pierde el nuevo.
 
 Una sesión bloqueada puede entrar en intervención por RPC: `takeover.start`
 pasa `Blocked` a `human_control` con instante de inicio, mientras
 `takeover.end{resolved}` devuelve una intervención resuelta a `Ready`,
 avanzando la época documental de cada pestaña e invalidando referencias
 previas como `stale_ref(takeover)`; una intervención sin resolver o vencida
-(15 minutos) vuelve a `Blocked` con `blocked_unresolved`. El visor es una
-biblioteca del backend (`webd::viewer`): código de 8 caracteres de un solo uso
-válido 10 minutos, consumido por POST en una cookie `HttpOnly;
-SameSite=Strict` ligada a la pestaña y al plazo, exigida junto a coincidencia
-exacta de `Origin` para el WebSocket; el código nunca se lee de la URL. Las
-respuestas llevan `Content-Security-Policy: default-src 'none'; img-src data:
-blob:; script-src 'self'; style-src 'self'; connect-src 'self';
-frame-ancestors 'none'; base-uri 'none'; form-action 'self';
-require-trusted-types-for 'script'` más cabeceras `nosniff`, sin referrer y
-sin caché, y el título/origen de la página solo se dibujan como texto escapado,
-`textContent` y canvas. Servir el endpoint del visor y la revisión visual 18.5
-quedan pendientes.
+(15 minutos) vuelve a `Blocked` con `blocked_unresolved`. Pruebas
+deterministas de ciclo de vida fijan el límite del plazo (899 s resuelve,
+901 s caduca), el salto de época y el estado `blocked_unresolved`.
+
+El visor lo sirve `--serve` en `127.0.0.1:<aleatorio>` (`webd::viewer`):
+`viewer.issue` acuña un código de 8 caracteres de un solo uso por el socket
+Unix con credenciales de par mientras la sesión está en `human_control`;
+`POST /auth` lo canjea una vez por una cookie `HttpOnly; SameSite=Strict`
+ligada a la pestaña y al plazo, y `GET /`, `/viewer.js` y `/style.css` exigen
+esa cookie. La mejora a WebSocket exige además coincidencia exacta de
+`Origin` antes de responder `101`; cualquier otro caso (código desconocido,
+reutilizado o caducado, cookie ausente, origen ajeno) falla cerrado con
+`403`. El código nunca se lee de la URL: las query strings se ignoran por
+construcción. Las respuestas llevan
+`Content-Security-Policy: default-src 'none'; img-src data: blob:; script-src
+'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none';
+base-uri 'none'; form-action 'self'; require-trusted-types-for 'script'` más
+cabeceras `nosniff`, sin referrer y sin caché; el script de cliente solo toca
+el DOM con `textContent`, imágenes de canvas y `document.title`, y la hoja de
+estilos apila controles de ≥44 px en viewports pequeños manteniendo el canvas
+1:1 hasta 1280 px en grandes. El streaming de screencast tras la trama `101`
+sigue pendiente de la integración del arnés.
+
+Los informes de bloqueo se traducen al resultado de tarea del arnés sin juicio
+de modelo (`browser::takeover::intervention_outcome`): los llamantes
+interactivos aparcan la ejecución en `input_required` con el bloqueo e
+instrucciones, mientras los no interactivos (`excalibur exec`, perfil de
+evaluación) fallan de inmediato con `blocked_requires_human`. La navegación
+efímera conserva el conjunto de orígenes C2: cada navegación confirmada
+registra orígenes nuevos (`note_ephemeral_origin` en `nav.go` y `tab.new`),
+los esquemas prohibidos siguen denegados y el riesgo C4 (`navigation_risk`:
+cargas entre orígenes largas o entrópicas, POST entre orígenes) se informa
+antes de confirmar; la autorización de dominios pertenece al arnés, fuera del
+límite de este crate.
 
 Ejecuta `cargo test -p excalibur-browser --lib` y
 `cargo test -p excalibur-webd --lib`. Cubren tablas proc y UID, orígenes,
-entropía y exfiltración, las doce denegaciones y su forma CDP, clasificación de
+entropía y exfiltración, las quince denegaciones y su forma CDP, clasificación de
 detectores y páginas de control, códigos de intervención y visor de un solo uso
-con caducidad, cookie/origen del socket, cabeceras CSP y escape de marcado. Las
-matrices 9.5 con Chrome real y páginas de control, la caducidad de 15 minutos,
-los rechazos del visor, el flujo `input_required` del arnés,
-`blocked_requires_human` no interactivo y la revisión del visor servido quedan
-pendientes.
+con caducidad, comprobaciones de cookie/página/socket del visor, cabeceras CSP
+y escape de marcado, el límite de la intervención, la compuerta documental
+efímera y el mapeo `input_required`/`blocked_requires_human`.
+`cargo test -p excalibur-webd --test viewer_http` ejercita el endpoint servido
+por TCP real (canje único, códigos caducados/reutilizados/desconocidos, código
+en URL ignorado, cookie ausente, origen ajeno, handshake de mejora y cabeceras
+estrictas). `cargo test -p excalibur-browser --test block_matrix -- --nocapture`
+corre las matrices 9.5 con Chrome real sobre páginas sintéticas locales (frame
+y marcadores de captcha, páginas de bloqueo perimetrales, cabecera
+`cf-mitigated`, contraseña en sitio con sesión iniciada, campos de un solo uso
+y grupos OTP, elevación por corroboración, denegación de origen de login solo
+humano, más páginas de control con insignia invisible, ruta inyectada y texto
+plano)
+con la matriz en `target/test-evidence/browser/block_matrix/`.
+`cargo test -p excalibur-webd --test viewer_viewport -- --nocapture` dibuja el
+shell servido con Chrome real en presets pequeño (360×740) y grande (1440×900)
+solo con páginas sintéticas, comprobando ancho, ausencia de scroll horizontal,
+objetivos táctiles y cabecera de origen, con capturas en
+`target/test-evidence/browser/viewer/`. Quedan pendientes: la elevación por
+estado de documento conectada a la red, tipos de detector fuera del
+vocabulario fijo 9.1 (variantes de muro de cookies/geo-bloqueo sin marcadores
+9.1 no bloquean), la puesta a cero de la copia de relleno del adaptador
+(F-B4-03) y la unificación de magias ZIP (F-B4-04), ambas fuera del conjunto de
+ficheros B5.
 
 ## Lectura ligera y citas
 

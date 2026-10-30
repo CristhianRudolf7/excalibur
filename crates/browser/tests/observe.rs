@@ -511,7 +511,7 @@ async fn contract(root: PathBuf) {
     .await
     .unwrap();
     let captcha = navigate(&m, &s, &t, "/captcha").await;
-    assert_eq!(captcha["blocked"]["kind"], "captcha", "{captcha}");
+    assert_eq!(captcha["blocked"]["kind"], "blocked_captcha", "{captcha}");
     navigate(&m, &s, &t, "/controls").await;
     let (c, cdp) = m.diagnostic_client("owner", &s, &t).await.unwrap();
     let ft = c

@@ -13,13 +13,16 @@ pub const DENIED_PERMISSIONS: &[&str] = &[
     "camera",
     "microphone",
     "midi",
-    "clipboard",
-    "sensors",
+    "clipboard-read",
+    "clipboard-write",
+    "accelerometer",
+    "gyroscope",
+    "magnetometer",
     "idle-detection",
     "local-network-access",
     "display-capture",
     "window-management",
-    "shared-storage",
+    "nfc",
 ];
 
 /// Build one `Browser.setPermission` parameter object per denied permission.
@@ -51,7 +54,7 @@ mod tests {
 
     #[test]
     fn denies_the_full_sensitive_set() {
-        assert_eq!(DENIED_PERMISSIONS.len(), 12);
+        assert_eq!(DENIED_PERMISSIONS.len(), 15);
         for required in [
             "geolocation",
             "camera",

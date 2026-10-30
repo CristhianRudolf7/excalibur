@@ -94,6 +94,31 @@ impl Takeover {
     }
 }
 
+/// Map a deterministic block report onto the harness task outcome (9.2).
+///
+/// Interactive callers park the execution in `input_required` with the block
+/// and human instructions; non-interactive callers (`excalibur exec`, eval
+/// profile) fail immediately with `blocked_requires_human` so no run waits
+/// for a person who will never arrive. No model judgement is involved.
+pub fn intervention_outcome(
+    blocked: &serde_json::Value,
+    non_interactive: bool,
+) -> serde_json::Value {
+    if non_interactive {
+        serde_json::json!({
+            "state": "failed",
+            "error": "blocked_requires_human",
+            "blocked": blocked,
+        })
+    } else {
+        serde_json::json!({
+            "state": "input_required",
+            "blocked": blocked,
+            "instructions": "human intervention required: resolve the block in the viewer, then end the takeover",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +134,19 @@ mod tests {
         let (takeover2, code2) = Takeover::issue("tab-2", now);
         assert!(takeover2.check(&code2, now + CODE_TTL_SECS + 1).is_err());
         assert!(takeover2.check("WRONGCOD", now).is_err());
+    }
+
+    #[test]
+    fn blocked_maps_to_input_required_or_immediate_failure() {
+        let blocked = serde_json::json!({"kind": "needs_login", "confidence": "high"});
+        let waiting = intervention_outcome(&blocked, false);
+        assert_eq!(waiting["state"], serde_json::json!("input_required"));
+        assert_eq!(waiting["blocked"], blocked);
+        assert!(waiting["instructions"].as_str().is_some());
+        let failed = intervention_outcome(&blocked, true);
+        assert_eq!(failed["state"], serde_json::json!("failed"));
+        assert_eq!(failed["error"], serde_json::json!("blocked_requires_human"));
+        assert_eq!(failed["blocked"], blocked);
     }
 
     #[test]

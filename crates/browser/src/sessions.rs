@@ -392,6 +392,7 @@ struct Model {
     health: HashMap<String, tokio::time::Instant>,
     unread_health: HashMap<String, tokio::time::Instant>,
     frame_sources: HashMap<String, ProbeKey>,
+    viewer_codes: HashMap<String, ViewerCode>,
     probes: tokio::task::JoinSet<ProbeResult>,
     pending_probes: HashMap<String, (ProbeKey, tokio::task::Id)>,
     modes: HashMap<String, String>,
@@ -516,6 +517,21 @@ impl Drop for TabLease {
         }
     }
 }
+/// Single-use viewer credential bound to one tab and deadline (9.3).
+///
+/// Issued over the peer-credential Unix socket while the session is in
+/// `human_control`; redeemed once over HTTP into an `HttpOnly` cookie. The
+/// map is keyed by cookie so the HTTP layer authenticates without names.
+#[derive(Clone, Debug)]
+pub struct ViewerCode {
+    pub tab_id: String,
+    pub code_hash: String,
+    pub cookie: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub used: bool,
+}
+
 pub struct Manager {
     pub observation: crate::observation::Observation,
     weak: Weak<Manager>,
@@ -1144,6 +1160,12 @@ impl Manager {
                 return Err(e);
             }
         };
+        if s.profile == "ephemeral"
+            && let Some(session) = m.sessions.get_mut(sid)
+        {
+            // C2: same origin-set tracking as navigation commits.
+            Self::note_ephemeral_origin(session, url);
+        }
         let t = Tab {
             id: tid.clone(),
             session_id: sid.into(),
@@ -2631,6 +2653,10 @@ impl Manager {
                 }
                 let client = &ctx.client;
                 let cdp = ctx.tab.cdp_session.as_deref();
+                // Drop the previous document's header-block signal before the
+                // new navigation commits, so `wait` neither reports a stale
+                // block nor misses the fresh one (9.5).
+                self.observation.note_navigation_started(&ctx);
                 if method == "nav.go" {
                     let url = required(&p, "url")?;
                     self.document_allowed(&ctx.session, url, true)?;
@@ -2642,6 +2668,19 @@ impl Manager {
                             Duration::from_secs(2),
                         )
                         .await?;
+                    if ctx.session.profile == "ephemeral" {
+                        // C2: record the newly navigated origin. Domain
+                        // authorization itself belongs to the harness, which
+                        // approves the navigation before dispatch; the
+                        // deterministic C4 risk for a contaminated run is
+                        // reported through `navigation_risk`.
+                        let mut m = self.model.lock().await;
+                        if let Some(session) = m.sessions.get_mut(&ctx.session.id)
+                            && Self::note_ephemeral_origin(session, url)
+                        {
+                            self.db.save(&mut m).await?;
+                        }
+                    }
                 } else if method == "nav.reload" {
                     client
                         .send_with_timeout(
@@ -2802,6 +2841,149 @@ impl Manager {
             )
             .await?;
         Ok(json!({"session_id":sid,"state":state,"reason":reason,"resolved":ok,"expired":expired}))
+    }
+    /// Issue a single-use viewer code for a tab under human control (9.3).
+    ///
+    /// The code travels to the person through the harness channel, never in
+    /// a URL; the HTTP layer redeems it once into a tab-bound cookie.
+    pub async fn viewer_issue(
+        &self,
+        run: &str,
+        sid: &str,
+        tab_id: &str,
+        now: i64,
+    ) -> Result<Value> {
+        use sha2::{Digest, Sha256};
+        let mut m = self.model.lock().await;
+        let session = m
+            .sessions
+            .get(sid)
+            .ok_or_else(|| Fault::new("unknown_session", sid))?;
+        if session.owner_run != run {
+            return Err(Fault::new("denied", "session_owner"));
+        }
+        if session.state != SessionState::HumanControl {
+            return Err(Fault::new(
+                "invalid_state",
+                "viewer codes require human control",
+            ));
+        }
+        let tab = m
+            .tabs
+            .get(tab_id)
+            .filter(|t| t.session_id == sid && t.state != "closed")
+            .ok_or_else(|| Fault::new("unknown_tab", tab_id))?;
+        let tab_id = tab.id.clone();
+        let code = crate::takeover::generate_code();
+        let code_hash = crate::takeover::code_hash(&code);
+        let cookie = format!(
+            "{:x}",
+            Sha256::digest(format!("{code}-{tab_id}-{now}").as_bytes())
+        );
+        let expires_at = now + crate::takeover::CODE_TTL_SECS;
+        m.viewer_codes.insert(
+            cookie.clone(),
+            ViewerCode {
+                tab_id: tab_id.clone(),
+                code_hash,
+                cookie,
+                issued_at: now,
+                expires_at,
+                used: false,
+            },
+        );
+        self.db.save(&mut m).await?;
+        self.db
+            .event(
+                "viewer_code",
+                json!({"session_id":sid,"tab_id":tab_id,"issued_at":now,"expires_at":expires_at}),
+            )
+            .await?;
+        Ok(json!({"tab_id":tab_id,"code":code,"expires_at":expires_at}))
+    }
+    /// Redeem a posted viewer code once into its cookie (9.3).
+    ///
+    /// The code is never read from the URL: only the POST body is accepted by
+    /// the HTTP layer, so query strings are ignored by construction.
+    pub async fn viewer_redeem(&self, code: &str, now: i64) -> Result<String> {
+        let mut m = self.model.lock().await;
+        let key = m
+            .viewer_codes
+            .iter()
+            .find(|(_, v)| v.code_hash == crate::takeover::code_hash(code))
+            .map(|(k, _)| k.clone());
+        let Some(key) = key else {
+            return Err(Fault::new("invalid_code", "unknown viewer code"));
+        };
+        let entry = m.viewer_codes.get_mut(&key).unwrap();
+        if entry.used {
+            return Err(Fault::new("single_use_code_reused", key));
+        }
+        if now > entry.expires_at {
+            return Err(Fault::new("code_expired", key));
+        }
+        entry.used = true;
+        let cookie = entry.cookie.clone();
+        self.db.save(&mut m).await?;
+        Ok(cookie)
+    }
+    /// Check a viewer cookie for page loads, without an Origin gate (9.3).
+    ///
+    /// Top-level navigation issues no `Origin` header, so the shell,
+    /// script and stylesheet only require the redeemed cookie; the
+    /// WebSocket upgrade path uses [`Self::viewer_check`] with the exact
+    /// origin match instead.
+    pub async fn viewer_check_page(&self, cookie: &str, now: i64) -> Result<(String, String)> {
+        let m = self.model.lock().await;
+        let entry = m
+            .viewer_codes
+            .get(cookie)
+            .ok_or_else(|| Fault::new("missing_viewer_cookie", "viewer login required"))?;
+        if now > entry.expires_at {
+            return Err(Fault::new("intervention_expired", entry.tab_id.clone()));
+        }
+        let tab_id = entry.tab_id.clone();
+        let page_url = m
+            .tabs
+            .get(&tab_id)
+            .map(|t| t.url.clone())
+            .unwrap_or_default();
+        drop(m);
+        let display = crate::net::document_origin(&page_url).unwrap_or(page_url);
+        Ok((tab_id, display))
+    }
+    /// Check a viewer cookie and exact Origin for HTTP and socket use (9.3).
+    ///
+    /// Returns the tab id and its committed document origin for the shell
+    /// header so page-controlled titles never stand in for the origin.
+    pub async fn viewer_check(
+        &self,
+        cookie: &str,
+        origin: Option<&str>,
+        viewer_origin: &str,
+        now: i64,
+    ) -> Result<(String, String)> {
+        let m = self.model.lock().await;
+        let entry = m
+            .viewer_codes
+            .get(cookie)
+            .ok_or_else(|| Fault::new("missing_viewer_cookie", "viewer login required"))?;
+        if now > entry.expires_at {
+            return Err(Fault::new("intervention_expired", entry.tab_id.clone()));
+        }
+        match origin {
+            Some(value) if value == viewer_origin => {}
+            _ => return Err(Fault::new("foreign_origin", entry.tab_id.clone())),
+        }
+        let tab_id = entry.tab_id.clone();
+        let page_url = m
+            .tabs
+            .get(&tab_id)
+            .map(|t| t.url.clone())
+            .unwrap_or_default();
+        drop(m);
+        let display = crate::net::document_origin(&page_url).unwrap_or(page_url);
+        Ok((tab_id, display))
     }
 }
 fn required<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
@@ -3032,6 +3214,293 @@ mod lifecycle_tests {
         assert!(!manager.reconcile_documents(&mut model).await.unwrap());
         assert_eq!(model.sessions["s"].state, SessionState::HumanControl);
     }
+    fn test_session(id: &str, profile: &str, state: SessionState, reason: Option<&str>) -> Session {
+        let mut session = Session {
+            id: id.into(),
+            owner_run: "r".into(),
+            profile: profile.into(),
+            context_id: None,
+            instance_id: "instance".into(),
+            mode: "headless".into(),
+            site: None,
+            listen: false,
+            state: SessionState::Ready,
+            blocked_reason: None,
+            origins: vec![],
+            credentials: vec![],
+            created_at: now(),
+            updated_at: now(),
+            takeover_started_at: None,
+        };
+        if state == SessionState::HumanControl {
+            session
+                .set_state(SessionState::Blocked, Some("needs_login"))
+                .unwrap();
+            session.set_state(SessionState::HumanControl, None).unwrap();
+        } else {
+            session.set_state(state, reason).unwrap();
+        }
+        session
+    }
+
+    fn test_tab(id: &str, sid: &str, url: &str) -> Tab {
+        Tab {
+            id: id.into(),
+            session_id: sid.into(),
+            target_id: Some(format!("target-{id}")),
+            cdp_session: None,
+            owner_run: "r".into(),
+            label: None,
+            url: url.into(),
+            title: String::new(),
+            state: "ready".into(),
+            document_epoch: 1,
+            listen: false,
+        }
+    }
+
+    async fn test_manager() -> (tempfile::TempDir, std::sync::Arc<Manager>) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let manager = Manager::open(Options {
+            data_dir: dir.path().into(),
+            binary: "/not-used".into(),
+            proxy: "127.0.0.1:12345".parse().unwrap(),
+            profiles: BTreeMap::new(),
+            compact: false,
+            version: VersionPolicy::default(),
+            chrome_args: vec![],
+        })
+        .await
+        .unwrap();
+        (dir, manager)
+    }
+
+    #[tokio::test]
+    async fn takeover_expiry_returns_to_blocked_with_epoch_bump() {
+        let (_guard, manager) = test_manager().await;
+        {
+            let mut model = manager.model.lock().await;
+            model.sessions.insert(
+                "s".into(),
+                test_session("s", "personal", SessionState::Blocked, Some("needs_login")),
+            );
+            model
+                .tabs
+                .insert("t".into(), test_tab("t", "s", "http://chat.test/"));
+        }
+        manager.takeover_start("r", "s", 1_000).await.unwrap();
+        // Resolved before the deadline: Ready, live refs stale, epoch bumped.
+        let done = manager
+            .takeover_end("r", "s", true, 1_000 + 899)
+            .await
+            .unwrap();
+        assert_eq!(done["state"], serde_json::json!("ready"));
+        {
+            let model = manager.model.lock().await;
+            assert_eq!(model.tabs["t"].document_epoch, 2);
+            assert!(model.sessions["s"].takeover_started_at.is_none());
+        }
+        // Second intervention expires past the 15-minute deadline.
+        {
+            let mut model = manager.model.lock().await;
+            model
+                .sessions
+                .get_mut("s")
+                .unwrap()
+                .set_state(SessionState::Blocked, Some("needs_login"))
+                .unwrap();
+        }
+        manager.takeover_start("r", "s", 2_000).await.unwrap();
+        let expired = manager
+            .takeover_end("r", "s", true, 2_000 + 901)
+            .await
+            .unwrap();
+        assert_eq!(expired["reason"], serde_json::json!("blocked_unresolved"));
+        {
+            let model = manager.model.lock().await;
+            assert_eq!(model.sessions["s"].state, SessionState::Blocked);
+            assert_eq!(model.tabs["t"].document_epoch, 3);
+        }
+        // An explicitly unresolved intervention also returns to Blocked.
+        {
+            let mut model = manager.model.lock().await;
+            model
+                .sessions
+                .get_mut("s")
+                .unwrap()
+                .set_state(SessionState::HumanControl, None)
+                .unwrap();
+            model.sessions.get_mut("s").unwrap().takeover_started_at = Some(3_000);
+        }
+        let gave_up = manager.takeover_end("r", "s", false, 3_100).await.unwrap();
+        assert_eq!(gave_up["reason"], serde_json::json!("blocked_unresolved"));
+        assert_eq!(
+            manager.model.lock().await.sessions["s"].state,
+            SessionState::Blocked
+        );
+    }
+
+    #[tokio::test]
+    async fn viewer_codes_are_single_use_tab_bound_and_expiring() {
+        let (_guard, manager) = test_manager().await;
+        {
+            let mut model = manager.model.lock().await;
+            model.sessions.insert(
+                "s".into(),
+                test_session("s", "personal", SessionState::HumanControl, None),
+            );
+            model.sessions.get_mut("s").unwrap().takeover_started_at = Some(1_000);
+            model
+                .tabs
+                .insert("t".into(), test_tab("t", "s", "https://one.test/page"));
+        }
+        // Issuance requires human control.
+        {
+            let mut model = manager.model.lock().await;
+            model
+                .sessions
+                .get_mut("s")
+                .unwrap()
+                .set_state(SessionState::Ready, None)
+                .unwrap();
+        }
+        assert!(manager.viewer_issue("r", "s", "t", 1_000).await.is_err());
+        {
+            let mut model = manager.model.lock().await;
+            let session = model.sessions.get_mut("s").unwrap();
+            session
+                .set_state(SessionState::Blocked, Some("needs_login"))
+                .unwrap();
+            session.set_state(SessionState::HumanControl, None).unwrap();
+            session.takeover_started_at = Some(1_000);
+        }
+        let issued = manager.viewer_issue("r", "s", "t", 1_000).await.unwrap();
+        let code = issued["code"].as_str().unwrap().to_owned();
+        assert_eq!(code.len(), crate::takeover::CODE_LEN);
+        // Unknown tabs and other owners cannot mint codes.
+        assert!(
+            manager
+                .viewer_issue("r", "s", "missing", 1_000)
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .viewer_issue("intruder", "s", "t", 1_000)
+                .await
+                .is_err()
+        );
+        let cookie = manager.viewer_redeem(&code, 1_010).await.unwrap();
+        assert!(!cookie.is_empty());
+        assert!(manager.viewer_redeem(&code, 1_011).await.is_err());
+        assert!(manager.viewer_redeem("WRONGCOD", 1_011).await.is_err());
+        // Pages load with the cookie; sockets additionally need the origin.
+        let (tab, origin) = manager.viewer_check_page(&cookie, 1_011).await.unwrap();
+        assert_eq!((tab.as_str(), origin.as_str()), ("t", "https://one.test"));
+        assert!(manager.viewer_check_page("nope", 1_011).await.is_err());
+        assert!(
+            manager
+                .viewer_check(
+                    "nope",
+                    Some("http://127.0.0.1:9"),
+                    "http://127.0.0.1:9",
+                    1_011
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .viewer_check(
+                    &cookie,
+                    Some("http://evil.test"),
+                    "http://127.0.0.1:9",
+                    1_011
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .viewer_check_page(&cookie, 1_000 + crate::takeover::CODE_TTL_SECS + 1)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ephemeral_gate_denies_schemes_tracks_origins_and_flags_c4() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Manager::open(Options {
+                data_dir: dir.path().into(),
+                binary: "/not-used".into(),
+                proxy: "127.0.0.1:12345".parse().unwrap(),
+                profiles: BTreeMap::new(),
+                compact: false,
+                version: VersionPolicy::default(),
+                chrome_args: vec![],
+            }))
+            .unwrap();
+        let ephemeral = test_session("e", "ephemeral", SessionState::Ready, None);
+        // F-B4-01: forbidden schemes stay denied even in ephemeral sessions.
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,hi",
+            "chrome://settings",
+        ] {
+            assert!(
+                manager.document_allowed(&ephemeral, url, false).is_err(),
+                "{url}"
+            );
+            assert!(
+                manager.document_allowed(&ephemeral, url, true).is_err(),
+                "{url}"
+            );
+        }
+        // Ordinary origins are admitted; every new one is recorded (C2).
+        let mut session = ephemeral;
+        assert!(
+            manager
+                .document_allowed(&session, "https://a.test/page", true)
+                .is_ok()
+        );
+        assert!(Manager::note_ephemeral_origin(
+            &mut session,
+            "https://a.test/page"
+        ));
+        assert!(!Manager::note_ephemeral_origin(
+            &mut session,
+            "https://a.test/other"
+        ));
+        assert!(Manager::note_ephemeral_origin(
+            &mut session,
+            "https://b.test/"
+        ));
+        assert_eq!(session.origins, vec!["https://a.test", "https://b.test"]);
+        // C4: contaminated runs flag long or entropic cross-origin payloads
+        // and cross-origin POSTs before committing.
+        let long = format!("https://b.test/collect?{}", "x".repeat(129));
+        assert!(Manager::navigation_risk("https://a.test/page", &long, "GET").is_some());
+        assert!(
+            Manager::navigation_risk("https://a.test/page", "https://b.test/submit", "POST")
+                .is_some()
+        );
+        assert!(
+            Manager::navigation_risk("https://a.test/page", "https://b.test/plain", "GET")
+                .is_none()
+        );
+        assert!(
+            Manager::navigation_risk("https://a.test/page", "https://a.test/other", "GET")
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn late_probe_results_cannot_modify_a_replaced_navigated_or_closed_tab() {
         let directory = tempfile::tempdir().unwrap();
