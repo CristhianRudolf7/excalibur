@@ -2210,6 +2210,172 @@ mod exit_publication_tests {
         });
     }
 
+    #[cfg(unix)]
+    struct WatchdogGroup {
+        child: Option<std::process::Child>,
+    }
+
+    #[cfg(unix)]
+    impl WatchdogGroup {
+        fn spawn(command: &mut Command) -> Self {
+            use std::os::unix::process::CommandExt;
+            Self {
+                child: Some(command.process_group(0).spawn().unwrap()),
+            }
+        }
+
+        fn child(&mut self) -> &mut std::process::Child {
+            self.child.as_mut().unwrap()
+        }
+
+        fn stop(&mut self) -> std::process::ExitStatus {
+            let child = self.child.as_mut().unwrap();
+            let group = child.id() as libc::pid_t;
+            // Never try_wait/reap first: the unreaped leader pins this PGID,
+            // including on successful exit, until every member is signalled.
+            let result = unsafe { libc::kill(-group, libc::SIGKILL) };
+            assert!(
+                result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            );
+            let status = child.wait().unwrap();
+            self.child.take();
+            #[cfg(target_os = "linux")]
+            loop {
+                let mut status = 0;
+                let result = unsafe { libc::waitpid(-group, &mut status, 0) };
+                if result > 0 {
+                    continue;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+                break;
+            }
+            status
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for WatchdogGroup {
+        fn drop(&mut self) {
+            if self.child.is_some() {
+                self.stop();
+            }
+        }
+    }
+
+    // Only isolated controller subprocesses become subreapers. Never change
+    // process-wide adoption policy in the shared Rust test harness process.
+    #[cfg(unix)]
+    fn controller_subreaper() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    fn run_controller(name: &str) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--ignored", "--nocapture"])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated watchdog controller failed: {name}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_clock_spool_barrier_ab() {
+        run_controller("terminal::exit_publication_tests::real_clock_spool_barrier_controller");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_clock_watchdog_reaps_group() {
+        run_controller("terminal::exit_publication_tests::real_clock_watchdog_cleanup_controller");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated subreaper cleanup controller"]
+    fn real_clock_watchdog_cleanup_controller() {
+        controller_subreaper();
+        for unwind in [false, true] {
+            let mut group = WatchdogGroup::spawn(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "terminal::exit_publication_tests::real_clock_watchdog_held_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit()),
+            );
+            let leader = group.child().id() as libc::pid_t;
+            let stdout = group.child().stdout.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if let Some(pid) = line.unwrap().strip_prefix("HCC_HELD ") {
+                        tx.send(pid.parse::<libc::pid_t>().unwrap()).unwrap();
+                        break;
+                    }
+                }
+            });
+            let shell = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            reader.join().unwrap();
+            assert_eq!(unsafe { libc::getpgid(shell) }, leader);
+            // A readiness handshake, rather than scheduler delay, proves the
+            // real shell is alive and held when the watchdog is forced.
+            if unwind {
+                assert!(
+                    std::panic::catch_unwind(move || {
+                        let _guard = group;
+                        panic!("exercise watchdog RAII cleanup");
+                    })
+                    .is_err()
+                );
+            } else {
+                assert!(!group.stop().success());
+            }
+            assert_eq!(unsafe { libc::kill(-leader, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            assert_eq!(unsafe { libc::kill(shell, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            trace("watchdog_group_reaped");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "held real shell for external watchdog cleanup"]
+    fn real_clock_watchdog_held_child() {
+        let mut shell = Command::new("/bin/sh")
+            .args(["-c", r#"printf 'HCC_HELD %s\n' "$$"; read held"#])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Retain stdin so the shell remains blocked until the external group
+        // watchdog kills it. The helper never escapes its inherited PGID.
+        let _input = shell.stdin.take().unwrap();
+        shell.wait().unwrap();
+    }
+
     // Executed only by the external watchdog below. Default tokio::test flavor
     // deliberately matches HCC-1: one executor thread and a real clock.
     #[cfg(unix)]
@@ -2340,22 +2506,24 @@ mod exit_publication_tests {
 
     #[cfg(unix)]
     #[test]
-    fn real_clock_spool_barrier_ab() {
+    #[ignore = "isolated subreaper A/B controller"]
+    fn real_clock_spool_barrier_controller() {
+        controller_subreaper();
         for ordering in ["old", "fixed"] {
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "terminal::exit_publication_tests::real_clock_spool_barrier_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("HCC_TEST_ORDERING", ordering)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap();
-            let stdout = child.stdout.take().unwrap();
+            let mut group = WatchdogGroup::spawn(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "terminal::exit_publication_tests::real_clock_spool_barrier_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("HCC_TEST_ORDERING", ordering)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit()),
+            );
+            let stdout = group.child().stdout.take().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
             let reader = std::thread::spawn(move || {
                 use std::io::BufRead;
@@ -2371,11 +2539,15 @@ mod exit_publication_tests {
             let mut events = Vec::new();
             loop {
                 if started.elapsed() > Duration::from_secs(8) {
-                    child.kill().unwrap();
-                    child.wait().unwrap();
+                    group.stop();
                     panic!("external watchdog killed {ordering}: {events:?}");
                 }
-                if let Ok(line) = rx.recv_timeout(Duration::from_millis(10)) {
+                let received = rx.recv_timeout(Duration::from_millis(10));
+                let eof = matches!(
+                    received,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                );
+                if let Ok(line) = received {
                     println!(
                         "{ordering} parent_ns={} {line}",
                         started.elapsed().as_nanos()
@@ -2397,7 +2569,8 @@ mod exit_publication_tests {
                         .any(|(event, _)| event == "status_unpublished")
                 };
                 if ready && !released {
-                    child
+                    group
+                        .child()
                         .stdin
                         .as_mut()
                         .unwrap()
@@ -2405,7 +2578,8 @@ mod exit_publication_tests {
                         .unwrap();
                     released = true;
                 }
-                if let Some(status) = child.try_wait().unwrap() {
+                if eof {
+                    let status = group.stop();
                     reader.join().unwrap();
                     // Drain all lines, including durable publication after release.
                     for line in rx.try_iter() {

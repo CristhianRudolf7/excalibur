@@ -50,6 +50,8 @@ Terminal exit publication runs the spool `sync_all` barrier without holding the 
 
 The Unix `real_clock_spool_barrier_ab` regression adds a small causal A/B experiment on the default current-thread Tokio runtime with real time. A real short process exits and its stdout reader joins before a controlled synchronization barrier. A test-only old ordering holds the output mutex; the fixed arm calls production `finish_output`. Both use production `TerminalManager::wait` and `snapshot`, with normal blocking mutex acquisition. The external parent uses standard pipes, channels and `Instant`, releases the old barrier 350 ms after `wait_attempt`, and kills either stuck child after eight seconds. The fixed arm must report a heartbeat, a 100 ms wait timeout and readable `exited=false` before release; the old arm must acquire no output lock and make no heartbeat/timeout progress until release. Both publish durable exit only after release and close signal dispatch before the barrier. JSON traces include child monotonic nanoseconds and parent receipt times. This fixture constructs an internal session after a real process/readers boundary; it does not exercise sandbox admission or prove that fsync caused historical HCC-1 iteration 37. No production deadline, runtime or retries change.
 
+The watchdog owns each helper's isolated process group through an RAII guard. On completion, deadline or panic it sends group SIGKILL before reaping the leader, so an unreaped leader pins group identity and prevents signalling a reused PGID. EOF replaces `try_wait` as the completion trigger. Linux controllers run in isolated subprocesses with subreaper adoption and reap killed descendants; the shared test process never changes adoption policy. `real_clock_watchdog_reaps_group` uses a readiness handshake with a live shell blocked on input, forces both explicit watchdog cleanup and panic unwinding, then checks that neither the group nor shell remains (including zombies). Cleanup uses the helper group leader, never the synthetic session PID.
+
 The mechanism follows Tokio 1.54.1 [select concurrency](https://docs.rs/tokio/1.54.1/tokio/macro.select.html) and [timeout polling](https://docs.rs/tokio/1.54.1/tokio/time/fn.timeout.html) contracts (also checked in the locked dependency source): blocking a poll prevents timer progress. The [shared-state tutorial](https://tokio.rs/tokio/tutorial/shared-state) and upstream [issue 5024](https://github.com/tokio-rs/tokio/issues/5024) explain blocking-mutex contention; Rust documents the storage synchronization performed by [File::sync_all](https://doc.rust-lang.org/std/fs/struct.File.html#method.sync_all). These sources explain the mechanism, not historical incident attribution.
 
 ## Verification
@@ -57,7 +59,7 @@ The mechanism follows Tokio 1.54.1 [select concurrency](https://docs.rs/tokio/1.
 ```sh
 cargo test -p excalibur-workspace --test concurrency --test shadow_entries --test typed_checkpoint
 cargo test -p excalibur-code-intelligence
-cargo test -p excalibur-tools --lib real_clock_spool_barrier_ab -- --nocapture
+cargo test -p excalibur-tools --lib real_clock_ -- --nocapture
 cargo test -p excalibur-tools --lib slow_spool_sync_keeps_status_readable_and_exit_unpublished
 cargo test -p excalibur-tools --test terminal
 cargo test -p excalibur-tools --test tool_retrieval --test terminal_vs_tools

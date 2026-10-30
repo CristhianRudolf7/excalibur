@@ -50,6 +50,8 @@ La publicación de salida de terminal ejecuta la barrera `sync_all` del spool si
 
 La regresión Unix `real_clock_spool_barrier_ab` añade un experimento causal A/B pequeño con el runtime Tokio predeterminado de un hilo y reloj real. Un proceso real corto termina y su lector stdout se une antes de una barrera de sincronización controlada. El orden antiguo, exclusivo del test, retiene el mutex de salida; el caso corregido llama a `finish_output` de producción. Ambos usan `TerminalManager::wait` y `snapshot` reales, con adquisición bloqueante normal del mutex. El padre externo usa pipes, canales estándar e `Instant`, libera la barrera antigua 350 ms después de `wait_attempt` y mata cualquier hijo atascado a los ocho segundos. El caso corregido debe informar heartbeat, timeout de espera de 100 ms y estado legible `exited=false` antes de liberar; el antiguo no debe adquirir el mutex ni progresar heartbeat/timeout hasta liberar. Ambos publican salida durable tras liberar y cierran el envío de señales antes de la barrera. Las trazas JSON incluyen nanosegundos monotónicos del hijo y tiempos de recepción del padre. La fixture construye una sesión interna tras el límite real de proceso/lectores; no prueba admisión sandbox ni demuestra que fsync causara la iteración histórica 37 de HCC-1. No cambian plazos, runtime ni reintentos de producción.
 
+El watchdog posee el grupo aislado de cada helper mediante un guard RAII. Al terminar, vencer el plazo o producirse un panic envía SIGKILL al grupo antes de recolectar al líder; el líder sin recolectar mantiene la identidad del grupo y evita señalizar una PGID reutilizada. EOF sustituye `try_wait` como indicación de finalización. En Linux los controladores son subprocesos aislados con adopción subreaper y recolectan los descendientes terminados; el proceso compartido de pruebas nunca cambia su política de adopción. `real_clock_watchdog_reaps_group` usa un handshake con un shell vivo bloqueado esperando entrada, fuerza tanto cleanup explícito del watchdog como desenrollado por panic y comprueba que no quedan grupo ni shell, incluidos zombies. El cleanup usa al líder del grupo del helper, nunca el PID de la sesión sintética.
+
 El mecanismo sigue los contratos de Tokio 1.54.1 de [concurrencia select](https://docs.rs/tokio/1.54.1/tokio/macro.select.html) y [sondeo de timeout](https://docs.rs/tokio/1.54.1/tokio/time/fn.timeout.html), comprobados también en el código de la dependencia fijada: bloquear un sondeo impide progresar los temporizadores. El [tutorial de estado compartido](https://tokio.rs/tokio/tutorial/shared-state) y el [issue 5024](https://github.com/tokio-rs/tokio/issues/5024) explican contención de mutex bloqueantes; Rust documenta la sincronización de almacenamiento de [File::sync_all](https://doc.rust-lang.org/std/fs/struct.File.html#method.sync_all). Estas fuentes explican el mecanismo, no atribuyen el incidente histórico.
 
 ## Verificación
@@ -57,7 +59,7 @@ El mecanismo sigue los contratos de Tokio 1.54.1 de [concurrencia select](https:
 ```sh
 cargo test -p excalibur-workspace --test concurrency --test shadow_entries --test typed_checkpoint
 cargo test -p excalibur-code-intelligence
-cargo test -p excalibur-tools --lib real_clock_spool_barrier_ab -- --nocapture
+cargo test -p excalibur-tools --lib real_clock_ -- --nocapture
 cargo test -p excalibur-tools --lib slow_spool_sync_keeps_status_readable_and_exit_unpublished
 cargo test -p excalibur-tools --test terminal
 cargo test -p excalibur-tools --test tool_retrieval --test terminal_vs_tools
