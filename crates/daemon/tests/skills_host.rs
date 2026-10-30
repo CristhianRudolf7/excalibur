@@ -223,47 +223,48 @@ fn daemon_loads_real_skill_in_stable_context_enforces_it_and_restores_session() 
         let context = host.skills.runtime.session_context(&run).await.unwrap();
         assert!(context.identity.contains("reactor"));
         assert!(context.suggested_skills.len() <= 3);
-        let calls = model.requests.lock().unwrap();
-        assert!(calls.len() >= 5);
-        for request in calls.iter() {
-            assert_eq!(request.tools, calls[0].tools);
-            assert!(
+        {
+            let calls = model.requests.lock().unwrap();
+            assert!(calls.len() >= 5);
+            for request in calls.iter() {
+                assert_eq!(request.tools, calls[0].tools);
+                assert!(
+                    request
+                        .messages
+                        .iter()
+                        .any(|m| m.content.contains("Frozen skill catalog:"))
+                );
+            }
+            let stable = |request: &ModelRequest| {
                 request
                     .messages
                     .iter()
-                    .any(|m| m.content.contains("Frozen skill catalog:"))
+                    .filter(|m| m.content.contains("Frozen skill catalog:"))
+                    .map(|m| m.content.clone())
+                    .collect::<Vec<_>>()
+            };
+            for request in calls.iter().skip(1) {
+                assert_eq!(stable(request), stable(&calls[0]));
+            }
+            assert!(
+                calls
+                    .iter()
+                    .flat_map(|r| &r.messages)
+                    .any(|m| m.content.contains("ORIGINAL SKILL BODY"))
+            );
+            assert!(
+                calls
+                    .iter()
+                    .flat_map(|r| &r.messages)
+                    .any(|m| m.content.contains("allowed-tools"))
+            );
+            assert!(
+                calls
+                    .iter()
+                    .flat_map(|r| &r.messages)
+                    .any(|m| m.content.contains("reactor evidence"))
             );
         }
-        let stable = |request: &ModelRequest| {
-            request
-                .messages
-                .iter()
-                .filter(|m| m.content.contains("Frozen skill catalog:"))
-                .map(|m| m.content.clone())
-                .collect::<Vec<_>>()
-        };
-        for request in calls.iter().skip(1) {
-            assert_eq!(stable(request), stable(&calls[0]));
-        }
-        assert!(
-            calls
-                .iter()
-                .flat_map(|r| &r.messages)
-                .any(|m| m.content.contains("ORIGINAL SKILL BODY"))
-        );
-        assert!(
-            calls
-                .iter()
-                .flat_map(|r| &r.messages)
-                .any(|m| m.content.contains("allowed-tools"))
-        );
-        assert!(
-            calls
-                .iter()
-                .flat_map(|r| &r.messages)
-                .any(|m| m.content.contains("reactor evidence"))
-        );
-        drop(calls);
         assert!(!root.join("forbidden.txt").exists());
         let delta = host.skills.runtime.session_context(&run).await.unwrap();
         assert_eq!(delta.identity, context.identity);
