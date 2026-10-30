@@ -41,7 +41,10 @@ search_budget_bytes = 2147483648
 All paths must be absolute. Unknown settings are rejected. The free disk reserve
 cannot be reduced below 5 GiB; the default search budget includes a 1.5 GiB index
 and 0.5 GiB state. Data and runtime directories must already be writable by the
-final identity. No profiles or sockets are created by the check.
+final identity, owned by its UID and mode 0700. Symlinks at these directory
+paths are rejected. JSON `directories` entries report the path, owner UID, numeric
+permission mode, privacy and write access. No profiles or sockets are created by
+the check.
 
 ```sh
 cargo build -p excalibur-webd
@@ -58,7 +61,10 @@ configuration and identity failures also return JSON with `ready = false`.
 
 `ready` means environment preparation succeeded. `sandbox_verified` remains
 false: renderer sandbox verification and browser launching are not implemented.
-Chrome is invoked only with `--version`, with a five-second timeout. No remote
+Chrome is invoked only with `--version` in a separate process group. A five-second
+total deadline covers the process and stdout, including output held open by
+descendants. The group is killed on completion or error; output is capped at
+4096 bytes. No remote
 model or account is used. A shared or inaccessible cgroup is reported explicitly;
 it requires process-tree accounting when resource management is implemented.
 Cgroup availability is optional and does not imply memory limits are enforced.
@@ -69,7 +75,8 @@ Continuous monitoring and enforcement on future operations are not implemented.
 Verify with local, synthetic backend fixtures:
 
 ```sh
-cargo test -p excalibur-webd --test preflight
+(umask 0077; cargo test -p excalibur-webd --test preflight)
+(umask 0022; cargo test -p excalibur-webd --test preflight)
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -77,6 +84,8 @@ cargo build --workspace
 ```
 
 The backend suite covers configuration errors, exact disk boundaries, executable
-and version failures, rejected root identities, non-root startup, irreversible
+and version failures, descendant cleanup, total probe deadline, directory ownership
+and permissions, umask-independent fixtures, rejected root identities, non-root
+startup, irreversible
 privilege removal and live `/proc` identity/capability evidence. Root-only cases
 run when the test launcher is root. There is no frontend to review.

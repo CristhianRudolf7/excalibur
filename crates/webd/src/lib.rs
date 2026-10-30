@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     ffi::CString,
     fs,
+    io::Read,
+    os::{
+        fd::AsRawFd,
+        unix::{fs::MetadataExt, process::CommandExt},
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -142,31 +147,12 @@ pub fn detect_chrome(explicit: Option<&Path>) -> Result<Chrome, String> {
         .into_iter()
         .find(|p| p.is_file())
         .ok_or("Chrome binary unavailable")?;
-    let mut child = Command::new(&binary)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Chrome version check timed out".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let output = child.wait_with_output().map_err(|e| e.to_string())?;
-    let version = String::from_utf8(output.stdout)
+    let (status, stdout) = probe_version(&binary)?;
+    let version = String::from_utf8(stdout)
         .map_err(|_| "invalid Chrome version")?
         .trim()
         .to_owned();
-    if !output.status.success()
+    if !status.success()
         || !(version.starts_with("Google Chrome ") || version.starts_with("Chromium "))
         || !version.split_whitespace().any(|part| {
             part.split('.').count() == 4 && part.split('.').all(|n| n.parse::<u32>().is_ok())
@@ -176,6 +162,100 @@ pub fn detect_chrome(explicit: Option<&Path>) -> Result<Chrome, String> {
     }
     Ok(Chrome { binary, version })
 }
+// Own only the probe's process group, including descendants holding stdout open.
+struct Probe(std::process::Child);
+impl Drop for Probe {
+    fn drop(&mut self) {
+        // SAFETY: process_group(0) created a separate group with this child's PID.
+        unsafe {
+            libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = self.0.wait();
+    }
+}
+fn probe_version(binary: &Path) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut probe = Probe(
+        Command::new(binary)
+            .arg("--version")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?,
+    );
+    let mut stdout = probe.0.stdout.take().ok_or("missing probe stdout")?;
+    // SAFETY: stdout owns a valid descriptor; preserve its existing flags.
+    unsafe {
+        let flags = libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL);
+        if flags < 0 || libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    let mut output = Vec::new();
+    let mut eof = false;
+    loop {
+        if Instant::now() >= deadline {
+            return Err("Chrome version check timed out".into());
+        }
+        let mut buffer = [0; 1024];
+        if !eof {
+            match stdout.read(&mut buffer) {
+                Ok(0) => eof = true,
+                Ok(n) => {
+                    output.extend_from_slice(&buffer[..n]);
+                    if output.len() > 4096 {
+                        return Err("Chrome version output exceeds 4096 bytes".into());
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        if let Some(status) = probe.0.try_wait().map_err(|e| e.to_string())?
+            && eof
+        {
+            return Ok((status, output));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct DirectoryCheck {
+    pub path: PathBuf,
+    pub owner_uid: Option<u32>,
+    pub mode: Option<u32>,
+    pub private: bool,
+    pub writable: bool,
+}
+fn check_directory(path: &Path, uid: u32) -> DirectoryCheck {
+    use std::os::unix::ffi::OsStrExt;
+    let metadata = fs::symlink_metadata(path).ok();
+    let private = metadata
+        .as_ref()
+        .is_some_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o7777 == 0o700);
+    let writable = CString::new(path.as_os_str().as_bytes())
+        .ok()
+        .is_some_and(|p| {
+            // SAFETY: p is a valid NUL-terminated path; no filesystem mutation.
+            unsafe { libc::access(p.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+        });
+    DirectoryCheck {
+        path: path.to_owned(),
+        owner_uid: metadata.as_ref().map(MetadataExt::uid),
+        mode: metadata.as_ref().map(|m| m.mode() & 0o7777),
+        private,
+        writable,
+    }
+}
+
 pub fn disk_available(path: &Path) -> Result<u64, String> {
     use std::os::unix::ffi::OsStrExt;
     let name = CString::new(path.as_os_str().as_bytes()).map_err(|_| "invalid disk path")?;
@@ -253,6 +333,7 @@ pub struct Preflight {
     pub cgroup: Cgroup,
     pub errors: Vec<String>,
     pub sandbox_verified: bool,
+    pub directories: Vec<DirectoryCheck>,
 }
 pub fn preflight(config: &WebConfig, identity: Identity) -> Preflight {
     let mut errors = Vec::new();
@@ -267,16 +348,16 @@ pub fn preflight(config: &WebConfig, identity: Identity) -> Preflight {
     if !admissible {
         errors.push("insufficient or unavailable disk for search budget plus reserve".into());
     }
-    // Check access under the final identity; never create sockets or profiles.
-    for path in [&config.data_dir, &config.run_dir] {
-        use std::os::unix::ffi::OsStrExt;
-        let accessible = CString::new(path.as_os_str().as_bytes())
-            .ok()
-            .is_some_and(|p| unsafe { libc::access(p.as_ptr(), libc::W_OK | libc::X_OK) == 0 });
-        if !path.is_dir() || !accessible {
+    // Require private, owned directories under the final identity; create nothing.
+    let directories: Vec<_> = [&config.data_dir, &config.run_dir]
+        .into_iter()
+        .map(|path| check_directory(path, identity.euid))
+        .collect();
+    for directory in &directories {
+        if !directory.private || !directory.writable {
             errors.push(format!(
-                "directory unavailable or not writable: {}",
-                path.display()
+                "directory must be owned by the final UID, mode 0700 and writable: {}",
+                directory.path.display()
             ));
         }
     }
@@ -291,5 +372,6 @@ pub fn preflight(config: &WebConfig, identity: Identity) -> Preflight {
         cgroup: cgroup(),
         errors,
         sandbox_verified: false,
+        directories,
     }
 }

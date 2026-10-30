@@ -1,3 +1,8 @@
+fn own_by_final_user(path: &std::path::Path) {
+    if unsafe { libc::geteuid() } == 0 {
+        std::os::unix::fs::chown(path, Some(65534), Some(65534)).unwrap();
+    }
+}
 use excalibur_webd::{Config, GIB, admits_growth, detect_chrome, disk_available};
 use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 
@@ -74,7 +79,8 @@ fn root_is_rejected_before_any_runtime_resource() {
 #[test]
 fn final_identity_is_unprivileged_and_report_is_real() {
     let dir = tempfile::tempdir().unwrap();
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    own_by_final_user(dir.path());
     let output = invoke("nobody", dir.path(), "/not-installed");
     assert!(!output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -98,7 +104,8 @@ fn final_identity_is_unprivileged_and_report_is_real() {
 #[test]
 fn startup_exposes_only_final_identity_in_proc_and_accepts_local_fixture() {
     let dir = tempfile::tempdir().unwrap();
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    own_by_final_user(dir.path());
     let chrome = dir.path().join("chrome");
     fs::write(
         &chrome,
@@ -188,6 +195,8 @@ fn ordinary_user_starts_without_resolving_configured_root_identity() {
         "[web]\nos_user='root'\ndata_dir='/tmp'\nrun_dir='/tmp'\nchrome_binary='/not-installed'\n",
     )
     .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
     // Concurrent forked probes can briefly inherit the copy's write descriptor.
     let mut command = Command::new(binary);
     command.uid(65534).gid(65534).arg("--preflight").arg(config);
@@ -204,4 +213,75 @@ fn ordinary_user_starts_without_resolving_configured_root_identity() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["identity"]["uid"], 65534);
     assert_eq!(report["identity"]["euid"], 65534);
+}
+
+#[test]
+fn directory_privacy_and_owner_are_reported_and_required() {
+    let dir = tempfile::tempdir().unwrap();
+    own_by_final_user(dir.path());
+    for (mode, private) in [(0o777, false), (0o750, false), (0o700, true)] {
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+        let output = invoke("nobody", dir.path(), "/not-installed");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        for check in report["directories"].as_array().unwrap() {
+            assert_eq!(check["private"], private);
+            assert_eq!(check["mode"], mode);
+            assert_eq!(check["owner_uid"], report["identity"]["euid"]);
+        }
+        assert_eq!(report["ready"], false); // The Chrome fixture is deliberately absent.
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        std::os::unix::fs::chown(dir.path(), Some(0), Some(0)).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let output = invoke("nobody", dir.path(), "/not-installed");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["directories"][0]["owner_uid"], 0);
+        assert_eq!(report["directories"][0]["private"], false);
+        assert_eq!(report["ready"], false);
+    }
+}
+
+#[test]
+fn chrome_probe_bounds_total_time_and_stops_descendants() {
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("chrome");
+    let pidfile = dir.path().join("descendant.pid");
+    // Both an exited parent retaining stdout through its child and a waiting parent.
+    for tail in ["exit 0", "wait"] {
+        fs::write(&script, format!("#!/bin/sh\nsleep 30 &\necho $! > '{}'\necho 'Google Chrome 156.0.8078.73'\n{tail}\n", pidfile.display())).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let start = Instant::now();
+        let error = detect_chrome(Some(&script)).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(start.elapsed() < Duration::from_secs(9));
+        let pid: u32 = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let stopped = || match fs::read_to_string(format!("/proc/{pid}/status")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Ok(s) => s
+                .lines()
+                .any(|line| line.starts_with("State:") && line.contains('Z')),
+            Err(e) => panic!("cannot inspect descendant: {e}"),
+        };
+        for _ in 0..100 {
+            if stopped() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stopped(), "probe descendant {pid} is still running");
+    }
+}
+
+#[test]
+fn chrome_probe_rejects_excessive_output_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("chrome");
+    fs::write(&script, "#!/bin/sh\nexec head -c 65536 /dev/zero\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(detect_chrome(Some(&script)).unwrap_err().contains("4096"));
 }
