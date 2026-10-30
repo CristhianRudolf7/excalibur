@@ -111,6 +111,7 @@ struct EventState {
     tainted: bool,
     lagged: bool,
     navigation_pending: bool,
+    unobserved_sessions: HashMap<String, String>,
     last_network_activity: tokio::time::Instant,
 }
 struct TabObserver {
@@ -260,6 +261,7 @@ impl Observation {
             tainted: false,
             lagged: false,
             navigation_pending: false,
+            unobserved_sessions: Default::default(),
             last_network_activity: tokio::time::Instant::now(),
         }));
         let weak = Arc::downgrade(&state);
@@ -323,6 +325,36 @@ impl Observation {
             book.reason = Some(reason.to_owned());
             *t.last_ready.lock().unwrap() = None;
         }
+    }
+    /// Attach while the target is still blank so no initial request can precede Network.enable.
+    pub(crate) async fn prepare_tab(
+        &self,
+        session: &Session,
+        tab: &Tab,
+        client: Client,
+    ) -> Result<()> {
+        if tab.listen {
+            return Ok(());
+        }
+        let mut blank = tab.clone();
+        blank.url = "about:blank".into();
+        let ctx = Context {
+            session: session.clone(),
+            tab: blank,
+            client,
+            logged_in: false,
+        };
+        let frame = Frame {
+            id: tab.target_id.clone().unwrap_or_default(),
+            loader: String::new(),
+            url: "about:blank".into(),
+            session: tab.cdp_session.clone().unwrap_or_default(),
+            target: tab.target_id.clone().unwrap_or_default(),
+            parent: None,
+            offset: (0., 0.),
+        };
+        self.initialize(&ctx, &[frame]).await?;
+        Ok(())
     }
     pub fn mark_tainted(&self, tab: &str) {
         if let Some(t) = self.tabs.lock().unwrap().get(tab) {
@@ -466,6 +498,9 @@ impl Observation {
             state.sessions = frames.iter().map(|f| f.session.clone()).collect();
             let sessions = state.sessions.clone();
             state.inflight.retain(|(sid, _), _| sessions.contains(sid));
+            state
+                .unobserved_sessions
+                .retain(|sid, _| sessions.contains(sid));
         }
         Ok(frames)
     }
@@ -528,6 +563,12 @@ fn event_record(s: &mut EventState, e: excalibur_cdp::Event, r: &Redactor) {
                 }
                 s.lagged = false;
                 let loader = p["frame"]["loaderId"].as_str().unwrap_or("");
+                if s.unobserved_sessions
+                    .get(&sid)
+                    .is_some_and(|previous| previous != loader)
+                {
+                    s.unobserved_sessions.remove(&sid);
+                }
                 s.inflight.retain(|(_, id), _| id == loader);
                 s.last_network_activity = tokio::time::Instant::now();
             }

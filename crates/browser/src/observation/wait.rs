@@ -77,6 +77,17 @@ impl Drop for NetworkScope {
                     .unwrap()
                     .drain()
                     .collect::<Vec<_>>();
+                {
+                    let mut state = tracker.state.lock().unwrap();
+                    state.inflight.clear();
+                    state.unobserved_sessions.extend(
+                        sessions
+                            .iter()
+                            .cloned()
+                            .map(|session| (session, String::new())),
+                    );
+                }
+                *tracker.last_ready.lock().unwrap() = None;
                 for session in &sessions {
                     let _ = client
                         .send_with_timeout(
@@ -87,7 +98,6 @@ impl Drop for NetworkScope {
                         )
                         .await;
                 }
-                tracker.state.lock().unwrap().inflight.clear();
             });
         }
     }
@@ -155,6 +165,19 @@ impl Observation {
             }
             let enable = !tracker.network_enabled.lock().unwrap().contains(sid);
             if enable {
+                if frames
+                    .iter()
+                    .any(|frame| &frame.session == sid && frame.url != "about:blank")
+                {
+                    tracker.state.lock().unwrap().unobserved_sessions.insert(
+                        sid.clone(),
+                        frames
+                            .iter()
+                            .find(|f| &f.session == sid)
+                            .map(|f| f.loader.clone())
+                            .unwrap_or_default(),
+                    );
+                }
                 ctx.client
                     .send_with_timeout(
                         Method::NetworkEnable,
@@ -308,13 +331,24 @@ impl Observation {
                 long_quiet = tokio::time::Instant::now();
             }
             quiet = quiet.max(tracker.state.lock().unwrap().last_network_activity);
+            let unobserved = !tracker.state.lock().unwrap().unobserved_sessions.is_empty();
+            if unobserved && !report.degraded.iter().any(|s| s == "network_unobserved") {
+                report.degraded.push("network_unobserved".into());
+            }
+            if !unobserved {
+                report.degraded.retain(|s| s != "network_unobserved");
+            }
             let network = active <= criteria.max_inflight
                 && quiet.elapsed() >= Duration::from_millis(criteria.network_idle_ms)
                 && long == 0
-                && !lagged;
+                && !lagged
+                && !unobserved;
             let degraded_network = active <= criteria.max_inflight
                 && long > 0
                 && long_quiet.elapsed() >= Duration::from_millis(criteria.network_idle_ms + 2000);
+            let unobserved_ready = unobserved
+                && active <= criteria.max_inflight
+                && quiet.elapsed() >= Duration::from_millis(criteria.network_idle_ms + 2000);
             nav &= !pending;
             report.criteria_met = CriteriaMet {
                 navigation: nav,
@@ -330,7 +364,10 @@ impl Observation {
             if nav
                 && dom
                 && condition
-                && (network || (!criteria.strict_network && degraded_network && !lagged))
+                && (network
+                    || (!criteria.strict_network
+                        && (degraded_network || unobserved_ready)
+                        && !lagged))
             {
                 report.status = "ready".into();
                 if degraded_network {

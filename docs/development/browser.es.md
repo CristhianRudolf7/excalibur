@@ -463,7 +463,15 @@ estricto devuelve timeout. `timeout` incluye `criteria_met` y URL de diagnóstic
 Los marcos de desafío visibles, diálogos JavaScript, selectores de archivos,
 campos de verificación vacíos e indicadores de acceso producen `blocked`; observar no los resuelve. Los sitios pueden proporcionar los
 mismos criterios en su configuración opcional `wait`. El resultado ready se
-recuerda junto a los loaders de los marcos. La navegación invalida esa coincidencia;
+recuerda junto a los loaders de los marcos. Las pestañas no oyentes habilitan
+red, ciclo de vida y el script aislado de estabilidad mientras siguen vacías,
+antes de navegar inicialmente o restaurarse. En adjuntos tardíos u oyentes que
+reanuden la recogida, `network_unobserved` indica que no se midieron las peticiones
+anteriores: `criteria_met.network` sigue siendo false. La espera no estricta puede
+devolver ready con esa degradación tras cumplir DOM/condición y la ventana adicional
+de quietud; la estricta devuelve timeout. Un nuevo documento observado elimina
+esa incertidumbre. Desactivar la recogida del oyente invalida también su ready
+guardado. La navegación invalida esa coincidencia;
 una instantánea sin resultado vigente espera automáticamente.
 
 `observe.snapshot` acepta `options` con `dom: interactive|full`,
@@ -500,7 +508,11 @@ puede incluir `remapped_ref`; validar no envía entrada ni elige otro nodo. El h
 puede invalidar una pestaña al intervenir mediante
 `manager.observation.invalidate(tab_id, "takeover").await`.
 `observe.subtree` lee el árbol comprimido guardado por `snapshot_id` y `ref`
-opcional, sin volver a capturar la página.
+opcional, sin volver a capturar la página. `delivery: inline` devuelve los nodos
+si ocupan hasta 1 MiB serializados. Las selecciones mayores devuelven
+`delivery: blob`, `node_count`, `root_ref` y `source_blob`, con `nodes` vacío.
+Se lee el blob completo autorizado mediante `blob.read` y se selecciona la raíz
+indicada localmente; la respuesta queda bajo el límite de trama de 4 MiB.
 
 Los blobs usan SHA-256 y zstd del almacenamiento existente dentro del directorio
 privado `observations/`. Un registro en webd autoriza cada hash para la ejecución
@@ -531,5 +543,8 @@ Ejecuta `cargo test -p excalibur-browser --test observe -- --nocapture` con Chro
 real y páginas locales sintéticas. Comprueba esperas, bloqueos, 300 controles,
 shadow DOM abierto y cerrado, marcos y coordenadas OOPIF, 5.000 controles,
 redacción, referencias, subárboles guardados, blobs privados, captura en segundo
-plano, filtrado de cabeceras, límite de consola, métricas y tamaño móvil.
+plano, filtrado de cabeceras, límite de consola, métricas y tamaño móvil. También
+comprueba peticiones lentas iniciales con `tab.new`, la espera automática de la
+primera instantánea, adjuntos tardíos de oyentes y entrega por blob de subárboles
+grandes.
 Las evidencias quedan en `target/test-evidence/browser/observation/`.

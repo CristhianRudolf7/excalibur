@@ -439,6 +439,14 @@ additional quiet window of 500 ms + 2 s. Strict network mode times out instead.
 JavaScript dialogs, file choosers, empty verification fields and login indicators
 produce `blocked`; observing does not solve
 them. Sites may supply the same criteria in their optional `wait` configuration.
+Non-listening targets enable network events, lifecycle events and the isolated-world
+stability script while still blank, before initial or restored navigation.
+For a late attachment or a listener resuming collection, `network_unobserved`
+means earlier requests could not be measured: `criteria_met.network` stays false.
+Non-strict waits may return ready with that degradation after DOM/condition
+readiness and the additional quiet window; strict waits time out. A newly
+observed document replaces this uncertainty. Disabling listener collection also
+invalidates its cached ready result.
 A ready result is remembered with the frame loaders. Navigation invalidates that
 match; a snapshot without a current result waits automatically.
 
@@ -476,7 +484,11 @@ A superseded key may include `remapped_ref`; validation never dispatches input
 or silently chooses another node. The host can invalidate a tab on intervention
 with `manager.observation.invalidate(tab_id, "takeover").await`.
 `observe.subtree` reads the saved compressed tree, selected by `snapshot_id` and
-optional `ref`, without recapturing the page.
+optional `ref`, without recapturing the page. `delivery: inline` returns the nodes
+when their serialized size is at most 1 MiB. Larger selections return
+`delivery: blob`, `node_count`, `root_ref` and `source_blob`, with an empty `nodes`
+array. Read that authorized complete-tree blob through `blob.read` and select the
+indicated root locally; responses stay below the 4 MiB protocol frame limit.
 
 Blobs use the existing store's SHA-256 and zstd implementation in the private
 `observations/` directory. A webd ledger authorizes each hash for the requesting
@@ -506,5 +518,7 @@ Run `cargo test -p excalibur-browser --test observe -- --nocapture` for real Chr
 against synthetic local pages. It checks waits, blocked conditions, 300 controls,
 open/closed shadow trees, frames and OOPIF coordinates, 5,000-control capture,
 redaction, references, saved subtrees, private blobs, background capture,
-network header filtering, console bounds, metrics and mobile viewport size.
+network header filtering, console bounds, metrics and mobile viewport size. It also
+checks initial slow requests through `tab.new`, automatic first-snapshot waits,
+late listener attachment and blob delivery for oversized subtrees.
 Evidence is written to `target/test-evidence/browser/observation/`.

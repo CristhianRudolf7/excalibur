@@ -538,6 +538,9 @@ impl Observation {
             }
         }
         let current_frames = self.frames(ctx).await?;
+        // Hold collection through cache admission so a queued listener cleanup cannot
+        // disable Network between validating a ready result and starting capture.
+        let _admission_network = self.initialize(ctx, &current_frames).await?;
         let loaders = current_frames
             .iter()
             .map(|f| (f.id.clone(), f.loader.clone()))

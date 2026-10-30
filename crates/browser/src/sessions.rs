@@ -1043,6 +1043,7 @@ impl Manager {
             .as_str()
             .ok_or_else(|| Fault::new("cdp_error", "no target"))?
             .to_owned();
+        let tid = id();
         let setup = async {
             let cdp = instance.attach_page(&target).await?;
             instance
@@ -1060,6 +1061,22 @@ impl Manager {
                     .await?;
                 self.install_probe(&instance, &cdp, &s).await?;
             }
+            let tab = Tab {
+                id: tid.clone(),
+                session_id: sid.into(),
+                target_id: Some(target.clone()),
+                cdp_session: Some(cdp.clone()),
+                owner_run: s.owner_run.clone(),
+                label: label.clone(),
+                url: "about:blank".into(),
+                title: String::new(),
+                state: "loading".into(),
+                document_epoch: 1,
+                listen: s.listen,
+            };
+            self.observation
+                .prepare_tab(&s, &tab, instance.client().clone())
+                .await?;
             if url != "about:blank" {
                 instance
                     .client()
@@ -1079,7 +1096,6 @@ impl Manager {
                 return Err(e);
             }
         };
-        let tid = id();
         let t = Tab {
             id: tid.clone(),
             session_id: sid.into(),
@@ -1537,6 +1553,12 @@ impl Manager {
                     .await?;
                 self.install_probe(&i, &cdp, &s).await?;
             }
+            let mut tab = old.clone();
+            tab.target_id = Some(target.clone());
+            tab.cdp_session = Some(cdp.clone());
+            self.observation
+                .prepare_tab(&s, &tab, i.client().clone())
+                .await?;
             i.client()
                 .send(Method::PageNavigate, json!({"url":url}), Some(&cdp))
                 .await?;

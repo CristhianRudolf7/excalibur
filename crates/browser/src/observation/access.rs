@@ -67,8 +67,18 @@ impl Observation {
                 })
             })
             .collect::<Vec<_>>();
+        let count = selected.len();
+        let oversized = serde_json::to_vec(&selected)
+            .map_err(|e| Fault::new("storage_error", e))?
+            .len()
+            > 1024 * 1024;
+        if oversized {
+            return Ok(
+                json!({"snapshot_id":id,"url":saved.snapshot.url,"nodes":[],"node_count":count,"delivery":"blob","root_ref":reference,"untrusted":true,"source_blob":saved.snapshot.dom_tree_ref}),
+            );
+        }
         Ok(
-            json!({"snapshot_id":id,"url":saved.snapshot.url,"nodes":selected,"untrusted":true,"source_blob":saved.snapshot.dom_tree_ref}),
+            json!({"snapshot_id":id,"url":saved.snapshot.url,"nodes":selected,"node_count":count,"delivery":"inline","untrusted":true,"source_blob":saved.snapshot.dom_tree_ref}),
         )
     }
     pub(crate) async fn validate(&self, ctx: &Context, id: &str, reference: &str) -> Result<Value> {

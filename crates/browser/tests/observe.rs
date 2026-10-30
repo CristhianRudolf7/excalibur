@@ -1,6 +1,6 @@
 use excalibur_browser::{
     rpc::{Protocol, Request},
-    sessions::{Manager, Open, Options},
+    sessions::{Manager, Open, Options, Profile, Site},
     version::VersionPolicy,
 };
 use excalibur_cdp::protocol::Method;
@@ -162,6 +162,7 @@ async fn blob(m: &Manager, hash: &str) -> Vec<u8> {
 fn page(path: &str) -> String {
     let body=match path{
 "/static"=>"<h1>Static</h1><button id='target'>Save</button>".into(),
+"/slowdata"=>"<main id=slow>LOADING_MARKER</main><script>fetch('/slow').then(r=>r.text()).then(v=>slow.textContent=v)</script>".into(),
 "/spa"=>"<main id='data'>loading</main><script>fetch('/delay').then(r=>r.text()).then(v=>{data.textContent=v;data.className='loaded';window.loaded=performance.now()})</script>".into(),
 "/ws"=>"<button>Socket</button><script>const ws=new WebSocket('ws://one.test/socket');ws.onmessage=()=>{window.messages=(window.messages||0)+1}</script>".into(),
 "/long"=>"<button id='target'>long</button><script>fetch('/poll')</script>".into(),
@@ -223,13 +224,26 @@ async fn contract(root: PathBuf) {
                 if path == "/poll" {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                 }
+                if path == "/slow" {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
                 if path == "/delay" {
                     tokio::time::sleep(Duration::from_millis(800)).await;
                 }
-                let body = if path == "/delay" {
+                let body = if path == "/slow" {
+                    "DATA_ARRIVED".into()
+                } else if path == "/delay" {
                     "DATA_READY".into()
                 } else {
-                    page(&path)
+                    if path == "/"
+                        && reqwest::Url::parse(url)
+                            .ok()
+                            .is_some_and(|u| u.host_str() == Some("initial.test"))
+                    {
+                        page("/slowdata")
+                    } else {
+                        page(&path)
+                    }
                 };
                 let _=s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
             });
@@ -239,7 +253,25 @@ async fn contract(root: PathBuf) {
         data_dir: root.clone(),
         binary: "/usr/bin/google-chrome-stable".into(),
         proxy,
-        profiles: BTreeMap::new(),
+        profiles: BTreeMap::from([(
+            "personal".into(),
+            Profile {
+                sites: vec![
+                    Site {
+                        name: "local".into(),
+                        rw: vec!["http://one.test".into()],
+                        listen: true,
+                        ..Default::default()
+                    },
+                    Site {
+                        name: "initial".into(),
+                        rw: vec!["http://initial.test".into()],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        )]),
         compact: false,
         version: VersionPolicy::default(),
         chrome_args: vec![],
@@ -256,6 +288,153 @@ async fn contract(root: PathBuf) {
         )
         .await
         .unwrap());
+    // Initial navigation must be observed even without a prior observation API call.
+    let initial = m
+        .new_tab("owner", &s, "http://one.test/slowdata", None)
+        .await
+        .unwrap();
+    let initial_id = initial["tab_id"].as_str().unwrap();
+    let initial_wait = observe(
+        &m,
+        &s,
+        initial_id,
+        "observe.wait_ready",
+        json!({"criteria":{"timeout_ms":1200,"strict_network":true}}),
+    )
+    .await;
+    assert_eq!(initial_wait["status"], "timeout", "{initial_wait}");
+    assert_eq!(initial_wait["criteria_met"]["network"], false);
+    assert!(
+        initial_wait["inflight_sample"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap_or("").ends_with("/slow")),
+        "{initial_wait}"
+    );
+    let initial_snapshot = observe(&m, &s, initial_id, "observe.snapshot", json!({})).await;
+    assert_eq!(initial_snapshot["wait"]["status"], "ready");
+    assert_eq!(
+        eval(
+            &m,
+            "owner",
+            &s,
+            initial_id,
+            "return document.querySelector('#slow').textContent"
+        )
+        .await,
+        "DATA_ARRIVED"
+    );
+    m.close_tab("owner", &s, initial_id).await.unwrap();
+    let fresh_slow = m
+        .new_tab("owner", &s, "http://one.test/slowdata", None)
+        .await
+        .unwrap();
+    let fresh_id = fresh_slow["tab_id"].as_str().unwrap();
+    let fresh_snapshot = observe(&m, &s, fresh_id, "observe.snapshot", json!({})).await;
+    assert_eq!(fresh_snapshot["wait"]["status"], "ready");
+    assert_eq!(
+        eval(
+            &m,
+            "owner",
+            &s,
+            fresh_id,
+            "return document.querySelector('#slow').textContent"
+        )
+        .await,
+        "DATA_ARRIVED"
+    );
+    m.close_tab("owner", &s, fresh_id).await.unwrap();
+    let (site_session, site_tab) = ids(&m
+        .open_session(
+            "owner",
+            Open {
+                profile: "personal".into(),
+                site: Some("initial".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap());
+    let site_initial = observe(
+        &m,
+        &site_session,
+        &site_tab,
+        "observe.wait_ready",
+        json!({"criteria":{"timeout_ms":1000,"strict_network":true}}),
+    )
+    .await;
+    assert_eq!(site_initial["status"], "timeout", "{site_initial}");
+    assert_eq!(site_initial["criteria_met"]["network"], false);
+    assert!(
+        site_initial["inflight_sample"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "http://initial.test/slow")
+    );
+    m.end_session("owner", &site_session, true).await.unwrap();
+    let restored = observe(
+        &m,
+        &site_session,
+        &site_tab,
+        "observe.wait_ready",
+        json!({"criteria":{"timeout_ms":1000,"strict_network":true}}),
+    )
+    .await;
+    assert_eq!(restored["status"], "timeout", "{restored}");
+    assert_eq!(restored["criteria_met"]["network"], false);
+    assert!(
+        restored["inflight_sample"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "http://initial.test/slow")
+    );
+    m.end_session("owner", &site_session, false).await.unwrap();
+    // A listener has intentionally unobserved intervals; strict mode must not claim idle.
+    let (ls, lt) = ids(&m
+        .open_session(
+            "owner",
+            Open {
+                profile: "personal".into(),
+                site: Some("local".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap());
+    let late = observe(
+        &m,
+        &ls,
+        &lt,
+        "observe.wait_ready",
+        json!({"criteria":{"timeout_ms":4000}}),
+    )
+    .await;
+    assert_eq!(late["status"], "ready", "{late}");
+    assert_eq!(late["criteria_met"]["network"], false);
+    assert!(
+        late["degraded"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("network_unobserved"))
+    );
+    let late_strict = observe(
+        &m,
+        &ls,
+        &lt,
+        "observe.wait_ready",
+        json!({"criteria":{"timeout_ms":700,"strict_network":true}}),
+    )
+    .await;
+    assert_eq!(late_strict["status"], "timeout");
+    assert_eq!(late_strict["criteria_met"]["network"], false);
+    let fresh_navigation=observe(&m,&ls,&lt,"nav.go",json!({"url":"http://one.test/static","criteria":{"timeout_ms":4000,"strict_network":true}})).await;
+    assert_eq!(fresh_navigation["status"], "ready", "{fresh_navigation}");
+    assert_eq!(fresh_navigation["criteria_met"]["network"], true);
+    m.end_session("owner", &ls, false).await.unwrap();
+    fs::write(root.join("initial_network.json"),serde_json::to_vec_pretty(&json!({"initial_wait":initial_wait,"site_initial":site_initial,"restored":restored,"initial_snapshot_wait":initial_snapshot["wait"],"fresh_snapshot_wait":fresh_snapshot["wait"],"late":late,"late_strict":late_strict,"observed_navigation":fresh_navigation})).unwrap()).unwrap();
     let static_ready = navigate(&m, &s, &t, "/static").await;
     assert_eq!(static_ready["status"], "ready");
     assert!(
@@ -636,6 +815,24 @@ async fn contract(root: PathBuf) {
     assert!(huge_started.elapsed() <= Duration::from_secs(3) || huge["partial"] == true);
     assert!(huge["omitted"].as_u64().unwrap() > 0);
     assert!(huge["text"].as_str().unwrap().len() <= 16384);
+    let subtree_protocol = Protocol::new(m.clone());
+    let subtree_response=subtree_protocol.request(Request{jsonrpc:"2.0".into(),id:json!(2),method:"observe.subtree".into(),params:json!({"run_id":"owner","deadline_ms":10000,"session_id":s,"tab_id":t,"snapshot_id":huge["snapshot_id"]})}).await;
+    let large_subtree = &subtree_response["result"]["result"];
+    assert_eq!(large_subtree["delivery"], "blob", "{subtree_response}");
+    assert_eq!(
+        large_subtree["source_blob"]["sha256"],
+        huge["dom_tree_ref"]["sha256"]
+    );
+    assert_eq!(large_subtree["node_count"], 10008);
+    assert!(
+        serde_json::to_vec(&subtree_response).unwrap().len() < excalibur_browser::rpc::MAX_MESSAGE
+    );
+    assert!(large_subtree["nodes"].as_array().unwrap().is_empty());
+    fs::write(
+        root.join("subtree_delivery.json"),
+        serde_json::to_vec_pretty(&subtree_response).unwrap(),
+    )
+    .unwrap();
     let full = blob(&m, huge["dom_tree_ref"]["sha256"].as_str().unwrap()).await;
     let full: Value = serde_json::from_slice(&full).unwrap();
     assert_eq!(
