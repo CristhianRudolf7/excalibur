@@ -93,13 +93,18 @@ impl Agenda {
         let state = self.orchestrator.recovery().status(at).await?;
         let blocked = state.recovering || state.safe_mode;
         self.reminders.tick(at, blocked, limit).await?;
+        dispatch_pending(&self.reminders, &self.orchestrator, at, blocked, limit).await
+    }
+}
+/// Per-fire binding validation: no namespace representative grants delivery authority.
+pub(crate) async fn dispatch_pending(reminders: &Reminders, orchestrator: &Orchestrator, at: i64, blocked: bool, limit: u32) -> Result<usize, Error> {
         if blocked {
             return Ok(0);
         }
         let mut queued = 0;
         let mut after = None;
         loop {
-            let page = self.reminders.pending_after(after, limit).await?;
+            let page = reminders.pending_after(after, limit).await?;
             if page.is_empty() {
                 break;
             }
@@ -107,7 +112,7 @@ impl Agenda {
                 .last()
                 .map(|p| (p.fire.scheduled_at, p.fire.id.clone()));
             for pending in page {
-                let Some(metadata) = self.reminders.metadata(&pending).await? else {
+                let Some(metadata) = reminders.metadata(&pending).await? else {
                     continue;
                 };
                 let Ok(binding) = serde_json::from_value::<HostNotificationBinding>(metadata)
@@ -119,7 +124,7 @@ impl Agenda {
                 if !binding.allows_channel(pending.reminder.preferred_channel.as_deref()) {
                     continue;
                 }
-                let target = match self.orchestrator.bind_host_notification(binding).await {
+                let target = match orchestrator.bind_host_notification(binding).await {
                     Ok(target) => target,
                     Err(excalibur_orchestrator::Error::Storage(
                         excalibur_store::Error::Invalid(
@@ -136,8 +141,7 @@ impl Agenda {
                 // Hash the typed scheduler fire identity in a versioned JSON tuple.
                 // Caller-provided IDs never become raw notification operation keys.
                 let key = notice_key(&pending.fire.id)?;
-                if self
-                    .orchestrator
+                if orchestrator
                     .notify_host_guarded(
                         &target,
                         &key,
@@ -145,13 +149,13 @@ impl Agenda {
                         &pending.reminder.text,
                         pending.reminder.preferred_channel.as_deref(),
                         pending.fire.scheduled_at,
-                        self.reminders.condition(&pending),
+                        reminders.condition(&pending),
                         at,
                     )
                     .await?
                     .is_some()
                 {
-                    self.reminders.acknowledge_queued(pending.fire.id).await?;
+                    reminders.acknowledge_queued(pending.fire.id).await?;
                     queued += 1;
                     if queued >= limit as usize {
                         return Ok(queued);
@@ -161,7 +165,7 @@ impl Agenda {
         }
         Ok(queued)
     }
-}
+
 fn notice_key(fire: &str) -> Result<String, serde_json::Error> {
     use sha2::{Digest, Sha256};
     Ok(format!(

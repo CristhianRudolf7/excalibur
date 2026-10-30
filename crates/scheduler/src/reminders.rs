@@ -1,6 +1,21 @@
 //! Host-only reminder domain. Authority is supplied by the authenticated host,
 //! never inferred from reminder text, timer payloads, or model arguments.
 use super::*;
+use std::{collections::BTreeMap, path::PathBuf, sync::{Arc, Mutex, OnceLock, Weak}};
+
+/// Process-local wake hint shared by host handles for the same database path.
+/// Durable timers remain authoritative; a lost hint never loses a fire.
+pub fn changes(db: &Database) -> Arc<tokio::sync::Notify> {
+    static SIGNALS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<tokio::sync::Notify>>>> = OnceLock::new();
+    let mut signals = SIGNALS.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+    signals.retain(|_, signal| signal.strong_count() > 0);
+    let key = db.path().to_path_buf();
+    if let Some(signal) = signals.get(&key).and_then(Weak::upgrade) { return signal; }
+    let signal = Arc::new(tokio::sync::Notify::new());
+    signals.insert(key, Arc::downgrade(&signal));
+    signal
+}
+
 
 #[derive(Clone)]
 pub struct Reminders {
@@ -170,7 +185,7 @@ impl Reminders {
         } else {
             None
         };
-        self.scheduler.db.write(Priority::Journal,move|c|{
+        let result = self.scheduler.db.write(Priority::Journal,move|c|{
             check(c)?;
             if let Some(previous)=replay(c,&scope,&key,&request)? {return Ok(previous);}
             let (id, expected)=match &operation {
@@ -229,7 +244,9 @@ impl Reminders {
             c.execute("INSERT INTO scheduler_reminders(scope,id,generation,record) VALUES(?1,?2,?3,?4) ON CONFLICT(scope,id) DO UPDATE SET generation=excluded.generation,record=excluded.record",rusqlite::params![scope,id,reminder.generation,record])?;
             c.execute("INSERT INTO scheduler_reminder_receipts(scope,operation_key,request,response) VALUES(?1,?2,?3,?4)",rusqlite::params![scope,key,request,record])?;
             Ok(reminder)
-        }).await
+        }).await;
+        if result.is_ok() { changes(&self.scheduler.db).notify_one(); }
+        result
     }
     /// Keyed, bounded snapshot with keyset pagination; includes tombstones.
     pub async fn list(
@@ -259,6 +276,15 @@ impl Reminders {
     pub async fn tick(&self, now: i64, recovering: bool, limit: u32) -> Result<usize> {
         self.scheduler.tick(now, recovering, limit).await
     }
+    /// Earliest durable timer in this sealed namespace, including overdue work.
+    pub async fn next_at(&self) -> Result<Option<i64>> {
+        let scope = self.scheduler.scope.clone();
+        self.scheduler.db.read(ReadLane::Background, move |c| {
+            c.query_row("SELECT min(next_at) FROM scheduler_timers WHERE scope=?1", [scope], |r| r.get(0)).map_err(Error::from)
+        }).await
+    }
+    /// Verify that host metadata describes this handle's sealed namespace.
+    pub fn has_namespace(&self, scope: &str) -> bool { self.scheduler.scope == scope }
     /// This is a snapshot, not authorization for an external delivery. Hosts
     /// must atomically guard this generation with the notice and effect receipts.
     pub async fn pending(&self, limit: u32) -> Result<Vec<PendingReminder>> {
