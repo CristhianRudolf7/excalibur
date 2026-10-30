@@ -84,6 +84,7 @@ impl Shadow {
         }
         let id = hash(format!("{}:{run}:{step}:{phase}", self.workspace.root.display()).as_bytes());
         if let Some(existing) = self.lookup(&id).await? {
+            self.pin_tree(&existing.tree).await?;
             return Ok((existing, Vec::new()));
         }
         let directory = self.directory();
@@ -239,6 +240,10 @@ impl Shadow {
                 tree,
                 created_at: excalibur_store::unix_seconds(),
             };
+            // Immutable refs are keyed by tree, not snapshot ID: concurrent
+            // attempts at one receipt cannot overwrite the winner's root.
+            // Publish the GC root before making the SQLite receipt visible.
+            self.pin_tree(&snapshot.tree).await?;
             let (row, root) = (
                 snapshot.clone(),
                 self.workspace.root.to_string_lossy().into_owned(),
@@ -263,33 +268,43 @@ impl Shadow {
                 .await?;
             let found = self.lookup(&id).await?;
             let snapshot = found.ok_or(Error::Invalid("snapshot receipt missing"))?;
-            self.prune_old_snapshots(run).await?;
+            self.collect_garbage().await;
             Ok((snapshot, warnings))
         }
         .await;
         let _ = std::fs::remove_file(index);
         result
     }
-    /// Keep only the newest snapshots of a run so explicit diff/restore of
-    /// recent steps keeps working, then collect unreachable objects. The
-    /// shadow store would otherwise grow without bound because the helper
-    /// disables git's automatic housekeeping on every invocation.
-    async fn prune_old_snapshots(&self, run: &str) -> Result<()> {
-        let (run, root) = (
-            run.to_owned(),
-            self.workspace.root.to_string_lossy().into_owned(),
-        );
-        self.workspace
+    async fn pin_tree(&self, tree: &str) -> Result<()> {
+        self.git(
+            vec![
+                "update-ref".into(),
+                format!("refs/excalibur/trees/{tree}"),
+                tree.into(),
+            ],
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+    /// Upgrade legacy receipts before collecting. Never expire a live run's
+    /// history by snapshot count; time-based retention belongs to H9.
+    async fn protect_recorded_trees(&self) -> Result<()> {
+        let root = self.workspace.root.to_string_lossy().into_owned();
+        let trees = self
+            .workspace
             .db
-            .write(Priority::Journal, move |c| {
-                c.execute(
-                    "DELETE FROM workspace_snapshots WHERE run_id=?1 AND root=?2 AND id NOT IN(SELECT id FROM workspace_snapshots WHERE run_id=?1 AND root=?2 ORDER BY created_at DESC,id DESC LIMIT 32)",
-                    excalibur_store::rusqlite::params![run, root],
-                )?;
-                Ok(())
+            .read(ReadLane::Background, move |c| {
+                let mut q =
+                    c.prepare("SELECT DISTINCT tree FROM workspace_snapshots WHERE root=?1")?;
+                Ok(q.query_map([root], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?)
             })
             .await?;
-        self.collect_garbage().await;
+        for tree in trees {
+            self.pin_tree(&tree).await?;
+        }
         Ok(())
     }
     /// Rate-limited explicit `gc`: loose objects accumulate on every
@@ -319,6 +334,12 @@ impl Shadow {
             })
             .unwrap_or(true);
         if !stale {
+            return;
+        }
+        // A missing/corrupt legacy root prevents collection rather than
+        // exposing other retained snapshots to destructive pruning.
+        if self.protect_recorded_trees().await.is_err() {
+            eprintln!("shadow collection deferred: a retained tree could not be protected");
             return;
         }
         let _ = self
