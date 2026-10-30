@@ -8,6 +8,60 @@ use excalibur_models::{ModelCallBound, ModelGateway, ModelRole};
 use excalibur_store::ReadLane;
 
 impl Engine {
+    /// Build only fresh host-native contexts. Existing caller-supplied caps are
+    /// never rewritten. Duplicate schema variants are counted conservatively
+    /// because ownership may resolve after the run is bound to its host role.
+    pub fn native_context(
+        &self,
+        core: &str,
+        task: &str,
+        now: &str,
+        budget: &Budget,
+        core_suffix: &str,
+    ) -> Result<(excalibur_context::ContextInput, NativeContextBudget)> {
+        let mut variants = self.tools.definitions();
+        variants.extend(super::builtin_definitions());
+        variants.sort_by(|a, b| a.name.cmp(&b.name));
+        variants.dedup();
+        let text = format!(
+            "{core}{core_suffix}\nCore tool definitions: {}",
+            serde_json::to_string(&variants)?
+        );
+        let policy = self.effective_context_policy()?;
+        let core_tokens =
+            excalibur_context::estimate_tokens(&text).max(policy.counter.estimate_text(&text));
+        let model_input_limit = self
+            .model
+            .context_policy_override()
+            .map(serde_json::from_value::<SessionPolicy>)
+            .transpose()?
+            .map(|p| p.model_window.saturating_sub(p.output_reserve));
+        let host_input_limit = self
+            .context_policy
+            .model_window
+            .saturating_sub(self.context_policy.output_reserve);
+        let run_token_limit = usize::try_from(budget.max_tokens).unwrap_or(usize::MAX);
+        let available = model_input_limit
+            .unwrap_or(usize::MAX)
+            .min(host_input_limit)
+            .min(run_token_limit);
+        if core_tokens > available {
+            return Err(Error::Invalid(
+                "native core catalog exceeds the run or configured input budget",
+            ));
+        }
+        let mut context = excalibur_context::ContextInput::new(core, task, now);
+        context.token_budgets[0] = core_tokens;
+        Ok((
+            context,
+            NativeContextBudget {
+                core_tokens,
+                run_token_limit,
+                host_input_limit,
+                model_input_limit,
+            },
+        ))
+    }
     /// The host supplies a model's actual window and desired context policy.
     /// The selected policy is captured in each new run's durable seed.
     pub fn with_context_policy(mut self, policy: SessionPolicy) -> Self {

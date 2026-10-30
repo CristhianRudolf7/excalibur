@@ -37,6 +37,15 @@ pub enum Error {
     Model(String),
 }
 pub type Result<T> = std::result::Result<T, Error>;
+/// Sizing evidence for a fresh host-native context. Unknown provider windows
+/// stay unknown; the configured host and total run bounds still apply.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeContextBudget {
+    pub core_tokens: usize,
+    pub run_token_limit: usize,
+    pub host_input_limit: usize,
+    pub model_input_limit: Option<usize>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Budget {
     pub max_steps: u64,

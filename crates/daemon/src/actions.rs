@@ -920,7 +920,35 @@ impl FastActions for DaemonActions {
                         RequirementId::from_ulid(task_ulid).to_string(),
                         CriterionId::from_ulid(task_ulid).to_string(),
                     ];
-                    let agent=self.orchestrator.spawn(&self.master_agent,Delegation{operation:format!("delegate:{task}"),name:args["name"].as_str().unwrap_or("Coordinator").into(),profile:"coordinator".into(),scope:scope.to_owned(),task:task.clone(),origin_conversation:conversation.into(),goal:goal.into(),deliverable:deliverable.into(),inputs,pinned_instructions,suggested_skills:vec![],fork_context:false,token,spec:RunSpec{context:excalibur_context::ContextInput::new("Work within the delegated scope and permissions. Ask rather than guessing irreversible details.",goal,"host-time-in-durable-journal"),budget,criteria:vec![Criterion::FinalResponse{schema:None}]},priority:1}).await.map_err(|e|e.to_string())?;
+                    let (context,_sizing)=self.orchestrator.engine().native_context("Work within the delegated scope and permissions. Ask rather than guessing irreversible details.",goal,"host-time-in-durable-journal",&budget,"\n[excalibur-host-lane:1]\n").map_err(|e|e.to_string())?;
+                    let agent = self
+                        .orchestrator
+                        .spawn(
+                            &self.master_agent,
+                            Delegation {
+                                operation: format!("delegate:{task}"),
+                                name: args["name"].as_str().unwrap_or("Coordinator").into(),
+                                profile: "coordinator".into(),
+                                scope: scope.to_owned(),
+                                task: task.clone(),
+                                origin_conversation: conversation.into(),
+                                goal: goal.into(),
+                                deliverable: deliverable.into(),
+                                inputs,
+                                pinned_instructions,
+                                suggested_skills: vec![],
+                                fork_context: false,
+                                token,
+                                spec: RunSpec {
+                                    context,
+                                    budget,
+                                    criteria: vec![Criterion::FinalResponse { schema: None }],
+                                },
+                                priority: 1,
+                            },
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
                     Ok(
                         json!({"agent_id":agent.id,"run_id":agent.run_id,"task_id":task,"state":"ready"}),
                     )

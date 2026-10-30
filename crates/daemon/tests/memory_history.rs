@@ -17,6 +17,21 @@ impl ModelGateway for Model {
     fn complete(&self, request: ModelRequest) -> BoxFuture<'_, Result<ModelResponse, ModelError>> {
         Box::pin(async move {
             let step = self.0.fetch_add(1, Ordering::SeqCst);
+            if step == 0 {
+                let core = request.messages[0].content.strip_prefix("[L0]\n").unwrap();
+                let mut root_tools = request.tools.clone();
+                root_tools
+                    .retain(|tool| !matches!(tool.name.as_str(), "search_skills" | "load_skill"));
+                let text = format!(
+                    "{core}\nCore tool definitions: {}",
+                    serde_json::to_string(&root_tools).unwrap()
+                );
+                eprintln!(
+                    "L0_MEASUREMENT {}",
+                    json!({"tool_count":root_tools.len(),"bytes":text.len(),"compiler_estimated_tokens":excalibur_context::estimate_tokens(&text),"default_cap":4096})
+                );
+            }
+
             let mut names = std::collections::BTreeSet::new();
             assert!(
                 request
@@ -100,9 +115,9 @@ fn memory_and_journal_history_have_distinct_schemas_and_dispatchers() {
         .unwrap();
     runtimes.block_on(async {
         db.write(Priority::Journal,|c|{
-            c.execute("INSERT OR IGNORE INTO principals(id) VALUES('owner')",[])?;
-            c.execute("INSERT INTO conversations(id,channel,principal_id,scope_id,active_scope) VALUES('chat','test','owner','project:default','project:default')",[])?;
-            c.execute("INSERT INTO messages(id,conversation_id,role,text,principal_id,scope_id) VALUES('seed','chat','user','MEMORY ONLY WITNESS','owner','project:default')",[])?;Ok(())
+            c.execute("INSERT OR IGNORE INTO principals(id) VALUES('local')",[])?;
+            c.execute("INSERT INTO conversations(id,channel,principal_id,scope_id,active_scope) VALUES('chat','test','local','project:default','project:default')",[])?;
+            c.execute("INSERT INTO messages(id,conversation_id,role,text,principal_id,scope_id) VALUES('seed','chat','user','MEMORY ONLY WITNESS','local','project:default')",[])?;Ok(())
         }).await.unwrap();
         let parent=host.orchestrator.list_agents().await.unwrap().into_iter().find(|a|a.depth==0).unwrap();
         let mut context=ContextInput::new("rules","Search both histories","now");context.token_budgets[0]=16000;
