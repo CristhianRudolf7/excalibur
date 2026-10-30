@@ -126,3 +126,5 @@ Pending cancellation questions leave unrelated ordinary text available to the ma
 Cancellation requests use a separate durable request key per tool call. One human message can therefore open up to three questions for distinct targets; replaying a call preserves its question, including a rejected decision. Schema v4 migrates existing v3 cancellation questions and keeps their answer/effect keys intact.
 
 A fourth cancellation request from the same human source produces a durable tool rejection, without a confirmation question or cancellation authority. The master preserves the turn and continues later independent tool calls. Replaying the rejected operation returns its stored rejection; infrastructure failures still propagate instead of being disguised as quota decisions.
+
+The integrated cancellation backend fixtures enable memory and exercise the real `MemoryFastActions` composition. Its host-only confirmation route delegates to the underlying durable human-decision guard and is never added to model tool definitions. This preserves cancellation after restart while retaining memory source/scope checks.

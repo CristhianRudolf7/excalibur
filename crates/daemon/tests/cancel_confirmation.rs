@@ -20,6 +20,11 @@ impl ModelGateway for NoModels {
         Box::pin(async { Err(ModelError::Provider) })
     }
 }
+fn memory_options(root: std::path::PathBuf) -> HostOptions {
+    let mut options = HostOptions::project(root);
+    options.memory = Some(excalibur_daemon::MemoryOptions::default());
+    options
+}
 async fn serve(host: &DaemonHost) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/rpc", listener.local_addr().unwrap());
@@ -92,7 +97,7 @@ fn authenticated_confirmation_survives_restart_and_cancels_once_with_full_inbox(
     let host = runtimes
         .block_on(DaemonHost::open(
             db.clone(),
-            HostOptions::project(root.clone()),
+            memory_options(root.clone()),
             model.clone(),
             None,
             TOKEN,
@@ -143,7 +148,7 @@ fn authenticated_confirmation_survives_restart_and_cancels_once_with_full_inbox(
     let host = runtimes
         .block_on(DaemonHost::open(
             db.clone(),
-            HostOptions::project(root.clone()),
+            memory_options(root.clone()),
             model.clone(),
             None,
             TOKEN,
@@ -278,7 +283,7 @@ fn natural_language_master_request_opens_confirmation_without_control() {
     let host = runtimes
         .block_on(DaemonHost::open(
             db.clone(),
-            HostOptions::project(root),
+            memory_options(root),
             model.clone(),
             None,
             TOKEN,

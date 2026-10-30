@@ -505,6 +505,17 @@ impl FastActions for MemoryFastActions {
     ) -> BoxFuture<'a, Result<Value, String>> {
         self.inner.execute(conversation, command, target, key)
     }
+    fn confirm_cancel<'a>(
+        &'a self,
+        conversation: &'a str,
+        scope: &'a str,
+        target: &'a str,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Value, String>> {
+        // This host-only route retains the inner durable human-decision guard;
+        // it is deliberately absent from model-facing tool definitions.
+        self.inner.confirm_cancel(conversation, scope, target, key)
+    }
     fn invoke<'a>(
         &'a self,
         conversation: &'a str,

@@ -126,3 +126,5 @@ Las preguntas pendientes de cancelación dejan el texto ordinario independiente 
 Las peticiones de cancelación usan una clave durable distinta por llamada de herramienta. Un mensaje humano puede abrir hasta tres preguntas para objetivos distintos; repetir una llamada conserva su pregunta, incluido un rechazo. El esquema v4 migra las preguntas de cancelación v3 y conserva sus claves de respuesta y efecto.
 
 Una cuarta petición de cancelación desde la misma fuente humana produce un rechazo durable de herramienta, sin pregunta de confirmación ni autoridad de cancelación. El maestro conserva el turno y continúa las llamadas independientes posteriores. Repetir la operación rechazada devuelve el rechazo guardado; los fallos de infraestructura siguen propagándose, sin ocultarse como decisiones de cuota.
+
+Las pruebas backend integradas de cancelación habilitan memoria y recorren la composición real `MemoryFastActions`. Su puerto de confirmación exclusivo del anfitrión delega en la guarda durable de decisión humana y nunca se añade a las definiciones de herramientas del modelo. Así conserva cancelación tras reinicio y controles de fuente/ámbito de memoria.
