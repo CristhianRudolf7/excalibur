@@ -34,3 +34,5 @@
 
 - Skill/decider library verification: `cargo test -p excalibur-skills --test catalog` and `cargo test -p excalibur-decider --test contract` cover local manifest validation, precedence, catalog freezing, authority intersection, quarantine, labeled decisions and calibration. See [Skills and bounded decisions](docs/development/skills-decider.md) for integration limits.
 - Decider adapter verification: `cargo test -p excalibur-decider --test llm_contract` checks strict LLM response validation, retry/fallback through local mock gateways, per-answer attribution and calibration isolation by backend/model and question semantics.
+
+- Startup recovery checks: `cargo test -p excalibur-orchestrator --test startup_recovery`, `cargo test -p excalibur-cli --test startup_recovery` and `cargo test -p excalibur-daemon --test service_supervision` cover durable boot/clean-exit receipts, crash-loop safe mode, exact-step quarantine, actual dispatch gating, conservative restart policy and real foreground SIGKILL/restart with authenticated status/control. See [Startup recovery](docs/development/startup-recovery.md). This does not close the remaining H9 operational requirements.

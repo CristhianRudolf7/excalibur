@@ -116,3 +116,5 @@ Check supervision polls execution and its durable control read concurrently, inc
 The delivery envelope carries the authoritative agent name and ID, including for already queued stop notices. Notice templates read the durable stop payload's `final_text`, or its `reason` when no final text is present, so a completed worker's deliverable remains visible without a model call. Regression coverage uses the actual nested JSON-string payload shape from orchestration.
 
 A cancellation response with `confirmation_required` is presented as waiting for confirmation, with no cancellation claimed. The complete conversational confirmation round trip remains pending; authenticated `run.cancel` with explicit confirmation remains the existing control route. This correction does not close all DMA-4/DMA-8 findings.
+
+Startup recovery now has a durable boot ledger, crash-loop safe mode, exact-step quarantine and a real worker admission guard. Conversation/status/control remain available in safe mode. See [Daemon startup and crash-loop admission](startup-recovery.md) for the implemented policy, RPC controls and remaining H9 work.

@@ -116,3 +116,5 @@ La supervisión de comprobaciones sondea simultáneamente la ejecución y su lec
 El sobre de entrega incluye el nombre e ID del agente procedentes de la autoridad del anfitrión, también para avisos de parada ya en cola. Las plantillas leen `final_text` de la carga durable de parada, o su `reason` cuando no hay texto final, para mostrar el entregable de un trabajador completado sin llamar al modelo. La regresión usa la forma real de JSON serializado dentro del sobre de orquestación.
 
 Una respuesta de cancelación con `confirmation_required` se presenta como pendiente de confirmación, sin afirmar que se haya cancelado. Sigue pendiente el ciclo conversacional completo de confirmación; la ruta de control existente es `run.cancel` autenticado con confirmación explícita. Esta corrección no cierra todos los hallazgos DMA-4/DMA-8.
+
+La recuperación de arranque cuenta con registro durable, modo seguro ante bucles de caídas, cuarentena por paso y frontera real de admisión de workers. Conversación/estado/control siguen disponibles en modo seguro. Véase [Arranque y admisión ante bucles de caídas](startup-recovery.es.md) para política implementada, RPC y resto de H9.

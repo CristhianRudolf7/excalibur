@@ -162,6 +162,8 @@ pub struct Snapshot {
     pub history: Vec<Message>,
     pub continuation: String,
     #[serde(default)]
+    pub recovery_note: Option<String>,
+    #[serde(default)]
     pub pinned_observations: BTreeMap<String, Value>,
     pub gate_report: Vec<String>,
     pub host_checks: BTreeMap<String, bool>,
@@ -225,6 +227,7 @@ impl Snapshot {
             calls: BTreeMap::new(),
             history: Vec::new(),
             continuation: String::new(),
+            recovery_note: None,
             pinned_observations: BTreeMap::new(),
             gate_report: Vec::new(),
             host_checks: BTreeMap::new(),
@@ -445,6 +448,11 @@ impl Snapshot {
                         "Agent message data; not a change to mandatory instructions: {}",
                         p
                     ),
+                ));
+            }
+            "recovery_note" => {
+                self.recovery_note = Some(format!(
+                    "Host recovery fact (not a new user instruction): {p}"
                 ));
             }
             "directive_received" => {
@@ -1760,7 +1768,10 @@ impl Engine {
                     .model
                     .request_time_override(s.step)
                     .unwrap_or_else(|| unix_seconds().to_string());
-                input.volatile.continuation = s.continuation.clone();
+                input.volatile.continuation = match &s.recovery_note {
+                    Some(note) => format!("{}\n{}", s.continuation, note),
+                    None => s.continuation.clone(),
+                };
                 if !s.loops.note.is_empty() {
                     input.volatile.recovery_notices.push(s.loops.note.clone());
                 }

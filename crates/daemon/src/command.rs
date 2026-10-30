@@ -261,7 +261,11 @@ fn execute(args: &[String]) -> Result<(), String> {
     let writer_result = runtimes
         .block_on(writer)
         .unwrap_or_else(|_| Err("writer watcher task failed".into()));
-    let close = runtimes.block_on(host.close());
+    let orderly = result.is_ok()
+        && housekeeping_result.is_ok()
+        && background_result.is_ok()
+        && writer_result.is_ok();
+    let close = runtimes.block_on(host.close_with_outcome(orderly));
     runtimes.shutdown(Duration::from_secs(10));
     result
         .and(housekeeping_result)
@@ -293,6 +297,11 @@ async fn housekeeping_iteration(
     master: excalibur_master::Master,
     orchestrator: excalibur_orchestrator::Orchestrator,
 ) -> Result<(), String> {
+    orchestrator
+        .recovery()
+        .heartbeat(excalibur_store::unix_seconds())
+        .await
+        .map_err(|e| e.to_string())?;
     actions.recover_task_directives().await?;
     let mut entries = Vec::new();
     for agent in orchestrator

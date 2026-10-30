@@ -644,6 +644,28 @@ impl SharedBackend {
                 }
                 value(changed)
             }
+            "daemon.recovery.status" => value(
+                self.orchestrator
+                    .recovery()
+                    .status(excalibur_store::unix_seconds())
+                    .await
+                    .map_err(|_| RpcError::invalid("recovery status unavailable"))?,
+            ),
+            "daemon.recovery.exit_safe_mode" => {
+                self.orchestrator
+                    .recovery()
+                    .exit_safe_mode(text(&params, "operation")?, excalibur_store::unix_seconds())
+                    .await
+                    .map_err(|_| RpcError::invalid("safe mode exit rejected"))?;
+                Ok(json!({"requested":true}))
+            }
+            "daemon.recovery.release_quarantine" => {
+                self.orchestrator
+                    .release_recovery_quarantine(text(&params, "operation")?, text(&params, "run")?)
+                    .await
+                    .map_err(|_| RpcError::invalid("quarantine release rejected"))?;
+                Ok(json!({"released":true,"resume_requires_explicit_control":true}))
+            }
             "daemon.stop" => {
                 let Some(notify) = &self.shutdown else {
                     return Err(RpcError::not_found());
