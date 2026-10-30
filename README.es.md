@@ -33,3 +33,5 @@ Consulta [Trabajo verificable](docs/development/verifiable-work.es.md) para tare
 Consulta [Contexto y caché](docs/development/context-cache.es.md) para las vistas durables de contexto, compactación, instrucciones literales y contratos de caché de proveedores.
 
 Consulta [Herramientas de proyecto y concurrencia de edición](docs/development/project-tools.es.md) para herramientas diferidas, servicios de lenguaje confinados, grafos de código, instantáneas reversibles de comandos e integración de worktrees de tareas.
+
+Consulta [Memoria y documentos](docs/development/memory.es.md) para la biblioteca de memoria por ámbitos, el Recuperador, la consolidación, los embeddings, los documentos de identidad y la biblioteca de documentos citables, y para las conexiones con el maestro que siguen pendientes.

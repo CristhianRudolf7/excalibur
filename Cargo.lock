@@ -1116,6 +1116,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "excalibur-memory"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "excalibur-store",
+ "excalibur-types",
+ "excalibur-vault",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
 name = "excalibur-models"
 version = "0.1.0"
 dependencies = [

@@ -33,3 +33,5 @@ See [Verifiable work](docs/development/verifiable-work.md) for durable tasks, pl
 See [Context and cache](docs/development/context-cache.md) for durable context views, compaction, literal instructions and provider cache contracts.
 
 See [Project tools and editing concurrency](docs/development/project-tools.md) for deferred tools, confined language services, source graphs, reversible command snapshots and task worktree integration.
+
+See [Memory and documents](docs/development/memory.md) for the scoped memory library, the Retriever, consolidation, embeddings, identity documents and citable document library, and for the connections to the master that are still pending.
