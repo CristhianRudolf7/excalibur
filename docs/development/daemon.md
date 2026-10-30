@@ -128,3 +128,5 @@ Cancellation requests use a separate durable request key per tool call. One huma
 A fourth cancellation request from the same human source produces a durable tool rejection, without a confirmation question or cancellation authority. The master preserves the turn and continues later independent tool calls. Replaying the rejected operation returns its stored rejection; infrastructure failures still propagate instead of being disguised as quota decisions.
 
 The integrated cancellation backend fixtures enable memory and exercise the real `MemoryFastActions` composition. Its host-only confirmation route delegates to the underlying durable human-decision guard and is never added to model tool definitions. This preserves cancellation after restart while retaining memory source/scope checks.
+
+The memory-enabled daemon composition also validates every declared fast memory tool against the master allowlist. `memory_propose`, `doc_edit` and `library_search` are admitted; ingestion remains a deferred worker operation. The composed cancellation fixture found and now covers the earlier startup rejection of these existing tools.
