@@ -385,3 +385,183 @@ pub fn model(
     command.options.metadata.role = Some("coordinator".into());
     Ok((Arc::new(gateway), redactor))
 }
+pub const BROWSER_HELP: &str = "excalibur browser takeover <session> [--socket PATH] [--tab TAB] [--run RUN] [--timeout-ms N] [--json]\n\nStart human takeover for a blocked browser session (arch 17). Thin wrapper over the webd `takeover.start` RPC (plus `viewer.issue` with --tab); owner checks stay with webd, no new authorization. Socket defaults to EXCALIBUR_WEB_SOCKET. The viewer address is printed by `excalibur-webd --serve`; forward it over SSH.";
+pub const BROWSER_SOCKET_ENV: &str = "EXCALIBUR_WEB_SOCKET";
+pub struct BrowserTakeover {
+    pub session: String,
+    pub socket: PathBuf,
+    pub tab: Option<String>,
+    pub run: String,
+    pub timeout_ms: u64,
+    pub json: bool,
+}
+fn flag_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
+    *index += 1;
+    args.get(*index)
+        .cloned()
+        .ok_or_else(|| format!("missing value for {flag}"))
+}
+fn timeout_ms(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|v| *v > 0 && *v <= 300_000)
+        .ok_or_else(|| "timeout must be 1..300000 ms".into())
+}
+pub fn parse_browser_takeover(args: &[String]) -> Result<BrowserTakeover, String> {
+    if args.first().map(String::as_str) != Some("browser") {
+        return Err(BROWSER_HELP.into());
+    }
+    if args.get(1).map(String::as_str) != Some("takeover") {
+        return Err(BROWSER_HELP.into());
+    }
+    let session = args
+        .get(2)
+        .filter(|s| !s.starts_with('-') && !s.is_empty())
+        .cloned()
+        .ok_or_else(|| "browser takeover requires a session id".to_string())?;
+    let mut socket: Option<PathBuf> = None;
+    let mut tab: Option<String> = None;
+    let mut run: Option<String> = None;
+    let mut timeout = 30_000;
+    let mut json = false;
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--socket" => socket = Some(flag_value(args, &mut index, "--socket")?.into()),
+            "--tab" => tab = Some(flag_value(args, &mut index, "--tab")?),
+            "--run" => run = Some(flag_value(args, &mut index, "--run")?),
+            "--timeout-ms" => timeout = timeout_ms(&flag_value(args, &mut index, "--timeout-ms")?)?,
+            "--json" => {}
+            other => return Err(format!("unknown browser flag: {other}")),
+        }
+        if args[index].as_str() == "--json" {
+            json = true;
+        }
+        index += 1;
+    }
+    if tab.as_deref().is_some_and(str::is_empty) {
+        return Err("tab id must not be empty".into());
+    }
+    let socket = socket
+        .or_else(|| std::env::var(BROWSER_SOCKET_ENV).ok().map(PathBuf::from))
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| {
+            "webd socket is required: pass --socket PATH or set EXCALIBUR_WEB_SOCKET".to_string()
+        })?;
+    let run = run.unwrap_or_else(|| {
+        format!(
+            "cli-takeover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        )
+    });
+    if run.len() > 256 {
+        return Err("run id must fit in 256 bytes".into());
+    }
+    Ok(BrowserTakeover {
+        session,
+        socket,
+        tab,
+        run,
+        timeout_ms: timeout,
+        json,
+    })
+}
+async fn rpc_unix(
+    socket: &PathBuf,
+    method: &str,
+    params: Value,
+    timeout: u64,
+) -> Result<Value, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let id = format!(
+        "cli-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let mut body = serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": method, "params": params,
+    }))
+    .map_err(|e| e.to_string())?;
+    if body.len() > 4 * 1024 * 1024 {
+        return Err("browser request exceeds frame limit".into());
+    }
+    body.push(b'\n');
+    let connect = tokio::net::UnixStream::connect(socket);
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_millis(timeout.min(30_000)),
+        connect,
+    )
+    .await
+    .map_err(|_| "webd socket connection timed out".to_string())?
+    .map_err(|_| "cannot reach webd socket; is the daemon serving?".to_string())?;
+    let write = async { stream.write_all(&body).await };
+    tokio::time::timeout(std::time::Duration::from_millis(timeout), write)
+        .await
+        .map_err(|_| "browser request timed out".to_string())?
+        .map_err(|_| "browser request interrupted".to_string())?;
+    let mut reader = BufReader::new(stream);
+    let mut line = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_millis(timeout),
+        reader.read_until(b'\n', &mut line),
+    )
+    .await
+    .map_err(|_| "browser response timed out".to_string())?
+    .map_err(|_| "browser response interrupted".to_string())?;
+    let value: Value =
+        serde_json::from_slice(&line).map_err(|_| "invalid browser response".to_string())?;
+    if value["id"] != id {
+        return Err("browser response id mismatch".to_string());
+    }
+    if !value["error"].is_null() {
+        return Err(format!(
+            "{}:{}",
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or("browser error"),
+            value["error"]["data"]["detail"].as_str().unwrap_or("")
+        ));
+    }
+    Ok(value["result"].clone())
+}
+pub async fn browser_takeover(command: &BrowserTakeover) -> Result<Value, String> {
+    let takeover = rpc_unix(
+        &command.socket,
+        "takeover.start",
+        serde_json::json!({
+            "run_id": command.run,
+            "session_id": command.session,
+            "deadline_ms": command.timeout_ms,
+        }),
+        command.timeout_ms,
+    )
+    .await?;
+    let mut outcome = serde_json::json!({
+        "session_id": command.session,
+        "takeover": takeover,
+    });
+    if let Some(tab) = &command.tab {
+        let viewer = rpc_unix(
+            &command.socket,
+            "viewer.issue",
+            serde_json::json!({
+                "run_id": command.run,
+                "session_id": command.session,
+                "tab_id": tab,
+                "deadline_ms": command.timeout_ms,
+            }),
+            command.timeout_ms,
+        )
+        .await?;
+        outcome["viewer"] = viewer;
+    }
+    Ok(outcome)
+}

@@ -924,14 +924,25 @@ blocks into immediate failures. Registration in the host composition
 enabled via `EXCALIBUR_WEB_HARNESS=1` with `EXCALIBUR_WEB_SOCKET` pointing at
 the webd socket and the host network flag allowing web tools; the default path
 is unchanged. A dedicated `op.cancel` RPC
-for in-flight dispatched operations is still pending in webd, so
-cancellation of already-dispatched work relies on client-side polling stop
-plus ephemeral cleanup. Takeover stays a thin wrapper: `takeover_start`
+for in-flight dispatched operations is closed on the client and decision
+side: `WebHarness::cancel_operation` sends `op.cancel` with the owning
+`run_id` (best-effort inside `interrupt_execution` for non-`Pure` tools with
+an `op_key`, keeping client-side polling stop plus ephemeral cleanup as the
+fallback), and `excalibur-webd::ops` validates the parameters with the
+boundary bounds and classifies the stored state (`received` to `cancelled`,
+`dispatched` with a live worker to a cooperative cancel request,
+`dispatched` without one to `uncertain` without resend, terminal states
+returned stored and unchanged). Persisting the `cancelled` mark and
+interrupting the live dispatch worker happen in the browser-crate
+`Protocol` dispatch, which stays main-lane work outside this lane; until
+then the harness tolerates `method_not_found` and keeps the fallback.
+Takeover stays a thin wrapper: `takeover_start`
 calls the existing `takeover.start` RPC and `viewer_issue` calls the
 existing `viewer.issue` RPC with the same owner checks; no new
-authorization is introduced. Wiring the `excalibur browser takeover
-<session>` command into the CLI binary is pending (the CLI currently only
-implements `exec`).
+authorization is introduced. The `excalibur browser takeover <session>`
+command is wired into the CLI binary on the same terms (`--tab` also issues
+a single-use viewer code); the viewer address itself is still printed by
+`excalibur-webd --serve` for SSH forwarding (arch 17).
 
 ```sh
 cargo test -p excalibur-web-adapter
@@ -949,5 +960,14 @@ commit `Uncertain` without resend, listener relaunch bookkeeping,
 cancellation closing ephemeral sessions while persistent ones stay alive,
 `search_tools` retrieval returning `browser_snapshot`/`browser_act` in the
 top five with a stable catalog hash, eval denials, and the reused-key
-conflict. Real-daemon crash rows and the 18.4 manual runs with real sites
-stay pending-user and are never claimed.
+conflict. The `op.cancel` rows cover cancelling a `received` commit to
+`cancelled` without dispatch, requesting worker cancel for a `dispatched`
+commit with `Uncertain` reconciliation and no resend, and rejecting unknown
+keys plus foreign owners; `op.get` also enforces operation ownership now.
+Two durable-stack rows run the real `Protocol` over a real `Manager` and
+SQLite `webd.db` on a temporary directory (real RPC boundary, owner checks
+and restart reopen; no Chrome launch, no daemon process): unknown-operation
+and parameter validation plus manager restart reopening the same durable
+state. A SIGKILL during a real dispatched effect with live Chrome, and the
+18.4 manual runs with real sites (including the WhatsApp/Teams 1 h/24 h
+session figures), stay pending-user and are never claimed.

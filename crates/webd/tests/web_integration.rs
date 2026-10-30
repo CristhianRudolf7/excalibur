@@ -1,8 +1,11 @@
 //! Harness integration suite (arch 16.10): local synthetic fixtures only.
 //!
 //! This suite exercises the web harness `ToolRuntime`, the tool catalog, the
-//! manifests, reconciliation, cancellation and the eval profile against an
-//! in-memory webd stand-in. No real Chrome, no network, no daemon.
+//! manifests, reconciliation, cancellation (including the dedicated
+//! `op.cancel` RPC) and the eval profile against an in-memory webd stand-in,
+//! plus the real durable RPC boundary (`Protocol` over a real `Manager` and
+//! SQLite `webd.db` on a temporary directory). No real Chrome is launched,
+//! no network is used and no daemon process is spawned.
 
 use excalibur_tools::deferred::{CallerRole, ToolCatalog};
 use excalibur_types::runtime::{
@@ -23,8 +26,10 @@ use std::{
 
 struct FakeOp {
     hash: String,
+    owner: String,
     state: String,
     result: Value,
+    cancel_requested: bool,
 }
 
 struct FakeState {
@@ -149,13 +154,43 @@ impl BrowserBackend for FakeBackend {
             state.order.push(method.to_owned());
             if method == "op.get" {
                 let key = params["op_key"].as_str().unwrap_or("").to_owned();
+                let run = params["run_id"].as_str().unwrap_or("").to_owned();
                 let op = state.ops.get(&key).ok_or("unknown_operation: op_key")?;
+                if op.owner != run {
+                    return Err("denied: operation_owner".into());
+                }
                 if op.state == "dispatched" {
                     return Ok(
                         json!({"state": "uncertain", "op_key": key, "reason": "webd_restarted_after_dispatch"}),
                     );
                 }
                 return Ok(json!({"state": op.state, "result": op.result}));
+            }
+            if method == "op.cancel" {
+                let key = params["op_key"].as_str().unwrap_or("").to_owned();
+                let run = params["run_id"].as_str().unwrap_or("").to_owned();
+                let op = state.ops.get_mut(&key).ok_or("unknown_operation: op_key")?;
+                if op.owner != run {
+                    return Err("denied: operation_owner".into());
+                }
+                match op.state.as_str() {
+                    "received" => {
+                        op.state = "cancelled".into();
+                        return Ok(json!({"state": "cancelled", "op_key": key}));
+                    }
+                    "dispatched" => {
+                        op.cancel_requested = true;
+                        return Ok(
+                            json!({"state": "working", "op_key": key, "cancel_requested": true}),
+                        );
+                    }
+                    "completed" | "failed" => {
+                        return Ok(json!({"state": op.state.clone(), "result": op.result.clone()}));
+                    }
+                    _ => {
+                        return Ok(json!({"state": op.state.clone(), "result": op.result.clone()}));
+                    }
+                }
             }
             if method == "tab.list" {
                 let sid = params["session_id"].as_str().unwrap_or("").to_owned();
@@ -216,12 +251,15 @@ impl BrowserBackend for FakeBackend {
                         return Err("browser effect uncertain; reconciliation required".into());
                     }
                 } else {
+                    let owner = params["run_id"].as_str().unwrap_or("").to_owned();
                     state.ops.insert(
                         key.clone(),
                         FakeOp {
                             hash,
+                            owner,
                             state: "received".into(),
                             result: Value::Null,
+                            cancel_requested: false,
                         },
                     );
                 }
@@ -494,6 +532,254 @@ fn webd_restart_turns_dispatched_commit_uncertain() {
             other => panic!("expected Uncertain, got {other:?}"),
         }
         assert_eq!(backend.sends("act.perform", "op-doomed"), 0);
+    });
+}
+
+#[test]
+fn op_cancel_received_marks_cancelled_without_dispatch() {
+    let rt = runtime();
+    rt.block_on(async {
+        let backend = Arc::new(FakeBackend::new());
+        let (harness, backend) = harness(backend, false);
+        let run = "run-op-cancel";
+        // Seed a received (never dispatched) commit op directly: no effect
+        // has reached any backend, so cancellation must not send anything.
+        backend.state.lock().unwrap().ops.insert(
+            "op-seeded".into(),
+            FakeOp {
+                hash: "seed".into(),
+                owner: run.into(),
+                state: "received".into(),
+                result: Value::Null,
+                cancel_requested: false,
+            },
+        );
+        let cancelled = harness.cancel_operation(run, "op-seeded").await.unwrap();
+        assert_eq!(cancelled["state"], json!("cancelled"));
+        assert_eq!(backend.sends("act.perform", "op-seeded"), 0);
+        let seen: Value = backend
+            .request(
+                "op.get",
+                json!({"run_id": run, "op_key": "op-seeded", "deadline_ms": 5_000}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seen["state"], json!("cancelled"));
+        let commit = harness
+            .prepare(
+                run,
+                call(
+                    "browser_act",
+                    json!({"session_id": "s-1", "tab_id": "t-1", "snapshot_id": "snap-1",
+                    "op_key": "op-seeded", "request": {"action": "click", "ref": "r2"}}),
+                ),
+            )
+            .await
+            .unwrap();
+        match harness.reconcile(run, "op-seeded", &commit).await {
+            Reconcile::Uncertain(_) => {}
+            other => panic!("expected Uncertain, got {other:?}"),
+        }
+        assert_eq!(backend.sends("act.perform", "op-seeded"), 0);
+    });
+}
+
+#[test]
+fn op_cancel_dispatched_requests_worker_cancel_without_resend() {
+    let rt = runtime();
+    rt.block_on(async {
+        let backend = Arc::new(FakeBackend::new());
+        backend.state.lock().unwrap().freeze_writes = true;
+        let run = "run-op-cancel-dispatched";
+        let (harness, _) = harness(backend.clone(), false);
+        let commit = harness
+            .prepare(
+                run,
+                call(
+                    "browser_act",
+                    json!({"session_id": "s-1", "tab_id": "t-1", "snapshot_id": "snap-1",
+                    "op_key": "op-doomed-cancel", "request": {"action": "click", "ref": "r9"}}),
+                ),
+            )
+            .await
+            .unwrap();
+        let failed = harness.execute(run, "op-doomed-cancel", &commit).await;
+        assert!(!failed.success);
+        let working = harness
+            .cancel_operation(run, "op-doomed-cancel")
+            .await
+            .unwrap();
+        assert_eq!(working["state"], json!("working"));
+        assert_eq!(working["cancel_requested"], json!(true));
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .ops
+                .get("op-doomed-cancel")
+                .is_some_and(|op| op.cancel_requested)
+        );
+        backend.restart();
+        match harness.reconcile(run, "op-doomed-cancel", &commit).await {
+            Reconcile::Uncertain(_) => {}
+            other => panic!("expected Uncertain, got {other:?}"),
+        }
+        assert_eq!(backend.sends("act.perform", "op-doomed-cancel"), 0);
+    });
+}
+
+#[test]
+fn op_cancel_rejects_unknown_key_and_foreign_owner() {
+    let rt = runtime();
+    rt.block_on(async {
+        let backend = Arc::new(FakeBackend::new());
+        let (harness, backend) = harness(backend, false);
+        let missing = harness.cancel_operation("run-a", "no-such-op").await;
+        assert!(missing.is_err());
+        assert!(missing.unwrap_err().contains("unknown_operation"));
+        backend.state.lock().unwrap().ops.insert(
+            "op-owned".into(),
+            FakeOp {
+                hash: "seed".into(),
+                owner: "run-a".into(),
+                state: "received".into(),
+                result: Value::Null,
+                cancel_requested: false,
+            },
+        );
+        let denied = harness.cancel_operation("run-b", "op-owned").await;
+        assert!(denied.is_err());
+        assert!(denied.unwrap_err().contains("denied"));
+        // The foreign cancel changed nothing: the owner can still cancel.
+        let cancelled = harness.cancel_operation("run-a", "op-owned").await.unwrap();
+        assert_eq!(cancelled["state"], json!("cancelled"));
+    });
+}
+
+#[test]
+fn real_protocol_rejects_unknown_operation_and_bad_params() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            excalibur_browser::sessions::Manager::open(excalibur_browser::sessions::Options {
+                data_dir: dir.path().join("data"),
+                binary: std::path::PathBuf::from("/usr/bin/google-chrome"),
+                proxy: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 9),
+                profiles: Default::default(),
+                compact: false,
+                version: Default::default(),
+                chrome_args: Vec::new(),
+            })
+            .await
+            .expect("real manager opens on a temporary directory");
+        let protocol = excalibur_browser::rpc::Protocol::new(manager);
+        let req = |method: &str, params: Value| excalibur_browser::rpc::Request {
+            jsonrpc: "2.0".into(),
+            id: json!(1),
+            method: method.into(),
+            params,
+        };
+        // Unknown operation through the real durable stack.
+        let unknown = protocol
+            .request(req(
+                "op.get",
+                json!({"run_id": "run-a", "op_key": "missing", "deadline_ms": 5_000}),
+            ))
+            .await;
+        assert_eq!(unknown["error"]["message"], json!("unknown_operation"));
+        // Boundary validation matches the documented RPC contract.
+        let no_run = protocol
+            .request(req(
+                "op.get",
+                json!({"op_key": "missing", "deadline_ms": 5_000}),
+            ))
+            .await;
+        assert_eq!(no_run["error"]["message"], json!("invalid_params"));
+        let no_deadline = protocol
+            .request(req(
+                "op.get",
+                json!({"run_id": "run-a", "op_key": "missing"}),
+            ))
+            .await;
+        assert_eq!(no_deadline["error"]["message"], json!("invalid_params"));
+        let bogus = protocol
+            .request(req(
+                "no.such",
+                json!({"run_id": "run-a", "op_key": "missing", "deadline_ms": 5_000}),
+            ))
+            .await;
+        assert_eq!(bogus["error"]["message"], json!("method_not_found"));
+        // Real read paths work without launching Chrome.
+        let listed = protocol
+            .request(req(
+                "session.list",
+                json!({"run_id": "run-a", "deadline_ms": 5_000}),
+            ))
+            .await;
+        assert_eq!(listed["result"]["state"], json!("completed"));
+        assert!(listed["result"]["result"].is_array());
+        let status = protocol
+            .request(req(
+                "status.get",
+                json!({"run_id": "run-a", "deadline_ms": 5_000}),
+            ))
+            .await;
+        assert_eq!(status["result"]["state"], json!("completed"));
+        assert!(status["result"]["result"].get("instances").is_some());
+    });
+}
+
+#[test]
+fn real_manager_restart_reopens_durable_state() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let options = || excalibur_browser::sessions::Options {
+            data_dir: data.clone(),
+            binary: std::path::PathBuf::from("/usr/bin/google-chrome"),
+            proxy: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 9),
+            profiles: Default::default(),
+            compact: false,
+            version: Default::default(),
+            chrome_args: Vec::new(),
+        };
+        let listed = {
+            let manager = excalibur_browser::sessions::Manager::open(options())
+                .await
+                .expect("first open");
+            let protocol = excalibur_browser::rpc::Protocol::new(manager);
+            protocol
+                .request(excalibur_browser::rpc::Request {
+                    jsonrpc: "2.0".into(),
+                    id: json!(1),
+                    method: "session.list".into(),
+                    params: json!({"run_id": "run-a", "deadline_ms": 5_000}),
+                })
+                .await
+        };
+        assert_eq!(listed["result"]["state"], json!("completed"));
+        // Dropping the manager releases the data-directory lock, so a fresh
+        // manager (the webd-restart shape) reopens the same durable state.
+        // A SIGKILL during a real dispatched effect with live Chrome stays
+        // pending-user (18.4 manual procedure) and is never claimed here.
+        let reopened = {
+            let manager = excalibur_browser::sessions::Manager::open(options())
+                .await
+                .expect("reopen after shutdown");
+            let protocol = excalibur_browser::rpc::Protocol::new(manager);
+            protocol
+                .request(excalibur_browser::rpc::Request {
+                    jsonrpc: "2.0".into(),
+                    id: json!(1),
+                    method: "session.list".into(),
+                    params: json!({"run_id": "run-a", "deadline_ms": 5_000}),
+                })
+                .await
+        };
+        assert_eq!(reopened["result"]["state"], json!("completed"));
     });
 }
 

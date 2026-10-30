@@ -8,6 +8,9 @@ async fn main() {
 }
 async fn execute() -> i32 {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) == Some("browser") {
+        return browser_main(args).await;
+    }
     if args.as_slice() == ["--version"] {
         println!(
             "excalibur {} ({})",
@@ -126,4 +129,59 @@ fn write_event(event: &excalibur_telemetry::EventEnvelope) -> Result<(), String>
         .write_all(b"\n")
         .and_then(|_| output.flush())
         .map_err(|_| "event output failed".into())
+}
+
+async fn browser_main(args: Vec<String>) -> i32 {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", excalibur_cli::BROWSER_HELP);
+        return 0;
+    }
+    let command = match excalibur_cli::parse_browser_takeover(&args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                excalibur_vault::Redactor::default().redact_text(&e.to_string())
+            );
+            return 1;
+        }
+    };
+    match excalibur_cli::browser_takeover(&command).await {
+        Ok(outcome) => {
+            if command.json {
+                println!("{outcome}");
+            } else {
+                let takeover = &outcome["takeover"];
+                let inner = takeover.get("result").unwrap_or(takeover);
+                println!(
+                    "session {} is now {} (started_at {})",
+                    command.session,
+                    inner
+                        .get("state")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("human_control"),
+                    inner.get("started_at").unwrap_or(&serde_json::Value::Null)
+                );
+                if let Some(viewer) = outcome.get("viewer").and_then(|v| v.get("result")) {
+                    println!(
+                        "viewer code for tab {}: {} (expires_at {})",
+                        viewer.get("tab_id").and_then(|v| v.as_str()).unwrap_or(""),
+                        viewer.get("code").and_then(|v| v.as_str()).unwrap_or(""),
+                        viewer.get("expires_at").unwrap_or(&serde_json::Value::Null)
+                    );
+                }
+                println!(
+                    "viewer address is printed by `excalibur-webd --serve`; forward it over SSH (arch 17)."
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!(
+                "{}",
+                excalibur_vault::Redactor::default().redact_text(&e.to_string())
+            );
+            1
+        }
+    }
 }
