@@ -361,7 +361,7 @@ async fn housekeeping_iteration(
         let content = if delivery.cross_conversation.is_some() {
             json!({"notification_id":delivery.notification.id,"origin":delivery.notification.conversation,"scope":agent.scope,"summary":"Urgent update in the origin conversation"})
         } else {
-            json!({"notification_id":delivery.notification.id,"content":delivery.notification.content,"origin":delivery.notification.conversation,"scope":agent.scope,"created_at":delivery.notification.created})
+            json!({"notification_id":delivery.notification.id,"content":delivery.notification.content,"origin":delivery.notification.conversation,"scope":agent.scope,"name":agent.name,"agent_id":agent.id,"created_at":delivery.notification.created})
         };
         let key = format!("{}:{}", delivery.notification.id, delivery.channel);
         let published = if delivery.cross_conversation.is_some() {
