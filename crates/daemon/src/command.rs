@@ -136,6 +136,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         runtimes.shutdown(Duration::from_secs(5));
         return result;
     }
+    let notifier = crate::watchdog::ServiceNotifier::from_environment()?;
     std::fs::create_dir_all(&options.data).map_err(|_| "data directory unavailable")?;
     let db = Database::open(
         options.data.join("excalibur.db"),
@@ -238,8 +239,10 @@ fn execute(args: &[String]) -> Result<(), String> {
         &runtimes.interactive(),
         host.orchestrator.database().clone(),
         host.shutdown.clone(),
-        stopping,
+        stopping.clone(),
     );
+    let watchdog = notifier
+        .map(|notifier| notifier.start(&runtimes.interactive(), host.shutdown.clone(), stopping));
     let result = runtimes.block_on(async {
         let shutdown = host.shutdown.clone();
         let connections = host.gateway.clone();
@@ -261,7 +264,14 @@ fn execute(args: &[String]) -> Result<(), String> {
     let writer_result = runtimes
         .block_on(writer)
         .unwrap_or_else(|_| Err("writer watcher task failed".into()));
-    let orderly = result.is_ok()
+    let watchdog_result = match watchdog {
+        Some(task) => runtimes
+            .block_on(task)
+            .unwrap_or_else(|_| Err("service watchdog task failed".into())),
+        None => Ok(()),
+    };
+    let orderly = watchdog_result.is_ok()
+        && result.is_ok()
         && housekeeping_result.is_ok()
         && background_result.is_ok()
         && writer_result.is_ok();
@@ -271,6 +281,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         .and(housekeeping_result)
         .and(background_result)
         .and(writer_result)
+        .and(watchdog_result)
         .and(close)
 }
 

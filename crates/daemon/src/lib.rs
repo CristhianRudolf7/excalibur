@@ -32,3 +32,5 @@ pub mod skills;
 
 pub mod agenda;
 pub mod master_skills;
+
+pub mod watchdog;
