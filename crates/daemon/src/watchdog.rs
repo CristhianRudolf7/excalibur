@@ -50,7 +50,7 @@ impl ServiceNotifier {
         };
         let interval = if applies {
             usec.as_ref()
-                .map(|value| {
+                .map(|value| -> Result<Duration, String> {
                     let value = number(value)?;
                     if value < 2 {
                         return Err("WATCHDOG_USEC must be at least two microseconds".into());
