@@ -483,3 +483,35 @@ async fn due_normal_groups_wait_for_the_active_conversation_then_publish_once() 
     master.shutdown().await;
     db.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn persisted_daemon_stop_payload_preserves_agent_and_deliverable_without_a_model() {
+    let model = Arc::new(Model {
+        calls: AtomicUsize::new(0),
+        healthy: AtomicBool::new(false),
+        hung: false,
+    });
+    let (_dir, db, master) = open(MasterConfig::default(), model.clone(), None).await;
+    master.receive(incoming("setup", "/status")).await.unwrap();
+    // This is the persisted emit_stop_notice shape nested in the daemon envelope,
+    // including an old queued notice without identity in its inner JSON string.
+    master.publish_notice("stop-real","conv",json!({
+        "notification_id":"stop-real","name":"Research worker","agent_id":"agent-1",
+        "scope":"general","origin":"conv",
+        "content":json!({"state":"completed","reason":null,"final_text":"The report is ready in result.md","step":7}).to_string()
+    }),"normal").await.unwrap();
+    assert_eq!(master.flush_notices(i64::MAX).await.unwrap(), 1);
+    let events = master.events(0, 1000).await.unwrap();
+    let group = events
+        .iter()
+        .find(|e| e.kind == "notification_group")
+        .unwrap();
+    let text = group.payload["text"].as_str().unwrap();
+    assert!(text.contains("Research worker"), "{text}");
+    assert!(text.contains("completed"), "{text}");
+    assert!(text.contains("result.md"), "{text}");
+    assert!(!text.contains("unknown"), "{text}");
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    master.shutdown().await;
+    db.shutdown().await.unwrap();
+}
