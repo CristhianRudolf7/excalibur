@@ -152,14 +152,16 @@ impl FastActions for Core {
 #[test]
 fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopening() {
     let dir = tempfile::tempdir().unwrap();
-    let a = dir.path().join("a");
-    let b = dir.path().join("b");
+    let workspace = dir.path().join("workspace");
+    let a = workspace.join("a");
+    let b = workspace.join("b");
     write(&a, "reactor", "history_search", "ORIGINAL_MASTER_SKILL");
     write(&a, "worker-only", "terminal", "NO_WORKER_SCHEMA");
     write(&a, "core-only", "run_history_search", "NO_ENGINE_SCHEMA");
     write(&b, "private-b", "status", "B_PRIVATE_BODY");
     let make_options = || {
-        let mut options = HostOptions::project(a.clone());
+        let mut options = HostOptions::project(workspace.clone());
+        options.projects[0].roots = vec![a.clone()];
         let mut project = options.projects[0].clone();
         project.id = "b".into();
         project.name = "B".into();
@@ -171,7 +173,9 @@ fn master_skills_keep_frozen_prefix_original_scope_and_turn_policy_after_reopeni
         });
         options
     };
-    let path = dir.path().join("main.db");
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let path = data.join("main.db");
     let db = Database::open(&path, DatabaseKind::Main, Default::default()).unwrap();
     let runtimes = RuntimeSet::new(2, 1).unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
