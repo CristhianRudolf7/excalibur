@@ -329,3 +329,59 @@ fn restart_reprovisions_master_preserves_children_and_retains_unprovisioned_proj
     interactive.block_on(host.close()).unwrap();
     assert_eq!(model.0.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn recovery_summary_without_project_agents_enters_project_master_inbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(
+        dir.path().join("main.db"),
+        DatabaseKind::Main,
+        Default::default(),
+    )
+    .unwrap();
+    let interactive = runtime();
+    let work = runtime();
+    let host = interactive
+        .block_on(DaemonHost::open(
+            db.clone(),
+            options(dir.path(), vec![project("a", dir.path().to_path_buf())]),
+            Arc::new(NoModels(AtomicUsize::new(0))),
+            None,
+            "synthetic-scoped-startup-notice-token-32chars",
+            Redactor::default(),
+            work.handle().clone(),
+        ))
+        .unwrap();
+    interactive.block_on(async {
+        let at = excalibur_store::unix_seconds();
+        db.write(Priority::Journal, move |c| {
+            c.execute("INSERT INTO conversations(id,principal_id,scope_id,active_scope) VALUES('scoped-recovery','local','project:a','project:a')", [])?;
+            c.execute("UPDATE daemon_recovery_state SET safe_until=?1", [at + 1800])?;
+            Ok(())
+        }).await.unwrap();
+        let boot = host.orchestrator.recovery().status(at).await.unwrap().boot_id.unwrap();
+        host.orchestrator.recovery().publish_summary(&boot, at).await.unwrap();
+        let notes = host.orchestrator.notifications("scoped-recovery").await.unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].class, "urgent");
+        let payload: serde_json::Value = serde_json::from_str(&notes[0].content).unwrap();
+        assert_eq!(payload["scope"], "project:a");
+        assert_eq!(payload["decisions"], json!([]));
+        excalibur_daemon::command::deliver_notifications(&host.master, &host.orchestrator, at).await.unwrap();
+        let (scope, queued, envelope): (String, bool, String) = db.read(excalibur_store::ReadLane::Interactive, |c| {
+            Ok(c.query_row("SELECT m.scope_id,EXISTS(SELECT 1 FROM master_inbox i WHERE i.message_id=m.id),e.payload FROM master_notices n JOIN messages m ON m.id=n.message_id JOIN master_events e ON e.sequence=n.event_sequence WHERE n.conversation_id='scoped-recovery'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?)
+        }).await.unwrap();
+        assert_eq!(scope, "project:a");
+        assert!(queued, "an urgent project summary must reach the master inbox");
+        let envelope: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+        assert_eq!(envelope["content"]["scope"], "project:a");
+        assert_eq!(envelope["content"]["host"], true);
+        assert!(envelope["content"].get("agent_id").is_none());
+        // Delivery retries use the existing durable outbox receipt.
+        excalibur_daemon::command::deliver_notifications(&host.master, &host.orchestrator, at).await.unwrap();
+        let count: u64 = db.read(excalibur_store::ReadLane::Interactive, |c| Ok(c.query_row("SELECT count(*) FROM master_notices WHERE conversation_id='scoped-recovery'", [], |r| r.get(0))?)).await.unwrap();
+        assert_eq!(count, 1);
+    });
+    drop(work);
+    interactive.block_on(host.close()).unwrap();
+}

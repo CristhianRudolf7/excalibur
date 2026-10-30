@@ -64,7 +64,9 @@ pub struct Fixture {
     pub master: Agent,
 }
 pub async fn fixture() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
+    open_fixture(tempfile::tempdir().unwrap()).await
+}
+pub async fn open_fixture(dir: tempfile::TempDir) -> Fixture {
     let db = Database::open(
         dir.path().join("main.db"),
         DatabaseKind::Main,
@@ -84,7 +86,10 @@ pub async fn fixture() -> Fixture {
     .await
     .unwrap()
     .with_authority(Arc::new(Authority));
-    let master = host.register_master("Excalibur", token()).await.unwrap();
+    let master = host
+        .rebind_master_at_startup("Excalibur", token())
+        .await
+        .unwrap();
     Fixture {
         dir,
         db,
