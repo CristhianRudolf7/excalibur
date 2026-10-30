@@ -1,0 +1,3 @@
+-- Additive host-origin receipts; existing notification and delivery rows stay shared.
+CREATE TABLE IF NOT EXISTS orchestration_host_notification_bindings(id TEXT PRIMARY KEY,body TEXT NOT NULL CHECK(json_valid(body)));
+CREATE TABLE IF NOT EXISTS orchestration_host_notification_origins(notification_id TEXT PRIMARY KEY REFERENCES orchestration_notifications(id),binding_id TEXT NOT NULL REFERENCES orchestration_host_notification_bindings(id),request TEXT NOT NULL CHECK(json_valid(request)),snapshot TEXT NOT NULL CHECK(json_valid(snapshot)),preferred_channel TEXT,source_kind TEXT NOT NULL CHECK(source_kind='host'));

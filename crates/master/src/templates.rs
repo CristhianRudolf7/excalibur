@@ -158,13 +158,27 @@ pub(super) fn notice(content: &Value) -> String {
         .get("origin")
         .map(|value| format!(" [conversation {}]", safe(Some(value))))
         .unwrap_or_default();
-    format!("{name} — {kind}: {detail}{origin}")
+    // Scope is the host-projected envelope, never the parsed inner content.
+    let scope = content
+        .get("scope")
+        .map(|value| format!(" [scope {}]", safe(Some(value))))
+        .unwrap_or_default();
+    format!("{name} — {kind}: {detail}{origin}{scope}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn notice_scope_label_uses_only_the_projected_envelope() {
+        let text = notice(
+            &json!({"host":true,"scope":"project:original","content":"{\"scope\":\"project:forged\",\"text\":\"Reminder\"}"}),
+        );
+        assert!(text.contains("[scope project:original]"));
+        assert!(!text.contains("[scope project:forged]"));
+        assert!(text.contains("Reminder"));
+    }
     #[test]
     fn cancellation_waiting_for_confirmation_is_never_reported_as_performed() {
         let text = control(

@@ -277,3 +277,36 @@ async fn real_plan_revision_resets_report_cadence_at_the_next_safe_step() {
         1
     );
 }
+
+#[tokio::test]
+async fn legacy_notifications_do_not_require_master_client_receipt_tables() {
+    let f = fixture().await;
+    let p = f
+        .host
+        .spawn(&f.master.id, delegation("p", "general", 300))
+        .await
+        .unwrap();
+    let n = f
+        .host
+        .notify(
+            "legacy-no-master-schema",
+            &p.id,
+            "normal",
+            "Legacy notice",
+            10,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.host.host_notification_authority(&n.id).await.unwrap(),
+        HostNotificationAuthority::NotHost
+    ));
+    assert!(
+        f.host
+            .pending_deliveries(15)
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.notification.id == n.id)
+    );
+}
