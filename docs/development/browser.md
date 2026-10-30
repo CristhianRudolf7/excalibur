@@ -879,3 +879,59 @@ claimed. Pending: cgroup scope management, real Chrome supervision, broker
 pressure signals, CDP GC/pressure/cache calls, profile walks with
 `Storage.getUsageAndQuota` and VPS measurement runs. See [Browser resource
 foundation](browser-resources.md).
+
+## Harness integration
+
+`excalibur-web-adapter::harness` provides the harness `ToolRuntime`, the
+tool catalog and the capability manifests (arch 16). The twelve `browser_*`
+tools register as deferred (outside the eager prefix, through
+`search_tools`/`call_tool`); `web_search` and `web_read` are core (arch
+14.3). Static metadata follows 16.2 (effect, idempotency, risk,
+`timeout_ms`, fast, cancel class); `browser_act` downgrades its effect per
+call in `prepare` (`observe` to `Pure`, `input` to `Idempotent`, commit
+classes stay `NonIdempotent`).
+
+Reconciliation follows 16.3: pure tools retry, `browser_navigate` probes the
+tab URL (`Done` when the tab already shows the target document, `Retry`
+otherwise), keyed tools resend with the same key, and commit classes consult
+`op.get(op_key)` (`completed` to `Done` with the stored result, `received`
+to `Retry`, `failed`/`dispatched`/restarted to `Uncertain`, never repeated
+blindly). Cancellation follows 16.5: `immediate` stops client-side polling,
+`graceful` and `after_completion` additionally close the run's tracked
+ephemeral sessions when cancelled while persistent sessions stay alive;
+`execution_state` releases the run tracking on pause and terminal states.
+The eval profile (16.8) denies persistent profiles, blocks benchmark
+sources in `web_read`/`browser_navigate`/search results and turns human
+blocks into immediate failures. Registration in the host composition
+(`DeferredTools(ExecutionTools(SecuredTools(...)))` chain in
+`crates/eval/src/runner.rs`) happens only when the harness is explicitly
+enabled via `EXCALIBUR_WEB_HARNESS=1` with `EXCALIBUR_WEB_SOCKET` pointing at
+the webd socket and the host network flag allowing web tools; the default path
+is unchanged. A dedicated `op.cancel` RPC
+for in-flight dispatched operations is still pending in webd, so
+cancellation of already-dispatched work relies on client-side polling stop
+plus ephemeral cleanup. Takeover stays a thin wrapper: `takeover_start`
+calls the existing `takeover.start` RPC and `viewer_issue` calls the
+existing `viewer.issue` RPC with the same owner checks; no new
+authorization is introduced. Wiring the `excalibur browser takeover
+<session>` command into the CLI binary is pending (the CLI currently only
+implements `exec`).
+
+```sh
+cargo test -p excalibur-web-adapter
+cargo test -p excalibur-cdp -p excalibur-browser -p excalibur-search -p excalibur-web-adapter
+cargo test -p excalibur-webd --test web_integration -- --nocapture
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+`web_integration` covers the 16.10 rows over local synthetic fixtures only:
+an ephemeral harness walkthrough (open, navigate a local URL, wait,
+snapshot, input action, `web_read`) with source events, crash-before-result
+reconciliation to `Done` without resend, webd restart turning a dispatched
+commit `Uncertain` without resend, listener relaunch bookkeeping,
+cancellation closing ephemeral sessions while persistent ones stay alive,
+`search_tools` retrieval returning `browser_snapshot`/`browser_act` in the
+top five with a stable catalog hash, eval denials, and the reused-key
+conflict. Real-daemon crash rows and the 18.4 manual runs with real sites
+stay pending-user and are never claimed.

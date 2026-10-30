@@ -1,5 +1,6 @@
 //! Trusted host adapter for browser effects, file authority and reference-only credentials.
 //! This does not register agent tools or a viewer.
+pub mod harness;
 mod transport;
 use excalibur_browser::observation::actions::ActionRequest;
 use excalibur_security::{Action, Decision, FileScanner, SecretExecutor, Security};
