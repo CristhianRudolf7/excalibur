@@ -618,15 +618,15 @@ impl DaemonHost {
         if let Err(error) = self.telemetry.shutdown().await {
             failure.get_or_insert_with(|| error.to_string());
         }
-        if orderly && failure.is_none() {
-            if let Err(error) = self
+        if orderly
+            && failure.is_none()
+            && let Err(error) = self
                 .orchestrator
                 .recovery()
                 .clean_exit(&self.boot.id, excalibur_store::unix_seconds())
                 .await
-            {
-                failure.get_or_insert_with(|| error.to_string());
-            }
+        {
+            failure.get_or_insert_with(|| error.to_string());
         }
         if let Err(error) = self.db.shutdown().await {
             failure.get_or_insert_with(|| error.to_string());

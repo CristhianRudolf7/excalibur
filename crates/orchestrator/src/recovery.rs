@@ -59,6 +59,25 @@ impl RecoveryLedger {
                 "INSERT OR IGNORE INTO daemon_recovery_schema VALUES(1,?1)",
                 [checksum],
             )?;
+            let next = include_str!("recovery2.sql");
+            let checksum = digest(next.as_bytes());
+            let known: Option<String> = c
+                .query_row(
+                    "SELECT checksum FROM daemon_recovery_schema WHERE version=2",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if known.as_ref().is_some_and(|v| v != &checksum) {
+                return Err(excalibur_store::Error::Invalid(
+                    "daemon recovery notification schema checksum mismatch",
+                ));
+            }
+            c.execute_batch(next)?;
+            c.execute(
+                "INSERT OR IGNORE INTO daemon_recovery_schema VALUES(2,?1)",
+                [checksum],
+            )?;
             Ok(())
         })
         .await?;
@@ -141,18 +160,41 @@ impl RecoveryLedger {
         self.db.write(Priority::Journal,move|c|{let summary:String=c.query_row("SELECT json_object('decisions',count(*),'resumable',sum(resume_after_safe)) FROM daemon_recovery_decisions WHERE boot_id=?1",[&boot],|r|r.get(0))?;c.execute("UPDATE daemon_boots SET summary=?2 WHERE id=?1",rusqlite::params![boot,summary])?;c.execute("UPDATE daemon_recovery_state SET recovering=0 WHERE id=1 AND boot_id=?1",[boot])?;Ok(())}).await?;
         Ok(())
     }
-    /// One additive host event per conversation and boot, with an atomic receipt.
+    /// Atomically enqueue scoped notices through the normal delivery pipeline.
+    /// Each blocked decision is urgent; the separate conversation summary is
+    /// unique per boot. Existing v1 summary events remain immutable history.
     pub async fn publish_summary(&self, boot: &str, at: i64) -> Result<()> {
         let boot = boot.to_owned();
         self.db.write(Priority::Journal,move|c|{
-            let summary:String=c.query_row("SELECT summary FROM daemon_boots WHERE id=?1",[&boot],|r|r.get(0))?;
             let safe_until:i64=c.query_row("SELECT safe_until FROM daemon_recovery_state WHERE id=1",[],|r|r.get(0))?;
-            let payload=json!({"boot_id":boot,"safe_mode":safe_until>at,"safe_until":safe_until,"summary":serde_json::from_str::<Value>(&summary).unwrap_or(json!({})),"kind":"host_recovery"}).to_string();
-            let conversations=c.prepare("SELECT id FROM conversations ORDER BY id")?.query_map([],|r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
-            for conversation in conversations {
-                if c.execute("INSERT OR IGNORE INTO daemon_recovery_notice_receipts VALUES(?1,?2)",rusqlite::params![boot,conversation])?>0 {
-                    c.execute("INSERT INTO master_events(conversation_id,kind,payload) VALUES(?1,'recovery_summary',?2)",rusqlite::params![conversation,payload])?;
+            let crashes:u64=c.query_row("SELECT count(*) FROM daemon_boots WHERE crashed_at>=?1 AND crashed_at<=?2",rusqlite::params![at.saturating_sub(WINDOW),at],|r|r.get(0))?;
+            let master: String=c.query_row("SELECT id FROM orchestration_agents WHERE depth=0 ORDER BY id LIMIT 1",[],|r|r.get(0))?;
+            let conversations=c.prepare("SELECT id,COALESCE(active_scope,scope_id,'general') FROM conversations ORDER BY id")?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            let mut query=c.prepare("SELECT d.run_id,d.decision,d.reason,a.id,json_extract(a.body,'$.origin_conversation'),a.scope FROM daemon_recovery_decisions d JOIN orchestration_agents a ON a.run_id=d.run_id WHERE d.boot_id=?1 ORDER BY d.run_id")?;
+            let decisions=query.query_map([&boot],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            let enqueue=|subject:&str,agent:&str,conversation:&str,class:&str,content:Value|->excalibur_store::Result<()> {
+                let id=format!("ntf_{}",digest(format!("startup:{boot}:{subject}").as_bytes()));
+                let inserted=c.execute("INSERT OR IGNORE INTO daemon_recovery_notification_receipts VALUES(?1,?2,?3)",rusqlite::params![boot,subject,id])?;
+                if inserted>0 {c.execute("INSERT INTO orchestration_notifications(id,agent_id,conversation,class,content,created,acknowledged) VALUES(?1,?2,?3,?4,?5,?6,0)",rusqlite::params![id,agent,conversation,class,content.to_string(),at])?;}
+                Ok(())
+            };
+            for (run,decision,reason,agent,origin,scope) in &decisions {
+                if decision=="blocked" && conversations.iter().any(|(id,_)|id==origin) {
+                    enqueue(&format!("decision:{run}:{decision}"),agent,origin,"urgent",json!({"kind":"recovery_blocked","boot_id":boot,"run_id":run,"decision":decision,"reason":reason,"origin_conversation":origin,"scope":scope,"text":format!("{run}: {decision}: {reason}")}))?;
                 }
+            }
+            for (conversation,scope) in conversations {
+                let scoped=decisions.iter().filter(|(_,_,_,_,origin,own_scope)|origin==&conversation&&own_scope==&scope).collect::<Vec<_>>();
+                let mut details=Vec::new();
+                for (run,decision,reason,_,_,_) in &scoped {
+                    let item=json!({"run_id":run,"decision":decision,"reason":reason.chars().take(256).collect::<String>()});
+                    if details.len()>=100 || serde_json::to_vec(&details).map_err(|_|excalibur_store::Error::Invalid("recovery summary serialization failed"))?.len()+item.to_string().len()>32*1024 {break}
+                    details.push(item);
+                }
+                let counts=scoped.iter().fold(std::collections::BTreeMap::<String,usize>::new(),|mut counts,row|{*counts.entry(row.1.clone()).or_default()+=1;counts});
+                let text=format!("Startup recovery: {crashes} recent unclean restarts; safe mode {}. Decisions in {scope}: {}. Details are attached; full recovery state is available.",if safe_until>at{"active"}else{"inactive"},serde_json::to_string(&counts).unwrap_or_default());
+                let agent=scoped.first().map(|row|row.3.as_str()).unwrap_or(&master);
+                enqueue(&format!("conversation:{conversation}"),agent,&conversation,if safe_until>at{"urgent"}else{"normal"},json!({"kind":"recovery_summary","boot_id":boot,"scope":scope,"origin_conversation":conversation,"safe_mode":safe_until>at,"safe_until":safe_until,"recent_crashes":crashes,"counts":counts,"decisions":details,"omitted_decisions":scoped.len().saturating_sub(details.len()),"text":text}))?;
             }
             Ok(())
         }).await?;
