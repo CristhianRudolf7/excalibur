@@ -23,8 +23,8 @@ pub mod sampling;
 pub mod telemetry;
 
 pub use admission::{
-    AdmissionBreakdown, AdmissionDecision, AdmissionRequest, DenyReason, OriginEstimator, decide,
-    default_estimate_bytes, is_heavy_origin,
+    AdmissionBreakdown, AdmissionDecision, AdmissionReadings, AdmissionRequest, DenyReason,
+    OriginEstimator, decide, default_estimate_bytes, is_heavy_origin,
 };
 pub use budgets::{
     ADMISSION_DEFAULT_ESTIMATE_BYTES, ADMISSION_HEAVY_ESTIMATE_BYTES, ADMISSION_MARGIN_BYTES,

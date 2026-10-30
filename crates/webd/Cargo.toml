@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 excalibur-browser = { path = "../browser" }
+excalibur-browser-resources = { path = "../browser-resources" }
 excalibur-sandbox = { path = "../sandbox" }
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "signal", "io-util", "macros", "sync"] }

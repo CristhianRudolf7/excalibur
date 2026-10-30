@@ -843,3 +843,41 @@ host binding, `robots.txt` retrieval/caching, actual index-queue insertion,
 served-viewer/RPC registration), the `dom_smoothie`/`htmd` production
 extractors, PDF/feed/charset handling, live ephemeral-context rendering and
 RPC method registration stay pending (B9 broker lane).
+
+## Resources, budgets, admission and measurement
+
+`webd::resources::ResourceGate` wires the `excalibur-browser-resources`
+foundation into the service (architecture 13.1-13.6, 18.3; NB-17, NB-18).
+Admission uses the per-origin moving-average estimate (200 MiB default,
+400 MiB heavy class) plus a 200 MiB margin under the 1.5 GiB soft budget,
+with immediate denials for tab limits (4 per run, 12 global), PSI
+`some avg10` at or above 20 % and disk growth breaching the 5 GiB reserve;
+over-budget requests wait up to 120 s before `capacity_exceeded` with the
+memory breakdown. Eviction follows steps 1-7 (webd caches, IDLE LRU,
+ephemeral GC plus moderate pressure only on the ephemeral instance,
+ephemeral browser cache, close of one over-limit ephemeral ACTIVE tab with
+`tab_evicted`, ephemeral restart, LIVE quiet reload only); listening tabs
+are never frozen, discarded, pressured or suspended, and
+`browser_suspend_session` on a listening session returns
+`listener_cannot_suspend` without user approval. Low-disk policy (below
+7 GiB free or webd budget exceeded) empties ephemeral caches and persistent
+`cache_storage`/`shader_cache` of non-listening origins only. `serve`
+refuses to grow below the configured reserve. Telemetry adds
+`browser_working_set_bytes`, `browser_pss_bytes`, `browser_instances` and
+`browser_tabs` with peaks, separate from harness and container RAM.
+
+```sh
+cargo test -p excalibur-webd --test resources_gates -- --nocapture
+cargo test -p excalibur-webd --test resources_measure -- --nocapture
+```
+
+`resources_gates` verifies the 13.6 rows over synthetic fixtures only;
+`resources_measure` runs the 18.3 procedure shape (blank instance, static
+local page, ten heavy ephemeral tabs, level A/B/C with PSS by type, 3
+repetitions with median/min/max) with the report in
+`target/test-evidence/browser/resources/measure.json`. Logged-in
+WhatsApp/Teams figures (18.4, 1 h/24 h) stay pending-user and are never
+claimed. Pending: cgroup scope management, real Chrome supervision, broker
+pressure signals, CDP GC/pressure/cache calls, profile walks with
+`Storage.getUsageAndQuota` and VPS measurement runs. See [Browser resource
+foundation](browser-resources.md).

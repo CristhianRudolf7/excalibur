@@ -24,8 +24,8 @@ acceso a modelos, rastreos en vivo, sesiones reales ni despliegue.
 
 ## Verificación
 
-Ejecuta la suite backend aislada de este alcance (workspace independiente,
-directorio de destino propio):
+Ejecuta la suite backend aislada de este alcance (directorio de destino
+propio):
 
 ```sh
 cargo fmt --check --manifest-path crates/browser-resources/Cargo.toml
@@ -47,12 +47,49 @@ buscador, orden LRU, picos de telemetría y medianas de tres repeticiones.
 El crate no tiene dependencias, así que no necesita cambios de lock ni del
 manifiesto raíz.
 
-## No implementado aquí
+## Cableado en webd (B6)
 
-El cableado en `webd`, la gestión del scope del cgroup, la supervisión real
-de Chrome, las señales de presión del intermediario, las llamadas CDP de
-GC/presión/caché, los recorridos de perfiles con
-`Storage.getUsageAndQuota`, las mediciones en la VPS y la aceptación
-completa de B6 pertenecen al carril principal. Una decisión de recursos
-sigue siendo una entrada de admisión y desalojo: solo el servicio cableado
-la aplica.
+`excalibur-webd` aplica el fundamento mediante
+`webd::resources::ResourceGate` (arquitectura 13.2-13.5): admisión con la
+media móvil por origen, plan de desalojo 1-7 con protección LIVE, puertas de
+reserva de disco, limpieza con disco bajo que respeta los orígenes en
+escucha y campos de telemetría. `serve` rechaza crecer cuando el disco libre
+rompería la reserva configurada. `AdmissionRequest::with_estimator` rellena
+la estimación desde el estimador del núcleo compartido para no fijar
+valores en webd. El crate no trae marcador `[workspace]` y se resuelve como
+dependencia de ruta de `webd` dentro del workspace principal; las suites
+aisladas anteriores siguen con `--manifest-path` y directorio propio.
+
+```sh
+cargo test -p excalibur-webd --test resources_gates -- --nocapture
+cargo test -p excalibur-webd --test resources_measure -- --nocapture
+```
+
+`resources_gates` cubre la arquitectura 13.6 solo con fixtures sintéticas:
+constantes, puertas de admisión con media móvil, orden de desalojo 1-7 con
+protección LIVE, puertas de disco, `listener_cannot_suspend` y picos de
+telemetría.
+
+## Mediciones (18.3)
+
+`resources_measure` ejecuta la forma del procedimiento reproducible solo con
+fixtures sintéticas: instancia en blanco, página estática local, diez
+pestañas efímeras pesadas, lecturas A/B/C con PSS por tipo de proceso,
+exactamente 3 repeticiones con mediana/mínimo/máximo más metadatos de
+Chrome, kernel y flags. Los niveles B y C enumeran árboles sintéticos con
+forma de `/proc`; una lectura propia en vivo de `/proc/self/status` ancla el
+nivel B a la máquina real. Los 30 s de reposo constan como constante del
+procedimiento sin espera real para que la suite sea rápida; una medición VPS
+real espera el retardo completo. El informe JSON queda en
+`target/test-evidence/browser/resources/measure.json`. Las cifras con sesión
+de WhatsApp/Teams (18.4, 1 h/24 h) siguen pendientes del usuario y nunca se
+afirman aquí.
+
+## Aún pendiente
+
+La gestión del scope del cgroup, la supervisión real de Chrome, las señales
+de presión del intermediario, las llamadas CDP de GC/presión/caché, los
+recorridos de perfiles con `Storage.getUsageAndQuota`, las mediciones en la
+VPS y la aceptación completa de B6 pertenecen al carril principal. Una
+decisión de recursos sigue siendo una entrada de admisión y desalojo: solo
+el servicio cableado la aplica.
