@@ -94,6 +94,11 @@ fn is_pe(bytes: &[u8]) -> bool {
     !is_text(bytes)
 }
 
+/// Legacy (pre-1.0) zstd frame magics 0xFD2FB51E..=0xFD2FB527.
+fn is_legacy_zstd(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && (0x1E..=0x27).contains(&bytes[0]) && bytes[1..4] == [0xB5, 0x2F, 0xFD]
+}
+
 /// Detects the content kind from leading bytes.
 pub fn detect(bytes: &[u8]) -> Kind {
     let at = |offset: usize, magic: &[u8]| {
@@ -123,7 +128,8 @@ pub fn detect(bytes: &[u8]) -> Kind {
         Kind::Zip
     } else if at(0, b"\x1F\x8B") {
         Kind::Gzip
-    } else if at(0, b"\x28\xB5\x2F\xFD") {
+    } else if at(0, b"\x28\xB5\x2F\xFD") || is_legacy_zstd(bytes) {
+        // Legacy frames are classified as zstd so that expansion refuses them.
         Kind::Zstd
     } else if at(257, b"ustar") {
         Kind::Tar

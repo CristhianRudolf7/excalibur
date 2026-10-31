@@ -342,6 +342,11 @@ fn legacy_zstd_frames_are_refused() {
         code(guard().examine(None, "application/zstd", &legacy)),
         Code::Unsupported
     );
+    // Not passed off as unknown binary under a neutral declared type either.
+    assert_eq!(
+        code(guard().examine(None, "application/octet-stream", &legacy)),
+        Code::Unsupported
+    );
     let mut mixed = zstd(b"first frame");
     let mut tail = 0xFD2F_B525u32.to_le_bytes().to_vec();
     tail.extend_from_slice(&[0u8; 32]);
