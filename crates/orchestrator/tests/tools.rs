@@ -24,10 +24,14 @@ async fn real_model_callable_spawn_reconciles_and_workers_cannot_delegate() {
         .await
         .unwrap();
     let run = p.run_id.as_ref().unwrap();
+    // The child must afford its own L0 core, which here includes the
+    // coordination catalog; a 1,000-token run cap is rejected at spawn.
+    let mut child = delegation("c", "general", 60);
+    child.spec.budget.max_tokens = 10_000;
     let call = ToolCall {
         id: "spawncall".into(),
         name: "subagent".into(),
-        arguments: json!({"action":"spawn","delegation":delegation("c","general",60)}).to_string(),
+        arguments: json!({"action":"spawn","delegation":child}).to_string(),
     };
     let prepared = adapter.prepare(run, call).await.unwrap();
     let result = adapter.execute(run, "stable-spawn", &prepared).await;
@@ -84,10 +88,10 @@ async fn waiting_parent_spends_no_model_calls_and_child_completion_wakes_it() {
         .spawn(&f.master.id, delegation("p", "general", 300))
         .await
         .unwrap();
-    let c = host
-        .spawn(&p.id, delegation("c", "general", 60))
-        .await
-        .unwrap();
+    // The child must afford its own L0 core including the coordination catalog.
+    let mut child = delegation("c", "general", 60);
+    child.spec.budget.max_tokens = 10_000;
+    let c = host.spawn(&p.id, child).await.unwrap();
     host.request_wait_for_children(&p.id).await.unwrap();
     let waiting = host.engine().run(p.run_id.as_ref().unwrap()).await.unwrap();
     assert_eq!(waiting.status, excalibur_engine::Status::Waiting);

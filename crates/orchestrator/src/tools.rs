@@ -261,11 +261,19 @@ async fn delegation_from_call(
         }
     }
     let goal = required("goal")?;
-    let mut context = excalibur_context::ContextInput::new(
-        state.spec.context.layers[0].clone(),
-        goal.clone(),
-        format!("UTC Unix seconds {}", now()),
-    );
+    let priority = parent.delegation.as_ref().map(|d| d.priority).unwrap_or(1);
+    // The child's L0 core is sized by the same native path as its parent, but
+    // against the child's own run budget and the host/model input limits. The
+    // parent's lane marker is removed here; spawn appends the child's own,
+    // which is exactly the suffix counted below.
+    let (mut context, _) = host.inner.engine.native_context(
+        &crate::without_lane_markers(&state.spec.context.layers[0]),
+        &goal,
+        &format!("UTC Unix seconds {}", now()),
+        &budget,
+        &crate::lane_marker(priority.max(1)),
+    )?;
+    // Parent profile identity is removed by spawn, which owns that block.
     context.layers[1] = state.spec.context.layers[1].clone();
     context.layers[2] = state.spec.context.layers[2].clone();
     let bytes = Sha256::digest(operation.as_bytes());
@@ -298,7 +306,7 @@ async fn delegation_from_call(
             budget,
             criteria: vec![excalibur_engine::Criterion::FinalResponse { schema: None }],
         },
-        priority: parent.delegation.as_ref().map(|d| d.priority).unwrap_or(1),
+        priority,
     })
 }
 fn coordination_definitions(parent: bool) -> Vec<ToolDefinition> {

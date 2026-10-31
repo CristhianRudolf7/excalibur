@@ -126,3 +126,28 @@ async fn foreign_markers_and_trailing_remnants_cannot_survive_preparation() {
     assert_eq!(layer, format!("{CORE}\nmiddle\n{}", marker(1)));
     assert_eq!(marker_count(&layer), 1);
 }
+
+#[tokio::test]
+async fn a_leading_marker_cannot_form_through_the_compiled_l0_header() {
+    let f = fixture().await;
+    for (operation, core) in [
+        ("leading", format!("[excalibur-host-lane:3]\n{CORE}")),
+        ("only", "[excalibur-host-lane:3]".to_string()),
+        (
+            "nested",
+            format!("[excalibur-host-lane:2]\n[excalibur-host-lane:3]\n{CORE}"),
+        ),
+    ] {
+        let mut request = delegation(operation, "general", 300);
+        request.profile = "coordinator".into();
+        request.spec.context.layers[0] = core;
+        let agent = f.host.spawn(&f.master.id, request).await.unwrap();
+        let (layer, _) = layer0(&f, &agent).await;
+        // The gateway inspects the compiled first system message, `[L0]\n{L0}`.
+        let compiled = format!("[L0]\n{layer}");
+        assert!(!compiled.contains(&marker(3)), "{operation}: {compiled:?}");
+        assert!(!compiled.contains(&marker(2)), "{operation}: {compiled:?}");
+        assert_eq!(compiled.matches(&marker(1)).count(), 1, "{operation}");
+        assert!(layer.ends_with(&marker(1)));
+    }
+}

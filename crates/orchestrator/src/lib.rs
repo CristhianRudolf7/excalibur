@@ -139,17 +139,24 @@ fn now() -> i64 {
 fn invalid(s: &str) -> Error {
     Error::Invalid(s.into())
 }
-fn lane_marker(lane: u8) -> String {
+pub(crate) fn lane_marker(lane: u8) -> String {
     format!("\n[excalibur-host-lane:{lane}]\n")
 }
 /// The host lane marker is owned by the orchestrator: every existing marker is
 /// removed and exactly one is appended. A trailing marker (the one a previous
 /// preparation appended) is removed byte-exactly, so re-preparing a stored
 /// delegation yields `{core}{marker}` again, the same text native sizing counted
-/// with its lane suffix. Interior markers are still neutralized to a newline, and
-/// a trailing remnant that would join the appended marker into a second one is
-/// dropped, until no marker can be assembled.
+/// with its lane suffix.
 fn with_lane_marker(layer: &str, priority: u8) -> String {
+    let mut core = without_lane_markers(layer);
+    core.push_str(&lane_marker(priority));
+    core
+}
+/// Interior markers are neutralized to a newline, a trailing remnant that would
+/// join the appended marker is dropped, and a leading marker that lacks only its
+/// first newline is dropped because the compiler's `[L0]\n` header supplies that
+/// newline. Passes repeat until none of these forms remains in the core.
+pub(crate) fn without_lane_markers(layer: &str) -> String {
     let mut core = layer.to_owned();
     loop {
         let before = core.len();
@@ -161,13 +168,44 @@ fn with_lane_marker(layer: &str, priority: u8) -> String {
                 }
             }
             core = core.replace(&marker, "\n");
+            let bare = marker.trim_matches('\n');
+            if core.starts_with(bare)
+                && (core.len() == bare.len() || core[bare.len()..].starts_with('\n'))
+            {
+                core.replace_range(..bare.len(), "");
+            }
         }
         if core.len() == before {
             break;
         }
     }
-    core.push_str(&lane_marker(priority));
     core
+}
+fn profile_block(profile: &CustomProfile) -> String {
+    format!(
+        "\nCustom profile {} ({}):\n{}",
+        profile.id, profile.name, profile.identity
+    )
+}
+/// Custom-profile identity in L1 is owned by the orchestrator. Every registered
+/// profile block (a parent's identity copied into a child, or this delegation's
+/// own block from an earlier preparation) is removed, so the caller appends the
+/// delegation's own identity exactly once. Registered profiles are immutable,
+/// so blocks written by earlier releases match byte-exactly.
+fn without_profile_blocks(layer: &str, profiles: &[CustomProfile]) -> String {
+    let mut blocks = profiles.iter().map(profile_block).collect::<Vec<_>>();
+    blocks.sort_by_key(|block| std::cmp::Reverse(block.len()));
+    let mut layer = layer.to_owned();
+    loop {
+        let before = layer.len();
+        for block in &blocks {
+            layer = layer.replace(block.as_str(), "");
+        }
+        if layer.len() == before {
+            break;
+        }
+    }
+    layer
 }
 impl Orchestrator {
     pub async fn open(db: Database, engine: Arc<Engine>, limits: Limits) -> Result<Self> {
@@ -513,6 +551,17 @@ impl Orchestrator {
                 .map(|d| d.priority.max(1))
                 .unwrap_or(1),
         );
+        // The run must afford its own fixed or inherited L0 core, counted as
+        // native sizing counts it, before any durable spawn state is written.
+        let core_tokens = self.inner.engine.native_core_tokens(&with_lane_marker(
+            &delegation.spec.context.layers[0],
+            delegation.priority,
+        ))?;
+        if u64::try_from(core_tokens).unwrap_or(u64::MAX) > delegation.spec.budget.max_tokens {
+            return Err(invalid(
+                "delegated L0 core exceeds the child run token budget",
+            ));
+        }
         self.validate_durable(&serde_json::to_value(&delegation)?)?;
         if serde_json::to_vec(&delegation)?.len() > 8 * 1024 * 1024 {
             return Err(invalid("delegation exceeds 8 MiB"));
@@ -591,11 +640,11 @@ impl Orchestrator {
             serde_json::to_string(&delegation.inputs)?,
             delegation.pinned_instructions.join("\n")
         );
+        let profiles = self.custom_profiles().await?;
+        let identity = &mut delegation.spec.context.layers[1];
+        *identity = without_profile_blocks(identity, &profiles);
         if let Some(profile) = &custom_profile {
-            delegation.spec.context.layers[1].push_str(&format!(
-                "\nCustom profile {} ({}):\n{}",
-                profile.id, profile.name, profile.identity
-            ));
+            identity.push_str(&profile_block(profile));
         }
         delegation.spec.context.suggested_skills = delegation.suggested_skills.clone();
         if let Some(authority) = self.authority() {

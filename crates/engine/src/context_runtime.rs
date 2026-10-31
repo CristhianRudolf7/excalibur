@@ -19,20 +19,7 @@ impl Engine {
         budget: &Budget,
         core_suffix: &str,
     ) -> Result<(excalibur_context::ContextInput, NativeContextBudget)> {
-        let mut variants = self.tools.definitions();
-        variants.extend(super::builtin_definitions());
-        variants.sort_by(|a, b| a.name.cmp(&b.name));
-        variants.dedup();
-        let text = format!(
-            "{core}{core_suffix}\nCore tool definitions: {}",
-            serde_json::to_string(&variants)?
-        );
-        let policy = self.effective_context_policy()?;
-        let core_message = Message::text("system", format!("[L0]\n{core}{core_suffix}"));
-        let core_tokens = excalibur_context::TokenCounter::with_margin(
-            policy.counter.core_layer_tokens(&core_message, &variants),
-        )
-        .max(excalibur_context::estimate_tokens(&text));
+        let core_tokens = self.native_core_tokens(&format!("{core}{core_suffix}"))?;
         let model_input_limit = self
             .model
             .context_policy_override()
@@ -64,6 +51,26 @@ impl Engine {
                 model_input_limit,
             },
         ))
+    }
+    /// Tokens that native sizing counts for an L0 core text (including any
+    /// lane suffix) with this engine's composed core tool catalog and counter.
+    /// Delegation guards use the same count so a fixed L0 is judged exactly as
+    /// `native_context` would have judged it.
+    pub fn native_core_tokens(&self, layer: &str) -> Result<usize> {
+        let mut variants = self.tools.definitions();
+        variants.extend(super::builtin_definitions());
+        variants.sort_by(|a, b| a.name.cmp(&b.name));
+        variants.dedup();
+        let text = format!(
+            "{layer}\nCore tool definitions: {}",
+            serde_json::to_string(&variants)?
+        );
+        let policy = self.effective_context_policy()?;
+        let core_message = Message::text("system", format!("[L0]\n{layer}"));
+        Ok(excalibur_context::TokenCounter::with_margin(
+            policy.counter.core_layer_tokens(&core_message, &variants),
+        )
+        .max(excalibur_context::estimate_tokens(&text)))
     }
     /// The host supplies a model's actual window and desired context policy.
     /// The selected policy is captured in each new run's durable seed.
