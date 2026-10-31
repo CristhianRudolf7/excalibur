@@ -9,6 +9,6 @@ Los siguientes puntos son planes, no funcionalidades terminadas ni compromisos d
 3. Añadir una interfaz web y ampliar capacidades y soporte de proveedores.
 4. Explorar una tienda de herramientas y flujos de automatización, incluidos catálogo, instalación y publicación.
 
-Alcance de plataforma: la implementación y la verificación se centran actualmente en Linux; el soporte para otros sistemas operativos está previsto para una fase posterior.
+Alcance de plataforma: la implementación y la verificación se centran actualmente en Linux; el soporte para otros sistemas operativos está previsto para una fase posterior. El aprendizaje y la autopoiesis (H13) están previstos para una fase posterior.
 
 El alcance y el orden pueden cambiar conforme evolucione el proyecto.

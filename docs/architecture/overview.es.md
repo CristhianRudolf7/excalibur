@@ -4,7 +4,7 @@
 
 Este documento describe la arquitectura prevista. Existen bibliotecas Rust de proveedores, base/almacenamiento y motor durable mínimo; la aplicación completa y las interfaces siguen previstas. Consulta la [cobertura de proveedores](provider-implementation.es.md).
 
-La implementación y la verificación se centran actualmente en Linux; el soporte para otros sistemas operativos (incluidos Windows, macOS y perfiles móviles) está previsto para una fase posterior.
+La implementación y la verificación se centran actualmente en Linux; el soporte para otros sistemas operativos (incluidos Windows, macOS y perfiles móviles) está previsto para una fase posterior. El aprendizaje y la autopoiesis (H13) están previstos para una fase posterior.
 
 ## Núcleo compartido e interfaces
 

@@ -4,7 +4,7 @@
 
 This document describes the intended architecture. Rust provider, base/storage and minimum durable engine libraries exist; the complete application and interfaces remain planned. See [provider coverage](provider-implementation.md).
 
-Implementation and verification currently target Linux; support for other operating systems (including Windows, macOS and mobile profiles) is planned for a later phase.
+Implementation and verification currently target Linux; support for other operating systems (including Windows, macOS and mobile profiles) is planned for a later phase. Learning and autopoiesis (H13) are planned for a later phase.
 
 ## Shared core and interfaces
 
