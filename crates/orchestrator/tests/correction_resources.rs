@@ -220,7 +220,8 @@ async fn weighted_project_round_robin_is_deterministic_and_fifth_child_stays_que
     for i in 0..5 {
         let mut d = delegation(&format!("child{i}"), "general", 20);
         d.spec.budget.max_steps = 10;
-        d.spec.budget.max_tokens = 100;
+        // Each child must afford its own L0 core catalog.
+        d.spec.budget.max_tokens = 5_000;
         d.spec.budget.max_tool_calls = 1;
         children.push(host.spawn(&p.id, d).await.unwrap());
     }
@@ -294,7 +295,8 @@ async fn four_admitted_waiting_children_keep_slots_until_terminal_while_fifth_is
     for i in 0..5 {
         let mut d = delegation(&format!("wait-child{i}"), "general", 20);
         d.spec.budget.max_steps = 10;
-        d.spec.budget.max_tokens = 100;
+        // Each child must afford its own L0 core catalog.
+        d.spec.budget.max_tokens = 5_000;
         d.spec.budget.max_tool_calls = 1;
         children.push(host.spawn(&p.id, d).await.unwrap());
     }
