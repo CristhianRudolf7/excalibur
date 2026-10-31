@@ -1047,7 +1047,6 @@ static PURGE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub struct PurgeService {
     principal: String,
     main: Database,
-    journal: Journal,
     telemetry: Option<Telemetry>,
     participants: Vec<Arc<dyn PurgeParticipant>>,
     observer: Option<PurgeObserver>,
@@ -1109,11 +1108,11 @@ impl PurgeService {
             return Err(Error::Invalid("principal required"));
         }
         install(&main).await?;
-        let journal = Journal::new(main.clone()).await?;
+        // Installs the journal schema, including payload redirects.
+        Journal::new(main.clone()).await?;
         Ok(Self {
             principal,
             main,
-            journal,
             telemetry,
             participants: Vec::new(),
             observer: None,

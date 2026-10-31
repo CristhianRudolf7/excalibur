@@ -411,6 +411,7 @@ async fn rp2_json_and_identifier_texts_keep_every_payload_valid() {
             (linked.clone(), unrelated.clone(), structured.clone());
         world
             .sql(move |c| {
+                c.execute("INSERT OR IGNORE INTO principals(id,name) VALUES(?1,?1)", [PRINCIPAL])?;
                 c.execute("INSERT INTO conversations(id,active_scope,scope_id,principal_id) VALUES('cnv_json',?1,?1,?2)", [SCOPE, PRINCIPAL])?;
                 c.execute("INSERT INTO messages(id,conversation_id,text,scope_id,principal_id) VALUES('msg_json','cnv_json',?1,?2,?3)", [structured.as_str(), SCOPE, PRINCIPAL])?;
                 c.execute("INSERT INTO messages(id,conversation_id,text,scope_id,principal_id) VALUES('msg_runid','cnv_json',?1,?2,?3)", [unrelated.as_str(), SCOPE, PRINCIPAL])?;
@@ -615,9 +616,17 @@ async fn rp6_active_runs_fence_and_late_rows_are_covered() {
         .await
         .unwrap();
     assert!(late > 0);
+    // Telemetry records the late event directly (a full reconcile is only consistent
+    // once the purge has re-sealed the offsets of the events it redacted).
+    let event = world
+        .journal
+        .entries(&planted.run, late - 1, 1)
+        .await
+        .unwrap()
+        .remove(0);
     world
         .telemetry
-        .reconcile(&world.journal, &planted.run)
+        .record_event(&planted.run, &event)
         .await
         .unwrap();
     for outcome in service.resume_pending().await.unwrap() {
@@ -707,6 +716,7 @@ async fn rp4_base_deletion_is_bounded_and_incremental() {
     let world = World::open(dir.path()).await;
     world
         .sql(|c| {
+            c.execute("INSERT OR IGNORE INTO principals(id,name) VALUES(?1,?1)", [PRINCIPAL])?;
             c.execute("INSERT INTO conversations(id,active_scope,scope_id,principal_id) VALUES('cnv_big','general','general',?1)", [PRINCIPAL])?;
             c.execute("INSERT INTO conversations(id,active_scope,scope_id,principal_id) VALUES('cnv_keep','general','general',?1)", [PRINCIPAL])?;
             for n in 0..300 {
