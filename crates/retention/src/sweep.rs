@@ -404,6 +404,8 @@ fn target_condition(table: &SweepTable) -> String {
     }
     if table.scope {
         sql.push_str(" AND (scope_id IS NULL OR scope_id IN (SELECT value FROM json_each(?5)))");
+    } else {
+        sql.push_str(" AND ?5 IS NOT NULL");
     }
     sql
 }
