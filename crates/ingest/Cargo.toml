@@ -6,8 +6,10 @@ edition = "2024"
 [dependencies]
 # Pure-Rust DEFLATE decoder (no build script, no network access); used for zip and gzip.
 miniz_oxide = "0.8"
-# Already in the workspace lock through excalibur-store.
-zstd = "0.13"
+# Already in the workspace lock through excalibur-store. Legacy (pre-1.0) frame support is not
+# requested; the guard also refuses legacy frame magics before decoding, because another
+# workspace crate enables the default features and Cargo unifies them.
+zstd = { version = "0.13", default-features = false }
 crc32fast = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

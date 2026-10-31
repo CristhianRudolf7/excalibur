@@ -17,7 +17,7 @@ pub use detect::{Expectation, Kind, detect};
 pub use quarantine::{Quarantine, QuarantineItem, QuarantineRecord};
 pub use scanner::{ScanVerdict, Scanner, SignatureScanner, eicar_test_string};
 
-use archive::{Budget, Entry, Failure, fail};
+use archive::{Budget, Entry, Failure, fail, quoted};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -72,7 +72,9 @@ impl Code {
 pub struct Limits {
     /// Size of the submitted file.
     pub max_input_bytes: u64,
-    /// Total bytes produced by all decompression streams across every nesting level.
+    /// Total bytes produced by all decompression streams plus bytes of stored zip and tar
+    /// entries handed out for inspection, across every nesting level (a container nested
+    /// inside another is counted at each level).
     pub max_expanded_bytes: u64,
     /// Maximum expanded/compressed ratio per stream and for the whole file.
     pub max_ratio: u64,
@@ -82,6 +84,8 @@ pub struct Limits {
     pub max_entries: u64,
     /// Maximum container nesting; a plain archive has depth 1, `.tar.gz` has depth 2.
     pub max_depth: u32,
+    /// Maximum gzip members or zstd frames in one stream.
+    pub max_stream_members: u64,
 }
 
 impl Default for Limits {
@@ -93,6 +97,7 @@ impl Default for Limits {
             ratio_grace_bytes: 1024 * 1024,
             max_entries: 10_000,
             max_depth: 3,
+            max_stream_members: 4096,
         }
     }
 }
@@ -189,6 +194,18 @@ impl std::fmt::Debug for ContentGuard {
     }
 }
 
+/// Detected kind, except that valid UTF-8 text promised as text stays text even when it
+/// happens to start with another format's magic bytes (`%PDF`, `ID3`, `GIF89a`, ...).
+/// Executable signatures never survive this rule: none of them is valid NUL-free UTF-8.
+fn effective_kind(text_promised: bool, bytes: &[u8]) -> Kind {
+    let detected = detect(bytes);
+    if text_promised && !detected.is_executable() && detect::is_text(bytes) {
+        Kind::Text
+    } else {
+        detected
+    }
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -229,7 +246,9 @@ impl ContentGuard {
         bytes: &[u8],
     ) -> Result<Inspection, Rejection> {
         let sha256 = sha256_hex(bytes);
-        let detected = detect(bytes);
+        let text_promised = detect::expectation_for_media_type(declared_type) == Expectation::Text
+            || name.and_then(detect::expectation_for_name) == Some(Expectation::Text);
+        let detected = effective_kind(text_promised, bytes);
         match self.evaluate(name, declared_type, bytes, detected) {
             Ok((flags, entries, expanded_bytes)) => Ok(Inspection {
                 sha256,
@@ -313,13 +332,13 @@ impl ContentGuard {
             }
         };
         if let Some(conflict) = declared.conflict(detected) {
-            mismatch(format!("declared {declared_type}: {conflict}"))?;
+            mismatch(format!("declared {}: {conflict}", quoted(declared_type)))?;
         }
         if let Some(name) = name
             && let Some(conflict) =
                 detect::expectation_for_name(name).and_then(|e| e.conflict(detected))
         {
-            mismatch(format!("name {name:?}: {conflict}"))?;
+            mismatch(format!("name {}: {conflict}", quoted(name)))?;
         }
         let mut walk = Walk {
             guard: self,
@@ -345,16 +364,24 @@ impl Walk<'_> {
         let Some(scanner) = &self.guard.scanner else {
             return Ok(());
         };
-        let label = path.unwrap_or("<file>");
+        let label = quoted(path.unwrap_or("<file>"));
         match scanner.scan(path, bytes) {
             ScanVerdict::Clean => Ok(()),
             ScanVerdict::Infected { signature } => Err(fail(
                 Code::ScannerHit,
-                format!("{} found {signature} in {label:?}", scanner.name()),
+                format!(
+                    "{} found {} in {label}",
+                    quoted(scanner.name()),
+                    quoted(&signature)
+                ),
             )),
             ScanVerdict::Failed { reason } => Err(fail(
                 Code::ScannerFailed,
-                format!("{} could not scan {label:?}: {reason}", scanner.name()),
+                format!(
+                    "{} could not scan {label}: {}",
+                    quoted(scanner.name()),
+                    quoted(&reason)
+                ),
             )),
         }
     }
@@ -378,13 +405,15 @@ impl Walk<'_> {
             let detected = if entry.directory {
                 Kind::Binary
             } else {
-                detect(&entry.bytes)
+                effective_kind(
+                    detect::expectation_for_name(&entry.path) == Some(Expectation::Text),
+                    &entry.bytes,
+                )
             };
+            let shown = quoted(&entry.path);
             if entry.executable_mode {
-                self.flags.push(format!(
-                    "executable_mode_ignored: {:?} at depth {depth}",
-                    entry.path
-                ));
+                self.flags
+                    .push(format!("executable_mode_ignored: {shown} at depth {depth}"));
             }
             self.entries.push(EntryReport {
                 path: entry.path.clone(),
@@ -400,10 +429,7 @@ impl Walk<'_> {
             if detected.is_executable() {
                 return Err(fail(
                     Code::Executable,
-                    format!(
-                        "archive entry {:?} contains executable content ({detected})",
-                        entry.path
-                    ),
+                    format!("archive entry {shown} contains executable content ({detected})"),
                 ));
             }
             if let Some(conflict) =
@@ -413,12 +439,12 @@ impl Walk<'_> {
                     MismatchPolicy::Reject => {
                         return Err(fail(
                             Code::TypeMismatch,
-                            format!("archive entry {:?}: {conflict}", entry.path),
+                            format!("archive entry {shown}: {conflict}"),
                         ));
                     }
                     MismatchPolicy::Flag => self
                         .flags
-                        .push(format!("type_mismatch: entry {:?}: {conflict}", entry.path)),
+                        .push(format!("type_mismatch: entry {shown}: {conflict}")),
                 }
             }
             self.scan(Some(&entry.path), &entry.bytes)?;

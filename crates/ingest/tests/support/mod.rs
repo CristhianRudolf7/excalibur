@@ -39,6 +39,8 @@ pub struct ZipEntry {
     pub deflate: bool,
     /// Unix mode stored in the external attributes (made-by Unix) when present.
     pub unix_mode: Option<u32>,
+    /// Bytes appended after the compressed data and counted in the compressed size.
+    pub trailing: Vec<u8>,
 }
 
 pub fn file(name: &str, data: &[u8]) -> ZipEntry {
@@ -47,6 +49,7 @@ pub fn file(name: &str, data: &[u8]) -> ZipEntry {
         data: data.to_vec(),
         deflate: true,
         unix_mode: None,
+        trailing: Vec::new(),
     }
 }
 
@@ -55,11 +58,12 @@ pub fn zip(entries: &[ZipEntry]) -> Vec<u8> {
     let mut central = Vec::new();
     for e in entries {
         let offset = out.len() as u32;
-        let (method, body) = if e.deflate {
+        let (method, mut body) = if e.deflate {
             (8u16, deflate(&e.data))
         } else {
             (0u16, e.data.clone())
         };
+        body.extend_from_slice(&e.trailing);
         let crc = crc32fast::hash(&e.data);
         let name = e.name.as_bytes();
         out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());

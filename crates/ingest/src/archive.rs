@@ -1,16 +1,20 @@
 //! Bounded, in-memory expansion of zip, gzip, zstd and tar containers. Nothing is written to
 //! disk and nothing is executed: entries are returned as bytes for type detection and scanning.
-//! Every decoder stops as soon as a limit would be exceeded instead of streaming past it.
+//! Container structure is validated before any entry is materialized, stored entries borrow
+//! the input instead of copying it, and every decoder stops as soon as a limit would be
+//! exceeded instead of streaming past it.
 use crate::{Code, Limits};
 use miniz_oxide::{
     DataFormat, MZError, MZFlush, MZStatus,
     inflate::stream::{InflateState, inflate},
 };
-use std::io::Read;
+use std::{borrow::Cow, io::Read};
 
 /// Maximum zstd window (32 MiB) accepted by the decoder, bounding decoder memory.
 const ZSTD_WINDOW_LOG_MAX: u32 = 25;
 const CHUNK: usize = 64 * 1024;
+/// Longest piece of attacker-controlled text echoed in a message.
+const ECHO_CHARS: usize = 96;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Failure {
@@ -25,11 +29,23 @@ pub(crate) fn fail(code: Code, message: impl Into<String>) -> Failure {
     }
 }
 
+/// Debug-quotes untrusted text, truncated to a bounded number of characters.
+pub(crate) fn quoted(text: &str) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(ECHO_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head:?}… ({} bytes)", text.len())
+    } else {
+        format!("{head:?}")
+    }
+}
+
 /// Shared budget across every nesting level of one inspection.
 #[derive(Debug)]
 pub(crate) struct Budget<'a> {
     pub limits: &'a Limits,
     pub input_bytes: u64,
+    /// Bytes produced by decoders plus bytes of stored entries handed out for inspection.
     pub expanded: u64,
     pub entries: u64,
 }
@@ -59,6 +75,15 @@ impl Budget<'_> {
         }
     }
     fn charge(&mut self, produced: u64) -> Result<(), Failure> {
+        if produced > self.remaining() {
+            return Err(fail(
+                Code::ExpansionLimit,
+                format!(
+                    "expanded content exceeds {} bytes",
+                    self.limits.max_expanded_bytes
+                ),
+            ));
+        }
         self.expanded += produced;
         let overall = self
             .input_bytes
@@ -70,6 +95,18 @@ impl Budget<'_> {
                 format!(
                     "total expansion exceeds {}:1 of the {}-byte input",
                     self.limits.max_ratio, self.input_bytes
+                ),
+            ));
+        }
+        Ok(())
+    }
+    fn members(&self, count: u64, what: &str) -> Result<(), Failure> {
+        if count > self.limits.max_stream_members {
+            return Err(fail(
+                Code::EntryLimit,
+                format!(
+                    "more than {} {what} in one stream",
+                    self.limits.max_stream_members
                 ),
             ));
         }
@@ -104,18 +141,18 @@ impl StreamCap {
     }
 }
 
-/// One extracted entry, held in memory only.
+/// One entry, held in memory only. Stored entries borrow the container bytes.
 #[derive(Clone, Debug)]
-pub(crate) struct Entry {
+pub(crate) struct Entry<'a> {
     pub path: String,
-    pub bytes: Vec<u8>,
+    pub bytes: Cow<'a, [u8]>,
     pub executable_mode: bool,
     pub directory: bool,
 }
 
 /// Validates an entry path: relative, no parent components, no NUL, no drive prefix.
 pub fn safe_entry_path(name: &str) -> Result<String, Failure> {
-    let unsafe_path = |why: &str| fail(Code::UnsafePath, format!("entry {name:?}: {why}"));
+    let unsafe_path = |why: &str| fail(Code::UnsafePath, format!("entry {}: {why}", quoted(name)));
     if name.is_empty() {
         return Err(unsafe_path("empty name"));
     }
@@ -147,56 +184,80 @@ pub fn safe_entry_path(name: &str) -> Result<String, Failure> {
     Ok(parts.join("/"))
 }
 
-/// Raw DEFLATE inflation that refuses to produce more than the cap allows.
-/// Returns the output and the number of input bytes consumed.
-fn inflate_bounded(
-    input: &[u8],
-    cap: StreamCap,
-    limits: &Limits,
-) -> Result<(Vec<u8>, usize), Failure> {
-    let mut state = InflateState::new_boxed(DataFormat::Raw);
-    let mut out = Vec::new();
-    let mut buf = vec![0u8; CHUNK];
-    let mut pos = 0usize;
-    loop {
-        let res = inflate(&mut state, &input[pos..], &mut buf, MZFlush::None);
-        pos += res.bytes_consumed;
-        cap.check((out.len() + res.bytes_written) as u64, limits)?;
-        out.extend_from_slice(&buf[..res.bytes_written]);
-        match res.status {
-            Ok(MZStatus::StreamEnd) => return Ok((out, pos)),
-            Ok(_) if res.bytes_consumed > 0 || res.bytes_written > 0 => {}
-            Ok(_) | Err(MZError::Buf) => {
-                return Err(fail(Code::Malformed, "truncated deflate stream"));
-            }
-            Err(e) => {
-                return Err(fail(
-                    Code::Malformed,
-                    format!("invalid deflate stream: {e:?}"),
-                ));
+/// Reusable raw DEFLATE decoder: one state and one output chunk per container.
+struct Inflater {
+    state: Box<InflateState>,
+    buf: Vec<u8>,
+}
+
+impl Inflater {
+    fn new() -> Self {
+        Self {
+            state: InflateState::new_boxed(DataFormat::Raw),
+            buf: vec![0u8; CHUNK],
+        }
+    }
+
+    /// Appends one raw DEFLATE stream to `out`, refusing to let `out` grow past the cap.
+    /// Returns the number of input bytes consumed by the stream.
+    fn inflate_into(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        cap: StreamCap,
+        limits: &Limits,
+    ) -> Result<usize, Failure> {
+        self.state.reset(DataFormat::Raw);
+        let mut pos = 0usize;
+        loop {
+            let res = inflate(&mut self.state, &input[pos..], &mut self.buf, MZFlush::None);
+            pos += res.bytes_consumed;
+            cap.check((out.len() + res.bytes_written) as u64, limits)?;
+            out.extend_from_slice(&self.buf[..res.bytes_written]);
+            match res.status {
+                Ok(MZStatus::StreamEnd) => return Ok(pos),
+                Ok(_) if res.bytes_consumed > 0 || res.bytes_written > 0 => {}
+                Ok(_) | Err(MZError::Buf) => {
+                    return Err(fail(Code::Malformed, "truncated deflate stream"));
+                }
+                Err(e) => {
+                    return Err(fail(
+                        Code::Malformed,
+                        format!("invalid deflate stream: {e:?}"),
+                    ));
+                }
             }
         }
     }
 }
 
 fn le16(b: &[u8], at: usize) -> Result<u16, Failure> {
-    b.get(at..at + 2)
+    b.get(at..at.saturating_add(2))
+        .filter(|s| s.len() == 2)
         .map(|s| u16::from_le_bytes([s[0], s[1]]))
         .ok_or_else(|| fail(Code::Malformed, "truncated header"))
 }
 fn le32(b: &[u8], at: usize) -> Result<u32, Failure> {
-    b.get(at..at + 4)
+    b.get(at..at.saturating_add(4))
+        .filter(|s| s.len() == 4)
         .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
         .ok_or_else(|| fail(Code::Malformed, "truncated header"))
 }
 
 /// Decodes every gzip member (RFC 1952) into one entry.
-pub(crate) fn gunzip(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>, Failure> {
+pub(crate) fn gunzip<'a>(
+    input: &'a [u8],
+    budget: &mut Budget<'_>,
+) -> Result<Vec<Entry<'a>>, Failure> {
     let mut out = Vec::new();
     let mut name = None;
     let mut pos = 0usize;
+    let mut members = 0u64;
+    let mut inflater = Inflater::new();
     let cap = budget.stream_cap(input.len() as u64);
     while pos < input.len() {
+        members += 1;
+        budget.members(members, "gzip members")?;
         let h = &input[pos..];
         if h.len() < 18 || h[0] != 0x1F || h[1] != 0x8B {
             return Err(fail(Code::Malformed, "invalid or trailing gzip data"));
@@ -238,32 +299,64 @@ pub(crate) fn gunzip(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>
         if p > h.len() {
             return Err(fail(Code::Malformed, "truncated gzip header"));
         }
-        let member_cap = StreamCap {
-            total: cap.total.saturating_sub(out.len() as u64),
-            ratio: cap.ratio.saturating_sub(out.len() as u64),
-        };
-        let (data, used) = inflate_bounded(&h[p..], member_cap, budget.limits)?;
-        p += used;
+        let start = out.len();
+        p += inflater.inflate_into(&h[p..], &mut out, cap, budget.limits)?;
         let crc = le32(h, p)?;
         let size = le32(h, p + 4)?;
-        if crc != crc32fast::hash(&data) || size != data.len() as u32 {
+        let member = &out[start..];
+        if crc != crc32fast::hash(member) || size != member.len() as u32 {
             return Err(fail(Code::Malformed, "gzip checksum or size mismatch"));
         }
-        out.extend_from_slice(&data);
         pos += p + 8;
     }
     budget.count_entry()?;
     budget.charge(out.len() as u64)?;
     Ok(vec![Entry {
         path: name.unwrap_or_else(|| "<gzip>".into()),
-        bytes: out,
+        bytes: Cow::Owned(out),
         executable_mode: false,
         directory: false,
     }])
 }
 
+const ZSTD_MAGIC: u32 = 0xFD2F_B528;
+
+/// Walks the zstd frame sequence before decoding: only standard and skippable frames are
+/// accepted. Legacy (pre-1.0) frames are refused so the bounded window always applies.
+fn zstd_frames(input: &[u8], budget: &Budget<'_>) -> Result<(), Failure> {
+    let mut pos = 0usize;
+    let mut frames = 0u64;
+    while pos < input.len() {
+        frames += 1;
+        budget.members(frames, "zstd frames")?;
+        let magic = le32(input, pos)?;
+        let size = if magic == ZSTD_MAGIC {
+            zstd::zstd_safe::find_frame_compressed_size(&input[pos..])
+                .map_err(|_| fail(Code::Malformed, "invalid zstd frame"))?
+        } else if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
+            8usize.saturating_add(le32(input, pos + 4)? as usize)
+        } else if (0xFD2F_B51E..=0xFD2F_B527).contains(&magic) {
+            return Err(fail(
+                Code::Unsupported,
+                "legacy zstd frames are not supported",
+            ));
+        } else {
+            return Err(fail(Code::Malformed, "trailing data after zstd frame"));
+        };
+        pos = pos
+            .checked_add(size)
+            .filter(|&e| e <= input.len() && size > 0)
+            .ok_or_else(|| fail(Code::Malformed, "truncated zstd frame"))?;
+    }
+    Ok(())
+}
+
 /// Decodes a zstd stream into one entry with a bounded window and bounded output.
-pub(crate) fn unzstd(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>, Failure> {
+pub(crate) fn unzstd<'a>(
+    input: &'a [u8],
+    budget: &mut Budget<'_>,
+) -> Result<Vec<Entry<'a>>, Failure> {
+    zstd_frames(input, budget)?;
     let cap = budget.stream_cap(input.len() as u64);
     let mut decoder = zstd::stream::read::Decoder::with_buffer(input)
         .map_err(|e| fail(Code::Malformed, format!("zstd: {e}")))?;
@@ -286,7 +379,7 @@ pub(crate) fn unzstd(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>
     budget.charge(out.len() as u64)?;
     Ok(vec![Entry {
         path: "<zstd>".into(),
-        bytes: out,
+        bytes: Cow::Owned(out),
         executable_mode: false,
         directory: false,
     }])
@@ -297,8 +390,24 @@ const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFLNK: u32 = 0o120000;
 
-/// Parses a zip archive through its central directory with bounded inflation.
-pub(crate) fn unzip(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>, Failure> {
+/// Central-directory entry validated against its local header; nothing is decoded yet.
+struct ZipRecord {
+    path: String,
+    directory: bool,
+    executable: bool,
+    method: u16,
+    crc: u32,
+    size: u64,
+    data: (usize, usize),
+}
+
+/// Parses a zip archive through its central directory. Every structural check (bounds,
+/// local/central agreement, full central-directory consumption, contiguous non-overlapping
+/// records) runs before any entry is decoded or handed out.
+pub(crate) fn unzip<'a>(
+    input: &'a [u8],
+    budget: &mut Budget<'_>,
+) -> Result<Vec<Entry<'a>>, Failure> {
     const EOCD: u32 = 0x0605_4b50;
     if input.len() < 22 {
         return Err(fail(Code::Malformed, "zip too short"));
@@ -337,20 +446,19 @@ pub(crate) fn unzip(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>,
         ));
     }
 
-    let mut entries = Vec::with_capacity(usize::from(total));
-    let mut ranges = Vec::with_capacity(usize::from(total));
+    let mut records = Vec::with_capacity(usize::from(total));
+    let mut spans = Vec::with_capacity(usize::from(total));
     let mut names = std::collections::BTreeSet::new();
     let mut p = cd_offset;
     for _ in 0..total {
         if le32(input, p)? != 0x0201_4b50 {
             return Err(fail(Code::Malformed, "bad zip central directory entry"));
         }
-        let made_by = le16(input, p + 4)?;
         let flags = le16(input, p + 8)?;
         let method = le16(input, p + 10)?;
         let crc = le32(input, p + 16)?;
         let csize = le32(input, p + 20)? as usize;
-        let usize_declared = le32(input, p + 24)? as u64;
+        let size = le32(input, p + 24)?;
         let name_len = le16(input, p + 28)? as usize;
         let extra_len = le16(input, p + 30)? as usize;
         let comment_len = le16(input, p + 32)? as usize;
@@ -366,25 +474,35 @@ pub(crate) fn unzip(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>,
         let name = std::str::from_utf8(raw_name)
             .map_err(|_| fail(Code::UnsafePath, "zip entry name is not UTF-8"))?;
         let path = safe_entry_path(name)?;
-        let unix_mode = if made_by >> 8 == 3 { external >> 16 } else { 0 };
-        let file_type = unix_mode & S_IFMT;
+        let shown = quoted(&path);
+        // Info-ZIP applies the high 16 bits as a Unix mode for several host systems (Unix,
+        // VMS, BeOS, AtheOS and others), and some writers set them on FAT/NTFS too. Interpret
+        // them whenever they are present, whatever the host byte says.
+        let mode = external >> 16;
+        let file_type = mode & S_IFMT;
         if file_type == S_IFLNK {
             return Err(fail(
                 Code::Link,
-                format!("zip entry {path:?} is a symbolic link"),
+                format!("zip entry {shown} is a symbolic link"),
             ));
         }
         if file_type != 0 && file_type != S_IFREG && file_type != S_IFDIR {
             return Err(fail(
                 Code::Link,
-                format!("zip entry {path:?} is a special file"),
+                format!("zip entry {shown} is a special file"),
             ));
         }
         let directory = name.ends_with('/') || file_type == S_IFDIR;
         if flags & 0x0001 != 0 {
             return Err(fail(
                 Code::Unsupported,
-                format!("zip entry {path:?} is encrypted and cannot be scanned"),
+                format!("zip entry {shown} is encrypted and cannot be scanned"),
+            ));
+        }
+        if method != 0 && method != 8 {
+            return Err(fail(
+                Code::Unsupported,
+                format!("zip compression method {method} for {shown}"),
             ));
         }
         let key = if directory {
@@ -395,70 +513,151 @@ pub(crate) fn unzip(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>,
         if !names.insert(key) {
             return Err(fail(
                 Code::Malformed,
-                format!("duplicate zip entry {path:?}"),
+                format!("duplicate zip entry {shown}"),
             ));
         }
         budget.count_entry()?;
 
+        // The local header must describe the same entry, so that streaming extractors which
+        // read local headers see exactly what was inspected.
         if le32(input, local)? != 0x0403_4b50 {
             return Err(fail(Code::Malformed, "bad zip local header"));
         }
+        let mismatch = |what: &str| {
+            fail(
+                Code::Malformed,
+                format!("zip local header {what} differs for {shown}"),
+            )
+        };
+        if le16(input, local + 6)? != flags {
+            return Err(mismatch("flags"));
+        }
+        if le16(input, local + 8)? != method {
+            return Err(mismatch("method"));
+        }
+        let (lcrc, lcsize, lsize) = (
+            le32(input, local + 14)?,
+            le32(input, local + 18)? as usize,
+            le32(input, local + 22)?,
+        );
         let lname = le16(input, local + 26)? as usize;
         let lextra = le16(input, local + 28)? as usize;
         if input.get(local + 30..local + 30 + lname) != Some(raw_name) {
-            return Err(fail(
-                Code::Malformed,
-                format!("zip local name differs for {path:?}"),
-            ));
+            return Err(mismatch("name"));
+        }
+        let descriptor = flags & 0x0008 != 0;
+        let agrees = |l: u64, c: u64| l == c || (descriptor && l == 0);
+        if !agrees(lcrc.into(), crc.into())
+            || !agrees(lcsize as u64, csize as u64)
+            || !agrees(lsize.into(), size.into())
+        {
+            return Err(mismatch("checksum or sizes"));
         }
         let start = local + 30 + lname + lextra;
         let end = start
             .checked_add(csize)
             .filter(|&e| e <= cd_offset)
             .ok_or_else(|| fail(Code::Malformed, "zip entry data out of bounds"))?;
-        ranges.push((local, end));
-        let data = &input[start..end];
-
-        let cap = budget.stream_cap(csize as u64);
-        let bytes = match method {
-            0 => {
-                cap.check(data.len() as u64, budget.limits)?;
-                data.to_vec()
+        let mut record_end = end;
+        if descriptor {
+            let at = if le32(input, end).ok() == Some(0x0807_4b50) {
+                end + 4
+            } else {
+                end
+            };
+            if le32(input, at)? != crc
+                || le32(input, at + 4)? as usize != csize
+                || le32(input, at + 8)? != size
+            {
+                return Err(mismatch("data descriptor"));
             }
-            8 => inflate_bounded(data, cap, budget.limits)?.0,
-            m => {
-                return Err(fail(
-                    Code::Unsupported,
-                    format!("zip compression method {m} for {path:?}"),
-                ));
-            }
-        };
-        if bytes.len() as u64 != usize_declared || crc32fast::hash(&bytes) != crc {
-            return Err(fail(
-                Code::Malformed,
-                format!("zip entry {path:?} size or checksum mismatch"),
-            ));
+            record_end = at + 12;
         }
-        if directory && !bytes.is_empty() {
-            return Err(fail(
-                Code::Malformed,
-                format!("zip directory {path:?} has data"),
-            ));
+        if record_end > cd_offset {
+            return Err(fail(Code::Malformed, "zip entry data out of bounds"));
         }
-        if method != 0 {
-            budget.charge(bytes.len() as u64)?;
-        }
-        entries.push(Entry {
+        spans.push((local, record_end));
+        records.push(ZipRecord {
             path,
-            bytes,
-            executable_mode: unix_mode & 0o111 != 0 && !directory,
             directory,
+            executable: mode & 0o111 != 0 && !directory,
+            method,
+            crc,
+            size: size.into(),
+            data: (start, end),
         });
     }
-    // Overlapping local records are a known amplification technique; refuse them.
-    ranges.sort_unstable();
-    if ranges.windows(2).any(|w| w[1].0 < w[0].1) {
-        return Err(fail(Code::Malformed, "overlapping zip entries"));
+    if p != eocd {
+        return Err(fail(
+            Code::Malformed,
+            "zip central directory holds more data than its declared entries",
+        ));
+    }
+    // Local records must tile the area before the central directory exactly: overlapping
+    // records are an amplification technique and gaps can hide entries from this parser.
+    spans.sort_unstable();
+    let mut cursor = 0usize;
+    for (start, end) in &spans {
+        if *start != cursor {
+            return Err(fail(
+                Code::Malformed,
+                if *start < cursor {
+                    "overlapping zip entries"
+                } else {
+                    "unaccounted data between zip entries"
+                },
+            ));
+        }
+        cursor = *end;
+    }
+    if cursor != cd_offset {
+        return Err(fail(
+            Code::Malformed,
+            "unaccounted data before the zip central directory",
+        ));
+    }
+
+    let mut inflater = Inflater::new();
+    let mut entries = Vec::with_capacity(records.len());
+    for record in records {
+        let data = &input[record.data.0..record.data.1];
+        let shown = quoted(&record.path);
+        let bytes: Cow<'a, [u8]> = if record.method == 0 {
+            budget
+                .stream_cap(data.len() as u64)
+                .check(data.len() as u64, budget.limits)?;
+            Cow::Borrowed(data)
+        } else {
+            let mut out = Vec::new();
+            let cap = budget.stream_cap(data.len() as u64);
+            let used = inflater.inflate_into(data, &mut out, cap, budget.limits)?;
+            if used != data.len() {
+                return Err(fail(
+                    Code::Malformed,
+                    format!("trailing data after the deflate stream of {shown}"),
+                ));
+            }
+            Cow::Owned(out)
+        };
+        if bytes.len() as u64 != record.size || crc32fast::hash(&bytes) != record.crc {
+            return Err(fail(
+                Code::Malformed,
+                format!("zip entry {shown} size or checksum mismatch"),
+            ));
+        }
+        if record.directory && !bytes.is_empty() {
+            return Err(fail(
+                Code::Malformed,
+                format!("zip directory {shown} has data"),
+            ));
+        }
+        budget.charge(bytes.len() as u64)?;
+        entries.push(Entry {
+            path: record.path,
+            bytes,
+            executable_mode: record.executable,
+            directory: record.directory,
+        });
     }
     Ok(entries)
 }
@@ -485,8 +684,12 @@ fn cstr(field: &[u8]) -> Result<&str, Failure> {
         .map_err(|_| fail(Code::UnsafePath, "tar entry name is not UTF-8"))
 }
 
-/// Parses a POSIX ustar archive. Links, devices and pax/GNU extension headers are refused.
-pub(crate) fn untar(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>, Failure> {
+/// Parses a POSIX ustar archive. Links, devices, pax/GNU extension headers and any non-zero
+/// data after the end-of-archive block are refused.
+pub(crate) fn untar<'a>(
+    input: &'a [u8],
+    budget: &mut Budget<'_>,
+) -> Result<Vec<Entry<'a>>, Failure> {
     let mut entries = Vec::new();
     let mut names = std::collections::BTreeSet::new();
     let mut pos = 0usize;
@@ -495,6 +698,12 @@ pub(crate) fn untar(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>,
             .get(pos..pos + 512)
             .ok_or_else(|| fail(Code::Malformed, "truncated tar header"))?;
         if header.iter().all(|&b| b == 0) {
+            if input[pos..].iter().any(|&b| b != 0) {
+                return Err(fail(
+                    Code::Malformed,
+                    "data after the tar end-of-archive block",
+                ));
+            }
             break;
         }
         let stored = octal(&header[148..156])?;
@@ -520,6 +729,7 @@ pub(crate) fn untar(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>,
             }
         }
         let path = safe_entry_path(&name)?;
+        let shown = quoted(&path);
         let mode = octal(&header[100..108])?;
         let size = octal(&header[124..136])?;
         let kind = header[156];
@@ -529,19 +739,19 @@ pub(crate) fn untar(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>,
             b'1' => {
                 return Err(fail(
                     Code::Link,
-                    format!("tar entry {path:?} is a hard link"),
+                    format!("tar entry {shown} is a hard link"),
                 ));
             }
             b'2' => {
                 return Err(fail(
                     Code::Link,
-                    format!("tar entry {path:?} is a symbolic link"),
+                    format!("tar entry {shown} is a symbolic link"),
                 ));
             }
             b'3' | b'4' | b'6' => {
                 return Err(fail(
                     Code::Link,
-                    format!("tar entry {path:?} is a special file"),
+                    format!("tar entry {shown} is a special file"),
                 ));
             }
             b'x' | b'g' | b'L' | b'K' => {
@@ -566,7 +776,7 @@ pub(crate) fn untar(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>,
         if directory && size != 0 {
             return Err(fail(
                 Code::Malformed,
-                format!("tar directory {path:?} has data"),
+                format!("tar directory {shown} has data"),
             ));
         }
         let key = if directory {
@@ -577,13 +787,14 @@ pub(crate) fn untar(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>,
         if !names.insert(key) {
             return Err(fail(
                 Code::Malformed,
-                format!("duplicate tar entry {path:?}"),
+                format!("duplicate tar entry {shown}"),
             ));
         }
         budget.count_entry()?;
+        budget.charge(size as u64)?;
         entries.push(Entry {
             path,
-            bytes: input[start..end].to_vec(),
+            bytes: Cow::Borrowed(&input[start..end]),
             executable_mode: mode & 0o111 != 0 && !directory,
             directory,
         });

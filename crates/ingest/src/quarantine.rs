@@ -2,6 +2,7 @@
 //! JSON Lines manifest. Objects are written with mode 0600 inside 0700 directories, so
 //! nothing quarantined is ever executable.
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -10,7 +11,7 @@ use std::{
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub const MANIFEST: &str = "manifest.jsonl";
@@ -50,25 +51,50 @@ pub struct Quarantine {
     lock: Mutex<()>,
 }
 
+/// Temporary objects older than this are leftovers of an interrupted write and are removed
+/// when the quarantine is opened.
+pub const STALE_TEMP_AGE: Duration = Duration::from_secs(10 * 60);
+const MAX_NAME_BYTES: usize = 1024;
+const MAX_TYPE_BYTES: usize = 256;
+const MAX_REASON_BYTES: usize = 2048;
+
+/// Changes permissions through an open handle (fchmod), never through a path that could be
+/// swapped for a symlink.
 #[cfg(unix)]
-fn restrict(path: &Path, mode: u32) -> io::Result<()> {
+fn restrict(file: &File, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    file.set_permissions(fs::Permissions::from_mode(mode))
 }
 #[cfg(not(unix))]
-fn restrict(_path: &Path, _mode: u32) -> io::Result<()> {
+fn restrict(_file: &File, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+fn not_real(path: &Path, what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} is not a real {what}", path.display()),
+    )
+}
+
+#[cfg(unix)]
+fn same_inode(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+#[cfg(not(unix))]
+fn same_inode(_a: &fs::Metadata, _b: &fs::Metadata) -> bool {
+    true
+}
+
+/// Creates or validates a private directory without following a symlink at its final
+/// component, then restricts it through a handle to that same inode.
 fn private_dir(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
+    let created = match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{} is not a real directory", path.display()),
-            ));
+            return Err(not_real(path, "directory"));
         }
-        Ok(_) => {}
+        Ok(_) => false,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
@@ -77,10 +103,21 @@ fn private_dir(path: &Path) -> io::Result<()> {
                 builder.mode(0o700);
             }
             builder.create(path)?;
+            true
         }
         Err(e) => return Err(e),
+    };
+    let link = fs::symlink_metadata(path)?;
+    let handle = File::open(path)?;
+    let opened = handle.metadata()?;
+    if link.file_type().is_symlink() || !opened.is_dir() || !same_inode(&link, &opened) {
+        return Err(not_real(path, "directory"));
     }
-    restrict(path, 0o700)
+    restrict(&handle, 0o700)?;
+    if created && let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        sync_dir(parent)?;
+    }
+    Ok(())
 }
 
 fn open_private(options: &mut OpenOptions) -> &mut OpenOptions {
@@ -108,15 +145,78 @@ fn valid_hash(sha256: &str) -> bool {
     sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Truncates untrusted text at a character boundary.
+fn bounded(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// True when `path` is a regular file (not a symlink) whose content hashes to `sha256`.
+fn verified_object(path: &Path, sha256: &str) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {
+            let mut file = File::open(path)?;
+            if !same_inode(&meta, &file.metadata()?) {
+                return Ok(false);
+            }
+            let mut hasher = Sha256::new();
+            io::copy(&mut file, &mut hasher)?;
+            let actual: String = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            if actual != sha256 {
+                return Ok(false);
+            }
+            restrict(&file, 0o600)?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn remove_stale_temps(objects: &Path) -> io::Result<()> {
+    let now = SystemTime::now();
+    for entry in fs::read_dir(objects)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with(".tmp-") {
+            continue;
+        }
+        let meta = fs::symlink_metadata(entry.path())?;
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .unwrap_or_default();
+        if meta.file_type().is_symlink() || (meta.is_file() && age >= STALE_TEMP_AGE) {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 impl Quarantine {
-    /// Opens or creates the quarantine directory. The directory itself must not be a symlink.
+    /// Opens or creates the quarantine directory. Neither it nor its `objects` directory may
+    /// be a symlink; leftover temporary objects from interrupted writes are removed. Parent
+    /// directories are created as given and are trusted host configuration.
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
         if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
         private_dir(&dir)?;
-        private_dir(&dir.join(OBJECTS))?;
+        let objects = dir.join(OBJECTS);
+        private_dir(&objects)?;
+        remove_stale_temps(&objects)?;
         Ok(Self {
             dir,
             lock: Mutex::new(()),
@@ -135,7 +235,9 @@ impl Quarantine {
         self.dir.join(OBJECTS).join(format!("{sha256}.bin"))
     }
 
-    /// Stores the bytes (once per content hash) and appends a durable manifest record.
+    /// Stores the bytes (once per content hash) and appends a durable manifest record. An
+    /// existing object is reused only when it is a regular file whose content still matches
+    /// its hash; a symlink, a non-file or a corrupted object is replaced atomically.
     pub fn store(&self, item: QuarantineItem<'_>) -> io::Result<QuarantineRecord> {
         if !valid_hash(item.sha256) {
             return Err(io::Error::new(
@@ -146,34 +248,35 @@ impl Quarantine {
         let _local = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let objects = self.dir.join(OBJECTS);
         let object = self.object_path(item.sha256);
-        if fs::symlink_metadata(&object).is_err() {
+        if !verified_object(&object, item.sha256)? {
             let tmp = objects.join(format!(
                 ".tmp-{}-{}-{}",
                 item.sha256,
                 std::process::id(),
                 TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
             ));
-            let _ = fs::remove_file(&tmp);
             let mut file =
                 open_private(OpenOptions::new().write(true).create_new(true)).open(&tmp)?;
-            file.write_all(item.bytes)?;
-            file.sync_all()?;
-            drop(file);
-            restrict(&tmp, 0o600)?;
-            fs::rename(&tmp, &object)?;
+            let written = restrict(&file, 0o600)
+                .and_then(|()| file.write_all(item.bytes))
+                .and_then(|()| file.sync_all())
+                // rename replaces a planted symlink itself, never its target.
+                .and_then(|()| fs::rename(&tmp, &object));
+            if let Err(e) = written {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
             sync_dir(&objects)?;
         }
-        // Never leave an executable bit, even on an object written by an older process.
-        restrict(&object, 0o600)?;
 
         let record = QuarantineRecord {
             sha256: item.sha256.to_string(),
             size: item.bytes.len() as u64,
-            reason_code: item.reason_code.to_string(),
-            reason: item.reason.to_string(),
-            original_name: item.original_name.map(str::to_string),
-            declared_type: item.declared_type.to_string(),
-            detected_type: item.detected_type.to_string(),
+            reason_code: bounded(item.reason_code, MAX_TYPE_BYTES),
+            reason: bounded(item.reason, MAX_REASON_BYTES),
+            original_name: item.original_name.map(|n| bounded(n, MAX_NAME_BYTES)),
+            declared_type: bounded(item.declared_type, MAX_TYPE_BYTES),
+            detected_type: bounded(item.detected_type, MAX_TYPE_BYTES),
             object: format!("{OBJECTS}/{}.bin", item.sha256),
             recorded_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -184,17 +287,25 @@ impl Quarantine {
         line.push(b'\n');
 
         let manifest = self.manifest_path();
-        let created = fs::symlink_metadata(&manifest).is_err();
+        let created = match fs::symlink_metadata(&manifest) {
+            Ok(meta) if !meta.file_type().is_file() => return Err(not_real(&manifest, "file")),
+            Ok(_) => false,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+            Err(e) => return Err(e),
+        };
         let mut file =
             open_private(OpenOptions::new().read(true).write(true).create(true)).open(&manifest)?;
+        if !file.metadata()?.is_file() {
+            return Err(not_real(&manifest, "file"));
+        }
         // Cross-process exclusion for torn-tail repair and append.
         file.lock()?;
+        restrict(&file, 0o600)?;
         repair_tail(&mut file)?;
         file.seek(SeekFrom::End(0))?;
         file.write_all(&line)?;
         file.sync_all()?;
         file.unlock()?;
-        restrict(&manifest, 0o600)?;
         if created {
             sync_dir(&self.dir)?;
         }

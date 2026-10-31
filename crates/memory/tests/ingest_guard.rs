@@ -31,6 +31,17 @@ async fn default_library_guard_detects_types_by_content() {
         .await
         .unwrap();
     assert_eq!(ok.chunks, 1);
+    // Text that happens to start with another format's magic bytes is still text.
+    for text in [
+        &b"%PDF-1.7 is the PDF version we target."[..],
+        b"ID3 tags hold song titles.",
+    ] {
+        let r = f
+            .store
+            .library_ingest(&g, req("text/markdown", text), NOW)
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+    }
     let mut elf = b"\x7FELF\x02\x01\x01".to_vec();
     elf.resize(64, 0);
     for media in ["application/pdf", "audio/mpeg", "application/octet-stream"] {
