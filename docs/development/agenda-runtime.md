@@ -1,0 +1,49 @@
+# Automatic Agenda runtime
+
+`excalibur_daemon::agenda::AgendaRuntime` is the daemon-owned task that makes reminders fire without an explicit host tick. `excalibur daemon start` spawns it under the existing service supervisor on the work runtime, next to the orchestration and housekeeping services. It adds no RPC, model tool or second delivery path: every admission goes through the generation-guarded `notify_host_guarded` path described in [Explicit reminder dispatch core](agenda-dispatch.md), and the existing housekeeping service delivers the queued notices to the local Master.
+
+## Lifecycle
+
+- **Start.** The first pass after process start applies the missed-fire policy of section 17.4 instead of an ordinary tick. Reminder timers use `RunOnceNow`, so an `every` reminder that missed several intervals while the daemon was down produces one fire at the latest intended time, and the notice keeps that scheduled timestamp. The catch-up mode persists across passes until no reminder timer is overdue, so bounded pages cannot turn the remainder into a replay of every interval. A wake more than 60 seconds after its deadline (suspend, stalled host) is treated the same way.
+- **Index.** Each pass rebuilds its view from durable state: a keyset-paginated index (pages of 256) of every reminder namespace with its earliest enabled `next_at`, whether it has unadmitted fires, and the newest creator metadata. The runtime holds no binding of its own. It opens a namespace only when that persisted creator binding derives exactly to the sealed namespace (`reminders::namespace_of` with `source=None`); otherwise the namespace is not opened, ticked or admitted, and its rows remain for audit. A malformed metadata row affects only its own namespace. Dispatch additionally checks each fire's own generation binding against the namespace before using it, so metadata cannot redirect a fire to another principal, scope or conversation, and a missing binding is skipped rather than replaced by a fallback.
+- **Sleep.** The runtime sleeps until `min(next_fire_utc)` over all reminder namespaces, bounded by a 60-second re-check. The bound is enforced with a monotonic timer, independently of the wall clock: a wall clock stepping backwards cannot stretch a wait beyond 60 seconds, and every wake re-reads the clock and recomputes the deadline. The re-check also covers authority that becomes valid again, lost process-local hints and monotonic clocks paused by suspend. The clock is injectable (`AgendaClock`); the daemon uses `SystemClock` and tests use `ManualClock`, which also ends a wait when it is set backwards.
+- **Wake on mutation.** `excalibur_scheduler::mutation_signal` is a process-local hint keyed by database path. Successful reminder create, snooze, complete and delete operations, `Scheduler::create` and `Scheduler::change_timezone` notify it. A stored permit covers a mutation that lands while a pass is running. The hint is only an optimization; durable timers remain authoritative.
+- **Safe mode and startup recovery.** While the recovery ledger reports `recovering` or safe mode, passes still record due fires under the missed-fire policy but make no admission attempt; the notification writer independently rejects guarded admission in that state. The runtime re-checks every 5 seconds, so a manual safe-mode exit or the end of the safe window releases recorded fires without a restart.
+- **Shutdown.** The daemon stop signal cancels the wait immediately. The task result is part of the orderly-shutdown decision that records the clean-exit receipt. A pass cancelled midway is safe to repeat.
+
+## Backlog policy
+
+Reminders follow `RunOnceNow` everywhere, not only at start. Before dispatching a namespace, each pass coalesces its pending fires: for each reminder generation only the newest unadmitted fire stays pending, and older ones are retired durably with reason `superseded`. Fires that already have a committed notice guard are never retired, so a queued notice awaiting its scheduler acknowledgement cannot be suppressed. Consequences:
+
+- A safe-mode period admits at most one notice per active reminder generation when it ends, carrying the latest scheduled time, instead of one per elapsed interval.
+- Fires that cannot be admitted (revoked creator source, unapproved legacy route, cancelled generation, missing or mismatched binding) stay bounded at one per active generation. When restored authority makes them admissible again, one notice is queued, not a burst.
+
+## Failure isolation
+
+- **Per fire.** A deterministic refusal by the notice writer (for example text the orchestrator redactor rejects as a secret literal, or another invalid notice request) retires only that fire as a durable dead letter with a fixed reason code (`content_rejected` or `notice_rejected`). Dispatch continues with the remaining fires. Reminder text never appears in diagnostics. `Reminders::dead_letters` lists retired fires with reason codes for host inspection.
+- **Per namespace.** A transient failure (storage or writer unavailability) aborts only the affected namespace for that pass. The namespace then backs off for 60 seconds, doubling up to 15 minutes (`MAX_NAMESPACE_BACKOFF_SECONDS`), while other namespaces proceed. A namespace whose pending fires were all inadmissible uses the same backoff for retries, so it does not cost a writer transaction on every pass; a newly recorded fire is still attempted immediately. Restored authority is therefore picked up within at most 15 minutes. Only a failure to read the namespace index fails a whole pass, which the supervisor retries with its own backoff.
+- **Diagnostics.** The supervised task writes a line with counts only (fires retired, namespaces deferred) to daemon stderr. `AgendaStep` exposes recorded, queued, attempted, dead-lettered, failed and deferred counts.
+- **At creation.** `Agenda::apply` rejects a create whose text the notice writer would refuse, using the orchestrator's own durable-input rules (`Orchestrator::validate_host_notice_text`). It rejects rather than silently redacting, so the stored reminder is never something other than what the user asked for. Rows created before this check are handled by the dead-letter path.
+
+## Idempotency
+
+Fires are keyed by scope, timer and scheduled time; timer advancement is a compare-and-set on the stored definition and cursor; notice keys hash the typed fire ID; scheduler acknowledgement happens only after the durable notification receipt exists. Concurrent runtimes, an explicit `Agenda::tick_once` and a restart after SIGKILL therefore record and queue each fire once. If the process dies after the notice commits but before the acknowledgement, the next pass replays the notice by key and completes the acknowledgement. Passes inside one runtime are serialized.
+
+## Storage cost and retention
+
+Additive, checksum-verified scheduler schema 5 adds the dead-letter table and indexes on `scheduler_fires(scope, delivered, scheduled_at, id)` and `(scope, timer_id, delivered)`, so the pending checks and coalescing use an index rather than scanning a namespace's whole fire history. Acknowledged and retired fires, receipts and dead letters are still retained indefinitely: no pruning is implemented. The retention plan is a future H9 retention job that prunes acknowledged or retired fires and their dead letters after a retention window, while keeping operation receipts needed for keyed replay. Until then, storage grows with fire history.
+
+## Limits and pending work
+
+This closes the automatic wake, startup recomputation and safe-mode gating for reminder notices only. It does not implement Agenda RPC or model tools, task dispatch from reminders or schedules, `after`/`window` triggers, repetition when the user does not answer, mobile OS scheduled notifications or external channel adapters. Generic scheduler timers outside reminder namespaces are not dispatched by this runtime, reminder timers have no time-zone change API yet, and fire retention is not implemented. Concurrent runtimes were exercised inside one process; separate processes on one database are prevented by the daemon's single foreground process, not tested here. It does not complete H9 or sections 21.1–21.2.
+
+## Verification
+
+```sh
+cargo test -p excalibur-daemon --test agenda_runtime --test agenda_runtime_isolation
+cargo test -p excalibur-cli --test agenda_runtime
+cargo test -p excalibur-scheduler
+cargo test -p excalibur-daemon --test agenda_dispatch --test host_notifications --test service_supervision
+```
+
+`agenda_runtime` runs the runtime against a real host, Orchestrator and Master with an offline provider and a manual clock: startup `RunOnceNow` over ten missed intervals, a wake at the earliest timer, wakes on create, complete and delete without clock movement, creator-source preservation across snooze, safe-mode recording with no admission attempt and a coalesced single release, clean stop, a lost acknowledgement replayed after reopening, two racing runtimes and a forged namespace that stays inert. `agenda_runtime_isolation` covers the audit's eight-namespace poisoned-fire scenario (all eight ordinary reminders admitted, one `content_rejected` dead letter, no retries), 260 namespaces across two index pages, an `every` reminder with a revoked source staying at one pending fire and producing one notice after restoration, a backwards clock step ending the wait, and the monotonic bound of `SystemClock`. The CLI test seeds reminders, starts the real foreground `excalibur daemon start` process, observes the missed fire before the future reminder, SIGKILLs the daemon while that reminder is pending, removes the scheduler acknowledgement of the admitted fire to reproduce the crash window, restarts, and checks that the future reminder arrives on time, the earlier notice is not duplicated and every fire ends acknowledged after a clean stop. Fixtures are local and synthetic.

@@ -2,6 +2,85 @@
 //! never inferred from reminder text, timer payloads, or model arguments.
 use super::*;
 
+/// Sealed scheduler namespace for host-authenticated authority fields. The
+/// same derivation backs `Reminders::open`, so a host can prove that persisted
+/// creator metadata describes exactly the namespace whose fire it dispatches.
+pub fn namespace_of(
+    scope: &str,
+    principal: &str,
+    conversation: &str,
+    source: Option<&str>,
+) -> Result<String> {
+    if [scope, principal, conversation]
+        .iter()
+        .any(|s| !bounded(s, 512))
+        || source.is_some_and(|s| !bounded(s, 512))
+    {
+        return Err(invalid());
+    }
+    let authority = encode(&(scope, principal, conversation, source))?;
+    Ok(format!(
+        "reminder:{:x}",
+        Sha256::digest(authority.as_bytes())
+    ))
+}
+
+/// Host recovery index entry. It carries no authority: `binding` is only the
+/// newest creator metadata, which the host must re-derive into this sealed
+/// namespace and revalidate live before opening or dispatching anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamespaceIndex {
+    pub namespace: String,
+    /// Earliest enabled durable timer, including overdue work.
+    pub next_at: Option<i64>,
+    /// Recorded, uncancelled fires not yet admitted by the host.
+    pub pending: bool,
+    pub binding: Option<serde_json::Value>,
+}
+/// Keyset page over every reminder namespace in a principal database. Used by
+/// a daemon-owned runtime to rebuild its in-memory wake index after start.
+pub async fn index(
+    db: &Database,
+    after: Option<String>,
+    limit: u32,
+) -> Result<Vec<NamespaceIndex>> {
+    if limit == 0 || limit > 1000 || after.as_ref().is_some_and(|s| !bounded(s, 512)) {
+        return Err(invalid());
+    }
+    if db.kind() != DatabaseKind::Main {
+        return Err(Error::PrincipalOnly);
+    }
+    db.read(ReadLane::Background, move |c| {
+        let present: bool = c.query_row("SELECT count(*)=2 FROM sqlite_master WHERE type='table' AND name IN ('scheduler_reminder_timers','scheduler_reminder_metadata')", [], |r| r.get(0))?;
+        if !present {
+            return Ok(Vec::new());
+        }
+        let mut q = c.prepare("SELECT n.scope,(SELECT min(t.next_at) FROM scheduler_timers t WHERE t.scope=n.scope),EXISTS(SELECT 1 FROM scheduler_fires f WHERE f.scope=n.scope AND f.delivered=0 AND NOT EXISTS(SELECT 1 FROM scheduler_cancelled_fires x WHERE x.scope=f.scope AND x.fire_id=f.id)),(SELECT m.body FROM scheduler_reminder_metadata m WHERE m.scope=n.scope ORDER BY m.generation DESC,m.id LIMIT 1) FROM (SELECT DISTINCT scope FROM scheduler_reminder_timers WHERE ?1 IS NULL OR scope>?1 ORDER BY scope LIMIT ?2) n ORDER BY n.scope")?;
+        let rows = q
+            .query_map(rusqlite::params![after, limit], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // A malformed metadata row affects only its own namespace (no binding),
+        // never the index of every other namespace.
+        Ok(rows
+            .into_iter()
+            .map(|(namespace, next_at, pending, binding)| NamespaceIndex {
+                namespace,
+                next_at,
+                pending,
+                binding: binding.and_then(|b| decode(&b).ok()),
+            })
+            .collect())
+    })
+    .await
+}
+
 #[derive(Clone)]
 pub struct Reminders {
     scheduler: Scheduler,
@@ -87,15 +166,7 @@ impl Reminders {
         conversation: String,
         source: Option<String>,
     ) -> Result<Self> {
-        if [&scope, &principal, &conversation]
-            .iter()
-            .any(|s| !bounded(s, 512))
-            || source.as_ref().is_some_and(|s| !bounded(s, 512))
-        {
-            return Err(invalid());
-        }
-        let authority = encode(&(scope, principal, conversation, source))?;
-        let sealed = format!("reminder:{:x}", Sha256::digest(authority.as_bytes()));
+        let sealed = namespace_of(&scope, &principal, &conversation, source.as_deref())?;
         Ok(Self {
             scheduler: Scheduler::open(db, sealed).await?,
         })
@@ -170,7 +241,7 @@ impl Reminders {
         } else {
             None
         };
-        self.scheduler.db.write(Priority::Journal,move|c|{
+        let result = self.scheduler.db.write(Priority::Journal,move|c|{
             check(c)?;
             if let Some(previous)=replay(c,&scope,&key,&request)? {return Ok(previous);}
             let (id, expected)=match &operation {
@@ -229,7 +300,11 @@ impl Reminders {
             c.execute("INSERT INTO scheduler_reminders(scope,id,generation,record) VALUES(?1,?2,?3,?4) ON CONFLICT(scope,id) DO UPDATE SET generation=excluded.generation,record=excluded.record",rusqlite::params![scope,id,reminder.generation,record])?;
             c.execute("INSERT INTO scheduler_reminder_receipts(scope,operation_key,request,response) VALUES(?1,?2,?3,?4)",rusqlite::params![scope,key,request,record])?;
             Ok(reminder)
-        }).await
+        }).await;
+        if result.is_ok() {
+            signal_mutation(&self.scheduler.db);
+        }
+        result
     }
     /// Keyed, bounded snapshot with keyset pagination; includes tombstones.
     pub async fn list(
@@ -258,6 +333,25 @@ impl Reminders {
     }
     pub async fn tick(&self, now: i64, recovering: bool, limit: u32) -> Result<usize> {
         self.scheduler.tick(now, recovering, limit).await
+    }
+    /// Earliest enabled durable timer in this sealed namespace, including overdue work.
+    pub async fn next_at(&self) -> Result<Option<i64>> {
+        let scope = self.scheduler.scope.clone();
+        self.scheduler
+            .db
+            .read(ReadLane::Background, move |c| {
+                c.query_row(
+                    "SELECT min(next_at) FROM scheduler_timers WHERE scope=?1",
+                    [scope],
+                    |r| r.get(0),
+                )
+                .map_err(Error::from)
+            })
+            .await
+    }
+    /// Sealed namespace of this handle, for host comparison with `namespace_of`.
+    pub fn namespace(&self) -> &str {
+        &self.scheduler.scope
     }
     /// This is a snapshot, not authorization for an external delivery. Hosts
     /// must atomically guard this generation with the notice and effect receipts.
@@ -354,4 +448,74 @@ impl Reminders {
     pub async fn acknowledge_queued(&self, fire: String) -> Result<bool> {
         self.scheduler.acknowledge(fire).await
     }
+    /// Terminally retire one unadmitted fire with a fixed reason code. The fire
+    /// leaves pending and can never satisfy a notice guard afterwards. A fire
+    /// that already has a committed notice guard is left untouched, so this
+    /// cannot suppress a queued notice awaiting its scheduler acknowledgement.
+    pub async fn dead_letter(
+        &self,
+        fire: String,
+        reason: DeadLetterReason,
+        at: i64,
+    ) -> Result<bool> {
+        let scope = self.scheduler.scope.clone();
+        self.scheduler.db.write(Priority::Journal, move |c| {
+            let n = c.execute("INSERT OR IGNORE INTO scheduler_fire_dead_letters(scope,fire_id,reason,recorded_at) SELECT f.scope,f.id,?3,?4 FROM scheduler_fires f WHERE f.scope=?1 AND f.id=?2 AND f.delivered=0 AND NOT EXISTS(SELECT 1 FROM scheduler_cancelled_fires x WHERE x.scope=f.scope AND x.fire_id=f.id) AND NOT EXISTS(SELECT 1 FROM scheduler_notification_conditions n WHERE json_extract(n.body,'$.scope')=f.scope AND json_extract(n.body,'$.fire')=f.id)", rusqlite::params![scope, fire, reason.code(), at])?;
+            if n == 1 {
+                c.execute("INSERT OR IGNORE INTO scheduler_cancelled_fires(scope,fire_id,operation_key) VALUES(?1,?2,'agenda-dead-letter')", rusqlite::params![scope, fire])?;
+            }
+            Ok(n == 1)
+        }).await
+    }
+    /// Reminder fires follow `RunOnceNow`: for each reminder generation only
+    /// the newest unadmitted fire stays pending; older ones are retired as
+    /// `superseded`. This bounds undeliverable and safe-mode backlogs to one
+    /// fire per active generation, so restored authority causes no burst.
+    /// Fires with a committed notice guard are never retired.
+    pub async fn coalesce_pending(&self, at: i64) -> Result<usize> {
+        let scope = self.scheduler.scope.clone();
+        self.scheduler.db.write(Priority::Journal, move |c| {
+            let n = c.execute("INSERT OR IGNORE INTO scheduler_fire_dead_letters(scope,fire_id,reason,recorded_at) SELECT f.scope,f.id,?2,?3 FROM scheduler_fires f JOIN scheduler_reminder_timers t ON t.scope=f.scope AND t.timer_id=f.timer_id WHERE f.scope=?1 AND f.delivered=0 AND NOT EXISTS(SELECT 1 FROM scheduler_cancelled_fires x WHERE x.scope=f.scope AND x.fire_id=f.id) AND NOT EXISTS(SELECT 1 FROM scheduler_notification_conditions n WHERE json_extract(n.body,'$.scope')=f.scope AND json_extract(n.body,'$.fire')=f.id) AND EXISTS(SELECT 1 FROM scheduler_fires g WHERE g.scope=f.scope AND g.timer_id=f.timer_id AND g.delivered=0 AND (g.scheduled_at>f.scheduled_at OR (g.scheduled_at=f.scheduled_at AND g.id>f.id)) AND NOT EXISTS(SELECT 1 FROM scheduler_cancelled_fires y WHERE y.scope=g.scope AND y.fire_id=g.id))", rusqlite::params![scope, DeadLetterReason::Superseded.code(), at])?;
+            if n > 0 {
+                c.execute("INSERT OR IGNORE INTO scheduler_cancelled_fires(scope,fire_id,operation_key) SELECT d.scope,d.fire_id,'agenda-dead-letter' FROM scheduler_fire_dead_letters d WHERE d.scope=?1 AND NOT EXISTS(SELECT 1 FROM scheduler_cancelled_fires x WHERE x.scope=d.scope AND x.fire_id=d.fire_id)", [&scope])?;
+            }
+            Ok(n)
+        }).await
+    }
+    /// Host diagnostics: terminally retired fires with reason codes only.
+    pub async fn dead_letters(&self, limit: u32) -> Result<Vec<DeadLetter>> {
+        if limit == 0 || limit > 1000 {
+            return Err(invalid());
+        }
+        let scope = self.scheduler.scope.clone();
+        self.scheduler.db.read(ReadLane::Background, move |c| {
+            let mut q = c.prepare("SELECT fire_id,reason,recorded_at FROM scheduler_fire_dead_letters WHERE scope=?1 ORDER BY recorded_at,fire_id LIMIT ?2")?;
+            Ok(q.query_map(rusqlite::params![scope, limit], |r| Ok(DeadLetter { fire: r.get(0)?, reason: r.get(1)?, recorded_at: r.get(2)? }))?.collect::<std::result::Result<Vec<_>, _>>()?)
+        }).await
+    }
+}
+/// Fixed reason codes; reminder text never appears in diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeadLetterReason {
+    /// Notice content deterministically refused (for example a secret literal).
+    ContentRejected,
+    /// Notice request refused for another deterministic reason.
+    NoticeRejected,
+    /// A newer fire of the same reminder generation replaced this one.
+    Superseded,
+}
+impl DeadLetterReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ContentRejected => "content_rejected",
+            Self::NoticeRejected => "notice_rejected",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeadLetter {
+    pub fire: String,
+    pub reason: String,
+    pub recorded_at: i64,
 }
