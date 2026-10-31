@@ -388,6 +388,14 @@ impl OpRow {
     fn members_json(&self) -> String {
         json_list(self.members.iter().map(|m| m.id.clone()))
     }
+    fn scopes_json(&self) -> String {
+        let mut scopes = std::collections::BTreeSet::new();
+        scopes.insert(self.scope.clone());
+        for member in &self.members {
+            scopes.insert(member.scope.clone());
+        }
+        json_list(scopes.into_iter())
+    }
 }
 fn store_json(error: serde_json::Error) -> StoreError {
     StoreError::Configuration(format!("retention state: {error}"))
@@ -1617,16 +1625,17 @@ impl PurgeService {
             return Ok(());
         }
         let tables = self.main.read(ReadLane::Background, sweep_tables).await?;
-        let (runs, members) = (op.runs_json(), op.members_json());
+        let (runs, members, scopes) = (op.runs_json(), op.members_json(), op.scopes_json());
         for table in tables {
             let mut after = 0;
             loop {
-                let (t, m, r, s, p) = (
+                let (t, m, r, s, p, q) = (
                     table.clone(),
                     matcher.clone(),
                     runs.clone(),
                     members.clone(),
                     self.principal.clone(),
+                    scopes.clone(),
                 );
                 let (hits, last) = self
                     .main
@@ -1635,6 +1644,7 @@ impl PurgeService {
                             runs_json: &r,
                             members_json: &s,
                             principal: &p,
+                            scopes_json: &q,
                         };
                         scan_page(c, &t, &targets, after, PAGE, &m)
                     })
@@ -1642,12 +1652,13 @@ impl PurgeService {
                 let Some(last) = last else { break };
                 after = last;
                 for chunk in hits.chunks(BATCH) {
-                    let (t, m, r, s, p, key, rows) = (
+                    let (t, m, r, s, p, q, key, rows) = (
                         table.clone(),
                         matcher.clone(),
                         runs.clone(),
                         members.clone(),
                         self.principal.clone(),
+                        scopes.clone(),
                         op.key.clone(),
                         chunk.to_vec(),
                     );
@@ -1658,6 +1669,7 @@ impl PurgeService {
                                     runs_json: &r,
                                     members_json: &s,
                                     principal: &p,
+                                    scopes_json: &q,
                                 };
                                 redact_main(c, &key, &t, &targets, &rows, &m)
                             })
@@ -1770,17 +1782,18 @@ impl PurgeService {
         let tdb = telemetry.database().clone();
         let matcher = self.matcher(&op.key).await?;
         let tables = tdb.read(ReadLane::Background, sweep_tables).await?;
-        let (runs, members) = (op.runs_json(), op.members_json());
+        let (runs, members, scopes) = (op.runs_json(), op.members_json(), op.scopes_json());
         if !matcher.is_empty() {
             for table in tables.iter().filter(|t| t.run) {
                 let mut after = 0;
                 loop {
-                    let (t, m, r, s, p) = (
+                    let (t, m, r, s, p, q) = (
                         table.clone(),
                         matcher.clone(),
                         runs.clone(),
                         members.clone(),
                         self.principal.clone(),
+                        scopes.clone(),
                     );
                     let (hits, last) = tdb
                         .read(ReadLane::Background, move |c| {
@@ -1788,6 +1801,7 @@ impl PurgeService {
                                 runs_json: &r,
                                 members_json: &s,
                                 principal: &p,
+                                scopes_json: &q,
                             };
                             scan_page(c, &t, &targets, after, PAGE, &m)
                         })
@@ -1795,12 +1809,13 @@ impl PurgeService {
                     let Some(last) = last else { break };
                     after = last;
                     for chunk in hits.chunks(BATCH) {
-                        let (t, m, r, s, p, rows) = (
+                        let (t, m, r, s, p, q, rows) = (
                             table.clone(),
                             matcher.clone(),
                             runs.clone(),
                             members.clone(),
                             self.principal.clone(),
+                            scopes.clone(),
                             chunk.to_vec(),
                         );
                         let stats = tdb
@@ -1810,6 +1825,7 @@ impl PurgeService {
                                         runs_json: &r,
                                         members_json: &s,
                                         principal: &p,
+                                        scopes_json: &q,
                                     };
                                     redact_rows(
                                         c,

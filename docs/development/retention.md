@@ -42,7 +42,7 @@ Redaction never matches content across the whole database. A row is redacted onl
 
   Their journal rows, journal payload blobs, telemetry rows and other rows that carry their `run_id` are candidates.
 - **Member references.** Rows whose member-reference column holds one of the subject's member IDs are also candidates.
-- **Never candidates.** Rows of other runs, legacy rows with no link, and rows of other scopes are never touched, even when they contain the same text.
+- **Never candidates.** Rows of other runs, legacy rows with no link, and rows of other scopes are never touched, even when they contain the same text. Scoped tables additionally require an exact scope match (scope names are never substring-matched; legacy NULL scopes stay with unscoped subjects).
 
 Within candidate rows, only text columns that are not identifiers, keys, hashes, enumerations, timestamps or part of any primary key, index or foreign key are rewritten. The following are never rewritten:
 - independent subject content: other messages, memories, documents, chunks and identity documents;

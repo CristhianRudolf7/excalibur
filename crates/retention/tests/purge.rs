@@ -822,3 +822,89 @@ async fn rp8_memory_store_purge_resumes_and_covers_telemetry() {
     assert!(outcomes.is_empty());
     world.shutdown().await;
 }
+
+/// RP-1b: substring scopes and legacy NULL owners stay untouched, and every journal
+/// payload remains valid JSON after the purge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rp1b_substring_scopes_null_owners_and_json_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    let world = World::open(dir.path()).await;
+    // `general:extended` contains `general` as a substring; scoping is exact, never
+    // by substring.
+    let sub_scope = "general:extended";
+    let a = plant(&world, SCOPE, "sub-a").await;
+    let b = plant(&world, sub_scope, "sub-b").await;
+    // Legacy row without owner that quotes the purged text but has no provenance link.
+    let legacy_text = conversation_text("sub-a");
+    world
+        .sql({
+            let text = legacy_text.clone();
+            move |c| {
+                c.execute(
+                    "INSERT INTO evidence(id,run_id,result,code_version,principal_id,scope_id) VALUES('evd_legacy_null',NULL,?1,'abc123',NULL,NULL)",
+                    [text.as_str()],
+                )?;
+                Ok(())
+            }
+        })
+        .await;
+    let before_b = run_snapshot(&world, &b.run).await;
+    let legacy_before: String = world
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT result FROM evidence WHERE id='evd_legacy_null'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await;
+    let service = world.service().await;
+    for request in a.requests(SCOPE) {
+        service.purge(request).await.unwrap();
+    }
+    assert_eq!(
+        run_snapshot(&world, &b.run).await,
+        before_b,
+        "substring scope run changed"
+    );
+    let legacy_after: String = world
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT result FROM evidence WHERE id='evd_legacy_null'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await;
+    assert_eq!(legacy_before, legacy_after, "legacy NULL row changed");
+    // No journal payload was left as invalid JSON.
+    let invalid: i64 = world
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM journal WHERE json_valid(payload)=0",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await;
+    assert_eq!(invalid, 0, "journal holds invalid JSON after purge");
+    for run in [&a.run, &b.run] {
+        world.journal.replay(run, 0).await.unwrap();
+    }
+    // The purged scope is gone; the substring scope still resolves its memory.
+    assert!(
+        service
+            .tombstone(SCOPE, SubjectKind::Memory, &a.memory)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let kept = world
+        .memory
+        .memory(&grant(&[sub_scope]), &b.memory)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.statement, memory_text("sub-b"));
+    world.shutdown().await;
+}

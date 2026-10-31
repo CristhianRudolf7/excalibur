@@ -42,7 +42,7 @@ La redacción nunca busca coincidencias de contenido en toda la base. Una fila s
 
   Sus filas del registro, sus blobs de carga, sus filas de telemetría y otras filas que llevan su `run_id` son candidatas.
 - **Referencias a miembros.** Las filas cuya columna de referencia a un miembro contiene uno de los IDs de miembro del sujeto también son candidatas.
-- **Nunca candidatas.** Las filas de otras ejecuciones, las filas heredadas sin vínculo y las filas de otros ámbitos nunca se tocan, aunque contengan el mismo texto.
+- **Nunca candidatas.** Las filas de otras ejecuciones, las filas heredadas sin vínculo y las filas de otros ámbitos nunca se tocan, aunque contengan el mismo texto. Las tablas con ámbito exigen además coincidencia exacta de ámbito (los nombres de ámbito nunca se comparan por subcadena; los NULL antiguos quedan con sujetos sin ámbito).
 
 Dentro de las filas candidatas solo se reescriben las columnas de texto que no son identificadores, claves, hashes, enumeraciones, marcas de tiempo ni parte de una clave primaria, índice o clave foránea. Nunca se reescriben:
 - el contenido de sujetos independientes: otros mensajes, recuerdos, documentos, fragmentos y documentos de identidad;

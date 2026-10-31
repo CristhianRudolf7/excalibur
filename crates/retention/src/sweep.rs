@@ -206,6 +206,8 @@ pub(crate) struct SweepTable {
     /// Member-reference columns present (`conversation_id`, `message_id`, ...).
     pub members: Vec<String>,
     pub principal: bool,
+    /// Whether the table carries a `scope_id` column for defense-in-depth scoping.
+    pub scope: bool,
 }
 /// Primary content of independent subjects. Those rows are deleted only when they are
 /// the purge subject; a copy inside another subject is that subject's own content.
@@ -363,6 +365,7 @@ pub(crate) fn sweep_tables(c: &Connection) -> Result<Vec<SweepTable>> {
         }
         out.push(SweepTable {
             principal: columns.iter().any(|col| col == "principal_id"),
+            scope: columns.iter().any(|col| col == "scope_id"),
             name,
             columns,
             writable,
@@ -374,10 +377,13 @@ pub(crate) fn sweep_tables(c: &Connection) -> Result<Vec<SweepTable>> {
 }
 
 /// Rows provably owned by the subject: produced by a linked run or referencing a member.
+/// Tables that carry `scope_id` additionally require an exact scope match (NULL stays
+/// for legacy rows); scope names are never matched by substring.
 pub(crate) struct Targets<'a> {
     pub runs_json: &'a str,
     pub members_json: &'a str,
     pub principal: &'a str,
+    pub scopes_json: &'a str,
 }
 fn target_condition(table: &SweepTable) -> String {
     let mut parts = Vec::new();
@@ -396,6 +402,9 @@ fn target_condition(table: &SweepTable) -> String {
     } else {
         sql.push_str(" AND ?4 IS NOT NULL");
     }
+    if table.scope {
+        sql.push_str(" AND (scope_id IS NULL OR scope_id IN (SELECT value FROM json_each(?5)))");
+    }
     sql
 }
 fn target_params(targets: &Targets<'_>, first: i64) -> Vec<SqlValue> {
@@ -404,6 +413,7 @@ fn target_params(targets: &Targets<'_>, first: i64) -> Vec<SqlValue> {
         SqlValue::Text(targets.runs_json.into()),
         SqlValue::Text(targets.members_json.into()),
         SqlValue::Text(targets.principal.into()),
+        SqlValue::Text(targets.scopes_json.into()),
     ]
 }
 fn writable_matches(
