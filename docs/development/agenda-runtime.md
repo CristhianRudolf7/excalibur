@@ -35,7 +35,7 @@ Additive, checksum-verified scheduler schema 5 adds the dead-letter table and in
 
 ## Limits and pending work
 
-This closes the automatic wake, startup recomputation and safe-mode gating for reminder notices only. It does not implement Agenda RPC or model tools, task dispatch from reminders or schedules, `after`/`window` triggers, repetition when the user does not answer, mobile OS scheduled notifications or external channel adapters. Generic scheduler timers outside reminder namespaces are not dispatched by this runtime, reminder timers have no time-zone change API yet, and fire retention is not implemented. Concurrent runtimes were exercised inside one process; separate processes on one database are prevented by the daemon's single foreground process, not tested here. It does not complete H9 or sections 21.1–21.2.
+This closes the automatic wake, startup recomputation and safe-mode gating for reminder notices only. The reminders user surface (master `reminders` fast tool and authenticated `agenda.reminders` RPC, including the civil time-zone change API) is described in [Agenda reminders user surface](agenda-tools.md). Task dispatch from reminders or schedules, `after`/`window` triggers, repetition when the user does not answer, mobile OS scheduled notifications and external channel adapters remain pending. Generic scheduler timers outside reminder namespaces are not dispatched by this runtime, and fire retention is not implemented. Concurrent runtimes were exercised inside one process; separate processes on one database are prevented by the daemon's single foreground process, not tested here. It does not complete H9 or sections 21.1–21.2.
 
 ## Verification
 
