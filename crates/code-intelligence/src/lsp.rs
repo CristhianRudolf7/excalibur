@@ -122,6 +122,7 @@ impl LspSpawner for ReadOnlySpawner {
                 // Only async-signal-safe descriptor/process operations run after fork.
                 unsafe {
                     command.pre_exec(move || {
+                        excalibur_sandbox::signals::reset_child_signal_state()?;
                         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1
                             || libc::fcntl(filter_fd, libc::F_SETFD, 0) == -1
                         {

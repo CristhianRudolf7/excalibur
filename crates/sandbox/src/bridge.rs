@@ -113,7 +113,10 @@ fn run(
     // std::process owns fork/exec bookkeeping. Only constant stack data and
     // async-signal-safe syscalls execute in the child-side hook.
     unsafe {
-        command.pre_exec(child_filter);
+        command.pre_exec(|| {
+            crate::signals::reset_child_signal_state()?;
+            child_filter()
+        });
     }
     let status = command.spawn().and_then(|mut child| child.wait());
     stopping.store(true, Ordering::Release);

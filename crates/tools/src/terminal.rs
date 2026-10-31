@@ -1570,6 +1570,9 @@ fn launch(
     let parent = unsafe { libc::getpid() };
     unsafe {
         command.pre_exec(move || {
+            // First, so neither inherited ignored dispositions nor the parent's
+            // handlers survive into the tool process (see excalibur_sandbox::signals).
+            excalibur_sandbox::signals::reset_child_signal_state()?;
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
