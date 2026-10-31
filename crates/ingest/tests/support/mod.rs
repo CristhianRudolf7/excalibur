@@ -7,7 +7,18 @@ pub fn deflate(data: &[u8]) -> Vec<u8> {
 }
 
 pub fn gzip(name: Option<&str>, data: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x1F, 0x8B, 8, if name.is_some() { 0x08 } else { 0 }, 0, 0, 0, 0, 0, 3];
+    let mut out = vec![
+        0x1F,
+        0x8B,
+        8,
+        if name.is_some() { 0x08 } else { 0 },
+        0,
+        0,
+        0,
+        0,
+        0,
+        3,
+    ];
     if let Some(name) = name {
         out.extend_from_slice(name.as_bytes());
         out.push(0);
@@ -64,7 +75,11 @@ pub fn zip(entries: &[ZipEntry]) -> Vec<u8> {
         out.extend_from_slice(name);
         out.extend_from_slice(&body);
 
-        let made_by: u16 = if e.unix_mode.is_some() { 3 << 8 | 20 } else { 20 };
+        let made_by: u16 = if e.unix_mode.is_some() {
+            (3 << 8) | 20
+        } else {
+            20
+        };
         central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
         central.extend_from_slice(&made_by.to_le_bytes());
         central.extend_from_slice(&20u16.to_le_bytes());

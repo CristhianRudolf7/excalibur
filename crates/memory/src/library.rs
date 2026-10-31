@@ -86,9 +86,13 @@ impl Default for BasicIngestGuard {
 }
 impl IngestGuard for BasicIngestGuard {
     fn inspect(&self, media_type: &str, bytes: &[u8]) -> std::result::Result<(), String> {
-        let mut policy = excalibur_ingest::Policy::default();
-        policy.limits.max_input_bytes = self.max_bytes as u64;
-        let guard = excalibur_ingest::ContentGuard::new(policy);
+        let guard = excalibur_ingest::ContentGuard::new(excalibur_ingest::Policy {
+            limits: excalibur_ingest::Limits {
+                max_input_bytes: self.max_bytes as u64,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
         IngestGuard::inspect(&guard, media_type, bytes)
     }
 }

@@ -176,9 +176,7 @@ impl Expectation {
                 Some(format!("expected {kind}, content is {detected}"))
             }
             Expectation::Media
-                if detected.is_archive()
-                    || detected.is_executable()
-                    || detected == Kind::Pdf =>
+                if detected.is_archive() || detected.is_executable() || detected == Kind::Pdf =>
             {
                 Some(format!("expected media, content is {detected}"))
             }

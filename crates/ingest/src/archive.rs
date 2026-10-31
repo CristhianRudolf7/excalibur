@@ -170,7 +170,10 @@ fn inflate_bounded(
                 return Err(fail(Code::Malformed, "truncated deflate stream"));
             }
             Err(e) => {
-                return Err(fail(Code::Malformed, format!("invalid deflate stream: {e:?}")));
+                return Err(fail(
+                    Code::Malformed,
+                    format!("invalid deflate stream: {e:?}"),
+                ));
             }
         }
     }
@@ -209,7 +212,7 @@ pub(crate) fn gunzip(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>
         if flags & 0x04 != 0 {
             p += 2 + le16(h, p)? as usize;
         }
-        let mut read_cstr = |p: &mut usize| -> Result<Vec<u8>, Failure> {
+        let read_cstr = |p: &mut usize| -> Result<Vec<u8>, Failure> {
             let rest = h.get(*p..).unwrap_or(&[]);
             let end = rest
                 .iter()
@@ -384,7 +387,11 @@ pub(crate) fn unzip(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>,
                 format!("zip entry {path:?} is encrypted and cannot be scanned"),
             ));
         }
-        let key = if directory { format!("{path}/") } else { path.clone() };
+        let key = if directory {
+            format!("{path}/")
+        } else {
+            path.clone()
+        };
         if !names.insert(key) {
             return Err(fail(
                 Code::Malformed,
@@ -494,7 +501,13 @@ pub(crate) fn untar(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>,
         let sum: u64 = header
             .iter()
             .enumerate()
-            .map(|(i, &b)| if (148..156).contains(&i) { 32 } else { u64::from(b) })
+            .map(|(i, &b)| {
+                if (148..156).contains(&i) {
+                    32
+                } else {
+                    u64::from(b)
+                }
+            })
             .sum();
         if stored != sum {
             return Err(fail(Code::Malformed, "tar header checksum mismatch"));
@@ -514,7 +527,10 @@ pub(crate) fn untar(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>,
             b'0' | 0 | b'7' => false,
             b'5' => true,
             b'1' => {
-                return Err(fail(Code::Link, format!("tar entry {path:?} is a hard link")));
+                return Err(fail(
+                    Code::Link,
+                    format!("tar entry {path:?} is a hard link"),
+                ));
             }
             b'2' => {
                 return Err(fail(
@@ -548,11 +564,21 @@ pub(crate) fn untar(input: &[u8], budget: &mut Budget<'_>) -> Result<Vec<Entry>,
             .filter(|&e| e <= input.len())
             .ok_or_else(|| fail(Code::Malformed, "tar entry data out of bounds"))?;
         if directory && size != 0 {
-            return Err(fail(Code::Malformed, format!("tar directory {path:?} has data")));
+            return Err(fail(
+                Code::Malformed,
+                format!("tar directory {path:?} has data"),
+            ));
         }
-        let key = if directory { format!("{path}/") } else { path.clone() };
+        let key = if directory {
+            format!("{path}/")
+        } else {
+            path.clone()
+        };
         if !names.insert(key) {
-            return Err(fail(Code::Malformed, format!("duplicate tar entry {path:?}")));
+            return Err(fail(
+                Code::Malformed,
+                format!("duplicate tar entry {path:?}"),
+            ));
         }
         budget.count_entry()?;
         entries.push(Entry {

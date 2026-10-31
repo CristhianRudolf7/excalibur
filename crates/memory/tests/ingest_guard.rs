@@ -44,7 +44,10 @@ async fn default_library_guard_detects_types_by_content() {
         .store
         .library_ingest(&g, req("image/jpeg", b"%PDF-1.7"), NOW)
         .await;
-    assert!(matches!(&r, Err(Error::Rejected(m)) if m.starts_with("type_mismatch")), "{r:?}");
+    assert!(
+        matches!(&r, Err(Error::Rejected(m)) if m.starts_with("type_mismatch")),
+        "{r:?}"
+    );
 }
 
 #[tokio::test]
@@ -63,7 +66,10 @@ async fn configured_guard_scans_and_quarantines_rejected_uploads() {
 
     let mut sample = b"Meeting notes. ".to_vec();
     sample.extend_from_slice(&eicar_test_string());
-    let r = f.store.library_ingest(&g, req("text/plain", &sample), NOW).await;
+    let r = f
+        .store
+        .library_ingest(&g, req("text/plain", &sample), NOW)
+        .await;
     assert!(
         matches!(&r, Err(Error::Rejected(m)) if m.starts_with("scanner_hit")),
         "{r:?}"

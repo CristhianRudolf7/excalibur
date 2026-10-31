@@ -24,6 +24,8 @@ pub use consolidation::*;
 pub use context::*;
 pub use curation::*;
 pub use embeddings::*;
+/// Shared ingestion guard used by the library (architecture 20.7).
+pub use excalibur_ingest as ingest;
 pub use graph::*;
 pub use identity::*;
 pub use library::*;
@@ -33,8 +35,6 @@ pub use remote_embeddings::*;
 pub use retrieval::*;
 pub use runtime::*;
 pub use tools::*;
-/// Shared ingestion guard used by the library (architecture 20.7).
-pub use excalibur_ingest as ingest;
 
 use excalibur_store::{
     Database, Priority,

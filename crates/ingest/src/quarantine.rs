@@ -138,7 +138,10 @@ impl Quarantine {
     /// Stores the bytes (once per content hash) and appends a durable manifest record.
     pub fn store(&self, item: QuarantineItem<'_>) -> io::Result<QuarantineRecord> {
         if !valid_hash(item.sha256) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid sha256"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid sha256",
+            ));
         }
         let _local = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let objects = self.dir.join(OBJECTS);
@@ -151,7 +154,8 @@ impl Quarantine {
                 TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
             ));
             let _ = fs::remove_file(&tmp);
-            let mut file = open_private(OpenOptions::new().write(true).create_new(true)).open(&tmp)?;
+            let mut file =
+                open_private(OpenOptions::new().write(true).create_new(true)).open(&tmp)?;
             file.write_all(item.bytes)?;
             file.sync_all()?;
             drop(file);
@@ -181,8 +185,8 @@ impl Quarantine {
 
         let manifest = self.manifest_path();
         let created = fs::symlink_metadata(&manifest).is_err();
-        let mut file = open_private(OpenOptions::new().read(true).write(true).create(true))
-            .open(&manifest)?;
+        let mut file =
+            open_private(OpenOptions::new().read(true).write(true).create(true)).open(&manifest)?;
         // Cross-process exclusion for torn-tail repair and append.
         file.lock()?;
         repair_tail(&mut file)?;

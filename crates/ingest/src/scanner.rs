@@ -8,9 +8,13 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScanVerdict {
     Clean,
-    Infected { signature: String },
+    Infected {
+        signature: String,
+    },
     /// The scanner could not decide. The guard fails closed on this verdict.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
 }
 
 pub trait Scanner: Send + Sync {
@@ -53,7 +57,10 @@ impl Scanner for SignatureScanner {
     }
     fn scan(&self, _path: Option<&str>, bytes: &[u8]) -> ScanVerdict {
         for (label, pattern) in &self.signatures {
-            if bytes.windows(pattern.len()).any(|w| w == pattern.as_slice()) {
+            if bytes
+                .windows(pattern.len())
+                .any(|w| w == pattern.as_slice())
+            {
                 return ScanVerdict::Infected {
                     signature: label.clone(),
                 };

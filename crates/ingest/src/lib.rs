@@ -177,8 +177,14 @@ impl std::fmt::Debug for ContentGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContentGuard")
             .field("policy", &self.policy)
-            .field("scanner", &self.scanner.as_ref().map(|s| s.name().to_string()))
-            .field("quarantine", &self.quarantine.as_ref().map(|q| q.dir().to_path_buf()))
+            .field(
+                "scanner",
+                &self.scanner.as_ref().map(|s| s.name().to_string()),
+            )
+            .field(
+                "quarantine",
+                &self.quarantine.as_ref().map(|q| q.dir().to_path_buf()),
+            )
             .finish()
     }
 }
