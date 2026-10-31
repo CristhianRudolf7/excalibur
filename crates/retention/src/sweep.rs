@@ -48,7 +48,13 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    Value::Array(values.into_iter().map(|v| Value::String(v.into())).collect()).to_string()
+    Value::Array(
+        values
+            .into_iter()
+            .map(|v| Value::String(v.into()))
+            .collect(),
+    )
+    .to_string()
 }
 
 /// Exact texts plus long sentences/lines, longest first, deduplicated.
@@ -400,7 +406,11 @@ fn target_params(targets: &Targets<'_>, first: i64) -> Vec<SqlValue> {
         SqlValue::Text(targets.principal.into()),
     ]
 }
-fn writable_matches(table: &SweepTable, row: &rusqlite::Row<'_>, matcher: &Matcher) -> Result<bool> {
+fn writable_matches(
+    table: &SweepTable,
+    row: &rusqlite::Row<'_>,
+    matcher: &Matcher,
+) -> Result<bool> {
     for (index, column) in table.columns.iter().enumerate() {
         if !table.writable.contains(column) {
             continue;
@@ -496,7 +506,11 @@ pub(crate) fn with_secure_delete<T>(
     let previous: i64 = c.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
     c.pragma_update(None, "secure_delete", 1)?;
     let mut indexes = Vec::new();
-    let all = if fts { fts_content_tables(c)? } else { BTreeMap::new() };
+    let all = if fts {
+        fts_content_tables(c)?
+    } else {
+        BTreeMap::new()
+    };
     for tables in all.into_values() {
         for index in tables {
             let config = format!("{index}_config");
@@ -511,7 +525,10 @@ pub(crate) fn with_secure_delete<T>(
                 None
             };
             c.execute(
-                &format!("INSERT INTO {q}({q},rank) VALUES('secure-delete',1)", q = quote(&index)),
+                &format!(
+                    "INSERT INTO {q}({q},rank) VALUES('secure-delete',1)",
+                    q = quote(&index)
+                ),
                 [],
             )?;
             indexes.push((index, before.unwrap_or(0)));
@@ -521,7 +538,10 @@ pub(crate) fn with_secure_delete<T>(
     let mut restored: Result<()> = Ok(());
     for (index, before) in indexes {
         if let Err(error) = c.execute(
-            &format!("INSERT INTO {q}({q},rank) VALUES('secure-delete',?1)", q = quote(&index)),
+            &format!(
+                "INSERT INTO {q}({q},rank) VALUES('secure-delete',?1)",
+                q = quote(&index)
+            ),
             [before],
         ) {
             restored = Err(error.into());
@@ -541,6 +561,8 @@ pub(crate) type AfterRedaction<'a> =
 pub(crate) struct RedactStats {
     pub rows: u64,
     pub structured: u64,
+    /// Rows where a match remains inside JSON structure after leaf redaction.
+    pub structured_rows: Vec<i64>,
 }
 /// Rewrite matching text in writable columns of the given targeted rows.
 pub(crate) fn redact_rows(
@@ -578,6 +600,7 @@ pub(crate) fn redact_rows(
             let Some(values) = values else { continue };
             let mut updates = Vec::new();
             let mut old = BTreeMap::new();
+            let mut structured = false;
             for (index, value) in values.iter().enumerate() {
                 let column = &table.columns[index];
                 let SqlValue::Text(text) = value else {
@@ -588,12 +611,17 @@ pub(crate) fn redact_rows(
                 }
                 match matcher.redact_value(text) {
                     Redaction::Unchanged => {}
-                    Redaction::Structured => stats.structured += 1,
+                    Redaction::Structured => structured = true,
                     Redaction::Changed(new) => {
+                        structured |= matcher.is_match(new.as_bytes());
                         old.insert(column.clone(), text.clone());
                         updates.push((column.clone(), new));
                     }
                 }
+            }
+            if structured {
+                stats.structured += 1;
+                stats.structured_rows.push(*rowid);
             }
             if updates.is_empty() {
                 continue;
@@ -882,7 +910,10 @@ mod tests {
         assert_eq!(value["state"], "running");
         assert_eq!(value["n"], 3);
         assert!(!out.contains("quartz-falcon"));
-        assert_eq!(m.redact_value(r#"{"state":"running"}"#), Redaction::Unchanged);
+        assert_eq!(
+            m.redact_value(r#"{"state":"running"}"#),
+            Redaction::Unchanged
+        );
         assert!(derive_needles(&["short".into()]).is_empty());
     }
     #[test]
@@ -891,19 +922,32 @@ mod tests {
         let m = matcher(&[r#"{"alpha":1,"beta":2}"#]);
         let text = r#"{"call":{"arguments":{"alpha":1,"beta":2}}}"#;
         assert_eq!(m.redact_value(text), Redaction::Structured);
-        assert_eq!(m.redact_value(r#"{"call": broken {"alpha":1,"beta":2}"#), Redaction::Structured);
+        assert_eq!(
+            m.redact_value(r#"{"call": broken {"alpha":1,"beta":2}"#),
+            Redaction::Structured
+        );
     }
     #[test]
     fn ascii_case_variants_and_escaped_copies_are_matched() {
         let m = matcher(&["line one with \"quotes\"\nline two is longer than needed"]);
-        let encoded = serde_json::to_string("line one with \"quotes\"\nline two is longer than needed").unwrap();
+        let encoded =
+            serde_json::to_string("line one with \"quotes\"\nline two is longer than needed")
+                .unwrap();
         assert!(m.is_match(encoded.as_bytes()));
         let m = matcher(&["Remember The Kestrel Vault"]);
         assert!(m.is_match(b"remember the KESTREL vault"));
     }
     #[test]
     fn protected_columns_are_recognized() {
-        for column in ["id", "run_id", "idempotency_key", "payload_hash", "code_version", "state", "created_at"] {
+        for column in [
+            "id",
+            "run_id",
+            "idempotency_key",
+            "payload_hash",
+            "code_version",
+            "state",
+            "created_at",
+        ] {
             assert!(protected_name(column), "{column}");
         }
         for column in ["payload", "content", "text", "result", "metadata"] {
@@ -913,11 +957,15 @@ mod tests {
     #[test]
     fn content_option_is_parsed() {
         assert_eq!(
-            fts_content("CREATE VIRTUAL TABLE x USING fts5(text,content='messages',content_rowid='rowid')"),
+            fts_content(
+                "CREATE VIRTUAL TABLE x USING fts5(text,content='messages',content_rowid='rowid')"
+            ),
             Some("messages".into())
         );
         assert_eq!(
-            fts_content("CREATE VIRTUAL TABLE files_fts USING fts5(path,content,content='files',content_rowid='rowid',tokenize='trigram')"),
+            fts_content(
+                "CREATE VIRTUAL TABLE files_fts USING fts5(path,content,content='files',content_rowid='rowid',tokenize='trigram')"
+            ),
             Some("files".into())
         );
     }

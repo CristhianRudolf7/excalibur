@@ -116,6 +116,19 @@ async fn expiry_classes_follow_the_injected_clock() {
     )
     .unwrap();
     assert!(exported.is_empty(), "re-export drops expired detail");
+    // Reconciling the journal must not re-ingest deliberately expired events.
+    telemetry.reconcile(&journal, &done).await.unwrap();
+    let reingested: i64 = telemetry
+        .database()
+        .read(ReadLane::Interactive, |c| {
+            Ok(c.query_row("SELECT count(*) FROM events", [], |r| r.get(0))?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        reingested, 0,
+        "expired telemetry came back through reconcile"
+    );
     let again = sweeper.run_once().await.unwrap();
     assert_eq!(again.telemetry_events_expired, 0);
     sweeper.release_hold(&held).await.unwrap();

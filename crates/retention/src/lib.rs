@@ -25,9 +25,9 @@ use std::{
     sync::Arc,
 };
 use sweep::{
-    DeleteStats, ForeignKeys, Matcher, Redaction, Targets, columns, delete_vectors,
-    derive_needles, guarded, json_list, redact_rows, regular_tables, remove_rows, scan_page,
-    sweep_tables, table_exists, with_secure_delete,
+    DeleteStats, ForeignKeys, Matcher, Redaction, Targets, columns, delete_vectors, derive_needles,
+    guarded, json_list, redact_rows, regular_tables, remove_rows, scan_page, sweep_tables,
+    table_exists, with_secure_delete,
 };
 
 /// Weekly backups are kept four weeks (§4.6); daily and pre-update copies rotate sooner.
@@ -523,9 +523,7 @@ fn durable_state(c: &Connection, run: &str) -> excalibur_store::Result<Option<St
             |r| r.get(0),
         )
         .optional()?;
-    Ok(Some(
-        latest.flatten().unwrap_or_else(|| "running".into()),
-    ))
+    Ok(Some(latest.flatten().unwrap_or_else(|| "running".into())))
 }
 /// A linked durable run that is not terminal fences the purge.
 fn active_run(c: &Connection, runs: &BTreeSet<String>) -> excalibur_store::Result<Option<String>> {
@@ -610,9 +608,9 @@ fn linked_runs(
                 sweep::quote(&table),
                 sweep::quote(column)
             ))?;
-            for run in statement.query_map([json_list(ids.iter().cloned())], |r| {
-                r.get::<_, String>(0)
-            })? {
+            for run in
+                statement.query_map([json_list(ids.iter().cloned())], |r| r.get::<_, String>(0))?
+            {
                 runs.insert(run?);
             }
         }
@@ -666,7 +664,12 @@ fn journal_follow(
     let old_value: Value = match serde_json::from_str(old_payload) {
         Ok(value) => value,
         Err(_) => {
-            flag(c, key, "unparseable_journal_payload", &format!("{run}:{sequence}"))?;
+            flag(
+                c,
+                key,
+                "unparseable_journal_payload",
+                &format!("{run}:{sequence}"),
+            )?;
             return Ok(());
         }
     };
@@ -735,18 +738,33 @@ fn redact_main(
 ) -> excalibur_store::Result<()> {
     let mut journal_rows = 0u64;
     let journal = table.name.eq_ignore_ascii_case("journal");
-    let stats = redact_rows(c, table, targets, rowids, matcher, &mut |c, _, rowid, old| {
-        if journal && let Some(previous) = old.get("payload") {
-            let current: String =
-                c.query_row("SELECT payload FROM journal WHERE rowid=?1", [rowid], |r| {
-                    r.get(0)
-                })?;
-            let value = serde_json::from_str(&current).map_err(store_json)?;
-            journal_follow(c, key, rowid, previous, value)?;
-            journal_rows += 1;
-        }
-        Ok(())
-    })?;
+    let stats = redact_rows(
+        c,
+        table,
+        targets,
+        rowids,
+        matcher,
+        &mut |c, _, rowid, old| {
+            if journal && let Some(previous) = old.get("payload") {
+                let current: String =
+                    c.query_row("SELECT payload FROM journal WHERE rowid=?1", [rowid], |r| {
+                        r.get(0)
+                    })?;
+                let value = serde_json::from_str(&current).map_err(store_json)?;
+                journal_follow(c, key, rowid, previous, value)?;
+                journal_rows += 1;
+            }
+            Ok(())
+        },
+    )?;
+    for rowid in &stats.structured_rows {
+        flag(
+            c,
+            key,
+            "structured_match",
+            &format!("{}:{rowid}", table.name),
+        )?;
+    }
     if stats.rows > 0 || stats.structured > 0 {
         bump(c, key, |n| {
             n.rows_redacted += stats.rows;
@@ -906,11 +924,11 @@ fn load_subject(
                 id: id.into(),
                 scope: scope.into(),
             });
-            texts.push(c.query_row(
-                "SELECT statement FROM memories WHERE id=?1",
-                [id],
-                |r| r.get(0),
-            )?);
+            texts.push(
+                c.query_row("SELECT statement FROM memories WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })?,
+            );
         }
     }
     Ok(Some((
@@ -993,7 +1011,7 @@ fn trial_delete(c: &Connection, snapshot: &SubjectSnapshot) -> excalibur_store::
     let keys = ForeignKeys::load(c)?;
     keys.validate(base_roots(snapshot.kind))?;
     c.execute_batch("SAVEPOINT retention_trial")?;
-    let result = (|| {
+    let result = (|| -> excalibur_store::Result<()> {
         let mut stats = DeleteStats::default();
         if let Some((table, kind)) = member_table(snapshot.kind) {
             let sample: Vec<Value> = snapshot
@@ -1286,7 +1304,10 @@ impl PurgeService {
             operation_key: op.key.clone(),
             tombstone,
             counts: op.counts.clone(),
-            hygiene: op.hygiene.clone().ok_or(Error::Invalid("hygiene missing"))?,
+            hygiene: op
+                .hygiene
+                .clone()
+                .ok_or(Error::Invalid("hygiene missing"))?,
             telemetry_covered: op.telemetry_covered,
             notice: BackupNotice::standard(),
         })
@@ -1596,10 +1617,7 @@ impl PurgeService {
         if matcher.is_empty() {
             return Ok(());
         }
-        let tables = self
-            .main
-            .read(ReadLane::Background, sweep_tables)
-            .await?;
+        let tables = self.main.read(ReadLane::Background, sweep_tables).await?;
         let (runs, members) = (op.runs_json(), op.members_json());
         for table in tables {
             let mut after = 0;
@@ -1702,6 +1720,7 @@ impl PurgeService {
                     }
                 };
                 let payload: Value = serde_json::from_str(&redacted)?;
+                let residual = matcher.is_match(redacted.as_bytes());
                 let blobs = self.main.blobs();
                 let bytes = redacted.into_bytes();
                 let prepared = tokio::task::spawn_blocking(move || blobs.prepare(&bytes))
@@ -1726,7 +1745,12 @@ impl PurgeService {
                                     new.as_str(),
                                 )?;
                                 merge_json_list(c, &key, "blob_hashes", [old.clone()])?;
-                                bump(c, &key, |n| n.journal_events_redacted += 1)?;
+                                let flagged = residual
+                                    && flag(c, &key, "structured_match", &format!("journal:{rowid}"))?;
+                                bump(c, &key, |n| {
+                                    n.journal_events_redacted += 1;
+                                    n.structured_matches += u64::from(flagged);
+                                })?;
                             }
                             Ok(())
                         })
@@ -1788,9 +1812,14 @@ impl PurgeService {
                                         members_json: &s,
                                         principal: &p,
                                     };
-                                    redact_rows(c, &t, &targets, &rows, &m, &mut |_, _, _, _| {
-                                        Ok(())
-                                    })
+                                    redact_rows(
+                                        c,
+                                        &t,
+                                        &targets,
+                                        &rows,
+                                        &m,
+                                        &mut |_, _, _, _| Ok(()),
+                                    )
                                 })
                             })
                             .await?;
@@ -1961,10 +1990,7 @@ impl PurgeService {
         // Member rows (messages or chunks) in bounded batches.
         if let Some((table, kind)) = member_table(op.kind) {
             loop {
-                let (key, ids) = (
-                    op.key.clone(),
-                    op.members_of_json(kind),
-                );
+                let (key, ids) = (op.key.clone(), op.members_of_json(kind));
                 let deleted = self
                     .main
                     .write(Priority::Normal, move |c| {
@@ -2002,7 +2028,8 @@ impl PurgeService {
             }
         }
         // Final command: the subject row itself, then the phase change.
-        let (key, observer, subject) = (op.key.clone(), self.observer.clone(), op.subject_id.clone());
+        let (key, observer, subject) =
+            (op.key.clone(), self.observer.clone(), op.subject_id.clone());
         let kind = op.kind;
         self.main
             .write(Priority::Normal, move |c| {

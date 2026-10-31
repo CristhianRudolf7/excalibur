@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 //! Synthetic principal data with unique markers planted in every store that keeps
-//! derived copies, plus an exhaustive marker scanner over tables, shadow tables,
-//! blobs (raw and decompressed) and telemetry artifacts.
+//! derived copies of a subject, linked to it by real provenance, plus an exhaustive
+//! marker scanner over tables, shadow tables, blobs (raw and decompressed) and
+//! telemetry artifacts.
 use excalibur_journal::Journal;
 use excalibur_memory::{
     IngestRequest, MemoryGrant, MemoryInput, MemoryKind, MemoryPurgeParticipant, MemoryStore,
@@ -9,7 +10,7 @@ use excalibur_memory::{
 };
 use excalibur_retention::{PurgeReason, PurgeRequest, PurgeService, SubjectKind};
 use excalibur_store::{
-    Database, DatabaseKind, Priority, StorageConfig,
+    Database, DatabaseKind, Priority, ReadLane, StorageConfig,
     rusqlite::{self, Connection, OpenFlags, types::ValueRef},
     schema,
 };
@@ -31,6 +32,9 @@ pub const CONVERSATION_MARK: &str = "kestrelconvmark";
 pub const DOCUMENT_MARK: &str = "basaltdocmark";
 pub const MEMORY_MARK: &str = "fjordmemmark";
 pub const MARKERS: [&str; 3] = [CONVERSATION_MARK, DOCUMENT_MARK, MEMORY_MARK];
+/// Sentences shared verbatim by subjects of both scopes.
+pub const SHARED_CONVERSATION: &str = "Bring the brass key and say nothing";
+pub const SHARED_DOCUMENT: &str = "Second line about cooling loops and the pumps";
 /// Distinctive float32 probe vector stored for the purged memory.
 pub const PROBE: [f32; 4] = [0.123_456_7, -0.765_432_1, 0.314_159_3, 0.271_828_2];
 
@@ -58,6 +62,7 @@ impl World {
         ))
         .await
         .unwrap();
+        memory.set_purge_telemetry(telemetry.clone());
         Self {
             root: root.to_path_buf(),
             main,
@@ -77,6 +82,18 @@ impl World {
         self.telemetry.shutdown().await.unwrap();
         self.main.shutdown().await.unwrap();
     }
+    pub async fn sql<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Connection) -> excalibur_store::Result<T> + Send + 'static,
+    ) -> T {
+        self.main.write(Priority::Normal, work).await.unwrap()
+    }
+    pub async fn read<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Connection) -> excalibur_store::Result<T> + Send + 'static,
+    ) -> T {
+        self.main.read(ReadLane::Interactive, work).await.unwrap()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,6 +103,7 @@ pub struct Planted {
     pub document: String,
     pub memory: String,
     pub run: String,
+    pub observation: String,
     pub bystander_message: String,
 }
 impl Planted {
@@ -96,15 +114,18 @@ impl Planted {
             (SubjectKind::Memory, &self.memory),
         ]
         .into_iter()
-        .map(|(kind, id)| PurgeRequest {
-            operation_key: format!("purge:{}:{id}", kind.as_str()),
-            scope: scope.into(),
-            kind,
-            subject_id: id.clone(),
-            reason: PurgeReason::UserRequest,
-            requested_at: NOW,
-        })
+        .map(|(kind, id)| request(scope, kind, id, &format!("purge:{}:{id}", kind.as_str())))
         .collect()
+    }
+}
+pub fn request(scope: &str, kind: SubjectKind, id: &str, key: &str) -> PurgeRequest {
+    PurgeRequest {
+        operation_key: key.into(),
+        scope: scope.into(),
+        kind,
+        subject_id: id.into(),
+        reason: PurgeReason::UserRequest,
+        requested_at: NOW,
     }
 }
 pub fn grant(scopes: &[&str]) -> MemoryGrant {
@@ -112,21 +133,39 @@ pub fn grant(scopes: &[&str]) -> MemoryGrant {
 }
 pub fn conversation_text(tag: &str) -> String {
     format!(
-        "Remember that the {CONVERSATION_MARK} vault opens at dawn {tag}. Bring the brass key and say nothing."
+        "Remember that the {CONVERSATION_MARK} vault opens at dawn {tag}. {SHARED_CONVERSATION}."
     )
 }
 pub fn document_text(tag: &str) -> String {
-    format!(
-        "The {DOCUMENT_MARK} reactor schedule is confidential {tag}.\nSecond line about cooling loops and the pumps."
-    )
+    format!("The {DOCUMENT_MARK} reactor schedule is confidential {tag}.\n{SHARED_DOCUMENT}.")
 }
 pub fn memory_text(tag: &str) -> String {
     format!("My locker code is {MEMORY_MARK} 4471 {tag}")
 }
+/// A finished durable run with copies of `texts` in its seed and events.
+pub async fn finished_run(world: &World, key: &str, texts: &[String]) -> String {
+    let run = world
+        .journal
+        .create_run(key, json!({"instruction": texts.first(), "scope": "any"}))
+        .await
+        .unwrap();
+    world
+        .journal
+        .append(&run, "tool_result", "tool:1", json!({"quotes": texts}))
+        .await
+        .unwrap();
+    world
+        .journal
+        .set_state(&run, "completed", None, "done")
+        .await
+        .unwrap();
+    run
+}
 
-/// Plant one conversation, one document and one memory in `scope`, with copies in the
-/// journal (inline and blob payload), telemetry, exports, FTS, vectors, blobs, a
-/// referencing child table, notifications and edges.
+/// Plant one conversation, one document and one memory in `scope`, linked to one durable
+/// run by real provenance (memory run binding, chunk retrieval, explicit link), with
+/// copies in its journal (inline, >64 KiB blob, archived context observation), task
+/// hashes, telemetry, exports, FTS, vectors, blobs, notifications and evidence.
 pub async fn plant(world: &World, scope: &str, tag: &str) -> Planted {
     let embedder = Arc::new(HashEmbedder::new("hash-a", 64));
     world
@@ -222,21 +261,8 @@ pub async fn plant(world: &World, scope: &str, tag: &str) -> Planted {
         .await
         .unwrap()
         .document_id;
-    {
-        let (memory, scope, tag) = (memory.clone(), scope.to_string(), tag.to_string());
-        world
-            .main
-            .write(Priority::Normal, move |c| {
-                schema::create_vector_space(c, "probe", 4)?;
-                schema::put_vector(c, "probe", &scope, &format!("memory:{memory}"), &json!(PROBE).to_string())?;
-                c.execute("INSERT INTO notifications(id,class,content,principal_id,scope_id) VALUES(?1,'normal',?2,?3,?4)", rusqlite::params![format!("ntf_{memory}"), format!("Reminder: {}", memory_text(&tag)), PRINCIPAL, scope])?;
-                c.execute("INSERT INTO edges(id,layer,source_type,source_id,relation_type,destination_type,destination_id,principal_id,scope_id) VALUES(?1,'memory','memory',?2,'about','entity','ent_x',?3,?4)", rusqlite::params![format!("edg_{memory}"), memory, PRINCIPAL, scope])?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-    }
-    // Journal copies: run seed, inline event, >64 KiB blob event, terminal state.
+    // Journal copies: run seed, inline event, >64 KiB blob event, archived observation,
+    // an ASCII-case variant, terminal state.
     let run = world
         .journal
         .create_run(
@@ -251,7 +277,7 @@ pub async fn plant(world: &World, scope: &str, tag: &str) -> Planted {
             &run,
             "tool_result",
             "tool:1",
-            json!({"memory": memory_text(tag), "quote": format!("user wrote: {user_text}")}),
+            json!({"memory": memory_text(tag), "quote": format!("user wrote: {}", user_text.to_uppercase())}),
         )
         .await
         .unwrap();
@@ -265,9 +291,49 @@ pub async fn plant(world: &World, scope: &str, tag: &str) -> Planted {
         )
         .await
         .unwrap();
+    let (_, observation) = world
+        .journal
+        .archive_context_observation(
+            &run,
+            "context-source:1",
+            &json!({"recalled": memory_text(tag)}),
+        )
+        .await
+        .unwrap();
     world
         .journal
         .set_state(&run, "completed", None, "done")
+        .await
+        .unwrap();
+    // Provenance: memory binding (conversation), chunk retrieval (document), explicit
+    // link (memory). Plus a notification and evidence produced by the run.
+    {
+        let (run, conversation, document, memory, scope, tag) = (
+            run.clone(),
+            conversation.clone(),
+            document.clone(),
+            memory.clone(),
+            scope.to_string(),
+            tag.to_string(),
+        );
+        world
+            .sql(move |c| {
+                c.execute("INSERT INTO memory_run_bindings(run_id,principal_id,scopes,primary_scope,conversation_id,role,bound_at) VALUES(?1,?2,?3,?4,?5,'worker',?6)", rusqlite::params![run, PRINCIPAL, json!([scope]).to_string(), scope, conversation, NOW])?;
+                let chunk: String = c.query_row("SELECT id FROM doc_chunks WHERE document_id=?1 ORDER BY rowid LIMIT 1", [&document], |r| r.get(0))?;
+                c.execute("INSERT INTO chunk_retrievals(run_id,chunk_id,scope_id,retrieved_at) VALUES(?1,?2,?3,?4)", rusqlite::params![run, chunk, scope, NOW])?;
+                c.execute("INSERT INTO notifications(id,run_id,class,content,principal_id,scope_id) VALUES(?1,?2,'normal',?3,?4,?5)", rusqlite::params![format!("ntf_{tag}"), run, format!("Reminder: {}", memory_text(&tag)), PRINCIPAL, scope])?;
+                c.execute("INSERT INTO evidence(id,run_id,result,code_version,principal_id,scope_id) VALUES(?1,?2,?3,'abc123',?4,?5)", rusqlite::params![format!("evd_{tag}"), run, format!("checked: {}", document_text(&tag)), PRINCIPAL, scope])?;
+                schema::create_vector_space(c, "probe", 4)?;
+                schema::put_vector(c, "probe", &scope, &format!("memory:{memory}"), &json!(PROBE).to_string())?;
+                c.execute("INSERT INTO edges(id,layer,source_type,source_id,relation_type,destination_type,destination_id,principal_id,scope_id) VALUES(?1,'memory','memory',?2,'about','entity','ent_x',?3,?4)", rusqlite::params![format!("edg_{memory}"), memory, PRINCIPAL, scope])?;
+                Ok(())
+            })
+            .await;
+    }
+    world
+        .service()
+        .await
+        .link_run(SubjectKind::Memory, &memory, &run)
         .await
         .unwrap();
     // A consumer that hashes observed journal events (as the tasks crate does).
@@ -275,16 +341,14 @@ pub async fn plant(world: &World, scope: &str, tag: &str) -> Planted {
         let events = world.journal.replay(&run, 0).await.unwrap();
         let run = run.clone();
         world
-            .main
-            .write(Priority::Normal, move |c| {
+            .sql(move |c| {
                 c.execute("CREATE TABLE IF NOT EXISTS task_observed_events(run_id TEXT NOT NULL,sequence INTEGER NOT NULL,payload_hash TEXT NOT NULL,PRIMARY KEY(run_id,sequence))", [])?;
                 for event in &events {
                     c.execute("INSERT INTO task_observed_events VALUES(?1,?2,?3)", rusqlite::params![run, event.sequence, sha256(&serde_json::to_vec(event).unwrap())])?;
                 }
                 Ok(())
             })
-            .await
-            .unwrap();
+            .await;
     }
     world
         .telemetry
@@ -308,6 +372,7 @@ pub async fn plant(world: &World, scope: &str, tag: &str) -> Planted {
         document,
         memory,
         run,
+        observation: observation.as_str().to_string(),
         bystander_message: bystander,
     }
 }
@@ -316,7 +381,7 @@ pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
-/// Every place a marker was found, as `location: marker`.
+/// Every place a marker was found, as `location: marker` (ASCII case-insensitive).
 pub fn scan(root: &Path, markers: &[&str]) -> Vec<String> {
     let mut hits = Vec::new();
     for db in [
@@ -481,4 +546,65 @@ pub fn fts_hits(root: &Path, markers: &[&str]) -> Vec<String> {
         }
     }
     hits
+}
+/// Exact snapshot of every row of a run across the principal and telemetry stores.
+pub async fn run_snapshot(world: &World, run: &str) -> Vec<String> {
+    let probe = run.to_string();
+    let mut rows: Vec<String> = world
+        .read(move |c| {
+            let mut out = Vec::new();
+            for (table, column) in [
+                ("journal", "run_id"),
+                ("evidence", "run_id"),
+                ("notifications", "run_id"),
+                ("task_observed_events", "run_id"),
+            ] {
+                let exists: bool = c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
+                    [table],
+                    |r| r.get(0),
+                )?;
+                if !exists {
+                    continue;
+                }
+                let mut s = c.prepare(&format!(
+                    "SELECT * FROM {table} WHERE {column}=?1 ORDER BY rowid"
+                ))?;
+                let width = s.column_count();
+                let mut q = s.query([&probe])?;
+                while let Some(row) = q.next()? {
+                    let values: Vec<String> = (0..width)
+                        .map(|i| format!("{:?}", row.get_ref(i).unwrap()))
+                        .collect();
+                    out.push(format!("{table}|{}", values.join("|")));
+                }
+            }
+            Ok(out)
+        })
+        .await;
+    let probe = run.to_string();
+    let telemetry: Vec<String> = world
+        .telemetry
+        .database()
+        .read(ReadLane::Interactive, move |c| {
+            let mut out = Vec::new();
+            for table in ["events", "telemetry_runs", "telemetry_offsets"] {
+                let mut s = c.prepare(&format!(
+                    "SELECT * FROM {table} WHERE run_id=?1 ORDER BY rowid"
+                ))?;
+                let width = s.column_count();
+                let mut q = s.query([&probe])?;
+                while let Some(row) = q.next()? {
+                    let values: Vec<String> = (0..width)
+                        .map(|i| format!("{:?}", row.get_ref(i).unwrap()))
+                        .collect();
+                    out.push(format!("{table}|{}", values.join("|")));
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .unwrap();
+    rows.extend(telemetry);
+    rows
 }

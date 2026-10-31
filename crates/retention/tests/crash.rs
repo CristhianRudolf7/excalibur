@@ -11,14 +11,15 @@ use std::{
 };
 
 /// (boundary, subject index: 0 conversation, 1 document, 2 memory)
-const BOUNDARIES: [(PurgeBoundary, usize); 9] = [
+const BOUNDARIES: [(PurgeBoundary, usize); 10] = [
     (PurgeBoundary::Planned, 0),
-    (PurgeBoundary::MainSweepBatch, 0),
-    (PurgeBoundary::MainSwept, 1),
-    (PurgeBoundary::JournalBlobsSwept, 1),
-    (PurgeBoundary::TelemetrySwept, 2),
-    (PurgeBoundary::BaseDeleteUncommitted, 0),
-    (PurgeBoundary::BaseDeleted, 1),
+    (PurgeBoundary::SweepBatch, 0),
+    (PurgeBoundary::Swept, 1),
+    (PurgeBoundary::BaseDeleteBatch, 0),
+    (PurgeBoundary::BaseDeleteUncommitted, 1),
+    (PurgeBoundary::BaseDeleted, 2),
+    (PurgeBoundary::TelemetrySwept, 0),
+    (PurgeBoundary::Finalized, 1),
     (PurgeBoundary::BlobsReleased, 2),
     (PurgeBoundary::Completed, 0),
 ];
@@ -122,6 +123,9 @@ async fn sigkill_at_every_boundary_then_resume_converges() {
                 .unwrap();
         let service = world.service().await;
         let resumed = service.resume_pending().await.unwrap();
+        for outcome in &resumed {
+            assert!(outcome.result.is_ok(), "{boundary:?}: {:?}", outcome.result);
+        }
         let expected_pending = usize::from(*boundary != PurgeBoundary::Completed);
         assert_eq!(resumed.len(), expected_pending, "{boundary:?}");
         let mut receipts = Vec::new();
