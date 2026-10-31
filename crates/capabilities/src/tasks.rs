@@ -262,7 +262,9 @@ fn bounded_message(message: &str) -> String {
     message[..end].to_string()
 }
 fn json_size(value: &Value) -> usize {
-    serde_json::to_vec(value).map(|v| v.len()).unwrap_or(usize::MAX)
+    serde_json::to_vec(value)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX)
 }
 /// Durable task ID: stable across restarts and resubmissions of the same key.
 pub fn task_id(scope: &str, operation_key: &str) -> String {
@@ -501,7 +503,8 @@ impl CapabilityTasks {
         }
         db.write(Priority::Journal, |c| {
             c.execute_batch("CREATE TABLE IF NOT EXISTS capability_schema(version INTEGER PRIMARY KEY,checksum TEXT NOT NULL)")?;
-            for (version, schema) in [(1, include_str!("schema.sql"))] {
+            {
+                let (version, schema) = (1, include_str!("schema.sql"));
                 let checksum = format!("{:x}", Sha256::digest(schema.as_bytes()));
                 let known: Option<String> = c
                     .query_row("SELECT checksum FROM capability_schema WHERE version=?1", [version], |r| r.get(0))
@@ -567,7 +570,9 @@ impl CapabilityTasks {
         if submission.operation_key.is_empty()
             || submission.operation_key.len() > MAX_KEY
             || json_size(&submission.input) > MAX_JSON
-            || submission.timeout_ms.is_some_and(|t| t == 0 || t > 30 * 86_400_000)
+            || submission
+                .timeout_ms
+                .is_some_and(|t| t == 0 || t > 30 * 86_400_000)
         {
             return Err(Error::Invalid(
                 "bounded operation key, input and positive timeout",
@@ -631,24 +636,42 @@ impl CapabilityTasks {
         let (scope, id) = (self.scope.clone(), id.to_string());
         let outcome = self
             .db
-            .write(Priority::Interactive, move |c| -> excalibur_store::Result<Inner<Row>> {
-                let Some(mut row) = load(c, &scope, &id)? else { return Ok(Err("not found")) };
-                if row.task.state != TaskState::InputRequired || row.task.input_seq != request_seq {
-                    return Ok(Err("no matching input request is outstanding"));
-                }
-                if let Some(pending) = &row.pending_input {
-                    return Ok(if pending == &response { Ok(row) } else { Err("another answer is already pending") });
-                }
-                row.pending_input = Some(response);
-                if !row.task.in_flight {
-                    row.task.next_poll_at = row.task.next_poll_at.min(now);
-                }
-                if !save(c, &scope, &mut row, now)? {
-                    return Err(corrupt());
-                }
-                event(c, &scope, &id, now, "input_recorded", json!({"seq": request_seq}))?;
-                Ok(Ok(row))
-            })
+            .write(
+                Priority::Interactive,
+                move |c| -> excalibur_store::Result<Inner<Row>> {
+                    let Some(mut row) = load(c, &scope, &id)? else {
+                        return Ok(Err("not found"));
+                    };
+                    if row.task.state != TaskState::InputRequired
+                        || row.task.input_seq != request_seq
+                    {
+                        return Ok(Err("no matching input request is outstanding"));
+                    }
+                    if let Some(pending) = &row.pending_input {
+                        return Ok(if pending == &response {
+                            Ok(row)
+                        } else {
+                            Err("another answer is already pending")
+                        });
+                    }
+                    row.pending_input = Some(response);
+                    if !row.task.in_flight {
+                        row.task.next_poll_at = row.task.next_poll_at.min(now);
+                    }
+                    if !save(c, &scope, &mut row, now)? {
+                        return Err(corrupt());
+                    }
+                    event(
+                        c,
+                        &scope,
+                        &id,
+                        now,
+                        "input_recorded",
+                        json!({"seq": request_seq}),
+                    )?;
+                    Ok(Ok(row))
+                },
+            )
             .await?;
         match outcome {
             Ok(row) => Ok(row.task),
@@ -663,21 +686,26 @@ impl CapabilityTasks {
         let (scope, id) = (self.scope.clone(), id.to_string());
         let outcome = self
             .db
-            .write(Priority::Interactive, move |c| -> excalibur_store::Result<Option<Row>> {
-                let Some(mut row) = load(c, &scope, &id)? else { return Ok(None) };
-                if row.task.state.is_terminal() || row.task.cancel != CancelState::None {
-                    return Ok(Some(row));
-                }
-                row.task.cancel = CancelState::Requested;
-                if !row.task.in_flight {
-                    row.task.next_poll_at = row.task.next_poll_at.min(now);
-                }
-                if !save(c, &scope, &mut row, now)? {
-                    return Err(corrupt());
-                }
-                event(c, &scope, &id, now, "cancel_requested", json!({}))?;
-                Ok(Some(row))
-            })
+            .write(
+                Priority::Interactive,
+                move |c| -> excalibur_store::Result<Option<Row>> {
+                    let Some(mut row) = load(c, &scope, &id)? else {
+                        return Ok(None);
+                    };
+                    if row.task.state.is_terminal() || row.task.cancel != CancelState::None {
+                        return Ok(Some(row));
+                    }
+                    row.task.cancel = CancelState::Requested;
+                    if !row.task.in_flight {
+                        row.task.next_poll_at = row.task.next_poll_at.min(now);
+                    }
+                    if !save(c, &scope, &mut row, now)? {
+                        return Err(corrupt());
+                    }
+                    event(c, &scope, &id, now, "cancel_requested", json!({}))?;
+                    Ok(Some(row))
+                },
+            )
             .await?;
         outcome.map(|row| row.task).ok_or(Error::NotFound)
     }

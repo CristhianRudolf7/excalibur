@@ -15,9 +15,16 @@ pub enum FailureClass {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RemoteState {
     Working,
-    InputRequired { request: serde_json::Value },
-    Completed { result: serde_json::Value },
-    Failed { class: FailureClass, message: String },
+    InputRequired {
+        request: serde_json::Value,
+    },
+    Completed {
+        result: serde_json::Value,
+    },
+    Failed {
+        class: FailureClass,
+        message: String,
+    },
     Cancelled,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

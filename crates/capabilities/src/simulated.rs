@@ -25,9 +25,16 @@ use std::{
 #[serde(tag = "step", rename_all = "snake_case")]
 pub enum SimStep {
     Working,
-    InputRequired { request: Value },
-    Completed { result: Value },
-    Failed { class: FailureClass, message: String },
+    InputRequired {
+        request: Value,
+    },
+    Completed {
+        result: Value,
+    },
+    Failed {
+        class: FailureClass,
+        message: String,
+    },
     Cancelled,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
