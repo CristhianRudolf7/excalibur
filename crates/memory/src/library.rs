@@ -69,7 +69,11 @@ pub trait ContextWriter: Send + Sync {
     ) -> BoxFuture<'a, std::result::Result<String, String>>;
 }
 
-/// Minimal built-in guard: size bound, declared type versus signature, no NUL in text.
+/// Built-in guard. Delegates to the shared content guard (`excalibur_ingest::ContentGuard`):
+/// size bound, UTF-8 text, content-signature type detection against the declared media type,
+/// refusal of executable code and bounded inspection of zip, gzip, zstd and tar containers.
+/// It has no scanner and no quarantine; hosts that need them install a configured
+/// `ContentGuard` directly, which implements [`IngestGuard`] as well.
 pub struct BasicIngestGuard {
     pub max_bytes: usize,
 }
@@ -82,21 +86,17 @@ impl Default for BasicIngestGuard {
 }
 impl IngestGuard for BasicIngestGuard {
     fn inspect(&self, media_type: &str, bytes: &[u8]) -> std::result::Result<(), String> {
-        if bytes.is_empty() || bytes.len() > self.max_bytes {
-            return Err("empty or oversized file".into());
-        }
-        if media_type.starts_with("text/")
-            && (bytes.contains(&0) || std::str::from_utf8(bytes).is_err())
-        {
-            return Err("text file is not valid UTF-8".into());
-        }
-        if media_type == "application/pdf" && !bytes.starts_with(b"%PDF") {
-            return Err("declared PDF without PDF signature".into());
-        }
-        if media_type == "image/png" && !bytes.starts_with(b"\x89PNG") {
-            return Err("declared PNG without PNG signature".into());
-        }
-        Ok(())
+        let mut policy = excalibur_ingest::Policy::default();
+        policy.limits.max_input_bytes = self.max_bytes as u64;
+        let guard = excalibur_ingest::ContentGuard::new(policy);
+        IngestGuard::inspect(&guard, media_type, bytes)
+    }
+}
+impl IngestGuard for excalibur_ingest::ContentGuard {
+    fn inspect(&self, media_type: &str, bytes: &[u8]) -> std::result::Result<(), String> {
+        self.examine(None, media_type, bytes)
+            .map(|_| ())
+            .map_err(|rejection| rejection.to_string())
     }
 }
 

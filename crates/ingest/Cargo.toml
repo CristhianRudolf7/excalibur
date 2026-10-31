@@ -1,0 +1,17 @@
+[package]
+name = "excalibur-ingest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Pure-Rust DEFLATE decoder (no build script, no network access); used for zip and gzip.
+miniz_oxide = "0.8"
+# Already in the workspace lock through excalibur-store.
+zstd = "0.13"
+crc32fast = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
