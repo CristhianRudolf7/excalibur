@@ -81,6 +81,6 @@ The final verification of source snapshot `dfd294d1b42f5e665160eb4ff81edf65ae70b
 
 - The maintenance scope list is currently captured at host startup; automatically enrolling projects registered later remains pending. The noninteractive `exec` host does not yet enable long-term memory.
 - Provider batch APIs, local ONNX/candle model runtimes and an external HNSW index above 500 000 vectors per scope remain unimplemented. The foreground daemon defaults to degraded retrieval until an embedder is supplied; `RemoteEmbedder` adapts the shared provider client and `text-embedding-3-small`.
-- Full security-layer file inspection behind `IngestGuard` remains pending; the built-in guard checks size, type signature and UTF-8. The model-facing ingest tool currently accepts text and Markdown, not arbitrary paths.
+- `IngestGuard` is backed by the shared [ingestion guard](ingestion.md): content-type detection, executable refusal and bounded archive inspection by default, with scanner hook and quarantine when the host configures them. No real antivirus is connected, and the `file-analysis` sandbox step is not wired. The model-facing ingest tool currently accepts text and Markdown, not arbitrary paths.
 - Vision/transcription/context-sentence roles are contracts that hosts must supply. Office and video extraction are unsupported.
 - The fixed memory-model adapters and curation/maintenance entry points are backend building blocks; no memory management UI or measured external benchmark score is claimed.
