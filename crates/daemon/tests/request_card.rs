@@ -77,8 +77,10 @@ fn delegation_persists_literal_request_card_and_criteria_once_in_the_frozen_scop
         assert_eq!(host.orchestrator.mailbox(worker_id).await.unwrap().len(),notices.len());
         assert_eq!(tasks.requirements_and_criteria(&task.id).await.unwrap().0[0].text,"Export CSV rather than PDF");
         let parent=host.orchestrator.agent(worker_id).await.unwrap();
-        let mut child_request=parent.delegation.unwrap();child_request.operation="child-control-operation".into();child_request.name="Child worker".into();child_request.profile="implementer".into();child_request.token.budget=10;child_request.spec.budget=excalibur_engine::Budget{max_steps:20,max_tokens:1000,max_wall_seconds:60,max_tool_calls:10,tool_timeout_seconds:60,..Default::default()};
+        let mut child_request=parent.delegation.clone().unwrap();child_request.operation="child-control-operation".into();child_request.name="Child worker".into();child_request.profile="implementer".into();child_request.token.budget=10;child_request.spec.budget=excalibur_engine::Budget{max_steps:20,max_tokens:20_000,max_wall_seconds:60,max_tool_calls:10,tool_timeout_seconds:60,..Default::default()};
         let child=host.orchestrator.spawn(worker_id,child_request).await.unwrap();
+        // The inherited natively sized L0 must fit the child's own run budget, as native sizing requires.
+        let child_context=host.orchestrator.engine().load(child.run_id.as_ref().unwrap()).await.unwrap().spec.context;assert_eq!(child_context.layers[0],parent.delegation.as_ref().unwrap().spec.context.layers[0]);assert!(child_context.token_budgets[0]<=20_000);
         actions.execute("request-conversation","stop",Some("all"),"stop-all").await.unwrap();
         assert_eq!(host.orchestrator.status(&child.id).await.unwrap().state,"paused");
         actions.execute("request-conversation","resume",Some(worker_id),"resume-one-tree").await.unwrap();

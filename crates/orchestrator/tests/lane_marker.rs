@@ -71,6 +71,7 @@ async fn first_spawn_matches_native_sizing_and_stored_delegations_respawn_withou
         request.name = operation.into();
         request.profile = "implementer".into();
         request.token.budget = 10;
+        request.spec.budget.max_tokens = 40_000;
         request.spec.budget.max_steps = 20;
         request.spec.budget.max_tool_calls = 10;
         request.spec.budget.max_wall_seconds = 60;
@@ -98,6 +99,7 @@ async fn a_priority_change_swaps_the_marker_without_growth() {
         request.name = operation.into();
         request.profile = "implementer".into();
         request.token.budget = 10;
+        request.spec.budget.max_tokens = 40_000;
         request.spec.budget.max_steps = 20;
         request.spec.budget.max_tool_calls = 10;
         request.spec.budget.max_wall_seconds = 60;
