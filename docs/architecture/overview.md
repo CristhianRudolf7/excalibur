@@ -4,6 +4,8 @@
 
 This document describes the intended architecture. Rust provider, base/storage and minimum durable engine libraries exist; the complete application and interfaces remain planned. See [provider coverage](provider-implementation.md).
 
+Implementation and verification currently target Linux; support for other operating systems (including Windows, macOS and mobile profiles) is planned for a later phase.
+
 ## Shared core and interfaces
 
 The Rust core owns agent and provider logic. The CLI can call the core directly without an HTTP server. A future web interface will communicate through an HTTP API, which calls the same core; application logic must not be duplicated in the CLI or the API.

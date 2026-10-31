@@ -8,6 +8,8 @@ Excalibur is a planned personal AI agent that will converse with users, help pla
 
 The repository contains documentation and shared Rust provider, storage, minimum durable engine, durable task/planning and evidence, context/cache, security, vault, Linux sandbox, telemetry, evaluation, memory, skills, decider and scheduler libraries. The shared daemon, authenticated client gateway, conversational master and subagent orchestration are described in [Daemon, master and subagents](docs/development/daemon.md). The complete personal agent, interactive chat CLI, web interface and marketplace remain planned. See [provider coverage and limits](docs/architecture/provider-implementation.md).
 
+Implementation and verification currently target Linux; support for other operating systems is planned for a later phase.
+
 See [Base and storage](docs/development/storage.md) for implementation and verification evidence. See [Minimum durable engine](docs/development/durable-engine.md) for the embedded step loop, effect recovery, context, gateway and local tools.
 
 For toolchain setup and available checks, see the [development environment](docs/development/environment.md).

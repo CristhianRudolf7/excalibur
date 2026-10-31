@@ -4,6 +4,8 @@
 
 Este documento describe la arquitectura prevista. Existen bibliotecas Rust de proveedores, base/almacenamiento y motor durable mínimo; la aplicación completa y las interfaces siguen previstas. Consulta la [cobertura de proveedores](provider-implementation.es.md).
 
+La implementación y la verificación se centran actualmente en Linux; el soporte para otros sistemas operativos (incluidos Windows, macOS y perfiles móviles) está previsto para una fase posterior.
+
 ## Núcleo compartido e interfaces
 
 El núcleo en Rust contiene la lógica del agente y de los proveedores. La CLI puede llamar directamente al núcleo sin un servidor HTTP. La futura interfaz web se comunicará mediante una API HTTP, que llamará al mismo núcleo; la lógica de la aplicación no debe duplicarse en la CLI ni en la API.
