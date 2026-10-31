@@ -23,7 +23,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-pub use writer::{Database, Priority, ReadLane, ShortCodeKind, StoreEvent, StoreStats};
+pub use writer::{BlobRelease, Database, Priority, ReadLane, ShortCodeKind, StoreEvent, StoreStats};
 
 #[derive(Debug, Error)]
 pub enum Error {

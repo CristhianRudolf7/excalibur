@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 excalibur-store = { path = "../store" }
+excalibur-retention = { path = "../retention" }
 excalibur-providers = { path = "../providers" }
 excalibur-models = { path = "../models" }
 excalibur-vault = { path = "../vault" }

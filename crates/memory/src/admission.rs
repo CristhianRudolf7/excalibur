@@ -619,31 +619,36 @@ impl MemoryStore {
     }
 
     /// User-requested deletion: the only operation that destroys memory content.
+    /// Runs the shared durable purge (tombstone, derived-copy sweep, FTS/vector/blob
+    /// hygiene) keyed by the memory ID. Telemetry is swept only by hosts that open the
+    /// purge service with their telemetry handle.
     pub async fn purge_memory(&self, grant: &MemoryGrant, id: &str, now: i64) -> Result<()> {
         let memory = self
             .memory(grant, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.into()))?;
-        let id = id.to_string();
-        self.db
-            .write(Priority::Interactive, move |c| {
-                EmbeddingRegistry::remove_in(c, &memory.scope, &format!("memory:{id}"))?;
-                let mut s = c.prepare("SELECT id FROM memory_keys WHERE memory_id=?1")?;
-                let keys = s.query_map([&id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-                for key in keys {
-                    EmbeddingRegistry::remove_in(c, &memory.scope, &format!("key:{key}"))?;
-                    c.execute("DELETE FROM memory_keys WHERE id=?1", [&key])?;
-                }
-                c.execute("UPDATE memories SET superseded_by=NULL WHERE superseded_by=?1", [&id])?;
-                c.execute("DELETE FROM memory_admissions WHERE memory_id=?1 OR against_id=?1", [&id])?;
-                c.execute("DELETE FROM memory_transitions WHERE memory_id=?1", [&id])?;
-                c.execute("UPDATE memory_questions SET state='closed',question='[purged]' WHERE memory_ids LIKE '%' || ?1 || '%'", [&id])?;
-                c.execute("DELETE FROM memory_entity_links WHERE memory_id=?1", [&id])?;
-                c.execute("DELETE FROM memories WHERE id=?1", [&id])?;
-                let _ = now;
-                Ok(())
+        let service = excalibur_retention::PurgeService::open(&grant.principal, self.db.clone(), None)
+            .await
+            .map_err(purge_error)?
+            .with_participant(std::sync::Arc::new(crate::MemoryPurgeParticipant));
+        service
+            .purge(excalibur_retention::PurgeRequest {
+                operation_key: format!("memory:{id}"),
+                scope: memory.scope.clone(),
+                kind: excalibur_retention::SubjectKind::Memory,
+                subject_id: id.to_string(),
+                reason: excalibur_retention::PurgeReason::UserRequest,
+                requested_at: now,
             })
-            .await?;
+            .await
+            .map_err(purge_error)?;
         Ok(())
+    }
+}
+fn purge_error(error: excalibur_retention::Error) -> Error {
+    match error {
+        excalibur_retention::Error::Store(error) => Error::Store(error),
+        excalibur_retention::Error::NotFound => Error::NotFound("memory".into()),
+        other => Error::Invalid(other.to_string()),
     }
 }

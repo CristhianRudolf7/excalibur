@@ -97,6 +97,26 @@ pub(crate) fn sanitize(redactor: &Redactor, value: &Value) -> Value {
     visit(&mut value);
     value
 }
+fn journal_source_hash(event: &Event) -> Result<String> {
+    Ok(if event.kind == "context_prepared" {
+        context_projection::payload_hash(&event.payload)?
+    } else {
+        digest(&serde_json::to_vec(&event.payload)?)
+    })
+}
+fn offset_hash(kind: &str, key: &str, source_hash: &str) -> String {
+    digest(format!("{kind}\0{key}\0{source_hash}").as_bytes())
+}
+/// Identity hash stored in `telemetry_offsets.payload_hash` for a journal-sourced event.
+/// A purge that redacts a journal payload re-seals the offset with this value so that a
+/// later `reconcile` of the redacted journal stays idempotent instead of conflicting.
+pub fn journal_offset_hash(event: &Event) -> Result<String> {
+    Ok(offset_hash(
+        &event.kind,
+        &event.key,
+        &journal_source_hash(event)?,
+    ))
+}
 impl Telemetry {
     pub async fn open(config: TelemetryConfig) -> Result<Self> {
         let mut directories = std::fs::DirBuilder::new();
@@ -290,11 +310,7 @@ impl Telemetry {
         }
         // Only the principal journal owns recoverable ContextSession snapshots.
         // Keep source identity over the ORIGINAL payload, including omitted data.
-        let source_hash = if event.kind == "context_prepared" {
-            context_projection::payload_hash(&event.payload)?
-        } else {
-            digest(&serde_json::to_vec(&event.payload)?)
-        };
+        let source_hash = journal_source_hash(event)?;
         let payload = if event.kind == "context_prepared" {
             sanitize(
                 &self.inner.redactor,
@@ -339,12 +355,10 @@ impl Telemetry {
             key.to_owned(),
         );
         let text = serde_json::to_string(&payload)?;
-        let hash = digest(
-            format!(
-                "{kind}\0{key}\0{}",
-                source_hash.unwrap_or_else(|| digest(text.as_bytes()))
-            )
-            .as_bytes(),
+        let hash = offset_hash(
+            &kind,
+            &key,
+            &source_hash.unwrap_or_else(|| digest(text.as_bytes())),
         );
         let cursor=self.inner.db.write(Priority::Journal,move|c| {
             let sequence=if sequence==0 {c.query_row("SELECT COALESCE(MAX(sequence),0)+1 FROM telemetry_offsets WHERE run_id=?1 AND source=?2",rusqlite::params![run,source],|r|r.get::<_,u64>(0))?}else{sequence};

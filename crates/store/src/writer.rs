@@ -52,6 +52,16 @@ pub enum StoreEvent {
         parent: String,
     },
 }
+/// Outcome of releasing a blob after a user-requested purge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobRelease {
+    /// Metadata and file were removed (or the file was already gone).
+    Removed,
+    /// Another owner still references the same content; it is kept.
+    Shared,
+    /// Nothing was registered under this hash.
+    Absent,
+}
 #[derive(Clone, Debug, Default)]
 pub struct StoreStats {
     pub committed: [u64; 4],
@@ -872,6 +882,61 @@ impl Database {
     pub fn resume_background(&self) {
         self.inner.shared.paused.store(false, Ordering::Release);
         let _ = self.inner.shared.events.send(StoreEvent::BackgroundResumed);
+    }
+    /// Non-blocking full WAL checkpoint that resets the WAL file to zero bytes.
+    /// Returns `false` when a reader snapshot or another connection kept frames alive.
+    /// Without WAL (network file systems) there are no frames and the result is `true`.
+    pub async fn checkpoint_truncate(&self) -> Result<bool> {
+        let s = self.inner.shared.clone();
+        let timeout = self.inner.config.busy_timeout_ms;
+        self.command(Priority::Normal, false, move |conn| {
+            conn.busy_timeout(Duration::ZERO)?;
+            let result = conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })
+                .map_err(Error::from);
+            let _ = s.events.send(StoreEvent::Checkpoint("TRUNCATE"));
+            conn.busy_timeout(Duration::from_millis(timeout))?;
+            match result {
+                Ok((busy, frames)) => Ok(busy == 0 && frames <= 0),
+                Err(Error::Busy) => Ok(false),
+                Err(error) => Err(error),
+            }
+        })
+        .await
+    }
+    /// User-requested purge: drop an unreferenced blob immediately, without the 24 h
+    /// garbage-collection grace period. Shared content (still referenced) is retained.
+    pub async fn release_purged_blob(&self, hash: BlobHash) -> Result<BlobRelease> {
+        if self.inner.kind != DatabaseKind::Main {
+            return Err(Error::PrincipalOnly);
+        }
+        let blobs = self.blobs();
+        self.command(Priority::Normal, false, move |conn| {
+            let key = hash.as_str();
+            let referenced: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM blob_refs WHERE hash=?1) OR EXISTS(SELECT 1 FROM blobs WHERE hash=?1 AND ref_count>0)",
+                [key],
+                |r| r.get(0),
+            )?;
+            if referenced {
+                return Ok(BlobRelease::Shared);
+            }
+            let removed_row = conn.execute("DELETE FROM blobs WHERE hash=?1 AND ref_count=0", [key])?;
+            conn.execute("DELETE FROM blob_integrity WHERE hash=?1", [key])?;
+            conn.execute("DELETE FROM blob_incidents WHERE hash=?1", [key])?;
+            match fs::remove_file(blobs.path(&hash)) {
+                Ok(()) => Ok(BlobRelease::Removed),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(if removed_row > 0 {
+                    BlobRelease::Removed
+                } else {
+                    BlobRelease::Absent
+                }),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
     }
     /// Stop admissions, drain acknowledged queued work and join the dedicated writer.
     pub async fn shutdown(&self) -> Result<()> {

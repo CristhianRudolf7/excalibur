@@ -1,0 +1,23 @@
+[package]
+name = "excalibur-retention"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+excalibur-store = { path = "../store" }
+excalibur-journal = { path = "../journal" }
+excalibur-telemetry = { path = "../telemetry" }
+aho-corasick = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+ulid = "1"
+
+[dev-dependencies]
+excalibur-memory = { path = "../memory" }
+excalibur-vault = { path = "../vault" }
+tempfile = "3"
+zstd = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
