@@ -153,6 +153,30 @@ impl Telemetry {
                 "INSERT OR IGNORE INTO telemetry_schema VALUES(1,?1)",
                 [checksum],
             )?;
+            let expired = include_str!("schema2.sql");
+            let expired_checksum = digest(expired.as_bytes());
+            let old: Option<String> = c
+                .query_row(
+                    "SELECT checksum FROM telemetry_schema WHERE version=2",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match old {
+                Some(old) if old != expired_checksum => {
+                    return Err(excalibur_store::Error::Invalid(
+                        "telemetry extension checksum mismatch",
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    c.execute_batch(expired)?;
+                    c.execute(
+                        "INSERT INTO telemetry_schema VALUES(2,?1)",
+                        [expired_checksum],
+                    )?;
+                }
+            }
             Ok(())
         })
         .await?;
@@ -402,12 +426,28 @@ impl Telemetry {
             pending: VecDeque::new(),
         }
     }
+    /// Record journal events missing from telemetry. Events below a retention expiry
+    /// watermark (`telemetry_expired`) were deliberately removed and are not re-ingested.
     pub async fn reconcile(&self, journal: &Journal, run: &str) -> Result<u64> {
         let events = journal.replay(run, 0).await?;
-        for event in &events {
+        let probe = run.to_owned();
+        let through: u64 = self
+            .inner
+            .db
+            .read(ReadLane::Interactive, move |c| {
+                Ok(c.query_row(
+                    "SELECT coalesce(max(through_sequence),0) FROM telemetry_expired WHERE run_id=?1 AND source='journal'",
+                    [probe],
+                    |r| r.get(0),
+                )?)
+            })
+            .await?;
+        let mut recorded = 0;
+        for event in events.iter().filter(|e| e.sequence > through) {
             self.record_recovered_event(run, event).await?;
+            recorded += 1;
         }
-        Ok(events.len() as u64)
+        Ok(recorded)
     }
     pub(crate) async fn run_data(
         &self,

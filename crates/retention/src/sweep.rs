@@ -1,10 +1,12 @@
 //! Synchronous SQL helpers that run inside short writer commands or reader snapshots.
-//! Every helper works on the schema actually present, so purge coverage follows the
-//! tables other crates add instead of a hand-maintained list of derived copies.
+//! Redaction only ever touches rows that provably belong to the subject (its linked runs
+//! or exact references to its member IDs), never identifier, key, hash or indexed
+//! columns, and never the serialized structure of JSON values.
 use aho_corasick::{AhoCorasick, MatchKind};
 use excalibur_store::{
     Error as StoreError, Result,
-    rusqlite::{self, Connection, types::Value as SqlValue},
+    rusqlite::{self, Connection, OptionalExtension, types::Value as SqlValue},
+    schema,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,16 +19,36 @@ pub const MIN_TEXT_NEEDLE: usize = 12;
 /// Sentences/lines at least this long are searched independently to catch partial copies.
 pub const MIN_SEGMENT_NEEDLE: usize = 24;
 const MAX_NEEDLES: usize = 20_000;
+/// Vector object prefixes used by the shared core and the memory crate.
+pub const VECTOR_PREFIXES: &[&str] = &[
+    "memory",
+    "message",
+    "msg",
+    "chunk",
+    "key",
+    "document",
+    "conversation",
+];
 
 pub(crate) fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 fn json_escape(text: &str) -> String {
     let quoted = serde_json::to_string(text).unwrap_or_default();
-    quoted[1..quoted.len().saturating_sub(1).max(1)].to_string()
+    quoted
+        .get(1..quoted.len().saturating_sub(1))
+        .unwrap_or("")
+        .to_string()
 }
 pub(crate) fn invalid(reason: &'static str) -> StoreError {
     StoreError::Invalid(reason)
+}
+pub(crate) fn json_list<I, S>(values: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    Value::Array(values.into_iter().map(|v| Value::String(v.into())).collect()).to_string()
 }
 
 /// Exact texts plus long sentences/lines, longest first, deduplicated.
@@ -50,7 +72,17 @@ pub(crate) fn derive_needles(texts: &[String]) -> Vec<String> {
     needles
 }
 
-/// Multi-pattern matcher over raw and JSON-escaped spellings of every needle.
+/// Outcome of redacting one stored value.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Redaction {
+    Unchanged,
+    Changed(String),
+    /// A match spans JSON structure (keys, numbers, nesting) rather than a string leaf.
+    /// It is left as is and flagged; the serialized document is never rewritten.
+    Structured,
+}
+
+/// ASCII-case-insensitive multi-pattern matcher over raw and JSON-escaped spellings.
 pub(crate) struct Matcher {
     automaton: AhoCorasick,
     patterns: usize,
@@ -69,6 +101,7 @@ impl Matcher {
         patterns.dedup();
         let automaton = AhoCorasick::builder()
             .match_kind(MatchKind::LeftmostLongest)
+            .ascii_case_insensitive(true)
             .build(&patterns)
             .map_err(|_| invalid("purge needles could not be compiled"))?;
         Ok(Self {
@@ -82,65 +115,78 @@ impl Matcher {
     pub(crate) fn is_match(&self, bytes: &[u8]) -> bool {
         self.patterns > 0 && self.automaton.is_match(bytes)
     }
-    fn replace(&self, text: &str, mark: &str) -> String {
-        let marks = vec![mark; self.patterns];
+    fn replace(&self, text: &str) -> String {
+        let marks = vec![REDACTION_MARK; self.patterns];
         self.automaton.replace_all(text, &marks)
     }
-    /// JSON documents keep their structure: only string values and keys change.
-    pub(crate) fn redact_text(&self, text: &str, mark: &str) -> Option<String> {
+    /// Any JSON value is redacted only in its string leaves. Text that looks like JSON
+    /// but does not parse is left untouched; other plain text is replaced directly.
+    pub(crate) fn redact_value(&self, text: &str) -> Redaction {
         if !self.is_match(text.as_bytes()) {
-            return None;
+            return Redaction::Unchanged;
         }
-        let trimmed = text.trim_start();
-        if (trimmed.starts_with('{') || trimmed.starts_with('['))
-            && let Ok(mut value) = serde_json::from_str::<Value>(text)
-        {
-            self.redact_json(&mut value, mark);
-            if let Ok(out) = serde_json::to_string(&value) {
-                return Some(if self.is_match(out.as_bytes()) {
-                    self.replace(&out, mark)
+        match serde_json::from_str::<Value>(text) {
+            Ok(mut value) => {
+                if !self.redact_leaves(&mut value) {
+                    return Redaction::Structured;
+                }
+                match serde_json::to_string(&value) {
+                    Ok(out) => Redaction::Changed(out),
+                    Err(_) => Redaction::Structured,
+                }
+            }
+            Err(_) => {
+                let trimmed = text.trim_start();
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    Redaction::Structured
                 } else {
-                    out
-                });
+                    Redaction::Changed(self.replace(text))
+                }
             }
         }
-        Some(self.replace(text, mark))
     }
-    pub(crate) fn redact_json(&self, value: &mut Value, mark: &str) -> bool {
+    pub(crate) fn redact_leaves(&self, value: &mut Value) -> bool {
         match value {
-            Value::String(text) => {
-                if self.is_match(text.as_bytes()) {
-                    *text = self.replace(text, mark);
-                    true
-                } else {
-                    false
-                }
+            Value::String(text) if self.is_match(text.as_bytes()) => {
+                *text = self.replace(text);
+                true
             }
-            Value::Array(values) => {
-                let mut changed = false;
-                for value in values {
-                    changed |= self.redact_json(value, mark);
-                }
-                changed
-            }
-            Value::Object(map) => {
-                let mut changed = false;
-                let entries = std::mem::take(map);
-                for (key, mut value) in entries {
-                    changed |= self.redact_json(&mut value, mark);
-                    let key = if self.is_match(key.as_bytes()) {
-                        changed = true;
-                        self.replace(&key, mark)
-                    } else {
-                        key
-                    };
-                    map.insert(key, value);
-                }
-                changed
-            }
+            Value::Array(values) => values
+                .iter_mut()
+                .fold(false, |changed, v| self.redact_leaves(v) | changed),
+            Value::Object(map) => map
+                .values_mut()
+                .fold(false, |changed, v| self.redact_leaves(v) | changed),
             _ => false,
         }
     }
+}
+
+/// Names that hold identifiers, keys, hashes or enumerations: never rewritten.
+fn protected_name(column: &str) -> bool {
+    let lower = column.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "id" | "key"
+            | "hash"
+            | "checksum"
+            | "fingerprint"
+            | "kind"
+            | "state"
+            | "status"
+            | "source"
+            | "role"
+            | "type"
+            | "class"
+            | "cursor"
+            | "sequence"
+            | "path"
+            | "channel"
+            | "layer"
+            | "code_version"
+    ) || ["_id", "_key", "_hash", "_ids", "_at", "_code", "_version"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 /// A regular table that may hold derived copies of subject text.
@@ -148,10 +194,13 @@ impl Matcher {
 pub(crate) struct SweepTable {
     pub name: String,
     pub columns: Vec<String>,
-    pub scope: bool,
+    /// Columns that may be rewritten (not protected, not part of any key or index).
+    pub writable: BTreeSet<String>,
+    pub run: bool,
+    /// Member-reference columns present (`conversation_id`, `message_id`, ...).
+    pub members: Vec<String>,
     pub principal: bool,
 }
-
 /// Primary content of independent subjects. Those rows are deleted only when they are
 /// the purge subject; a copy inside another subject is that subject's own content.
 const INDEPENDENT: &[&str] = &[
@@ -166,7 +215,7 @@ const INDEPENDENT: &[&str] = &[
     "doc_fragment_versions",
     "notebook_timeline",
 ];
-/// Structural metadata and hash-chained audit (see the retention documentation).
+/// Structural metadata and the hash-chained audit table.
 const STRUCTURAL: &[&str] = &[
     "audit",
     "blobs",
@@ -179,14 +228,24 @@ const STRUCTURAL: &[&str] = &[
     "vector_indexes",
     "embedding_spaces",
     "short_codes",
+    "durable_operations",
+    "task_observed_events",
+    "journal_payload_redirects",
 ];
-fn excluded(name: &str, main: bool) -> bool {
+pub(crate) const MEMBER_COLUMNS: &[&str] = &[
+    "conversation_id",
+    "message_id",
+    "document_id",
+    "chunk_id",
+    "memory_id",
+];
+fn excluded(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.starts_with("sqlite_")
         || lower.starts_with("retention_")
         || lower.ends_with("_schema")
         || STRUCTURAL.contains(&lower.as_str())
-        || (main && INDEPENDENT.contains(&lower.as_str()))
+        || INDEPENDENT.contains(&lower.as_str())
 }
 pub(crate) fn table_names(c: &Connection) -> Result<Vec<(String, String)>> {
     let mut statement = c.prepare(
@@ -228,6 +287,28 @@ pub(crate) fn columns(c: &Connection, table: &str) -> Result<Vec<String>> {
         .collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(rows)
 }
+fn key_columns(c: &Connection, table: &str) -> Result<BTreeSet<String>> {
+    let mut keys = BTreeSet::new();
+    let mut statement = c.prepare("SELECT name FROM pragma_table_info(?1) WHERE pk>0")?;
+    for name in statement.query_map([table], |r| r.get::<_, String>(0))? {
+        keys.insert(name?);
+    }
+    let indexes: Vec<String> = c
+        .prepare("SELECT name FROM pragma_index_list(?1)")?
+        .query_map([table], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for index in indexes {
+        let mut statement = c.prepare("SELECT name FROM pragma_index_info(?1)")?;
+        for name in statement.query_map([index], |r| r.get::<_, Option<String>>(0))? {
+            keys.extend(name?);
+        }
+    }
+    let mut statement = c.prepare("SELECT \"from\" FROM pragma_foreign_key_list(?1)")?;
+    for name in statement.query_map([table], |r| r.get::<_, String>(0))? {
+        keys.insert(name?);
+    }
+    Ok(keys)
+}
 pub(crate) fn table_exists(c: &Connection, table: &str) -> Result<bool> {
     Ok(c.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
@@ -235,100 +316,125 @@ pub(crate) fn table_exists(c: &Connection, table: &str) -> Result<bool> {
         |r| r.get(0),
     )?)
 }
-pub(crate) fn sweep_tables(c: &Connection, main: bool) -> Result<Vec<SweepTable>> {
+/// Content tables of external-content FTS5 indexes. Their rows are never rewritten
+/// in place: they are either independent content or deleted with the subject.
+pub(crate) fn fts_content_tables(c: &Connection) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, sql) in table_names(c)? {
+        if is_virtual(&sql)
+            && sql.to_ascii_uppercase().contains("USING FTS5")
+            && let Some(content) = fts_content(&sql).filter(|c| !c.is_empty())
+        {
+            out.entry(content.to_ascii_lowercase())
+                .or_default()
+                .push(name);
+        }
+    }
+    Ok(out)
+}
+pub(crate) fn sweep_tables(c: &Connection) -> Result<Vec<SweepTable>> {
+    let fts = fts_content_tables(c)?;
     let mut out = Vec::new();
     for name in regular_tables(c)? {
-        if excluded(&name, main) {
+        if excluded(&name) || fts.contains_key(&name.to_ascii_lowercase()) {
             continue;
         }
         let columns = columns(c, &name)?;
+        let keys = key_columns(c, &name)?;
+        let writable = columns
+            .iter()
+            .filter(|col| !protected_name(col) && !keys.contains(*col))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let members: Vec<String> = columns
+            .iter()
+            .filter(|col| MEMBER_COLUMNS.contains(&col.as_str()))
+            .cloned()
+            .collect();
+        let run = columns.iter().any(|col| col == "run_id");
+        if writable.is_empty() || (!run && members.is_empty()) {
+            continue;
+        }
         out.push(SweepTable {
-            scope: columns.iter().any(|c| c == "scope_id"),
-            principal: columns.iter().any(|c| c == "principal_id"),
-            columns,
+            principal: columns.iter().any(|col| col == "principal_id"),
             name,
+            columns,
+            writable,
+            run,
+            members,
         });
     }
     Ok(out)
 }
-pub(crate) fn max_rowid(c: &Connection, table: &str) -> Result<i64> {
-    Ok(c.query_row(
-        &format!("SELECT coalesce(max(rowid),0) FROM {}", quote(table)),
-        [],
-        |r| r.get(0),
-    )?)
-}
 
-/// Scope filter: unscoped rows and rows of the subject's own scopes; never other scopes.
-pub(crate) struct Filter<'a> {
-    pub scopes_json: &'a str,
+/// Rows provably owned by the subject: produced by a linked run or referencing a member.
+pub(crate) struct Targets<'a> {
+    pub runs_json: &'a str,
+    pub members_json: &'a str,
     pub principal: &'a str,
 }
-fn conditions(table: &SweepTable, first: usize) -> (String, usize) {
-    let mut sql = String::new();
-    let mut next = first;
-    if table.scope {
-        sql.push_str(&format!(
-            " AND (scope_id IS NULL OR scope_id IN (SELECT value FROM json_each(?{next})))"
+fn target_condition(table: &SweepTable) -> String {
+    let mut parts = Vec::new();
+    if table.run {
+        parts.push("run_id IN (SELECT value FROM json_each(?2))".to_string());
+    }
+    for member in &table.members {
+        parts.push(format!(
+            "{} IN (SELECT value FROM json_each(?3))",
+            quote(member)
         ));
-        next += 1;
     }
+    let mut sql = format!(" AND ({})", parts.join(" OR "));
     if table.principal {
-        sql.push_str(&format!(
-            " AND (principal_id IS NULL OR principal_id=?{next})"
-        ));
-        next += 1;
+        sql.push_str(" AND (principal_id IS NULL OR principal_id=?4)");
+    } else {
+        sql.push_str(" AND ?4 IS NOT NULL");
     }
-    (sql, next)
+    sql
 }
-fn bind<'a>(
-    table: &SweepTable,
-    filter: &'a Filter<'a>,
-    mut params: Vec<SqlValue>,
-) -> Vec<SqlValue> {
-    if table.scope {
-        params.push(SqlValue::Text(filter.scopes_json.to_string()));
-    }
-    if table.principal {
-        params.push(SqlValue::Text(filter.principal.to_string()));
-    }
-    params
+fn target_params(targets: &Targets<'_>, first: i64) -> Vec<SqlValue> {
+    vec![
+        SqlValue::Integer(first),
+        SqlValue::Text(targets.runs_json.into()),
+        SqlValue::Text(targets.members_json.into()),
+        SqlValue::Text(targets.principal.into()),
+    ]
 }
-fn value_matches(value: &SqlValue, matcher: &Matcher) -> bool {
-    match value {
-        SqlValue::Text(text) => matcher.is_match(text.as_bytes()),
-        SqlValue::Blob(bytes) => matcher.is_match(bytes),
-        _ => false,
+fn writable_matches(table: &SweepTable, row: &rusqlite::Row<'_>, matcher: &Matcher) -> Result<bool> {
+    for (index, column) in table.columns.iter().enumerate() {
+        if !table.writable.contains(column) {
+            continue;
+        }
+        if let SqlValue::Text(text) = row.get::<_, SqlValue>(index + 1)?
+            && matcher.is_match(text.as_bytes())
+        {
+            return Ok(true);
+        }
     }
+    Ok(false)
 }
-/// One page of a scoped scan. Returns matching rowids and the last scanned rowid.
+/// One page of a targeted scan. Returns matching rowids and the last scanned rowid.
 pub(crate) fn scan_page(
     c: &Connection,
     table: &SweepTable,
-    filter: &Filter<'_>,
+    targets: &Targets<'_>,
     after: i64,
     limit: u32,
     matcher: &Matcher,
 ) -> Result<(Vec<i64>, Option<i64>)> {
-    let (cond, _) = conditions(table, 2);
     let sql = format!(
-        "SELECT rowid,* FROM {} WHERE rowid>?1{cond} ORDER BY rowid LIMIT {limit}",
-        quote(&table.name)
+        "SELECT rowid,* FROM {} WHERE rowid>?1{} ORDER BY rowid LIMIT {limit}",
+        quote(&table.name),
+        target_condition(table)
     );
-    let params = bind(table, filter, vec![SqlValue::Integer(after)]);
     let mut statement = c.prepare(&sql)?;
-    let width = statement.column_count();
-    let mut rows = statement.query(rusqlite::params_from_iter(params))?;
+    let mut rows = statement.query(rusqlite::params_from_iter(target_params(targets, after)))?;
     let (mut hits, mut last) = (Vec::new(), None);
     while let Some(row) = rows.next()? {
         let rowid: i64 = row.get(0)?;
         last = Some(rowid);
-        for index in 1..width {
-            let value: SqlValue = row.get(index)?;
-            if value_matches(&value, matcher) {
-                hits.push(rowid);
-                break;
-            }
+        if writable_matches(table, row, matcher)? {
+            hits.push(rowid);
         }
     }
     Ok((hits, last))
@@ -380,46 +486,89 @@ pub(crate) fn guarded<T>(
     restored?;
     Ok(value)
 }
-/// Zero freed cells and pages for the duration of a purge command.
-pub(crate) fn with_secure_delete<T>(c: &Connection, work: impl FnOnce() -> Result<T>) -> Result<T> {
+/// Zero freed cells and pages, and remove FTS5 entries immediately instead of leaving
+/// delete markers in older segments, for the duration of one purge command.
+pub(crate) fn with_secure_delete<T>(
+    c: &Connection,
+    fts: bool,
+    work: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let previous: i64 = c.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
     c.pragma_update(None, "secure_delete", 1)?;
+    let mut indexes = Vec::new();
+    let all = if fts { fts_content_tables(c)? } else { BTreeMap::new() };
+    for tables in all.into_values() {
+        for index in tables {
+            let config = format!("{index}_config");
+            let before: Option<i64> = if table_exists(c, &config)? {
+                c.query_row(
+                    &format!("SELECT v FROM {} WHERE k='secure-delete'", quote(&config)),
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?
+            } else {
+                None
+            };
+            c.execute(
+                &format!("INSERT INTO {q}({q},rank) VALUES('secure-delete',1)", q = quote(&index)),
+                [],
+            )?;
+            indexes.push((index, before.unwrap_or(0)));
+        }
+    }
     let result = work();
-    let restored = c.pragma_update(None, "secure_delete", previous);
+    let mut restored: Result<()> = Ok(());
+    for (index, before) in indexes {
+        if let Err(error) = c.execute(
+            &format!("INSERT INTO {q}({q},rank) VALUES('secure-delete',?1)", q = quote(&index)),
+            [before],
+        ) {
+            restored = Err(error.into());
+        }
+    }
+    let pragma = c.pragma_update(None, "secure_delete", previous);
     let value = result?;
     restored?;
+    pragma?;
     Ok(value)
 }
 
-/// Callback for each redacted row: (table, rowid, changed column names).
+/// Callback for each redacted row: (table, rowid, changed columns, old values).
 pub(crate) type AfterRedaction<'a> =
-    dyn FnMut(&Connection, &str, i64, &[String]) -> Result<()> + 'a;
-
-/// Rewrite matching text in the given rows. Rows outside the scope filter are skipped.
+    dyn FnMut(&Connection, &str, i64, &BTreeMap<String, String>) -> Result<()> + 'a;
+#[derive(Debug, Default)]
+pub(crate) struct RedactStats {
+    pub rows: u64,
+    pub structured: u64,
+}
+/// Rewrite matching text in writable columns of the given targeted rows.
 pub(crate) fn redact_rows(
     c: &Connection,
     table: &SweepTable,
-    filter: &Filter<'_>,
+    targets: &Targets<'_>,
     rowids: &[i64],
     matcher: &Matcher,
     after: &mut AfterRedaction<'_>,
-) -> Result<u64> {
+) -> Result<RedactStats> {
+    let mut stats = RedactStats::default();
     if rowids.is_empty() || matcher.is_empty() {
-        return Ok(0);
+        return Ok(stats);
     }
-    let (cond, _) = conditions(table, 2);
-    let select = format!("SELECT * FROM {} WHERE rowid=?1{cond}", quote(&table.name));
+    let select = format!(
+        "SELECT rowid,* FROM {} WHERE rowid=?1{}",
+        quote(&table.name),
+        target_condition(table)
+    );
     guarded(c, &table.name, "UPDATE", || {
-        let mut changed_rows = 0;
         for rowid in rowids {
-            let params = bind(table, filter, vec![SqlValue::Integer(*rowid)]);
             let values: Option<Vec<SqlValue>> = {
                 let mut statement = c.prepare(&select)?;
-                let width = statement.column_count();
-                let mut rows = statement.query(rusqlite::params_from_iter(params))?;
+                let mut rows =
+                    statement.query(rusqlite::params_from_iter(target_params(targets, *rowid)))?;
                 match rows.next()? {
                     Some(row) => Some(
-                        (0..width)
+                        (1..=table.columns.len())
                             .map(|i| row.get::<_, SqlValue>(i))
                             .collect::<rusqlite::Result<Vec<_>>>()?,
                     ),
@@ -427,66 +576,44 @@ pub(crate) fn redact_rows(
                 }
             };
             let Some(values) = values else { continue };
-            let attempt = |mark: &str| -> Vec<(usize, SqlValue)> {
-                let mut updates = Vec::new();
-                for (index, value) in values.iter().enumerate() {
-                    match value {
-                        SqlValue::Text(text) => {
-                            if let Some(new) = matcher.redact_text(text, mark) {
-                                updates.push((index, SqlValue::Text(new)));
-                            }
-                        }
-                        SqlValue::Blob(bytes) if matcher.is_match(bytes) => {
-                            let text = String::from_utf8_lossy(bytes);
-                            let new = matcher
-                                .redact_text(&text, mark)
-                                .unwrap_or_else(|| mark.to_string());
-                            updates.push((index, SqlValue::Blob(new.into_bytes())));
-                        }
-                        _ => {}
+            let mut updates = Vec::new();
+            let mut old = BTreeMap::new();
+            for (index, value) in values.iter().enumerate() {
+                let column = &table.columns[index];
+                let SqlValue::Text(text) = value else {
+                    continue;
+                };
+                if !table.writable.contains(column) {
+                    continue;
+                }
+                match matcher.redact_value(text) {
+                    Redaction::Unchanged => {}
+                    Redaction::Structured => stats.structured += 1,
+                    Redaction::Changed(new) => {
+                        old.insert(column.clone(), text.clone());
+                        updates.push((column.clone(), new));
                     }
                 }
-                updates
-            };
-            let updates = attempt(REDACTION_MARK);
+            }
             if updates.is_empty() {
                 continue;
             }
-            let apply = |updates: &[(usize, SqlValue)]| -> rusqlite::Result<usize> {
-                let set = updates
-                    .iter()
-                    .enumerate()
-                    .map(|(n, (index, _))| format!("{}=?{}", quote(&table.columns[*index]), n + 2))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let mut params = vec![SqlValue::Integer(*rowid)];
-                params.extend(updates.iter().map(|(_, v)| v.clone()));
-                c.execute(
-                    &format!("UPDATE {} SET {set} WHERE rowid=?1", quote(&table.name)),
-                    rusqlite::params_from_iter(params),
-                )
-            };
-            let used = match apply(&updates) {
-                Ok(_) => updates,
-                Err(error)
-                    if error.sqlite_error_code()
-                        == Some(rusqlite::ErrorCode::ConstraintViolation) =>
-                {
-                    // A redacted key may collide with another redacted key; keep rows distinct.
-                    let unique = attempt(&format!("[purged:{}:{rowid}]", table.name));
-                    apply(&unique)?;
-                    unique
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let names: Vec<String> = used
+            let set = updates
                 .iter()
-                .map(|(index, _)| table.columns[*index].clone())
-                .collect();
-            after(c, &table.name, *rowid, &names)?;
-            changed_rows += 1;
+                .enumerate()
+                .map(|(n, (column, _))| format!("{}=?{}", quote(column), n + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut params = vec![SqlValue::Integer(*rowid)];
+            params.extend(updates.iter().map(|(_, v)| SqlValue::Text(v.clone())));
+            c.execute(
+                &format!("UPDATE {} SET {set} WHERE rowid=?1", quote(&table.name)),
+                rusqlite::params_from_iter(params),
+            )?;
+            after(c, &table.name, *rowid, &old)?;
+            stats.rows += 1;
         }
-        Ok(changed_rows)
+        Ok(stats)
     })
 }
 
@@ -553,6 +680,33 @@ impl ForeignKeys {
         }
         Ok(Self { edges, composite })
     }
+    /// Static plan check: every table reachable from `roots` through required
+    /// references must be deletable with single-column keys within the depth bound.
+    pub(crate) fn validate(&self, roots: &[&str]) -> Result<()> {
+        let mut stack: Vec<(String, u32)> =
+            roots.iter().map(|r| (r.to_ascii_lowercase(), 0)).collect();
+        let mut seen = BTreeSet::new();
+        while let Some((table, depth)) = stack.pop() {
+            if depth > 16 {
+                return Err(invalid("foreign key cascade exceeds purge depth"));
+            }
+            if self.composite.contains(&table) {
+                return Err(invalid("composite foreign key references a purged table"));
+            }
+            if !seen.insert(table.clone()) {
+                continue;
+            }
+            for edge in self.edges.get(&table).into_iter().flatten() {
+                if !edge.nullable {
+                    if edge.child.eq_ignore_ascii_case(&table) {
+                        return Err(invalid("required self reference cannot be purged"));
+                    }
+                    stack.push((edge.child.to_ascii_lowercase(), depth + 1));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 fn primary_key(c: &Connection, table: &str) -> Result<String> {
     let mut statement =
@@ -570,7 +724,6 @@ fn primary_key(c: &Connection, table: &str) -> Result<String> {
 pub(crate) struct DeleteStats {
     pub deleted: u64,
     pub nulled: u64,
-    pub tables: BTreeSet<String>,
 }
 fn sql_to_json(value: SqlValue) -> Option<Value> {
     match value {
@@ -633,10 +786,7 @@ pub(crate) fn remove_rows(
                     [&parent_list],
                 )?)
             })?;
-            if nulled > 0 {
-                stats.nulled += nulled as u64;
-                stats.tables.insert(edge.child.clone());
-            }
+            stats.nulled += nulled as u64;
         } else {
             remove_rows(
                 c,
@@ -659,92 +809,43 @@ pub(crate) fn remove_rows(
             [&list],
         )?)
     })?;
-    if deleted > 0 {
-        stats.deleted += deleted as u64;
-        stats.tables.insert(table.to_string());
-    }
+    stats.deleted += deleted as u64;
     Ok(())
 }
 
-/// Delete vec0 rows whose object ID is a subject ID or `<prefix>:<subject id>`.
-/// sqlite-vec zeroes the deleted vector bytes in its chunk storage.
-pub(crate) fn delete_vectors(
-    c: &Connection,
-    ids: &BTreeSet<String>,
-    scopes: &[String],
-) -> Result<u64> {
+/// Delete vec0 rows by key lookups (no table scans): scoped spaces through their
+/// registered index, legacy `vectors_*` tables by object ID. sqlite-vec zeroes the
+/// deleted vector bytes in its chunk storage.
+pub(crate) fn delete_vectors(c: &Connection, objects: &BTreeSet<(String, String)>) -> Result<u64> {
     let mut removed = 0u64;
+    let spaces: Vec<String> = if table_exists(c, "vector_indexes")? {
+        c.prepare("SELECT space_id FROM vector_indexes ORDER BY space_id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    } else {
+        Vec::new()
+    };
+    for space in &spaces {
+        for (scope, object) in objects {
+            removed += schema::delete_vector(c, space, scope, object)? as u64;
+        }
+    }
     for (name, sql) in table_names(c)? {
-        if !sql.to_ascii_uppercase().contains("USING VEC0") {
+        let upper = sql.to_ascii_uppercase();
+        if !upper.contains("USING VEC0")
+            || !name.starts_with("vectors_")
+            || !columns(c, &name)?.iter().any(|c| c == "object_id")
+        {
             continue;
         }
-        let columns = columns(c, &name)?;
-        if !columns.iter().any(|c| c == "object_id") {
-            continue;
-        }
-        let key = if columns.iter().any(|c| c == "vector_key") {
-            "vector_key"
-        } else {
-            "object_id"
-        };
-        let scoped = columns.iter().any(|c| c == "scope_id");
-        let select = if scoped {
-            format!("SELECT {key},object_id,scope_id FROM {}", quote(&name))
-        } else {
-            format!("SELECT {key},object_id,NULL FROM {}", quote(&name))
-        };
-        let victims: Vec<String> = {
-            let mut statement = c.prepare(&select)?;
-            statement
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-                .into_iter()
-                .filter(|(_, object, scope)| {
-                    let tail = object.split_once(':').map_or(object.as_str(), |(_, t)| t);
-                    (ids.contains(object) || ids.contains(tail))
-                        && scope.as_ref().is_none_or(|s| scopes.contains(s))
-                })
-                .map(|(key, _, _)| key)
-                .collect()
-        };
-        for victim in victims {
+        for (_, object) in objects {
             removed += c.execute(
-                &format!("DELETE FROM {} WHERE {key}=?1", quote(&name)),
-                [victim],
+                &format!("DELETE FROM {} WHERE object_id=?1", quote(&name)),
+                [object],
             )? as u64;
         }
     }
     Ok(removed)
-}
-
-/// Rebuild external-content FTS5 indexes over modified tables so deleted terms leave
-/// the index segments instead of lingering behind delete markers until a merge.
-pub(crate) fn rebuild_fts(c: &Connection, content_tables: &BTreeSet<String>) -> Result<u64> {
-    let mut rebuilt = 0;
-    for (name, sql) in table_names(c)? {
-        let upper = sql.to_ascii_uppercase();
-        if !is_virtual(&sql) || !upper.contains("USING FTS5") {
-            continue;
-        }
-        let Some(content) = fts_content(&sql) else {
-            continue;
-        };
-        if content.is_empty() || !content_tables.contains(&content.to_ascii_lowercase()) {
-            continue;
-        }
-        c.execute(
-            &format!("INSERT INTO {q}({q}) VALUES('rebuild')", q = quote(&name)),
-            [],
-        )?;
-        rebuilt += 1;
-    }
-    Ok(rebuilt)
 }
 fn fts_content(sql: &str) -> Option<String> {
     let lower = sql.to_ascii_lowercase();
@@ -766,43 +867,57 @@ fn fts_content(sql: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn matcher(texts: &[&str]) -> Matcher {
+        let texts: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
+        Matcher::new(&derive_needles(&texts)).unwrap()
+    }
     #[test]
-    fn json_redaction_keeps_structure_and_short_values() {
-        let needles = derive_needles(&["The vault code is quartz-falcon-77.".into()]);
-        let matcher = Matcher::new(&needles).unwrap();
+    fn json_redaction_touches_only_string_leaves() {
+        let m = matcher(&["The vault code is quartz-falcon-77."]);
         let text = r#"{"state":"running","quote":"user said: The vault code is quartz-falcon-77. ok","n":3}"#;
-        let out = matcher.redact_text(text, REDACTION_MARK).unwrap();
+        let Redaction::Changed(out) = m.redact_value(text) else {
+            panic!("expected a change")
+        };
         let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["state"], "running");
         assert_eq!(value["n"], 3);
         assert!(!out.contains("quartz-falcon"));
-        assert!(
-            matcher
-                .redact_text(r#"{"state":"running"}"#, REDACTION_MARK)
-                .is_none()
-        );
+        assert_eq!(m.redact_value(r#"{"state":"running"}"#), Redaction::Unchanged);
         assert!(derive_needles(&["short".into()]).is_empty());
     }
     #[test]
-    fn escaped_copies_are_matched() {
-        let needles =
-            derive_needles(&["line one with \"quotes\"\nline two is longer than needed".into()]);
-        let matcher = Matcher::new(&needles).unwrap();
-        let encoded = serde_json::to_string(&needles[0]).unwrap();
-        assert!(matcher.is_match(encoded.as_bytes()));
+    fn structural_matches_are_never_rewritten() {
+        // The needle is a serialized object; it appears only as JSON structure.
+        let m = matcher(&[r#"{"alpha":1,"beta":2}"#]);
+        let text = r#"{"call":{"arguments":{"alpha":1,"beta":2}}}"#;
+        assert_eq!(m.redact_value(text), Redaction::Structured);
+        assert_eq!(m.redact_value(r#"{"call": broken {"alpha":1,"beta":2}"#), Redaction::Structured);
+    }
+    #[test]
+    fn ascii_case_variants_and_escaped_copies_are_matched() {
+        let m = matcher(&["line one with \"quotes\"\nline two is longer than needed"]);
+        let encoded = serde_json::to_string("line one with \"quotes\"\nline two is longer than needed").unwrap();
+        assert!(m.is_match(encoded.as_bytes()));
+        let m = matcher(&["Remember The Kestrel Vault"]);
+        assert!(m.is_match(b"remember the KESTREL vault"));
+    }
+    #[test]
+    fn protected_columns_are_recognized() {
+        for column in ["id", "run_id", "idempotency_key", "payload_hash", "code_version", "state", "created_at"] {
+            assert!(protected_name(column), "{column}");
+        }
+        for column in ["payload", "content", "text", "result", "metadata"] {
+            assert!(!protected_name(column), "{column}");
+        }
     }
     #[test]
     fn content_option_is_parsed() {
         assert_eq!(
-            fts_content(
-                "CREATE VIRTUAL TABLE x USING fts5(text,content='messages',content_rowid='rowid')"
-            ),
+            fts_content("CREATE VIRTUAL TABLE x USING fts5(text,content='messages',content_rowid='rowid')"),
             Some("messages".into())
         );
         assert_eq!(
-            fts_content(
-                "CREATE VIRTUAL TABLE files_fts USING fts5(path,content,content='files',content_rowid='rowid',tokenize='trigram')"
-            ),
+            fts_content("CREATE VIRTUAL TABLE files_fts USING fts5(path,content,content='files',content_rowid='rowid',tokenize='trigram')"),
             Some("files".into())
         );
     }

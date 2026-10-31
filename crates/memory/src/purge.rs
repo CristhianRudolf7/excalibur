@@ -77,25 +77,8 @@ impl PurgeParticipant for MemoryPurgeParticipant {
         }
         Ok(())
     }
-    fn purge(
-        &self,
-        c: &Connection,
-        subject: &SubjectSnapshot,
-        touched: &mut Vec<String>,
-    ) -> excalibur_store::Result<u64> {
+    fn purge(&self, c: &Connection, subject: &SubjectSnapshot) -> excalibur_store::Result<u64> {
         let mut removed = 0u64;
-        touched.extend(
-            [
-                "memory_keys",
-                "memory_vector_objects",
-                "memory_index_queue",
-                "memory_admissions",
-                "memory_transitions",
-                "memory_questions",
-                "memory_entity_links",
-            ]
-            .map(String::from),
-        );
         if exists(c, "memory_vector_objects")? {
             for member in &subject.members {
                 let objects: Vec<String> = match member.kind {

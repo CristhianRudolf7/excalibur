@@ -58,14 +58,18 @@ impl Journal {
     /// addresses and never grant access to another run's observations.
     pub async fn context_observation(&self, run: &str, hash: &BlobHash) -> Result<Value> {
         let (run, selected) = (run.to_owned(), hash.as_str().to_owned());
-        let allowed = self.db.read(excalibur_store::ReadLane::Interactive, move |c| {
-            Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM journal WHERE run_id=?1 AND kind='context_observation_archived' AND payload_blob=?2 AND state='confirmed')", excalibur_store::rusqlite::params![run, selected], |r| r.get::<_, bool>(0))?)
+        // A purge may have redacted the observation under a new content address.
+        let resolved = self.db.read(excalibur_store::ReadLane::Interactive, move |c| {
+            let resolved: String = c.query_row("SELECT coalesce((SELECT new_hash FROM journal_payload_redirects WHERE run_id=?1 AND old_hash=?2),?2)", excalibur_store::rusqlite::params![run, selected], |r| r.get(0))?;
+            let allowed: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM journal WHERE run_id=?1 AND kind='context_observation_archived' AND payload_blob=?2 AND state='confirmed')", excalibur_store::rusqlite::params![run, resolved], |r| r.get(0))?;
+            Ok(allowed.then_some(resolved))
         }).await?;
-        if !allowed {
+        let Some(resolved) = resolved else {
             return Err(Error::Invalid("observation is not archived in this run"));
-        }
+        };
+        let resolved: BlobHash = resolved.parse()?;
         Ok(serde_json::from_slice(
-            &self.db.read_blob(hash.clone(), 16 * 1024 * 1024).await?,
+            &self.db.read_blob(resolved, 16 * 1024 * 1024).await?,
         )?)
     }
 }

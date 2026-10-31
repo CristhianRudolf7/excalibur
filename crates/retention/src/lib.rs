@@ -2,20 +2,21 @@
 //!
 //! A purge is a keyed durable operation stored in the principal database. Each phase
 //! commits its own progress, so a process killed at any boundary resumes with the same
-//! key and converges. Content needed to find derived copies is kept only until the base
-//! rows are deleted; afterwards only identifiers, counters and a tombstone remain.
+//! key and converges. Derived copies are redacted only in rows that provably belong to
+//! the subject: rows of runs linked to it (explicit provenance, `*_id` reference columns
+//! next to `run_id`, child runs) and rows that reference one of its member IDs.
 mod policy;
 mod sweep;
 
+pub use excalibur_telemetry::Telemetry;
 pub use policy::{ExpiryReport, HoldReason, RetentionClock, RetentionPolicy, RetentionSweeper};
-pub use sweep::{MIN_SEGMENT_NEEDLE, MIN_TEXT_NEEDLE, REDACTION_MARK};
+pub use sweep::{MIN_SEGMENT_NEEDLE, MIN_TEXT_NEEDLE, REDACTION_MARK, VECTOR_PREFIXES};
 
 use excalibur_journal::{Event, Journal};
 use excalibur_store::{
     BlobHash, BlobRelease, Database, DatabaseKind, Error as StoreError, Priority, ReadLane,
     rusqlite::{self, Connection, OptionalExtension},
 };
-use excalibur_telemetry::Telemetry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -24,9 +25,9 @@ use std::{
     sync::Arc,
 };
 use sweep::{
-    DeleteStats, Filter, ForeignKeys, Matcher, columns, delete_vectors, derive_needles, guarded,
-    max_rowid, rebuild_fts, redact_rows, remove_rows, scan_page, sweep_tables, table_exists,
-    with_secure_delete,
+    DeleteStats, ForeignKeys, Matcher, Redaction, Targets, columns, delete_vectors,
+    derive_needles, guarded, json_list, redact_rows, regular_tables, remove_rows, scan_page,
+    sweep_tables, table_exists, with_secure_delete,
 };
 
 /// Weekly backups are kept four weeks (§4.6); daily and pre-update copies rotate sooner.
@@ -34,7 +35,9 @@ pub const MAX_BACKUP_AGE_DAYS: u32 = 28;
 pub const BACKUP_NOTICE_CODE: &str = "backups_retain_until_rotation";
 const PAGE: u32 = 512;
 const BATCH: usize = 64;
+const TRIAL_MEMBERS: usize = 16;
 const MAX_ORIGINAL_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_JOURNAL_BLOB: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -48,16 +51,39 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("subject not found for this principal and scope")]
     NotFound,
-    #[error("operation key already names a different purge")]
+    #[error("operation key already names a different purge in this scope")]
     KeyConflict,
     #[error("a registered purge participant is required: {0}")]
     ParticipantMissing(&'static str),
+    /// A run linked to the subject is still active; stop or finish it first.
+    #[error("a run linked to the subject is still active: {0}")]
+    ActiveRun(String),
+    /// Planning validation failed before anything was changed.
+    #[error("purge rejected during planning: {0}")]
+    Rejected(String),
     #[error("invalid purge request: {0}")]
     Invalid(&'static str),
 }
 impl From<rusqlite::Error> for Error {
     fn from(error: rusqlite::Error) -> Self {
         Self::Store(error.into())
+    }
+}
+impl Error {
+    /// Content-free code recorded on a purge that stopped in a phase.
+    fn code(&self) -> String {
+        match self {
+            Self::ActiveRun(run) => format!("active_run:{run}"),
+            Self::Store(error) => format!("storage:{error}"),
+            Self::Journal(_) => "journal".into(),
+            Self::Telemetry(_) => "telemetry".into(),
+            Self::Json(_) => "serialization".into(),
+            Self::NotFound => "not_found".into(),
+            Self::KeyConflict => "key_conflict".into(),
+            Self::ParticipantMissing(name) => format!("participant_missing:{name}"),
+            Self::Rejected(reason) => format!("rejected:{reason}"),
+            Self::Invalid(reason) => format!("invalid:{reason}"),
+        }
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
@@ -122,6 +148,18 @@ pub enum MemberKind {
     /// Identifiers added by a participant (for example, extracted memory keys).
     Derived,
 }
+impl MemberKind {
+    fn reference_column(self) -> Option<&'static str> {
+        match self {
+            Self::Conversation => Some("conversation_id"),
+            Self::Message => Some("message_id"),
+            Self::Document => Some("document_id"),
+            Self::Chunk => Some("chunk_id"),
+            Self::Memory => Some("memory_id"),
+            Self::Derived => None,
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     pub kind: MemberKind,
@@ -171,29 +209,25 @@ pub trait PurgeParticipant: Send + Sync {
         subject: &SubjectSnapshot,
         out: &mut Collection,
     ) -> excalibur_store::Result<()>;
-    /// Delete owned rows; called once, in the same transaction as the base deletion.
-    /// Tables named in `touched` get their external-content FTS5 indexes rebuilt.
-    fn purge(
-        &self,
-        c: &Connection,
-        subject: &SubjectSnapshot,
-        touched: &mut Vec<String>,
-    ) -> excalibur_store::Result<u64>;
+    /// Delete owned rows. It may run more than once after an interruption and must be
+    /// idempotent. FTS5 secure-delete is active, so index entries leave immediately.
+    fn purge(&self, c: &Connection, subject: &SubjectSnapshot) -> excalibur_store::Result<u64>;
 }
 /// Schemas whose derived rows require a named participant before any purge proceeds.
 const REQUIRED_PARTICIPANTS: &[(&str, &str)] = &[("memory_schema", "memory")];
 
 /// Interruption points exercised by crash tests. `BaseDeleteUncommitted` runs inside the
-/// open base-deletion transaction; all others run after their phase committed.
+/// open final base-deletion transaction; all others run after their write committed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PurgeBoundary {
     Planned,
-    MainSweepBatch,
-    MainSwept,
-    JournalBlobsSwept,
-    TelemetrySwept,
+    SweepBatch,
+    Swept,
+    BaseDeleteBatch,
     BaseDeleteUncommitted,
     BaseDeleted,
+    TelemetrySwept,
+    Finalized,
     BlobsReleased,
     Completed,
 }
@@ -203,10 +237,10 @@ pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Planned,
-    MainSwept,
-    JournalBlobsSwept,
-    TelemetrySwept,
+    Swept,
     BaseDeleted,
+    TelemetrySwept,
+    Finalized,
     BlobsReleased,
     Completed,
 }
@@ -214,10 +248,10 @@ impl Phase {
     fn as_str(self) -> &'static str {
         match self {
             Self::Planned => "planned",
-            Self::MainSwept => "main_swept",
-            Self::JournalBlobsSwept => "journal_blobs_swept",
-            Self::TelemetrySwept => "telemetry_swept",
+            Self::Swept => "swept",
             Self::BaseDeleted => "base_deleted",
+            Self::TelemetrySwept => "telemetry_swept",
+            Self::Finalized => "finalized",
             Self::BlobsReleased => "blobs_released",
             Self::Completed => "completed",
         }
@@ -225,10 +259,10 @@ impl Phase {
     fn parse(text: &str) -> Option<Self> {
         [
             Self::Planned,
-            Self::MainSwept,
-            Self::JournalBlobsSwept,
-            Self::TelemetrySwept,
+            Self::Swept,
             Self::BaseDeleted,
+            Self::TelemetrySwept,
+            Self::Finalized,
             Self::BlobsReleased,
             Self::Completed,
         ]
@@ -240,6 +274,7 @@ impl Phase {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PurgeCounts {
+    pub runs_linked: u64,
     pub rows_deleted: u64,
     pub rows_nulled: u64,
     pub participant_rows_deleted: u64,
@@ -247,16 +282,21 @@ pub struct PurgeCounts {
     pub journal_events_redacted: u64,
     pub telemetry_rows_redacted: u64,
     pub telemetry_offsets_resealed: u64,
+    pub task_hashes_resealed: u64,
+    /// Existing hashes that did not match the pre-purge content; left as found.
+    pub hash_mismatches: u64,
+    /// Matches inside JSON structure (not a string leaf); left as found and flagged.
+    pub structured_matches: u64,
     pub vectors_deleted: u64,
     pub edges_deleted: u64,
     pub blobs_removed: u64,
     pub blobs_shared: u64,
-    pub fts_rebuilt: u64,
+    pub base_batches: u64,
     pub runs_reexported: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hygiene {
-    /// `PRAGMA secure_delete=ON` was active for every purge write.
+    /// `PRAGMA secure_delete=ON` and FTS5 `secure-delete` were active for purge writes.
     pub secure_delete: bool,
     /// `VACUUM` is not run; secure_delete already zeroes freed cells and pages.
     pub vacuum: bool,
@@ -308,36 +348,45 @@ pub struct PurgeRequest {
     pub reason: PurgeReason,
     pub requested_at: i64,
 }
+/// Result of resuming one unfinished purge; one failure never blocks the others.
+#[derive(Debug)]
+pub struct PendingOutcome {
+    pub operation_key: String,
+    pub result: std::result::Result<PurgeReceipt, String>,
+}
 
 #[derive(Clone, Debug)]
 struct OpRow {
     key: String,
     tombstone_id: String,
+    principal: String,
     scope: String,
     kind: SubjectKind,
     subject_id: String,
     phase: Phase,
     members: Vec<Member>,
-    scopes: Vec<String>,
-    watermarks: BTreeMap<String, i64>,
-    blob_hashes: Vec<String>,
+    objects: Vec<(String, String)>,
     runs: Vec<String>,
+    blob_hashes: Vec<String>,
     counts: PurgeCounts,
     hygiene: Option<Hygiene>,
     telemetry_covered: bool,
 }
 impl OpRow {
-    fn snapshot(&self, principal: &str) -> SubjectSnapshot {
+    fn snapshot(&self) -> SubjectSnapshot {
         SubjectSnapshot {
             kind: self.kind,
             id: self.subject_id.clone(),
-            principal: principal.into(),
+            principal: self.principal.clone(),
             scope: self.scope.clone(),
             members: self.members.clone(),
         }
     }
-    fn scopes_json(&self) -> String {
-        serde_json::to_string(&self.scopes).unwrap_or_else(|_| "[]".into())
+    fn runs_json(&self) -> String {
+        json_list(self.runs.iter().cloned())
+    }
+    fn members_json(&self) -> String {
+        json_list(self.members.iter().map(|m| m.id.clone()))
     }
 }
 fn store_json(error: serde_json::Error) -> StoreError {
@@ -346,17 +395,19 @@ fn store_json(error: serde_json::Error) -> StoreError {
 fn load_op(c: &Connection, key: &str) -> excalibur_store::Result<Option<OpRow>> {
     let row = c
         .query_row(
-            "SELECT tombstone_id,scope_id,subject_kind,subject_id,phase,members,scopes,watermarks,blob_hashes,runs,counts,hygiene,telemetry_covered FROM retention_purges WHERE operation_key=?1",
+            "SELECT tombstone_id,principal_id,scope_id,subject_kind,subject_id,phase,members,objects,runs,blob_hashes,counts,hygiene,telemetry_covered FROM retention_purges WHERE operation_key=?1",
             [key],
             |r| {
                 Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
                     [
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
                         r.get::<_, String>(5)?,
+                    ],
+                    [
                         r.get::<_, String>(6)?,
                         r.get::<_, String>(7)?,
                         r.get::<_, String>(8)?,
@@ -369,24 +420,23 @@ fn load_op(c: &Connection, key: &str) -> excalibur_store::Result<Option<OpRow>> 
             },
         )
         .optional()?;
-    let Some((tombstone_id, scope, kind, subject_id, phase, json, hygiene, telemetry_covered)) =
-        row
-    else {
+    let Some((ids, json, hygiene, telemetry_covered)) = row else {
         return Ok(None);
     };
+    let [tombstone_id, principal, scope, kind, subject_id, phase] = ids;
     Ok(Some(OpRow {
         key: key.into(),
         tombstone_id,
+        principal,
         scope,
         kind: SubjectKind::parse(&kind).ok_or(StoreError::Invalid("unknown purge kind"))?,
         subject_id,
         phase: Phase::parse(&phase).ok_or(StoreError::Invalid("unknown purge phase"))?,
         members: serde_json::from_str(&json[0]).map_err(store_json)?,
-        scopes: serde_json::from_str(&json[1]).map_err(store_json)?,
-        watermarks: serde_json::from_str(&json[2]).map_err(store_json)?,
+        objects: serde_json::from_str(&json[1]).map_err(store_json)?,
+        runs: serde_json::from_str(&json[2]).map_err(store_json)?,
         blob_hashes: serde_json::from_str(&json[3]).map_err(store_json)?,
-        runs: serde_json::from_str(&json[4]).map_err(store_json)?,
-        counts: serde_json::from_str(&json[5]).map_err(store_json)?,
+        counts: serde_json::from_str(&json[4]).map_err(store_json)?,
         hygiene: hygiene
             .map(|h| serde_json::from_str(&h))
             .transpose()
@@ -412,6 +462,12 @@ fn bump(
     )?;
     Ok(())
 }
+fn flag(c: &Connection, key: &str, code: &str, location: &str) -> excalibur_store::Result<bool> {
+    Ok(c.execute(
+        "INSERT OR IGNORE INTO retention_purge_flags(operation_key,code,location) VALUES(?1,?2,?3)",
+        [key, code, location],
+    )? == 1)
+}
 fn load_needles(c: &Connection, key: &str) -> excalibur_store::Result<Vec<String>> {
     let mut statement = c.prepare(
         "SELECT needle FROM retention_purge_needles WHERE operation_key=?1 ORDER BY ordinal",
@@ -424,88 +480,278 @@ fn load_needles(c: &Connection, key: &str) -> excalibur_store::Result<Vec<String
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-fn id_list(ids: impl IntoIterator<Item = String>) -> String {
-    Value::Array(ids.into_iter().map(Value::String).collect()).to_string()
+fn merge_json_list(
+    c: &Connection,
+    key: &str,
+    column: &'static str,
+    values: impl IntoIterator<Item = String>,
+) -> excalibur_store::Result<()> {
+    let text: String = c.query_row(
+        &format!("SELECT {column} FROM retention_purges WHERE operation_key=?1"),
+        [key],
+        |r| r.get(0),
+    )?;
+    let mut set: BTreeSet<String> = serde_json::from_str::<Vec<String>>(&text)
+        .map_err(store_json)?
+        .into_iter()
+        .collect();
+    set.extend(values);
+    c.execute(
+        &format!("UPDATE retention_purges SET {column}=?2 WHERE operation_key=?1"),
+        rusqlite::params![key, json_list(set)],
+    )?;
+    Ok(())
 }
 
-/// run_id, sequence, kind, idempotency key and inline payload of one journal row.
-type JournalRow = (Option<String>, u64, String, Option<String>, Option<String>);
-/// Record a redacted journal event and re-seal hashes that other crates keep over it.
+/// Latest authoritative state of a durable run, or `None` when the journal has no run.
+fn durable_state(c: &Connection, run: &str) -> excalibur_store::Result<Option<String>> {
+    if !table_exists(c, "durable_operations")? {
+        return Ok(None);
+    }
+    let known: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM durable_operations WHERE run_id=?1)",
+        [run],
+        |r| r.get(0),
+    )?;
+    if !known {
+        return Ok(None);
+    }
+    let latest: Option<Option<String>> = c
+        .query_row(
+            "SELECT json_extract(payload,'$.state') FROM journal WHERE run_id=?1 AND kind='state_change' ORDER BY sequence DESC LIMIT 1",
+            [run],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(Some(
+        latest.flatten().unwrap_or_else(|| "running".into()),
+    ))
+}
+/// A linked durable run that is not terminal fences the purge.
+fn active_run(c: &Connection, runs: &BTreeSet<String>) -> excalibur_store::Result<Option<String>> {
+    for run in runs {
+        if let Some(state) = durable_state(c, run)?
+            && !matches!(state.as_str(), "completed" | "failed" | "cancelled")
+        {
+            return Ok(Some(run.clone()));
+        }
+    }
+    Ok(None)
+}
+/// Runs that provably belong to the subject: explicit provenance, tables that carry a
+/// `run_id` next to a member reference, memory origins, and their child runs.
+fn linked_runs(
+    c: &Connection,
+    snapshot: &SubjectSnapshot,
+) -> excalibur_store::Result<BTreeSet<String>> {
+    let mut runs = BTreeSet::new();
+    {
+        let mut statement = c.prepare("SELECT run_id FROM retention_subject_runs WHERE principal_id=?1 AND subject_kind=?2 AND subject_id=?3")?;
+        for run in statement.query_map(
+            [
+                snapshot.principal.as_str(),
+                snapshot.kind.as_str(),
+                snapshot.id.as_str(),
+            ],
+            |r| r.get::<_, String>(0),
+        )? {
+            runs.insert(run?);
+        }
+    }
+    let mut by_column: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for member in &snapshot.members {
+        if let Some(column) = member.kind.reference_column() {
+            by_column.entry(column).or_default().push(member.id.clone());
+        }
+    }
+    let mut origin_conversations = Vec::new();
+    if snapshot.kind == SubjectKind::Memory {
+        let memory_columns = columns(c, "memories")?;
+        if memory_columns.iter().any(|c| c == "origin_conversation") {
+            let origin: Option<String> = c.query_row(
+                "SELECT origin_conversation FROM memories WHERE id=?1",
+                [&snapshot.id],
+                |r| r.get(0),
+            )?;
+            origin_conversations.extend(origin);
+        }
+        if memory_columns.iter().any(|c| c == "origin_task") {
+            let task: Option<String> = c.query_row(
+                "SELECT origin_task FROM memories WHERE id=?1",
+                [&snapshot.id],
+                |r| r.get(0),
+            )?;
+            if let Some(task) = task {
+                let mut statement = c.prepare("SELECT id FROM runs WHERE task_id=?1")?;
+                for run in statement.query_map([task], |r| r.get::<_, String>(0))? {
+                    runs.insert(run?);
+                }
+            }
+        }
+    }
+    by_column
+        .entry("conversation_id")
+        .or_default()
+        .extend(origin_conversations);
+    for table in regular_tables(c)? {
+        if table.starts_with("retention_") {
+            continue;
+        }
+        let present = columns(c, &table)?;
+        if !present.iter().any(|c| c == "run_id") {
+            continue;
+        }
+        for (column, ids) in &by_column {
+            if ids.is_empty() || !present.iter().any(|c| c == column) {
+                continue;
+            }
+            let mut statement = c.prepare(&format!(
+                "SELECT DISTINCT run_id FROM {} WHERE {} IN (SELECT value FROM json_each(?1)) AND run_id IS NOT NULL",
+                sweep::quote(&table),
+                sweep::quote(column)
+            ))?;
+            for run in statement.query_map([json_list(ids.iter().cloned())], |r| {
+                r.get::<_, String>(0)
+            })? {
+                runs.insert(run?);
+            }
+        }
+    }
+    // Child runs, through memory bindings and journal child-budget allocations.
+    let bindings = table_exists(c, "memory_run_bindings")?;
+    let mut frontier: BTreeSet<String> = runs.clone();
+    for _ in 0..8 {
+        if frontier.is_empty() {
+            break;
+        }
+        let list = json_list(frontier.iter().cloned());
+        let mut next = BTreeSet::new();
+        if bindings {
+            let mut statement = c.prepare("SELECT run_id FROM memory_run_bindings WHERE parent_run_id IN (SELECT value FROM json_each(?1))")?;
+            for run in statement.query_map([&list], |r| r.get::<_, String>(0))? {
+                next.insert(run?);
+            }
+        }
+        let mut statement = c.prepare("SELECT json_extract(payload,'$.allocation.child_run') FROM journal WHERE kind='child_budget_reserved' AND run_id IN (SELECT value FROM json_each(?1))")?;
+        for run in statement.query_map([&list], |r| r.get::<_, Option<String>>(0))? {
+            next.extend(run?);
+        }
+        next.retain(|run| !runs.contains(run));
+        runs.extend(next.iter().cloned());
+        frontier = next;
+    }
+    Ok(runs)
+}
+
+/// Record a redacted journal event and re-seal the hashes other crates keep over it,
+/// but only when the stored hash still matches the pre-purge content.
 fn journal_follow(
     c: &Connection,
     key: &str,
     rowid: i64,
-    payload: Option<Value>,
+    old_payload: &str,
+    new_payload: Value,
 ) -> excalibur_store::Result<()> {
-    let row: Option<JournalRow> = c
+    let row: Option<(Option<String>, u64, String, Option<String>)> = c
         .query_row(
-            "SELECT run_id,sequence,kind,idempotency_key,payload FROM journal WHERE rowid=?1",
+            "SELECT run_id,sequence,kind,idempotency_key FROM journal WHERE rowid=?1",
             [rowid],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    let Some((Some(run), sequence, kind, event_key, inline)) = row else {
+    let Some((Some(run), sequence, kind, event_key)) = row else {
         return Ok(());
     };
+    let event_key = event_key.unwrap_or_default();
+    let old_value: Value = match serde_json::from_str(old_payload) {
+        Ok(value) => value,
+        Err(_) => {
+            flag(c, key, "unparseable_journal_payload", &format!("{run}:{sequence}"))?;
+            return Ok(());
+        }
+    };
+    let old = Event {
+        sequence,
+        kind: kind.clone(),
+        key: event_key.clone(),
+        payload: old_value,
+    };
+    let new = Event {
+        sequence,
+        kind,
+        key: event_key,
+        payload: new_payload,
+    };
+    let offset = |event: &Event| {
+        excalibur_telemetry::journal_offset_hash(event)
+            .map_err(|e| StoreError::Configuration(e.to_string()))
+    };
+    let (old_offset, new_offset) = (offset(&old)?, offset(&new)?);
     c.execute(
-        "INSERT OR IGNORE INTO retention_purge_events(operation_key,run_id,sequence) VALUES(?1,?2,?3)",
-        rusqlite::params![key, run, sequence],
+        "INSERT INTO retention_purge_events(operation_key,run_id,sequence,old_offset_hash,new_offset_hash) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(operation_key,run_id,sequence) DO UPDATE SET new_offset_hash=excluded.new_offset_hash,old_offset_hash=coalesce(old_offset_hash,excluded.old_offset_hash)",
+        rusqlite::params![key, run, sequence, old_offset, new_offset],
     )?;
     if !table_exists(c, "task_observed_events")? {
         return Ok(());
     }
-    let payload = match (payload, inline) {
-        (Some(payload), _) => payload,
-        (None, Some(text)) => serde_json::from_str(&text).map_err(store_json)?,
-        (None, None) => return Ok(()),
+    let stored: Option<String> = c
+        .query_row(
+            "SELECT payload_hash FROM task_observed_events WHERE run_id=?1 AND sequence=?2",
+            rusqlite::params![run, sequence],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        return Ok(());
     };
-    let event = Event {
-        sequence,
-        kind,
-        key: event_key.unwrap_or_default(),
-        payload,
-    };
-    let hash = sha256_hex(&serde_json::to_vec(&event).map_err(store_json)?);
+    let old_hash = sha256_hex(&serde_json::to_vec(&old).map_err(store_json)?);
+    let new_hash = sha256_hex(&serde_json::to_vec(&new).map_err(store_json)?);
+    if stored == new_hash {
+        return Ok(());
+    }
+    if stored != old_hash {
+        if flag(c, key, "task_hash_mismatch", &format!("{run}:{sequence}"))? {
+            bump(c, key, |n| n.hash_mismatches += 1)?;
+        }
+        return Ok(());
+    }
     guarded(c, "task_observed_events", "UPDATE", || {
         Ok(c.execute(
-            "UPDATE task_observed_events SET payload_hash=?1 WHERE run_id=?2 AND sequence=?3",
-            rusqlite::params![hash, run, sequence],
+            "UPDATE task_observed_events SET payload_hash=?1 WHERE run_id=?2 AND sequence=?3 AND payload_hash=?4",
+            rusqlite::params![new_hash, run, sequence, old_hash],
         )?)
     })?;
+    bump(c, key, |n| n.task_hashes_resealed += 1)?;
     Ok(())
 }
-/// Redact rows of one principal-database table and record follow-up work.
+/// Redact targeted rows of one principal-database table and record follow-up work.
 fn redact_main(
     c: &Connection,
     key: &str,
     table: &sweep::SweepTable,
-    filter: &Filter<'_>,
+    targets: &Targets<'_>,
     rowids: &[i64],
     matcher: &Matcher,
 ) -> excalibur_store::Result<()> {
     let mut journal_rows = 0u64;
-    let changed = redact_rows(
-        c,
-        table,
-        filter,
-        rowids,
-        matcher,
-        &mut |c, name, rowid, cols| {
-            c.execute(
-            "INSERT OR IGNORE INTO retention_purge_tables(operation_key,table_name) VALUES(?1,?2)",
-            [key, name.to_ascii_lowercase().as_str()],
-        )?;
-            if name.eq_ignore_ascii_case("journal") && cols.iter().any(|c| c == "payload") {
-                journal_follow(c, key, rowid, None)?;
-                journal_rows += 1;
-            }
-            Ok(())
-        },
-    )?;
-    if changed > 0 {
+    let journal = table.name.eq_ignore_ascii_case("journal");
+    let stats = redact_rows(c, table, targets, rowids, matcher, &mut |c, _, rowid, old| {
+        if journal && let Some(previous) = old.get("payload") {
+            let current: String =
+                c.query_row("SELECT payload FROM journal WHERE rowid=?1", [rowid], |r| {
+                    r.get(0)
+                })?;
+            let value = serde_json::from_str(&current).map_err(store_json)?;
+            journal_follow(c, key, rowid, previous, value)?;
+            journal_rows += 1;
+        }
+        Ok(())
+    })?;
+    if stats.rows > 0 || stats.structured > 0 {
         bump(c, key, |n| {
-            n.rows_redacted += changed;
+            n.rows_redacted += stats.rows;
             n.journal_events_redacted += journal_rows;
+            n.structured_matches += stats.structured;
         })?;
     }
     Ok(())
@@ -530,12 +776,12 @@ fn existing_op(
         )
         .optional()?;
     if let Some((p, scope, kind, id)) = by_key {
+        // A key of another principal or scope is indistinguishable from a missing subject.
+        if p != principal || scope != request.scope {
+            return Ok(Existing::Hidden);
+        }
         return Ok(
-            if p == principal
-                && scope == request.scope
-                && kind == request.kind.as_str()
-                && id == request.subject_id
-            {
+            if kind == request.kind.as_str() && id == request.subject_id {
                 Existing::Key(request.operation_key.clone())
             } else {
                 Existing::Conflict
@@ -565,29 +811,20 @@ fn load_subject(
 ) -> excalibur_store::Result<Option<(SubjectSnapshot, Vec<String>)>> {
     let mut members = Vec::new();
     let mut texts = Vec::new();
-    let owner: Option<(String, String)> = match kind {
-        SubjectKind::Conversation => c
-            .query_row(
-                "SELECT coalesce(principal_id,?2),coalesce(scope_id,active_scope,'legacy:unscoped') FROM conversations WHERE id=?1",
-                [id, principal],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?,
-        SubjectKind::Document => c
-            .query_row(
-                "SELECT coalesce(principal_id,?2),coalesce(scope_id,'legacy:unscoped') FROM documents WHERE id=?1",
-                [id, principal],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?,
-        SubjectKind::Memory => c
-            .query_row(
-                "SELECT coalesce(principal_id,?2),coalesce(scope_id,'legacy:unscoped') FROM memories WHERE id=?1",
-                [id, principal],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?,
+    let owner_sql = match kind {
+        SubjectKind::Conversation => {
+            "SELECT coalesce(principal_id,?2),coalesce(scope_id,active_scope,'legacy:unscoped') FROM conversations WHERE id=?1"
+        }
+        SubjectKind::Document => {
+            "SELECT coalesce(principal_id,?2),coalesce(scope_id,'legacy:unscoped') FROM documents WHERE id=?1"
+        }
+        SubjectKind::Memory => {
+            "SELECT coalesce(principal_id,?2),coalesce(scope_id,'legacy:unscoped') FROM memories WHERE id=?1"
+        }
     };
+    let owner: Option<(String, String)> = c
+        .query_row(owner_sql, [id, principal], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
     let Some((owner, owner_scope)) = owner else {
         return Ok(None);
     };
@@ -628,16 +865,14 @@ fn load_subject(
                 id: id.into(),
                 scope: scope.into(),
             });
-            let document_columns = columns(c, "documents")?;
-            if document_columns.iter().any(|c| c == "title") {
+            if columns(c, "documents")?.iter().any(|c| c == "title") {
                 texts.push(c.query_row(
                     "SELECT coalesce(title,'') FROM documents WHERE id=?1",
                     [id],
                     |r| r.get(0),
                 )?);
             }
-            let chunk_columns = columns(c, "doc_chunks")?;
-            let context = if chunk_columns.iter().any(|c| c == "context") {
+            let context = if columns(c, "doc_chunks")?.iter().any(|c| c == "context") {
                 "coalesce(context,'')"
             } else {
                 "''"
@@ -671,11 +906,11 @@ fn load_subject(
                 id: id.into(),
                 scope: scope.into(),
             });
-            texts.push(
-                c.query_row("SELECT statement FROM memories WHERE id=?1", [id], |r| {
-                    r.get(0)
-                })?,
-            );
+            texts.push(c.query_row(
+                "SELECT statement FROM memories WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )?);
         }
     }
     Ok(Some((
@@ -695,7 +930,7 @@ fn collect_blob_hashes(
     subject: &str,
     members: &[Member],
 ) -> excalibur_store::Result<BTreeSet<String>> {
-    let ids = id_list(members.iter().map(|m| m.id.clone()));
+    let ids = json_list(members.iter().map(|m| m.id.clone()));
     let mut hashes = BTreeSet::new();
     let mut statement = c.prepare(
         "SELECT DISTINCT hash FROM blob_refs WHERE owner_id IN (SELECT value FROM json_each(?1))",
@@ -731,26 +966,59 @@ fn collect_blob_hashes(
     }
     Ok(hashes)
 }
-fn merge_json_list(
-    c: &Connection,
-    key: &str,
-    column: &'static str,
-    values: impl IntoIterator<Item = String>,
-) -> excalibur_store::Result<()> {
-    let text: String = c.query_row(
-        &format!("SELECT {column} FROM retention_purges WHERE operation_key=?1"),
-        [key],
-        |r| r.get(0),
-    )?;
-    let mut set: BTreeSet<String> = serde_json::from_str::<Vec<String>>(&text)
-        .map_err(store_json)?
-        .into_iter()
-        .collect();
-    set.extend(values);
-    c.execute(
-        &format!("UPDATE retention_purges SET {column}=?2 WHERE operation_key=?1"),
-        rusqlite::params![key, id_list(set)],
-    )?;
+fn base_roots(kind: SubjectKind) -> &'static [&'static str] {
+    match kind {
+        SubjectKind::Conversation => &["messages", "conversations"],
+        SubjectKind::Document => &["doc_chunks", "documents"],
+        SubjectKind::Memory => &["memories"],
+    }
+}
+fn member_table(kind: SubjectKind) -> Option<(&'static str, MemberKind)> {
+    match kind {
+        SubjectKind::Conversation => Some(("messages", MemberKind::Message)),
+        SubjectKind::Document => Some(("doc_chunks", MemberKind::Chunk)),
+        SubjectKind::Memory => None,
+    }
+}
+fn subject_table(kind: SubjectKind) -> &'static str {
+    match kind {
+        SubjectKind::Conversation => "conversations",
+        SubjectKind::Document => "documents",
+        SubjectKind::Memory => "memories",
+    }
+}
+/// Bounded trial deletion inside a rolled-back savepoint, so constraint failures surface
+/// at planning time instead of leaving a half-applied purge.
+fn trial_delete(c: &Connection, snapshot: &SubjectSnapshot) -> excalibur_store::Result<()> {
+    let keys = ForeignKeys::load(c)?;
+    keys.validate(base_roots(snapshot.kind))?;
+    c.execute_batch("SAVEPOINT retention_trial")?;
+    let result = (|| {
+        let mut stats = DeleteStats::default();
+        if let Some((table, kind)) = member_table(snapshot.kind) {
+            let sample: Vec<Value> = snapshot
+                .members_of(kind)
+                .take(TRIAL_MEMBERS)
+                .map(|m| Value::String(m.id.clone()))
+                .collect();
+            remove_rows(c, &keys, table, "id", &sample, 0, &mut stats)?;
+        }
+        if snapshot.members.len() <= TRIAL_MEMBERS + 1 {
+            remove_rows(
+                c,
+                &keys,
+                subject_table(snapshot.kind),
+                "id",
+                &[Value::String(snapshot.id.clone())],
+                0,
+                &mut stats,
+            )?;
+        }
+        Ok(())
+    })();
+    let rollback = c.execute_batch("ROLLBACK TO retention_trial; RELEASE retention_trial");
+    result?;
+    rollback?;
     Ok(())
 }
 
@@ -852,6 +1120,28 @@ impl PurgeService {
             observer(boundary);
         }
     }
+    /// Declare that `run` derives from a subject (provenance for redaction and fencing).
+    pub async fn link_run(&self, kind: SubjectKind, subject_id: &str, run: &str) -> Result<()> {
+        if subject_id.trim().is_empty() || run.trim().is_empty() || run.len() > 512 {
+            return Err(Error::Invalid("subject and run required"));
+        }
+        let (principal, id, run, now) = (
+            self.principal.clone(),
+            subject_id.to_string(),
+            run.to_string(),
+            (self.clock)(),
+        );
+        self.main
+            .write(Priority::Normal, move |c| {
+                c.execute(
+                    "INSERT OR IGNORE INTO retention_subject_runs(principal_id,subject_kind,subject_id,run_id,linked_at) VALUES(?1,?2,?3,?4,?5)",
+                    rusqlite::params![principal, kind.as_str(), id, run, now],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
     /// Purge one subject. Replaying the same key (or the same subject) returns the
     /// stored receipt; an interrupted operation resumes from its last committed phase.
     pub async fn purge(&self, request: PurgeRequest) -> Result<PurgeReceipt> {
@@ -870,7 +1160,8 @@ impl PurgeService {
         self.drive(&key).await
     }
     /// Resume every unfinished purge of this principal, for example at host startup.
-    pub async fn resume_pending(&self) -> Result<Vec<PurgeReceipt>> {
+    /// Each purge is driven independently; a failure is reported and the rest continue.
+    pub async fn resume_pending(&self) -> Result<Vec<PendingOutcome>> {
         let _serial = PURGE_SERIAL.lock().await;
         let principal = self.principal.clone();
         let keys: Vec<String> = self
@@ -883,24 +1174,49 @@ impl PurgeService {
                 Ok(rows)
             })
             .await?;
-        let mut receipts = Vec::new();
+        let mut outcomes = Vec::new();
         for key in keys {
-            receipts.push(self.drive(&key).await?);
+            let result = self.drive(&key).await.map_err(|e| e.to_string());
+            outcomes.push(PendingOutcome {
+                operation_key: key,
+                result,
+            });
         }
-        Ok(receipts)
+        Ok(outcomes)
+    }
+    /// Resume a purge by key if it belongs to this principal and one of `scopes`.
+    /// `Ok(None)` means no such purge is visible to the caller.
+    pub async fn resume(&self, key: &str, scopes: &[String]) -> Result<Option<PurgeReceipt>> {
+        let _serial = PURGE_SERIAL.lock().await;
+        let probe = key.to_string();
+        let Some(op) = self
+            .main
+            .read(ReadLane::Interactive, move |c| {
+                if !table_exists(c, "retention_purges")? {
+                    return Ok(None);
+                }
+                load_op(c, &probe)
+            })
+            .await?
+        else {
+            return Ok(None);
+        };
+        if op.principal != self.principal || !scopes.contains(&op.scope) {
+            return Ok(None);
+        }
+        Ok(Some(self.drive(key).await?))
     }
     /// Completed receipt for a key, if any.
     pub async fn receipt(&self, key: &str) -> Result<Option<PurgeReceipt>> {
-        let key = key.to_string();
+        let probe = key.to_string();
         let row = self
             .main
-            .read(ReadLane::Interactive, {
-                let key = key.clone();
-                move |c| load_op(c, &key)
-            })
+            .read(ReadLane::Interactive, move |c| load_op(c, &probe))
             .await?;
         match row {
-            Some(op) if op.phase == Phase::Completed => Ok(Some(self.receipt_of(&op).await?)),
+            Some(op) if op.phase == Phase::Completed && op.principal == self.principal => {
+                Ok(Some(self.receipt_of(&op).await?))
+            }
             _ => Ok(None),
         }
     }
@@ -936,6 +1252,20 @@ impl PurgeService {
             })
             .await?)
     }
+    /// Content-free review flags (hash mismatches, structural matches) of a purge.
+    pub async fn flags(&self, key: &str) -> Result<Vec<(String, String)>> {
+        let key = key.to_string();
+        Ok(self
+            .main
+            .read(ReadLane::Interactive, move |c| {
+                let mut statement = c.prepare("SELECT code,location FROM retention_purge_flags WHERE operation_key=?1 ORDER BY code,location")?;
+                let rows = statement
+                    .query_map([key], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?)
+    }
 
     async fn load(&self, key: &str) -> Result<OpRow> {
         let key = key.to_string();
@@ -956,10 +1286,7 @@ impl PurgeService {
             operation_key: op.key.clone(),
             tombstone,
             counts: op.counts.clone(),
-            hygiene: op
-                .hygiene
-                .clone()
-                .ok_or(Error::Invalid("hygiene missing"))?,
+            hygiene: op.hygiene.clone().ok_or(Error::Invalid("hygiene missing"))?,
             telemetry_covered: op.telemetry_covered,
             notice: BackupNotice::standard(),
         })
@@ -1045,6 +1372,8 @@ impl PurgeService {
             Conflict,
             NotFound,
             Missing(&'static str),
+            Active(String),
+            Rejected(String),
         }
         let planned = self
             .main
@@ -1056,7 +1385,8 @@ impl PurgeService {
                     Existing::Absent => {}
                 }
                 for (schema, name) in REQUIRED_PARTICIPANTS {
-                    if table_exists(c, schema)? && !participants.iter().any(|p| p.name() == *name) {
+                    if table_exists(c, schema)? && !participants.iter().any(|p| p.name() == *name)
+                    {
                         return Ok(Planned::Missing(name));
                     }
                 }
@@ -1077,22 +1407,30 @@ impl PurgeService {
                 snapshot.members.extend(collection.derived);
                 texts.extend(collection.texts);
                 texts.extend(originals);
+                let runs = linked_runs(c, &snapshot)?;
+                if let Some(run) = active_run(c, &runs)? {
+                    return Ok(Planned::Active(run));
+                }
+                if let Err(error) = trial_delete(c, &snapshot) {
+                    return Ok(Planned::Rejected(error.to_string()));
+                }
                 let needles = derive_needles(&texts);
-                let scopes: BTreeSet<String> = snapshot
-                    .members
-                    .iter()
-                    .map(|m| m.scope.clone())
-                    .chain([request.scope.clone()])
-                    .collect();
-                let mut watermarks = BTreeMap::new();
-                for table in sweep_tables(c, true)? {
-                    watermarks.insert(table.name.clone(), max_rowid(c, &table.name)?);
+                let mut objects = BTreeSet::new();
+                for member in &snapshot.members {
+                    objects.insert((member.scope.clone(), member.id.clone()));
+                    for prefix in VECTOR_PREFIXES {
+                        objects.insert((member.scope.clone(), format!("{prefix}:{}", member.id)));
+                    }
                 }
                 let hashes =
                     collect_blob_hashes(c, request.kind, &request.subject_id, &snapshot.members)?;
                 let tombstone = format!("tmb_{}", ulid::Ulid::new());
+                let counts = PurgeCounts {
+                    runs_linked: runs.len() as u64,
+                    ..PurgeCounts::default()
+                };
                 c.execute(
-                    "INSERT INTO retention_purges(operation_key,tombstone_id,principal_id,scope_id,subject_kind,subject_id,reason,phase,requested_at,members,scopes,watermarks,blob_hashes) VALUES(?1,?2,?3,?4,?5,?6,?7,'planned',?8,?9,?10,?11,?12)",
+                    "INSERT INTO retention_purges(operation_key,tombstone_id,principal_id,scope_id,subject_kind,subject_id,reason,phase,requested_at,members,objects,runs,blob_hashes,counts) VALUES(?1,?2,?3,?4,?5,?6,?7,'planned',?8,?9,?10,?11,?12,?13)",
                     rusqlite::params![
                         request.operation_key,
                         tombstone,
@@ -1103,9 +1441,10 @@ impl PurgeService {
                         request.reason.as_str(),
                         request.requested_at,
                         serde_json::to_string(&snapshot.members).map_err(store_json)?,
-                        id_list(scopes),
-                        serde_json::to_string(&watermarks).map_err(store_json)?,
-                        id_list(hashes),
+                        serde_json::to_string(&objects).map_err(store_json)?,
+                        json_list(runs),
+                        json_list(hashes),
+                        serde_json::to_string(&counts).map_err(store_json)?,
                     ],
                 )?;
                 for (ordinal, needle) in needles.iter().enumerate() {
@@ -1127,6 +1466,8 @@ impl PurgeService {
             Planned::Conflict => Err(Error::KeyConflict),
             Planned::NotFound => Err(Error::NotFound),
             Planned::Missing(name) => Err(Error::ParticipantMissing(name)),
+            Planned::Active(run) => Err(Error::ActiveRun(run)),
+            Planned::Rejected(reason) => Err(Error::Rejected(reason)),
         }
     }
     async fn advance(
@@ -1140,7 +1481,7 @@ impl PurgeService {
         self.main
             .write(Priority::Normal, move |c| {
                 c.execute(
-                    "UPDATE retention_purges SET phase=?3,telemetry_covered=coalesce(?4,telemetry_covered) WHERE operation_key=?1 AND phase=?2",
+                    "UPDATE retention_purges SET phase=?3,telemetry_covered=coalesce(?4,telemetry_covered),last_error=NULL WHERE operation_key=?1 AND phase=?2",
                     rusqlite::params![key, from.as_str(), to.as_str(), telemetry],
                 )?;
                 Ok(())
@@ -1148,46 +1489,95 @@ impl PurgeService {
             .await?;
         Ok(())
     }
+    async fn record_error(&self, key: &str, error: &Error) {
+        let (key, code) = (key.to_string(), error.code());
+        let _ = self
+            .main
+            .write(Priority::Normal, move |c| {
+                c.execute(
+                    "UPDATE retention_purges SET last_error=?2 WHERE operation_key=?1",
+                    [key, code],
+                )?;
+                Ok(())
+            })
+            .await;
+    }
     async fn drive(&self, key: &str) -> Result<PurgeReceipt> {
         loop {
             let op = self.load(key).await?;
-            match op.phase {
-                Phase::Planned => {
+            let step = match op.phase {
+                Phase::Planned => self.sweep_main(&op).await.map(|_| {
+                    (
+                        Phase::Planned,
+                        Phase::Swept,
+                        None,
+                        Some(PurgeBoundary::Swept),
+                    )
+                }),
+                Phase::Swept => self.delete_base(&op).await.map(|restart| {
+                    if restart {
+                        (Phase::Swept, Phase::Planned, None, None)
+                    } else {
+                        (
+                            Phase::BaseDeleted,
+                            Phase::BaseDeleted,
+                            None,
+                            Some(PurgeBoundary::BaseDeleted),
+                        )
+                    }
+                }),
+                Phase::BaseDeleted => async {
                     self.sweep_main(&op).await?;
-                    self.advance(key, Phase::Planned, Phase::MainSwept, None)
-                        .await?;
-                    self.notify(PurgeBoundary::MainSwept);
+                    self.sweep_telemetry(&op).await
                 }
-                Phase::MainSwept => {
-                    self.sweep_journal_blobs(&op).await?;
-                    self.advance(key, Phase::MainSwept, Phase::JournalBlobsSwept, None)
-                        .await?;
-                    self.notify(PurgeBoundary::JournalBlobsSwept);
-                }
-                Phase::JournalBlobsSwept => {
-                    let covered = self.sweep_telemetry(&op).await?;
-                    self.advance(
-                        key,
-                        Phase::JournalBlobsSwept,
+                .await
+                .map(|covered| {
+                    (
+                        Phase::BaseDeleted,
                         Phase::TelemetrySwept,
                         Some(covered),
+                        Some(PurgeBoundary::TelemetrySwept),
                     )
-                    .await?;
-                    self.notify(PurgeBoundary::TelemetrySwept);
-                }
-                Phase::TelemetrySwept => {
-                    self.delete_base(&op).await?;
-                    self.notify(PurgeBoundary::BaseDeleted);
-                }
-                Phase::BaseDeleted => {
-                    self.release_blobs(&op).await?;
-                    self.notify(PurgeBoundary::BlobsReleased);
-                }
-                Phase::BlobsReleased => {
-                    self.complete(&op).await?;
-                    self.notify(PurgeBoundary::Completed);
-                }
+                }),
+                Phase::TelemetrySwept => self.finalize(&op).await.map(|_| {
+                    (
+                        Phase::Finalized,
+                        Phase::Finalized,
+                        None,
+                        Some(PurgeBoundary::Finalized),
+                    )
+                }),
+                Phase::Finalized => self.release_blobs(&op).await.map(|_| {
+                    (
+                        Phase::BlobsReleased,
+                        Phase::BlobsReleased,
+                        None,
+                        Some(PurgeBoundary::BlobsReleased),
+                    )
+                }),
+                Phase::BlobsReleased => self.complete(&op).await.map(|_| {
+                    (
+                        Phase::Completed,
+                        Phase::Completed,
+                        None,
+                        Some(PurgeBoundary::Completed),
+                    )
+                }),
                 Phase::Completed => return self.receipt_of(&op).await,
+            };
+            match step {
+                Ok((from, to, telemetry, boundary)) => {
+                    if from != to {
+                        self.advance(key, from, to, telemetry).await?;
+                    }
+                    if let Some(boundary) = boundary {
+                        self.notify(boundary);
+                    }
+                }
+                Err(error) => {
+                    self.record_error(key, &error).await;
+                    return Err(error);
+                }
             }
         }
     }
@@ -1199,6 +1589,8 @@ impl PurgeService {
             .await?;
         Ok(Arc::new(Matcher::new(&needles)?))
     }
+    /// Targeted pass over the principal database: inline journal payloads of linked runs,
+    /// their payload blobs, and other rows of linked runs or referencing members.
     async fn sweep_main(&self, op: &OpRow) -> Result<()> {
         let matcher = self.matcher(&op.key).await?;
         if matcher.is_empty() {
@@ -1206,85 +1598,85 @@ impl PurgeService {
         }
         let tables = self
             .main
-            .read(ReadLane::Background, |c| sweep_tables(c, true))
+            .read(ReadLane::Background, sweep_tables)
             .await?;
-        let scopes = op.scopes_json();
+        let (runs, members) = (op.runs_json(), op.members_json());
         for table in tables {
             let mut after = 0;
             loop {
-                let (t, m, s, p) = (
+                let (t, m, r, s, p) = (
                     table.clone(),
                     matcher.clone(),
-                    scopes.clone(),
+                    runs.clone(),
+                    members.clone(),
                     self.principal.clone(),
                 );
                 let (hits, last) = self
                     .main
                     .read(ReadLane::Background, move |c| {
-                        let filter = Filter {
-                            scopes_json: &s,
+                        let targets = Targets {
+                            runs_json: &r,
+                            members_json: &s,
                             principal: &p,
                         };
-                        scan_page(c, &t, &filter, after, PAGE, &m)
+                        scan_page(c, &t, &targets, after, PAGE, &m)
                     })
                     .await?;
                 let Some(last) = last else { break };
                 after = last;
                 for chunk in hits.chunks(BATCH) {
-                    let (t, m, s, p, key, rows) = (
+                    let (t, m, r, s, p, key, rows) = (
                         table.clone(),
                         matcher.clone(),
-                        scopes.clone(),
+                        runs.clone(),
+                        members.clone(),
                         self.principal.clone(),
                         op.key.clone(),
                         chunk.to_vec(),
                     );
                     self.main
                         .write(Priority::Normal, move |c| {
-                            with_secure_delete(c, || {
-                                let filter = Filter {
-                                    scopes_json: &s,
+                            with_secure_delete(c, false, || {
+                                let targets = Targets {
+                                    runs_json: &r,
+                                    members_json: &s,
                                     principal: &p,
                                 };
-                                redact_main(c, &key, &t, &filter, &rows, &m)
+                                redact_main(c, &key, &t, &targets, &rows, &m)
                             })
                         })
                         .await?;
-                    self.notify(PurgeBoundary::MainSweepBatch);
+                    self.notify(PurgeBoundary::SweepBatch);
                 }
             }
         }
-        Ok(())
+        self.sweep_journal_blobs(op, &matcher).await
     }
-    async fn sweep_journal_blobs(&self, op: &OpRow) -> Result<()> {
-        let matcher = self.matcher(&op.key).await?;
-        if matcher.is_empty() {
-            return Ok(());
-        }
+    async fn sweep_journal_blobs(&self, op: &OpRow, matcher: &Arc<Matcher>) -> Result<()> {
         let mut after = 0i64;
         loop {
-            let (scopes, principal) = (op.scopes_json(), self.principal.clone());
-            let page: Vec<(i64, String)> = self
+            let runs = op.runs_json();
+            let page: Vec<(i64, String, String)> = self
                 .main
                 .read(ReadLane::Background, move |c| {
-                    let mut statement = c.prepare("SELECT rowid,payload_blob FROM journal WHERE rowid>?1 AND payload_blob IS NOT NULL AND (scope_id IS NULL OR scope_id IN (SELECT value FROM json_each(?2))) AND (principal_id IS NULL OR principal_id=?3) ORDER BY rowid LIMIT 256")?;
+                    let mut statement = c.prepare("SELECT rowid,payload_blob,run_id FROM journal WHERE rowid>?1 AND payload_blob IS NOT NULL AND run_id IN (SELECT value FROM json_each(?2)) ORDER BY rowid LIMIT 256")?;
                     let rows = statement
-                        .query_map(rusqlite::params![after, scopes, principal], |r| {
-                            Ok((r.get(0)?, r.get(1)?))
+                        .query_map(rusqlite::params![after, runs], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                         })?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                     Ok(rows)
                 })
                 .await?;
-            let Some(last) = page.last().map(|(rowid, _)| *rowid) else {
+            let Some(last) = page.last().map(|(rowid, _, _)| *rowid) else {
                 break;
             };
             after = last;
-            for (rowid, old) in page {
+            for (rowid, old, run) in page {
                 let Ok(hash) = old.parse::<BlobHash>() else {
                     continue;
                 };
-                let bytes = match self.main.read_blob(hash, 16 * 1024 * 1024).await {
+                let bytes = match self.main.read_blob(hash, MAX_JOURNAL_BLOB).await {
                     Ok(bytes) => bytes,
                     Err(StoreError::BlobMissing(_)) => continue,
                     Err(error) => return Err(error.into()),
@@ -1293,7 +1685,22 @@ impl PurgeService {
                     continue;
                 }
                 let text = String::from_utf8_lossy(&bytes).into_owned();
-                let redacted = matcher.redact_text(&text, REDACTION_MARK).unwrap_or(text);
+                let redacted = match matcher.redact_value(&text) {
+                    Redaction::Changed(redacted) => redacted,
+                    Redaction::Unchanged => continue,
+                    Redaction::Structured => {
+                        let (key, location) = (op.key.clone(), format!("journal:{rowid}"));
+                        self.main
+                            .write(Priority::Normal, move |c| {
+                                if flag(c, &key, "structured_match", &location)? {
+                                    bump(c, &key, |n| n.structured_matches += 1)?;
+                                }
+                                Ok(())
+                            })
+                            .await?;
+                        continue;
+                    }
+                };
                 let payload: Value = serde_json::from_str(&redacted)?;
                 let blobs = self.main.blobs();
                 let bytes = redacted.into_bytes();
@@ -1303,7 +1710,7 @@ impl PurgeService {
                 let key = op.key.clone();
                 self.main
                     .write_with_blob(prepared, Priority::Normal, move |c, new| {
-                        with_secure_delete(c, || {
+                        with_secure_delete(c, false, || {
                             let changed = guarded(c, "journal", "UPDATE", || {
                                 Ok(c.execute(
                                     "UPDATE journal SET payload_blob=?1 WHERE rowid=?2 AND payload_blob=?3",
@@ -1311,176 +1718,148 @@ impl PurgeService {
                                 )?)
                             })?;
                             if changed == 1 {
-                                journal_follow(c, &key, rowid, Some(payload))?;
+                                journal_follow(c, &key, rowid, &text, payload)?;
+                                excalibur_journal::record_payload_redirect_in(
+                                    c,
+                                    &run,
+                                    &old,
+                                    new.as_str(),
+                                )?;
                                 merge_json_list(c, &key, "blob_hashes", [old.clone()])?;
-                                c.execute("INSERT OR IGNORE INTO retention_purge_tables(operation_key,table_name) VALUES(?1,'journal')", [&key])?;
                                 bump(c, &key, |n| n.journal_events_redacted += 1)?;
                             }
                             Ok(())
                         })
                     })
                     .await?;
+                self.notify(PurgeBoundary::SweepBatch);
             }
         }
         Ok(())
     }
-    /// Returns whether telemetry was covered.
+    /// Telemetry rows of linked runs, verified re-sealing and re-export. Runs after the
+    /// base deletion and the late principal-database pass, so late journal rows are
+    /// already recorded. Returns whether telemetry was covered.
     async fn sweep_telemetry(&self, op: &OpRow) -> Result<bool> {
         let Some(telemetry) = &self.telemetry else {
             return Ok(false);
         };
         let tdb = telemetry.database().clone();
         let matcher = self.matcher(&op.key).await?;
-        let tables = tdb
-            .read(ReadLane::Background, |c| sweep_tables(c, false))
-            .await?;
-        let scopes = op.scopes_json();
-        // Pass 1 persists affected runs before any change, so re-export survives a crash.
-        let mut runs: BTreeSet<String> = op.runs.iter().cloned().collect();
+        let tables = tdb.read(ReadLane::Background, sweep_tables).await?;
+        let (runs, members) = (op.runs_json(), op.members_json());
         if !matcher.is_empty() {
-            for table in tables
-                .iter()
-                .filter(|t| t.columns.iter().any(|c| c == "run_id"))
-            {
+            for table in tables.iter().filter(|t| t.run) {
                 let mut after = 0;
                 loop {
-                    let (t, m, s, p) = (
+                    let (t, m, r, s, p) = (
                         table.clone(),
                         matcher.clone(),
-                        scopes.clone(),
-                        self.principal.clone(),
-                    );
-                    let (found, last) = tdb
-                        .read(ReadLane::Background, move |c| {
-                            let filter = Filter {
-                                scopes_json: &s,
-                                principal: &p,
-                            };
-                            let (hits, last) = scan_page(c, &t, &filter, after, PAGE, &m)?;
-                            let mut found = Vec::new();
-                            for rowid in hits {
-                                let run: Option<String> = c.query_row(
-                                    &format!(
-                                        "SELECT run_id FROM {} WHERE rowid=?1",
-                                        sweep::quote(&t.name)
-                                    ),
-                                    [rowid],
-                                    |r| r.get(0),
-                                )?;
-                                found.extend(run);
-                            }
-                            Ok((found, last))
-                        })
-                        .await?;
-                    runs.extend(found);
-                    let Some(last) = last else { break };
-                    after = last;
-                }
-            }
-        }
-        let key = op.key.clone();
-        let journal_runs: Vec<(String, u64)> = self
-            .main
-            .read(ReadLane::Background, move |c| {
-                let mut statement = c.prepare("SELECT run_id,sequence FROM retention_purge_events WHERE operation_key=?1 ORDER BY run_id,sequence")?;
-                let rows = statement
-                    .query_map([key], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            })
-            .await?;
-        runs.extend(journal_runs.iter().map(|(run, _)| run.clone()));
-        let (key, list) = (op.key.clone(), runs.clone());
-        self.main
-            .write(Priority::Normal, move |c| {
-                merge_json_list(c, &key, "runs", list)
-            })
-            .await?;
-        // Pass 2 rewrites matching telemetry rows.
-        if !matcher.is_empty() {
-            for table in &tables {
-                let mut after = 0;
-                loop {
-                    let (t, m, s, p) = (
-                        table.clone(),
-                        matcher.clone(),
-                        scopes.clone(),
+                        runs.clone(),
+                        members.clone(),
                         self.principal.clone(),
                     );
                     let (hits, last) = tdb
                         .read(ReadLane::Background, move |c| {
-                            let filter = Filter {
-                                scopes_json: &s,
+                            let targets = Targets {
+                                runs_json: &r,
+                                members_json: &s,
                                 principal: &p,
                             };
-                            scan_page(c, &t, &filter, after, PAGE, &m)
+                            scan_page(c, &t, &targets, after, PAGE, &m)
                         })
                         .await?;
                     let Some(last) = last else { break };
                     after = last;
                     for chunk in hits.chunks(BATCH) {
-                        let (t, m, s, p, rows) = (
+                        let (t, m, r, s, p, rows) = (
                             table.clone(),
                             matcher.clone(),
-                            scopes.clone(),
+                            runs.clone(),
+                            members.clone(),
                             self.principal.clone(),
                             chunk.to_vec(),
                         );
-                        let changed = tdb
+                        let stats = tdb
                             .write(Priority::Normal, move |c| {
-                                with_secure_delete(c, || {
-                                    let filter = Filter {
-                                        scopes_json: &s,
+                                with_secure_delete(c, false, || {
+                                    let targets = Targets {
+                                        runs_json: &r,
+                                        members_json: &s,
                                         principal: &p,
                                     };
-                                    redact_rows(c, &t, &filter, &rows, &m, &mut |_, _, _, _| Ok(()))
+                                    redact_rows(c, &t, &targets, &rows, &m, &mut |_, _, _, _| {
+                                        Ok(())
+                                    })
                                 })
                             })
                             .await?;
                         let key = op.key.clone();
                         self.main
                             .write(Priority::Normal, move |c| {
-                                bump(c, &key, |n| n.telemetry_rows_redacted += changed)
+                                bump(c, &key, |n| {
+                                    n.telemetry_rows_redacted += stats.rows;
+                                    n.structured_matches += stats.structured;
+                                })
                             })
                             .await?;
                     }
                 }
             }
         }
-        // Re-seal journal-sourced offsets so reconciling the redacted journal is idempotent.
+        let key = op.key.clone();
+        let events: Vec<(String, u64, Option<String>, Option<String>)> = self
+            .main
+            .read(ReadLane::Background, move |c| {
+                let mut statement = c.prepare("SELECT run_id,sequence,old_offset_hash,new_offset_hash FROM retention_purge_events WHERE operation_key=?1 ORDER BY run_id,sequence")?;
+                let rows = statement
+                    .query_map([key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
         let offsets = tdb
             .read(ReadLane::Interactive, |c| {
                 table_exists(c, "telemetry_offsets")
             })
             .await?;
-        let mut resealed = 0u64;
+        let (mut resealed, mut mismatched) = (0u64, Vec::new());
         if offsets {
-            for (run, sequence) in journal_runs {
-                let Some(event) = self
-                    .journal
-                    .entries(&run, sequence.saturating_sub(1), 1)
-                    .await?
-                    .into_iter()
-                    .find(|e| e.sequence == sequence)
-                else {
+            for (run, sequence, old, new) in events {
+                let (Some(old), Some(new)) = (old, new) else {
                     continue;
                 };
-                let hash = excalibur_telemetry::journal_offset_hash(&event)?;
-                resealed += tdb
+                let outcome = tdb
                     .write(Priority::Normal, move |c| {
-                        guarded(c, "telemetry_offsets", "UPDATE", || {
-                            Ok(c.execute(
-                                "UPDATE telemetry_offsets SET payload_hash=?1 WHERE run_id=?2 AND source='journal' AND sequence=?3 AND payload_hash<>?1",
-                                rusqlite::params![hash, run, sequence],
-                            )? as u64)
-                        })
+                        let stored: Option<String> = c
+                            .query_row(
+                                "SELECT payload_hash FROM telemetry_offsets WHERE run_id=?1 AND source='journal' AND sequence=?2",
+                                rusqlite::params![run, sequence],
+                                |r| r.get(0),
+                            )
+                            .optional()?;
+                        match stored {
+                            None => Ok((0u64, None)),
+                            Some(stored) if stored == new => Ok((0, None)),
+                            Some(stored) if stored != old => Ok((0, Some(format!("{run}:{sequence}")))),
+                            Some(_) => guarded(c, "telemetry_offsets", "UPDATE", || {
+                                Ok((
+                                    c.execute(
+                                        "UPDATE telemetry_offsets SET payload_hash=?1 WHERE run_id=?2 AND source='journal' AND sequence=?3 AND payload_hash=?4",
+                                        rusqlite::params![new, run, sequence, old],
+                                    )? as u64,
+                                    None,
+                                ))
+                            }),
+                        }
                     })
                     .await?;
+                resealed += outcome.0;
+                mismatched.extend(outcome.1);
             }
         }
-        // Regenerate exported run artifacts from the redacted database.
         let mut exported = 0u64;
-        for run in runs {
+        for run in &op.runs {
             let probe = run.clone();
             let registered: bool = tdb
                 .read(ReadLane::Interactive, move |c| {
@@ -1493,135 +1872,192 @@ impl PurgeService {
                 })
                 .await?;
             if registered {
-                telemetry.export_run(&run).await?;
+                telemetry.export_run(run).await?;
                 exported += 1;
             }
         }
         let key = op.key.clone();
         self.main
             .write(Priority::Normal, move |c| {
+                let mut new_flags = 0;
+                for location in &mismatched {
+                    new_flags += u64::from(flag(c, &key, "telemetry_hash_mismatch", location)?);
+                }
                 bump(c, &key, |n| {
                     n.telemetry_offsets_resealed += resealed;
+                    n.hash_mismatches += new_flags;
                     n.runs_reexported += exported;
                 })
             })
             .await?;
         Ok(true)
     }
-    async fn delete_base(&self, op: &OpRow) -> Result<()> {
-        let key = op.key.clone();
-        let principal = self.principal.clone();
+    /// Bounded base deletion. Returns `true` when newly discovered linked runs require
+    /// another sweep before anything is deleted.
+    async fn delete_base(&self, op: &OpRow) -> Result<bool> {
         let participants = self.participants.clone();
-        let observer = self.observer.clone();
-        let now = (self.clock)();
-        self.main
+        let key = op.key.clone();
+        // First command: re-check provenance and fences, then participant rows, vectors,
+        // edges and blob references.
+        let restart = self
+            .main
             .write(Priority::Normal, move |c| {
-                with_secure_delete(c, || {
+                with_secure_delete(c, true, || {
                     let Some(op) = load_op(c, &key)? else {
                         return Err(StoreError::Invalid("purge disappeared"));
                     };
-                    if op.phase != Phase::TelemetrySwept {
-                        return Ok(());
+                    if op.phase != Phase::Swept {
+                        return Ok(Ok(false));
                     }
-                    let scopes = op.scopes_json();
-                    let filter = Filter {
-                        scopes_json: &scopes,
-                        principal: &principal,
-                    };
-                    // Copies written after planning are caught in the same transaction.
-                    let matcher = Matcher::new(&load_needles(c, &key)?)?;
-                    if !matcher.is_empty() {
-                        for table in sweep_tables(c, true)? {
-                            let mut after = op.watermarks.get(&table.name).copied().unwrap_or(0);
-                            loop {
-                                let (hits, last) = scan_page(c, &table, &filter, after, PAGE, &matcher)?;
-                                let Some(last) = last else { break };
-                                after = last;
-                                redact_main(c, &key, &table, &filter, &hits, &matcher)?;
-                            }
-                        }
+                    let snapshot = op.snapshot();
+                    let mut runs: BTreeSet<String> = op.runs.iter().cloned().collect();
+                    let fresh = linked_runs(c, &snapshot)?;
+                    if let Some(run) = active_run(c, &fresh)? {
+                        return Ok(Err(run));
                     }
-                    let snapshot = op.snapshot(&principal);
+                    if !fresh.is_subset(&runs) {
+                        runs.extend(fresh);
+                        merge_json_list(c, &key, "runs", runs.iter().cloned())?;
+                        bump(c, &key, |n| n.runs_linked = runs.len() as u64)?;
+                        return Ok(Ok(true));
+                    }
                     let mut participant_rows = 0;
-                    let mut touched = Vec::new();
                     for participant in &participants {
-                        participant_rows += participant.purge(c, &snapshot, &mut touched)?;
+                        participant_rows += participant.purge(c, &snapshot)?;
                     }
-                    let ids: BTreeSet<String> = op.members.iter().map(|m| m.id.clone()).collect();
-                    let vectors = delete_vectors(c, &ids, &op.scopes)?;
-                    let id_json = id_list(ids.iter().cloned());
+                    let objects: BTreeSet<(String, String)> = op.objects.iter().cloned().collect();
+                    let vectors = delete_vectors(c, &objects)?;
+                    let ids = op.members_json();
                     let edges = if table_exists(c, "edges")? {
                         guarded(c, "edges", "DELETE", || {
                             Ok(c.execute(
-                                "DELETE FROM edges WHERE (source_id IN (SELECT value FROM json_each(?1)) OR destination_id IN (SELECT value FROM json_each(?1))) AND (scope_id IS NULL OR scope_id IN (SELECT value FROM json_each(?2)))",
-                                [&id_json, &scopes],
+                                "DELETE FROM edges WHERE source_id IN (SELECT value FROM json_each(?1)) OR destination_id IN (SELECT value FROM json_each(?1))",
+                                [&ids],
                             )? as u64)
                         })?
                     } else {
                         0
                     };
-                    let mut hashes: BTreeSet<String> = op.blob_hashes.iter().cloned().collect();
-                    hashes.extend(collect_blob_hashes(c, op.kind, &op.subject_id, &op.members)?);
+                    let hashes = collect_blob_hashes(c, op.kind, &op.subject_id, &op.members)?;
+                    merge_json_list(c, &key, "blob_hashes", hashes)?;
                     c.execute(
                         "DELETE FROM blob_refs WHERE owner_id IN (SELECT value FROM json_each(?1))",
-                        [&id_json],
+                        [&ids],
                     )?;
+                    bump(c, &key, |n| {
+                        n.participant_rows_deleted += participant_rows;
+                        n.vectors_deleted += vectors;
+                        n.edges_deleted += edges;
+                    })?;
+                    Ok(Ok(false))
+                })
+            })
+            .await?;
+        match restart {
+            Err(run) => return Err(Error::ActiveRun(run)),
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+        }
+        // Member rows (messages or chunks) in bounded batches.
+        if let Some((table, kind)) = member_table(op.kind) {
+            loop {
+                let (key, ids) = (
+                    op.key.clone(),
+                    op.members_of_json(kind),
+                );
+                let deleted = self
+                    .main
+                    .write(Priority::Normal, move |c| {
+                        with_secure_delete(c, true, || {
+                            let batch: Vec<Value> = {
+                                let mut statement = c.prepare(&format!(
+                                    "SELECT id FROM {table} WHERE id IN (SELECT value FROM json_each(?1)) LIMIT {BATCH}"
+                                ))?;
+                                statement
+                                    .query_map([&ids], |r| r.get::<_, String>(0))?
+                                    .collect::<rusqlite::Result<Vec<_>>>()?
+                                    .into_iter()
+                                    .map(Value::String)
+                                    .collect()
+                            };
+                            if batch.is_empty() {
+                                return Ok(0);
+                            }
+                            let keys = ForeignKeys::load(c)?;
+                            let mut stats = DeleteStats::default();
+                            remove_rows(c, &keys, table, "id", &batch, 0, &mut stats)?;
+                            bump(c, &key, |n| {
+                                n.rows_deleted += stats.deleted;
+                                n.rows_nulled += stats.nulled;
+                                n.base_batches += 1;
+                            })?;
+                            Ok(batch.len())
+                        })
+                    })
+                    .await?;
+                if deleted == 0 {
+                    break;
+                }
+                self.notify(PurgeBoundary::BaseDeleteBatch);
+            }
+        }
+        // Final command: the subject row itself, then the phase change.
+        let (key, observer, subject) = (op.key.clone(), self.observer.clone(), op.subject_id.clone());
+        let kind = op.kind;
+        self.main
+            .write(Priority::Normal, move |c| {
+                with_secure_delete(c, true, || {
                     let keys = ForeignKeys::load(c)?;
                     let mut stats = DeleteStats::default();
-                    let of = |kind: MemberKind| -> Vec<Value> {
-                        op.members
-                            .iter()
-                            .filter(|m| m.kind == kind)
-                            .map(|m| Value::String(m.id.clone()))
-                            .collect()
-                    };
-                    let subject = vec![Value::String(op.subject_id.clone())];
-                    match op.kind {
-                        SubjectKind::Conversation => {
-                            remove_rows(c, &keys, "messages", "id", &of(MemberKind::Message), 0, &mut stats)?;
-                            remove_rows(c, &keys, "conversations", "id", &subject, 0, &mut stats)?;
-                        }
-                        SubjectKind::Document => {
-                            remove_rows(c, &keys, "doc_chunks", "id", &of(MemberKind::Chunk), 0, &mut stats)?;
-                            remove_rows(c, &keys, "documents", "id", &subject, 0, &mut stats)?;
-                        }
-                        SubjectKind::Memory => {
-                            remove_rows(c, &keys, "memories", "id", &subject, 0, &mut stats)?;
-                        }
-                    }
-                    let mut modified: BTreeSet<String> = stats
-                        .tables
-                        .iter()
-                        .chain(touched.iter())
-                        .map(|t| t.to_ascii_lowercase())
-                        .collect();
-                    {
-                        let mut statement = c.prepare("SELECT table_name FROM retention_purge_tables WHERE operation_key=?1")?;
-                        for table in statement.query_map([&key], |r| r.get::<_, String>(0))? {
-                            modified.insert(table?);
-                        }
-                    }
-                    let fts = rebuild_fts(c, &modified)?;
-                    c.execute(
-                        "INSERT OR IGNORE INTO retention_tombstones(id,principal_id,scope_id,subject_kind,subject_id,reason,purged_at) SELECT tombstone_id,principal_id,scope_id,subject_kind,subject_id,reason,?2 FROM retention_purges WHERE operation_key=?1",
-                        rusqlite::params![key, now],
+                    remove_rows(
+                        c,
+                        &keys,
+                        subject_table(kind),
+                        "id",
+                        &[Value::String(subject)],
+                        0,
+                        &mut stats,
                     )?;
-                    c.execute("DELETE FROM retention_purge_needles WHERE operation_key=?1", [&key])?;
                     c.execute(
-                        "UPDATE retention_purges SET phase='base_deleted',blob_hashes=?2 WHERE operation_key=?1",
-                        rusqlite::params![key, id_list(hashes)],
+                        "UPDATE retention_purges SET phase='base_deleted',last_error=NULL WHERE operation_key=?1 AND phase='swept'",
+                        [&key],
                     )?;
                     bump(c, &key, |n| {
                         n.rows_deleted += stats.deleted;
                         n.rows_nulled += stats.nulled;
-                        n.participant_rows_deleted += participant_rows;
-                        n.vectors_deleted += vectors;
-                        n.edges_deleted += edges;
-                        n.fts_rebuilt += fts;
+                        n.base_batches += 1;
                     })?;
                     if let Some(observer) = &observer {
                         observer(PurgeBoundary::BaseDeleteUncommitted);
                     }
+                    Ok(())
+                })
+            })
+            .await?;
+        Ok(false)
+    }
+    async fn finalize(&self, op: &OpRow) -> Result<()> {
+        let key = op.key.clone();
+        let now = (self.clock)();
+        self.main
+            .write(Priority::Normal, move |c| {
+                with_secure_delete(c, false, || {
+                    c.execute(
+                        "INSERT OR IGNORE INTO retention_tombstones(id,principal_id,scope_id,subject_kind,subject_id,reason,purged_at) SELECT tombstone_id,principal_id,scope_id,subject_kind,subject_id,reason,?2 FROM retention_purges WHERE operation_key=?1",
+                        rusqlite::params![key, now],
+                    )?;
+                    c.execute(
+                        "DELETE FROM retention_purge_needles WHERE operation_key=?1",
+                        [&key],
+                    )?;
+                    c.execute(
+                        "UPDATE retention_purge_events SET old_offset_hash=NULL,new_offset_hash=NULL WHERE operation_key=?1",
+                        [&key],
+                    )?;
+                    c.execute(
+                        "UPDATE retention_purges SET phase='finalized',last_error=NULL WHERE operation_key=?1 AND phase='telemetry_swept'",
+                        [&key],
+                    )?;
                     Ok(())
                 })
             })
@@ -1643,7 +2079,7 @@ impl PurgeService {
         self.main
             .write(Priority::Normal, move |c| {
                 let changed = c.execute(
-                    "UPDATE retention_purges SET phase='blobs_released',blob_hashes='[]' WHERE operation_key=?1 AND phase='base_deleted'",
+                    "UPDATE retention_purges SET phase='blobs_released',blob_hashes='[]',last_error=NULL WHERE operation_key=?1 AND phase='finalized'",
                     [&key],
                 )?;
                 if changed == 1 {
@@ -1675,12 +2111,22 @@ impl PurgeService {
         self.main
             .write(Priority::Normal, move |c| {
                 c.execute(
-                    "UPDATE retention_purges SET phase='completed',completed_at=?2,hygiene=?3,notice_code=?4,watermarks='{}' WHERE operation_key=?1 AND phase='blobs_released'",
+                    "UPDATE retention_purges SET phase='completed',completed_at=?2,hygiene=?3,notice_code=?4,last_error=NULL WHERE operation_key=?1 AND phase='blobs_released'",
                     rusqlite::params![key, now, text, BACKUP_NOTICE_CODE],
                 )?;
                 Ok(())
             })
             .await?;
         Ok(())
+    }
+}
+impl OpRow {
+    fn members_of_json(&self, kind: MemberKind) -> String {
+        json_list(
+            self.members
+                .iter()
+                .filter(|m| m.kind == kind)
+                .map(|m| m.id.clone()),
+        )
     }
 }

@@ -210,7 +210,7 @@ impl RetentionSweeper {
         loop {
             let (count, touched) = tdb
                 .write(Priority::Background, move |c| {
-                    with_secure_delete(c, || {
+                    with_secure_delete(c, false, || {
                         if !table_exists(c, "events")? {
                             return Ok((0u64, Vec::new()));
                         }
@@ -231,6 +231,13 @@ impl RetentionSweeper {
                         )
                         .to_string();
                         if table_exists(c, "telemetry_offsets")? {
+                            // Watermark first, so reconciliation never re-ingests these.
+                            if table_exists(c, "telemetry_expired")? {
+                                c.execute(
+                                    "INSERT INTO telemetry_expired(run_id,source,through_sequence,expired_at) SELECT run_id,source,max(sequence),?2 FROM telemetry_offsets WHERE event_id IN (SELECT value FROM json_each(?1)) GROUP BY run_id,source ON CONFLICT(run_id,source) DO UPDATE SET through_sequence=max(through_sequence,excluded.through_sequence),expired_at=excluded.expired_at",
+                                    rusqlite::params![ids, now],
+                                )?;
+                            }
                             guarded(c, "telemetry_offsets", "DELETE", || {
                                 Ok(c.execute(
                                     "DELETE FROM telemetry_offsets WHERE event_id IN (SELECT value FROM json_each(?1))",
@@ -264,7 +271,7 @@ impl RetentionSweeper {
             loop {
                 let deleted = tdb
                     .write(Priority::Background, move |c| {
-                        with_secure_delete(c, || {
+                        with_secure_delete(c, false, || {
                             if !table_exists(c, table)? {
                                 return Ok(0u64);
                             }

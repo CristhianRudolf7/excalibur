@@ -38,6 +38,24 @@ pub struct Journal {
 }
 type RunLocks = Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>;
 static LOCKS: OnceLock<RunLocks> = OnceLock::new();
+/// Record, inside the caller's transaction, that a run's payload blob `old` was replaced
+/// by `new` (purge redaction). Earlier redirects to `old` are re-pointed, keeping one hop.
+pub fn record_payload_redirect_in(
+    c: &rusqlite::Connection,
+    run: &str,
+    old: &str,
+    new: &str,
+) -> excalibur_store::Result<()> {
+    c.execute(
+        "UPDATE journal_payload_redirects SET new_hash=?3 WHERE run_id=?1 AND new_hash=?2",
+        rusqlite::params![run, old, new],
+    )?;
+    c.execute(
+        "INSERT INTO journal_payload_redirects(run_id,old_hash,new_hash) VALUES(?1,?2,?3) ON CONFLICT(run_id,old_hash) DO UPDATE SET new_hash=excluded.new_hash",
+        rusqlite::params![run, old, new],
+    )?;
+    Ok(())
+}
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -64,6 +82,30 @@ impl Journal {
                 Some(_) => {}
                 None => {
                     c.execute("INSERT INTO durable_schema VALUES(1,?1)", [checksum])?;
+                }
+            }
+            let redirects = include_str!("redirects.sql");
+            let redirects_checksum = digest(redirects.as_bytes());
+            let known: Option<String> = c
+                .query_row(
+                    "SELECT checksum FROM durable_schema WHERE version=2",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match known {
+                Some(value) if value != redirects_checksum => {
+                    return Err(StoreError::Configuration(
+                        "durable schema checksum mismatch".into(),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    c.execute_batch(redirects)?;
+                    c.execute(
+                        "INSERT INTO durable_schema VALUES(2,?1)",
+                        [redirects_checksum],
+                    )?;
                 }
             }
             Ok(())

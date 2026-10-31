@@ -392,6 +392,8 @@ pub struct MemoryStore {
     pub(crate) embeddings: EmbeddingRegistry,
     pub(crate) admission_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) library: LibraryServices,
+    /// Telemetry covered by user-requested purges; set by the host once it is open.
+    pub(crate) purge_telemetry: Arc<std::sync::RwLock<Option<excalibur_retention::Telemetry>>>,
 }
 impl std::fmt::Debug for MemoryStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -448,6 +450,7 @@ impl MemoryStore {
             services: MemoryServices::default(),
             admission_lock: Arc::new(tokio::sync::Mutex::new(())),
             library: LibraryServices::default(),
+            purge_telemetry: Arc::default(),
         })
     }
     pub fn with_config(mut self, config: MemoryConfig) -> Self {

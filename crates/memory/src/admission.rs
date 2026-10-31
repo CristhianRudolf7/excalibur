@@ -620,21 +620,22 @@ impl MemoryStore {
 
     /// User-requested deletion: the only operation that destroys memory content.
     /// Runs the shared durable purge (tombstone, derived-copy sweep, FTS/vector/blob
-    /// hygiene) keyed by the memory ID. Telemetry is swept only by hosts that open the
-    /// purge service with their telemetry handle.
+    /// hygiene) keyed by the memory ID. A purge interrupted after the memory row was
+    /// deleted is resumed by the same call. Telemetry is covered once the host has
+    /// called `set_purge_telemetry`.
     pub async fn purge_memory(&self, grant: &MemoryGrant, id: &str, now: i64) -> Result<()> {
-        let memory = self
-            .memory(grant, id)
-            .await?
-            .ok_or_else(|| Error::NotFound(id.into()))?;
-        let service =
-            excalibur_retention::PurgeService::open(&grant.principal, self.db.clone(), None)
-                .await
-                .map_err(purge_error)?
-                .with_participant(std::sync::Arc::new(crate::MemoryPurgeParticipant));
+        let key = format!("memory:{id}");
+        let service = self.purge_service(&grant.principal).await?;
+        let Some(memory) = self.memory(grant, id).await? else {
+            let scopes: Vec<String> = grant.scopes.iter().cloned().collect();
+            return match service.resume(&key, &scopes).await.map_err(purge_error)? {
+                Some(_) => Ok(()),
+                None => Err(Error::NotFound(id.into())),
+            };
+        };
         service
             .purge(excalibur_retention::PurgeRequest {
-                operation_key: format!("memory:{id}"),
+                operation_key: key,
                 scope: memory.scope.clone(),
                 kind: excalibur_retention::SubjectKind::Memory,
                 subject_id: id.to_string(),
@@ -644,6 +645,34 @@ impl MemoryStore {
             .await
             .map_err(purge_error)?;
         Ok(())
+    }
+    /// Telemetry database swept by later purges (the host's telemetry handle).
+    pub fn set_purge_telemetry(&self, telemetry: excalibur_retention::Telemetry) {
+        *self.purge_telemetry.write().unwrap() = Some(telemetry);
+    }
+    /// The shared purge service for this store, with the memory participant registered.
+    pub async fn purge_service(
+        &self,
+        principal: &str,
+    ) -> Result<excalibur_retention::PurgeService> {
+        let telemetry = self.purge_telemetry.read().unwrap().clone();
+        Ok(
+            excalibur_retention::PurgeService::open(principal, self.db.clone(), telemetry)
+                .await
+                .map_err(purge_error)?
+                .with_participant(std::sync::Arc::new(crate::MemoryPurgeParticipant)),
+        )
+    }
+    /// Host startup: finish purges interrupted by a crash. Failures are per purge.
+    pub async fn resume_pending_purges(
+        &self,
+        principal: &str,
+    ) -> Result<Vec<excalibur_retention::PendingOutcome>> {
+        self.purge_service(principal)
+            .await?
+            .resume_pending()
+            .await
+            .map_err(purge_error)
     }
 }
 fn purge_error(error: excalibur_retention::Error) -> Error {

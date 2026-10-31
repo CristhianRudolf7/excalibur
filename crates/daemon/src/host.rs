@@ -392,6 +392,16 @@ impl DaemonHost {
             .await
             .map_err(|e| e.to_string())?,
         );
+        if let Some(memory) = &memory {
+            // User-requested purges sweep this telemetry, and purges interrupted by a
+            // crash finish at startup. A failing purge stays recorded and never blocks boot.
+            memory.store.set_purge_telemetry((*telemetry).clone());
+            memory
+                .store
+                .resume_pending_purges(&memory.options.principal)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         let task_gate = crate::task_gate::WorkerTaskGate {
             store: tasks.clone(),
             runtime: planning.clone(),
