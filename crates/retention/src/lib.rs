@@ -394,7 +394,7 @@ impl OpRow {
         for member in &self.members {
             scopes.insert(member.scope.clone());
         }
-        json_list(scopes.into_iter())
+        json_list(scopes)
     }
 }
 fn store_json(error: serde_json::Error) -> StoreError {
