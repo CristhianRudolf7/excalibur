@@ -29,3 +29,7 @@ Las herramientas de proyecto y el aislamiento de edición se implementan en bibl
 La memoria por ámbitos, la recuperación, la consolidación y la biblioteca de documentos son una biblioteca compartida aún no conectada al maestro; consulta [Memoria y documentos](../development/memory.es.md).
 
 El daemon, la puerta autenticada, los turnos conversacionales y los árboles de agentes: [contrato](../development/daemon.es.md).
+
+## Alcance de plataforma
+
+El alcance actual de implementación y verificación es Linux. Los perfiles de Windows, macOS y móvil conservan sus contratos (incluidas capacidades, flujos y MCP); soporte previsto para una fase posterior.

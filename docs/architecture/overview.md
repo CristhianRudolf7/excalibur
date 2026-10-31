@@ -29,3 +29,7 @@ Project-domain tools and editing isolation are implemented in the shared librari
 Scoped memory, retrieval, consolidation and the document library are a shared library not yet connected to the master; see [Memory and documents](../development/memory.md).
 
 Daemon hosting, authenticated client transport, conversational turns and agent trees: [contract](../development/daemon.md).
+
+## Platform scope
+
+Current implementation and verification scope is Linux. Windows, macOS and mobile profiles keep their contracts (including capabilities, workflows and MCP); support planned for a later phase.

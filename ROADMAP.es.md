@@ -10,3 +10,7 @@ Los siguientes puntos son planes, no funcionalidades terminadas ni compromisos d
 4. Explorar una tienda de herramientas y flujos de automatización, incluidos catálogo, instalación y publicación.
 
 El alcance y el orden pueden cambiar conforme evolucione el proyecto.
+
+## Alcance de plataforma
+
+El alcance actual de implementación y verificación es Linux. Los perfiles de Windows, macOS y móvil conservan sus contratos (incluidas capacidades, flujos y MCP); soporte previsto para una fase posterior.

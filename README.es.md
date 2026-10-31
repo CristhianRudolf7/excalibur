@@ -14,6 +14,10 @@ Para preparar las herramientas y consultar las comprobaciones disponibles, revis
 
 Consulta [Seguridad obligatoria](docs/development/security.es.md) para los contratos de autorización, secretos y sandbox del backend.
 
+## Alcance de plataforma
+
+El alcance actual de implementación y verificación es Linux. Los perfiles de Windows, macOS y móvil conservan sus contratos (incluidas capacidades, flujos y MCP); soporte previsto para una fase posterior.
+
 ## Organización prevista
 
 - `apps/`: aplicaciones de línea de comandos y web.

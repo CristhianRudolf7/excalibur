@@ -14,6 +14,10 @@ For toolchain setup and available checks, see the [development environment](docs
 
 See [Mandatory security](docs/development/security.md) for backend authorization, secret handling and sandbox contracts.
 
+## Platform scope
+
+Current implementation and verification scope is Linux. Windows, macOS and mobile profiles keep their contracts (including capabilities, workflows and MCP); support planned for a later phase.
+
 ## Planned organization
 
 - `apps/`: CLI and web applications.
