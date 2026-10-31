@@ -149,7 +149,7 @@ pub struct Rejection {
     pub sha256: String,
     pub detected: Kind,
     /// Present when a quarantine is configured and the file was recorded.
-    pub quarantine: Option<QuarantineRecord>,
+    pub quarantine: Option<Box<QuarantineRecord>>,
     /// Present when a quarantine is configured but recording failed.
     pub quarantine_error: Option<String>,
 }
@@ -262,7 +262,7 @@ impl ContentGuard {
                         declared_type,
                         detected_type: detected.as_str(),
                     }) {
-                        Ok(record) => rejection.quarantine = Some(record),
+                        Ok(record) => rejection.quarantine = Some(Box::new(record)),
                         Err(e) => rejection.quarantine_error = Some(e.to_string()),
                     }
                 }
