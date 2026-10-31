@@ -428,6 +428,8 @@ fn id_list(ids: impl IntoIterator<Item = String>) -> String {
     Value::Array(ids.into_iter().map(Value::String).collect()).to_string()
 }
 
+/// run_id, sequence, kind, idempotency key and inline payload of one journal row.
+type JournalRow = (Option<String>, u64, String, Option<String>, Option<String>);
 /// Record a redacted journal event and re-seal hashes that other crates keep over it.
 fn journal_follow(
     c: &Connection,
@@ -435,7 +437,7 @@ fn journal_follow(
     rowid: i64,
     payload: Option<Value>,
 ) -> excalibur_store::Result<()> {
-    let row: Option<(Option<String>, u64, String, Option<String>, Option<String>)> = c
+    let row: Option<JournalRow> = c
         .query_row(
             "SELECT run_id,sequence,kind,idempotency_key,payload FROM journal WHERE rowid=?1",
             [rowid],
