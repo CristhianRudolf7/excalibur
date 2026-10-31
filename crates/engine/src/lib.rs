@@ -25,6 +25,10 @@ use std::{
     sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
+/// Pause reason owned by the host stall watchdog (17.6).
+pub const WATCHDOG_PAUSE_REASON: &str = "watchdog_stalled";
+/// Block reason when a stalled run left an unresolved non-pure intention.
+pub const WATCHDOG_BLOCK_REASON: &str = "watchdog: unresolved effect requires reconciliation";
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("durable journal: {0}")]
@@ -1195,6 +1199,85 @@ impl Engine {
         }
         Ok(applied)
     }
+    /// Host stall watchdog interruption of one exact running revision, without
+    /// waiting for a driver lock that a hung driver may hold. Any newer journal
+    /// fact, user control or terminal transition makes the CAS fail. With an
+    /// unresolved non-pure intention the run is blocked instead of paused, so
+    /// an uncertain effect can never be retried by an automatic resume.
+    /// Returns the applied stop state, or `None` when the revision was stale.
+    pub async fn interrupt_stalled_revision(
+        &self,
+        run: &str,
+        sequence: u64,
+    ) -> Result<Option<&'static str>> {
+        let state = self.load(run).await?;
+        if state.status != Status::Running || state.last_sequence != sequence {
+            return Ok(None);
+        }
+        // Evaluated on the exact revision that the CAS below requires.
+        let uncertain = state.calls.values().any(|call| {
+            call.result.is_none()
+                && call
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.effect != Effect::Pure)
+        });
+        let (next, reason, key) = if uncertain {
+            (
+                "blocked",
+                WATCHDOG_BLOCK_REASON,
+                format!("watchdog-blocked:{sequence}"),
+            )
+        } else {
+            (
+                "paused",
+                WATCHDOG_PAUSE_REASON,
+                format!("watchdog-stalled:{sequence}"),
+            )
+        };
+        let applied = self
+            .journal
+            .set_state_if_revision(run, &["running"], sequence, next, Some(reason.into()), &key)
+            .await?;
+        self.flush_events(run).await?;
+        if applied {
+            self.tools
+                .execution_state(run, next, Some(reason))
+                .await
+                .map_err(|_| Error::Invalid("tool lifecycle update failed"))?;
+        }
+        Ok(applied.then_some(next))
+    }
+    /// Resume only the watchdog-owned pause recorded for `sequence`, after the
+    /// host has reconciled it. The run boundary is acquired, so this must only be
+    /// called once the old driver task is gone. The key identifies the decision.
+    pub async fn resume_watchdog_pause(&self, run: &str, sequence: u64) -> Result<bool> {
+        let _guard = self.journal.lock_run(run).await;
+        let state = self.load(run).await?;
+        if state.status != Status::Paused || state.reason.as_deref() != Some(WATCHDOG_PAUSE_REASON)
+        {
+            return Ok(false);
+        }
+        let applied = self
+            .journal
+            .set_state_if_revision(
+                run,
+                &["paused"],
+                state.last_sequence,
+                "ready",
+                None,
+                &format!("watchdog-resume:{sequence}"),
+            )
+            .await?;
+        self.flush_events(run).await?;
+        if applied {
+            self.tools
+                .execution_state(run, "ready", None)
+                .await
+                .map_err(|_| Error::Invalid("tool lifecycle update failed"))?;
+        }
+        Ok(applied)
+    }
     /// Automatic resume is conditional on the exact pause ownership reason and
     /// journal revision after acquiring the run boundary. User control wins races.
     pub async fn resume_if_reason(&self, run: &str, expected_reason: &str) -> Result<bool> {
@@ -1625,6 +1708,9 @@ impl Engine {
                 .await?;
         }
         if initial.status == Status::Running {
+            // Liveness is advisory: a failed renewal only makes the watchdog
+            // conservative, it never fails the driver.
+            let _ = self.journal.heartbeat(run).await;
             if initial.confirmed_model_failure.is_some()
                 && initial.request.is_some()
                 && initial.response.is_none()
@@ -1688,6 +1774,11 @@ impl Engine {
                 .execution_state(run, s.status.label(), s.reason.as_deref())
                 .await
                 .map_err(|_| Error::Invalid("tool lifecycle update failed"))?;
+            // Each step renews the liveness heartbeat used by the host stall
+            // watchdog. It is a projection write, not a replayed journal fact.
+            // Liveness is advisory: a failed renewal only makes the watchdog
+            // conservative, it never fails the driver.
+            let _ = self.journal.heartbeat(run).await;
             self.tools
                 .begin_step(run, s.step)
                 .await

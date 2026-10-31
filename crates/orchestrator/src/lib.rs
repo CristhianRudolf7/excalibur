@@ -18,6 +18,10 @@ pub use notifications::{
 };
 pub use profiles::CustomProfile;
 pub mod recovery;
+mod run_watchdog;
+pub use run_watchdog::{
+    PROGRESS_KINDS as WATCHDOG_PROGRESS_KINDS, STALL_SECONDS, WatchdogIncident,
+};
 mod scheduling;
 mod tools;
 pub use gate::OrchestrationGate;
@@ -115,6 +119,16 @@ struct Inner {
     recovery: recovery::RecoveryLedger,
     runtime: Mutex<Option<tokio::runtime::Handle>>,
     tasks: Mutex<Option<excalibur_tasks::TaskStore>>,
+    /// Host autonomy supplied to startup recovery; absent means supervised.
+    host_autonomy: Mutex<Option<excalibur_security::Autonomy>>,
+    /// Serializes stall-watchdog passes of this process; durable CAS and keyed
+    /// rows make passes from different processes idempotent.
+    watchdog: AsyncMutex<()>,
+    /// Driver task observed at each watchdog detection; only it may be aborted.
+    watchdog_targets: Mutex<BTreeMap<String, tokio::task::Id>>,
+    /// Exact driver tasks this process aborted; only their cancellation is
+    /// not a run failure.
+    watchdog_aborted_tasks: Mutex<std::collections::HashSet<tokio::task::Id>>,
 }
 fn digest(v: &[u8]) -> String {
     format!("{:x}", Sha256::digest(v))
@@ -241,6 +255,7 @@ impl Orchestrator {
             Ok(())
         })
         .await?;
+        run_watchdog::initialize(&db).await?;
         let recovery = recovery::RecoveryLedger::open(db.clone()).await?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -256,6 +271,10 @@ impl Orchestrator {
                 recovery,
                 runtime: Mutex::new(None),
                 tasks: Mutex::new(None),
+                host_autonomy: Mutex::new(None),
+                watchdog: AsyncMutex::new(()),
+                watchdog_targets: Mutex::new(BTreeMap::new()),
+                watchdog_aborted_tasks: Mutex::new(Default::default()),
             }),
         })
     }
