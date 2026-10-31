@@ -7,9 +7,7 @@
 mod policy;
 mod sweep;
 
-pub use policy::{
-    ExpiryReport, HoldReason, RetentionClock, RetentionPolicy, RetentionSweeper,
-};
+pub use policy::{ExpiryReport, HoldReason, RetentionClock, RetentionPolicy, RetentionSweeper};
 pub use sweep::{MIN_SEGMENT_NEEDLE, MIN_TEXT_NEEDLE, REDACTION_MARK};
 
 use excalibur_journal::{Event, Journal};
@@ -371,7 +369,8 @@ fn load_op(c: &Connection, key: &str) -> excalibur_store::Result<Option<OpRow>> 
             },
         )
         .optional()?;
-    let Some((tombstone_id, scope, kind, subject_id, phase, json, hygiene, telemetry_covered)) = row
+    let Some((tombstone_id, scope, kind, subject_id, phase, json, hygiene, telemetry_covered)) =
+        row
     else {
         return Ok(None);
     };
@@ -483,17 +482,24 @@ fn redact_main(
     matcher: &Matcher,
 ) -> excalibur_store::Result<()> {
     let mut journal_rows = 0u64;
-    let changed = redact_rows(c, table, filter, rowids, matcher, &mut |c, name, rowid, cols| {
-        c.execute(
+    let changed = redact_rows(
+        c,
+        table,
+        filter,
+        rowids,
+        matcher,
+        &mut |c, name, rowid, cols| {
+            c.execute(
             "INSERT OR IGNORE INTO retention_purge_tables(operation_key,table_name) VALUES(?1,?2)",
-            [key, &name.to_ascii_lowercase()],
+            [key, name.to_ascii_lowercase().as_str()],
         )?;
-        if name.eq_ignore_ascii_case("journal") && cols.iter().any(|c| c == "payload") {
-            journal_follow(c, key, rowid, None)?;
-            journal_rows += 1;
-        }
-        Ok(())
-    })?;
+            if name.eq_ignore_ascii_case("journal") && cols.iter().any(|c| c == "payload") {
+                journal_follow(c, key, rowid, None)?;
+                journal_rows += 1;
+            }
+            Ok(())
+        },
+    )?;
     if changed > 0 {
         bump(c, key, |n| {
             n.rows_redacted += changed;
@@ -598,7 +604,11 @@ fn load_subject(
             )?;
             let rows = statement
                 .query_map([id, scope, principal], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for (message, message_scope, text) in rows {
@@ -659,11 +669,11 @@ fn load_subject(
                 id: id.into(),
                 scope: scope.into(),
             });
-            texts.push(c.query_row(
-                "SELECT statement FROM memories WHERE id=?1",
-                [id],
-                |r| r.get(0),
-            )?);
+            texts.push(
+                c.query_row("SELECT statement FROM memories WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })?,
+            );
         }
     }
     Ok(Some((
@@ -766,7 +776,9 @@ impl std::fmt::Debug for PurgeService {
 /// Install the checksummed retention schema on the principal database.
 pub(crate) async fn install(db: &Database) -> Result<()> {
     if db.kind() != DatabaseKind::Main {
-        return Err(Error::Invalid("retention state lives in the principal database"));
+        return Err(Error::Invalid(
+            "retention state lives in the principal database",
+        ));
     }
     let sql = include_str!("schema.sql");
     let checksum = sha256_hex(sql.as_bytes());
@@ -841,12 +853,15 @@ impl PurgeService {
     /// Purge one subject. Replaying the same key (or the same subject) returns the
     /// stored receipt; an interrupted operation resumes from its last committed phase.
     pub async fn purge(&self, request: PurgeRequest) -> Result<PurgeReceipt> {
-        let valid = |s: &str, max: usize| !s.trim().is_empty() && s.len() <= max && !s.contains('\0');
+        let valid =
+            |s: &str, max: usize| !s.trim().is_empty() && s.len() <= max && !s.contains('\0');
         if !valid(&request.operation_key, 256)
             || !valid(&request.scope, 4096)
             || !valid(&request.subject_id, 512)
         {
-            return Err(Error::Invalid("operation key, scope and subject are required"));
+            return Err(Error::Invalid(
+                "operation key, scope and subject are required",
+            ));
         }
         let _serial = PURGE_SERIAL.lock().await;
         let key = self.plan(&request).await?;
@@ -939,7 +954,10 @@ impl PurgeService {
             operation_key: op.key.clone(),
             tombstone,
             counts: op.counts.clone(),
-            hygiene: op.hygiene.clone().ok_or(Error::Invalid("hygiene missing"))?,
+            hygiene: op
+                .hygiene
+                .clone()
+                .ok_or(Error::Invalid("hygiene missing"))?,
             telemetry_covered: op.telemetry_covered,
             notice: BackupNotice::standard(),
         })
@@ -982,7 +1000,8 @@ impl PurgeService {
         let mut texts = Vec::new();
         let mut seen = BTreeSet::new();
         for (media, hash) in originals {
-            if !(media.starts_with("text/") || media == "application/json") || !seen.insert(hash.clone())
+            if !(media.starts_with("text/") || media == "application/json")
+                || !seen.insert(hash.clone())
             {
                 continue;
             }
@@ -1108,7 +1127,13 @@ impl PurgeService {
             Planned::Missing(name) => Err(Error::ParticipantMissing(name)),
         }
     }
-    async fn advance(&self, key: &str, from: Phase, to: Phase, telemetry: Option<bool>) -> Result<()> {
+    async fn advance(
+        &self,
+        key: &str,
+        from: Phase,
+        to: Phase,
+        telemetry: Option<bool>,
+    ) -> Result<()> {
         let key = key.to_string();
         self.main
             .write(Priority::Normal, move |c| {
@@ -1266,9 +1291,7 @@ impl PurgeService {
                     continue;
                 }
                 let text = String::from_utf8_lossy(&bytes).into_owned();
-                let redacted = matcher
-                    .redact_text(&text, REDACTION_MARK)
-                    .unwrap_or(text);
+                let redacted = matcher.redact_text(&text, REDACTION_MARK).unwrap_or(text);
                 let payload: Value = serde_json::from_str(&redacted)?;
                 let blobs = self.main.blobs();
                 let bytes = redacted.into_bytes();
@@ -1313,7 +1336,10 @@ impl PurgeService {
         // Pass 1 persists affected runs before any change, so re-export survives a crash.
         let mut runs: BTreeSet<String> = op.runs.iter().cloned().collect();
         if !matcher.is_empty() {
-            for table in tables.iter().filter(|t| t.columns.iter().any(|c| c == "run_id")) {
+            for table in tables
+                .iter()
+                .filter(|t| t.columns.iter().any(|c| c == "run_id"))
+            {
                 let mut after = 0;
                 loop {
                     let (t, m, s, p) = (
@@ -1332,7 +1358,10 @@ impl PurgeService {
                             let mut found = Vec::new();
                             for rowid in hits {
                                 let run: Option<String> = c.query_row(
-                                    &format!("SELECT run_id FROM {} WHERE rowid=?1", sweep::quote(&t.name)),
+                                    &format!(
+                                        "SELECT run_id FROM {} WHERE rowid=?1",
+                                        sweep::quote(&t.name)
+                                    ),
                                     [rowid],
                                     |r| r.get(0),
                                 )?;
@@ -1361,7 +1390,9 @@ impl PurgeService {
         runs.extend(journal_runs.iter().map(|(run, _)| run.clone()));
         let (key, list) = (op.key.clone(), runs.clone());
         self.main
-            .write(Priority::Normal, move |c| merge_json_list(c, &key, "runs", list))
+            .write(Priority::Normal, move |c| {
+                merge_json_list(c, &key, "runs", list)
+            })
             .await?;
         // Pass 2 rewrites matching telemetry rows.
         if !matcher.is_empty() {
@@ -1416,7 +1447,9 @@ impl PurgeService {
         }
         // Re-seal journal-sourced offsets so reconciling the redacted journal is idempotent.
         let offsets = tdb
-            .read(ReadLane::Interactive, |c| table_exists(c, "telemetry_offsets"))
+            .read(ReadLane::Interactive, |c| {
+                table_exists(c, "telemetry_offsets")
+            })
             .await?;
         let mut resealed = 0u64;
         if offsets {

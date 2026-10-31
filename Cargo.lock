@@ -1179,6 +1179,7 @@ dependencies = [
  "chrono-tz",
  "excalibur-models",
  "excalibur-providers",
+ "excalibur-retention",
  "excalibur-store",
  "excalibur-types",
  "excalibur-vault",
@@ -1248,6 +1249,26 @@ dependencies = [
  "tokio",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "excalibur-retention"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "excalibur-journal",
+ "excalibur-memory",
+ "excalibur-store",
+ "excalibur-telemetry",
+ "excalibur-vault",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "ulid",
+ "zstd",
 ]
 
 [[package]]

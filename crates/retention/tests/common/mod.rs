@@ -149,6 +149,7 @@ pub async fn plant(world: &World, scope: &str, tag: &str) -> Planted {
         .prepare(format!("attachment that repeats {CONVERSATION_MARK} verbatim").as_bytes())
         .unwrap();
     {
+        let tag = tag.to_string();
         let (conversation, m1, m2, other_conv, bystander, scope, text) = (
             conversation.clone(),
             m1.clone(),
@@ -296,7 +297,11 @@ pub async fn plant(world: &World, scope: &str, tag: &str) -> Planted {
         )
         .await
         .unwrap();
-    world.telemetry.reconcile(&world.journal, &run).await.unwrap();
+    world
+        .telemetry
+        .reconcile(&world.journal, &run)
+        .await
+        .unwrap();
     Planted {
         conversation,
         messages: vec![m1, m2],
@@ -314,7 +319,10 @@ pub fn sha256(bytes: &[u8]) -> String {
 /// Every place a marker was found, as `location: marker`.
 pub fn scan(root: &Path, markers: &[&str]) -> Vec<String> {
     let mut hits = Vec::new();
-    for db in [root.join("excalibur.db"), root.join("telemetry/telemetry.db")] {
+    for db in [
+        root.join("excalibur.db"),
+        root.join("telemetry/telemetry.db"),
+    ] {
         scan_database(&db, markers, &mut hits);
     }
     for dir in [root.join("blobs"), root.join("telemetry")] {
@@ -358,7 +366,10 @@ fn scan_database(path: &Path, markers: &[&str], hits: &mut Vec<String>) {
                     _ => continue,
                 };
                 if let Some(marker) = contains(&bytes, markers) {
-                    hits.push(format!("{}:{table}: {marker}", path.file_name().unwrap().to_string_lossy()));
+                    hits.push(format!(
+                        "{}:{table}: {marker}",
+                        path.file_name().unwrap().to_string_lossy()
+                    ));
                 }
             }
         }
@@ -414,8 +425,9 @@ pub fn probe_bytes() -> Vec<u8> {
     PROBE.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 pub fn probe_present(root: &Path) -> bool {
-    let c = Connection::open_with_flags(root.join("excalibur.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .unwrap();
+    let c =
+        Connection::open_with_flags(root.join("excalibur.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
     let needle = probe_bytes();
     let tables: Vec<String> = c
         .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name LIKE 'scoped_vectors_probe_%'")
@@ -443,8 +455,9 @@ pub fn probe_present(root: &Path) -> bool {
 /// FTS5 MATCH hits for every marker over every external-content index.
 pub fn fts_hits(root: &Path, markers: &[&str]) -> Vec<String> {
     excalibur_store::initialize_sqlite().unwrap();
-    let c = Connection::open_with_flags(root.join("excalibur.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .unwrap();
+    let c =
+        Connection::open_with_flags(root.join("excalibur.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
     let indexes: Vec<String> = c
         .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND sql LIKE 'CREATE VIRTUAL TABLE%fts5%'")
         .unwrap()

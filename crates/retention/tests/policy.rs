@@ -89,7 +89,10 @@ async fn expiry_classes_follow_the_injected_clock() {
     let quarter = sweeper.run_once().await.unwrap();
     assert_eq!(quarter.telemetry_events_expired as i64, detailed);
     assert_eq!(
-        (quarter.telemetry_traces_expired, quarter.telemetry_metrics_expired),
+        (
+            quarter.telemetry_traces_expired,
+            quarter.telemetry_metrics_expired
+        ),
         (1, 1)
     );
     assert_eq!(quarter.telemetry_runs_reexported, 1);
@@ -105,7 +108,13 @@ async fn expiry_classes_follow_the_injected_clock() {
         .await
         .unwrap();
     assert_eq!(left, (0, 0, 1), "daily aggregates are kept indefinitely");
-    let exported = std::fs::read(dir.path().join("telemetry/runs").join(&done).join("events.jsonl")).unwrap();
+    let exported = std::fs::read(
+        dir.path()
+            .join("telemetry/runs")
+            .join(&done)
+            .join("events.jsonl"),
+    )
+    .unwrap();
     assert!(exported.is_empty(), "re-export drops expired detail");
     let again = sweeper.run_once().await.unwrap();
     assert_eq!(again.telemetry_events_expired, 0);

@@ -627,10 +627,11 @@ impl MemoryStore {
             .memory(grant, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.into()))?;
-        let service = excalibur_retention::PurgeService::open(&grant.principal, self.db.clone(), None)
-            .await
-            .map_err(purge_error)?
-            .with_participant(std::sync::Arc::new(crate::MemoryPurgeParticipant));
+        let service =
+            excalibur_retention::PurgeService::open(&grant.principal, self.db.clone(), None)
+                .await
+                .map_err(purge_error)?
+                .with_participant(std::sync::Arc::new(crate::MemoryPurgeParticipant));
         service
             .purge(excalibur_retention::PurgeRequest {
                 operation_key: format!("memory:{id}"),

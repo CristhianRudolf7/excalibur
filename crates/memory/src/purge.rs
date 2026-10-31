@@ -2,9 +2,7 @@
 //! Covers extracted keys, embeddings of memories/messages/chunks/keys, admission and
 //! transition history, open questions and entity links.
 use crate::embeddings::EmbeddingRegistry;
-use excalibur_retention::{
-    Collection, MemberKind, PurgeParticipant, SubjectKind, SubjectSnapshot,
-};
+use excalibur_retention::{Collection, MemberKind, PurgeParticipant, SubjectKind, SubjectSnapshot};
 use excalibur_store::rusqlite::{self, Connection, OptionalExtension};
 use serde_json::Value;
 
@@ -39,7 +37,11 @@ impl PurgeParticipant for MemoryPurgeParticipant {
             let mut statement = c.prepare(sql)?;
             let rows = statement
                 .query_map([id], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for (key, scope, text) in rows {
@@ -114,7 +116,11 @@ impl PurgeParticipant for MemoryPurgeParticipant {
         if !exists(c, "memory_keys")? {
             return Ok(removed);
         }
-        let derived = list(subject.members_of(MemberKind::Derived).map(|m| m.id.as_str()));
+        let derived = list(
+            subject
+                .members_of(MemberKind::Derived)
+                .map(|m| m.id.as_str()),
+        );
         removed += c.execute(
             "DELETE FROM memory_keys WHERE id IN (SELECT value FROM json_each(?1))",
             [&derived],
@@ -122,7 +128,10 @@ impl PurgeParticipant for MemoryPurgeParticipant {
         match subject.kind {
             SubjectKind::Memory => {
                 let id = &subject.id;
-                c.execute("UPDATE memories SET superseded_by=NULL WHERE superseded_by=?1", [id])?;
+                c.execute(
+                    "UPDATE memories SET superseded_by=NULL WHERE superseded_by=?1",
+                    [id],
+                )?;
                 removed += c.execute("DELETE FROM memory_keys WHERE memory_id=?1", [id])? as u64;
                 removed += c.execute(
                     "DELETE FROM memory_admissions WHERE memory_id=?1 OR against_id=?1",
@@ -146,7 +155,11 @@ impl PurgeParticipant for MemoryPurgeParticipant {
                 }
             }
             SubjectKind::Conversation => {
-                let messages = list(subject.members_of(MemberKind::Message).map(|m| m.id.as_str()));
+                let messages = list(
+                    subject
+                        .members_of(MemberKind::Message)
+                        .map(|m| m.id.as_str()),
+                );
                 removed += c.execute(
                     "DELETE FROM memory_keys WHERE message_id IN (SELECT value FROM json_each(?1))",
                     [&messages],

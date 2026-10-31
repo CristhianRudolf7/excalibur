@@ -98,7 +98,12 @@ async fn sigkill_at_every_boundary_then_resume_converges() {
             if let Some(status) = child.try_wait().unwrap() {
                 let mut stderr = String::new();
                 use std::io::Read;
-                child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+                child
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut stderr)
+                    .unwrap();
                 panic!("worker exited before {boundary:?}: {status}\n{stderr}");
             }
             if start.elapsed() > Duration::from_secs(60) {
@@ -124,10 +129,17 @@ async fn sigkill_at_every_boundary_then_resume_converges() {
             receipts.push(service.purge(request).await.unwrap());
         }
         for (request, receipt) in planted.requests(SCOPE).into_iter().zip(&receipts) {
-            assert_eq!(&service.purge(request).await.unwrap(), receipt, "idempotent replay");
+            assert_eq!(
+                &service.purge(request).await.unwrap(),
+                receipt,
+                "idempotent replay"
+            );
         }
         let hits = scan(dir.path(), &MARKERS);
-        assert!(hits.is_empty(), "{boundary:?} (subject {subject}): {hits:#?}");
+        assert!(
+            hits.is_empty(),
+            "{boundary:?} (subject {subject}): {hits:#?}"
+        );
         assert!(fts_hits(dir.path(), &MARKERS).is_empty(), "{boundary:?}");
         assert!(!probe_present(dir.path()), "{boundary:?}");
         let state: (String, i64, i64, i64) = world
@@ -135,9 +147,17 @@ async fn sigkill_at_every_boundary_then_resume_converges() {
             .read(ReadLane::Interactive, |c| {
                 Ok((
                     c.query_row("PRAGMA quick_check", [], |r| r.get(0))?,
-                    c.query_row("SELECT count(*) FROM retention_tombstones", [], |r| r.get(0))?,
-                    c.query_row("SELECT count(*) FROM retention_purges WHERE phase='completed'", [], |r| r.get(0))?,
-                    c.query_row("SELECT count(*) FROM retention_purge_needles", [], |r| r.get::<_, i64>(0))?,
+                    c.query_row("SELECT count(*) FROM retention_tombstones", [], |r| {
+                        r.get(0)
+                    })?,
+                    c.query_row(
+                        "SELECT count(*) FROM retention_purges WHERE phase='completed'",
+                        [],
+                        |r| r.get(0),
+                    )?,
+                    c.query_row("SELECT count(*) FROM retention_purge_needles", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
                 ))
             })
             .await
@@ -154,9 +174,16 @@ async fn sigkill_at_every_boundary_then_resume_converges() {
             })
             .await
             .unwrap();
-        assert_eq!(trigger_count, 2, "append-only guards restored after {boundary:?}");
+        assert_eq!(
+            trigger_count, 2,
+            "append-only guards restored after {boundary:?}"
+        );
         world.journal.replay(&planted.run, 0).await.unwrap();
-        world.telemetry.reconcile(&world.journal, &planted.run).await.unwrap();
+        world
+            .telemetry
+            .reconcile(&world.journal, &planted.run)
+            .await
+            .unwrap();
         println!(
             "kill -9 at {boundary:?} (subject {subject}): resumed={} converged, markers=0, tombstones=3, quick_check=ok",
             resumed.len()

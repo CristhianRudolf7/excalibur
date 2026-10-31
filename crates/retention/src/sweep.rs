@@ -341,7 +341,9 @@ pub(crate) fn lift_guards(c: &Connection, table: &str, event: &str) -> Result<Ve
         "SELECT name,coalesce(sql,'') FROM sqlite_schema WHERE type='trigger' AND tbl_name=?1 COLLATE NOCASE",
     )?;
     let triggers = statement
-        .query_map([table], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .query_map([table], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     let wanted = format!("BEFORE{event}");
@@ -379,10 +381,7 @@ pub(crate) fn guarded<T>(
     Ok(value)
 }
 /// Zero freed cells and pages for the duration of a purge command.
-pub(crate) fn with_secure_delete<T>(
-    c: &Connection,
-    work: impl FnOnce() -> Result<T>,
-) -> Result<T> {
+pub(crate) fn with_secure_delete<T>(c: &Connection, work: impl FnOnce() -> Result<T>) -> Result<T> {
     let previous: i64 = c.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
     c.pragma_update(None, "secure_delete", 1)?;
     let result = work();
@@ -393,7 +392,8 @@ pub(crate) fn with_secure_delete<T>(
 }
 
 /// Callback for each redacted row: (table, rowid, changed column names).
-pub(crate) type AfterRedaction<'a> = dyn FnMut(&Connection, &str, i64, &[String]) -> Result<()> + 'a;
+pub(crate) type AfterRedaction<'a> =
+    dyn FnMut(&Connection, &str, i64, &[String]) -> Result<()> + 'a;
 
 /// Rewrite matching text in the given rows. Rows outside the scope filter are skipped.
 pub(crate) fn redact_rows(
@@ -408,10 +408,7 @@ pub(crate) fn redact_rows(
         return Ok(0);
     }
     let (cond, _) = conditions(table, 2);
-    let select = format!(
-        "SELECT * FROM {} WHERE rowid=?1{cond}",
-        quote(&table.name)
-    );
+    let select = format!("SELECT * FROM {} WHERE rowid=?1{cond}", quote(&table.name));
     guarded(c, &table.name, "UPDATE", || {
         let mut changed_rows = 0;
         for rowid in rowids {
@@ -472,7 +469,8 @@ pub(crate) fn redact_rows(
             let used = match apply(&updates) {
                 Ok(_) => updates,
                 Err(error)
-                    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) =>
+                    if error.sqlite_error_code()
+                        == Some(rusqlite::ErrorCode::ConstraintViolation) =>
                 {
                     // A redacted key may collide with another redacted key; keep rows distinct.
                     let unique = attempt(&format!("[purged:{}:{rowid}]", table.name));
@@ -557,7 +555,8 @@ impl ForeignKeys {
     }
 }
 fn primary_key(c: &Connection, table: &str) -> Result<String> {
-    let mut statement = c.prepare("SELECT name FROM pragma_table_info(?1) WHERE pk>0 ORDER BY pk")?;
+    let mut statement =
+        c.prepare("SELECT name FROM pragma_table_info(?1) WHERE pk>0 ORDER BY pk")?;
     let keys = statement
         .query_map([table], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -669,7 +668,11 @@ pub(crate) fn remove_rows(
 
 /// Delete vec0 rows whose object ID is a subject ID or `<prefix>:<subject id>`.
 /// sqlite-vec zeroes the deleted vector bytes in its chunk storage.
-pub(crate) fn delete_vectors(c: &Connection, ids: &BTreeSet<String>, scopes: &[String]) -> Result<u64> {
+pub(crate) fn delete_vectors(
+    c: &Connection,
+    ids: &BTreeSet<String>,
+    scopes: &[String],
+) -> Result<u64> {
     let mut removed = 0u64;
     for (name, sql) in table_names(c)? {
         if !sql.to_ascii_uppercase().contains("USING VEC0") {
@@ -773,12 +776,17 @@ mod tests {
         assert_eq!(value["state"], "running");
         assert_eq!(value["n"], 3);
         assert!(!out.contains("quartz-falcon"));
-        assert!(matcher.redact_text(r#"{"state":"running"}"#, REDACTION_MARK).is_none());
+        assert!(
+            matcher
+                .redact_text(r#"{"state":"running"}"#, REDACTION_MARK)
+                .is_none()
+        );
         assert!(derive_needles(&["short".into()]).is_empty());
     }
     #[test]
     fn escaped_copies_are_matched() {
-        let needles = derive_needles(&["line one with \"quotes\"\nline two is longer than needed".into()]);
+        let needles =
+            derive_needles(&["line one with \"quotes\"\nline two is longer than needed".into()]);
         let matcher = Matcher::new(&needles).unwrap();
         let encoded = serde_json::to_string(&needles[0]).unwrap();
         assert!(matcher.is_match(encoded.as_bytes()));
@@ -786,11 +794,15 @@ mod tests {
     #[test]
     fn content_option_is_parsed() {
         assert_eq!(
-            fts_content("CREATE VIRTUAL TABLE x USING fts5(text,content='messages',content_rowid='rowid')"),
+            fts_content(
+                "CREATE VIRTUAL TABLE x USING fts5(text,content='messages',content_rowid='rowid')"
+            ),
             Some("messages".into())
         );
         assert_eq!(
-            fts_content("CREATE VIRTUAL TABLE files_fts USING fts5(path,content,content='files',content_rowid='rowid',tokenize='trigram')"),
+            fts_content(
+                "CREATE VIRTUAL TABLE files_fts USING fts5(path,content,content='files',content_rowid='rowid',tokenize='trigram')"
+            ),
             Some("files".into())
         );
     }
