@@ -167,6 +167,9 @@ pub struct HostOptions {
     pub full_acknowledged: bool,
     /// Long-term memory and documents; `None` keeps the host without memory tools.
     pub memory: Option<crate::memory::MemoryOptions>,
+    /// Host-configured reminder delivery routes for the `reminders` tool and
+    /// `agenda.reminders` RPC. Empty means the conversation route only.
+    pub agenda_channels: Vec<String>,
 }
 impl HostOptions {
     pub fn project(root: PathBuf) -> Self {
@@ -196,6 +199,7 @@ impl HostOptions {
             autonomy: Autonomy::Autonomous,
             full_acknowledged: false,
             memory: None,
+            agenda_channels: Vec::new(),
         }
     }
 }
@@ -488,10 +492,20 @@ impl DaemonHost {
             )),
             None => fast_actions,
         };
+        // Reminders sit inside the skill adapter, so active skill restrictions
+        // apply to them like any other master fast tool.
+        let agenda_tools = Arc::new(crate::agenda_tools::AgendaTools::new(
+            orchestrator.clone(),
+            master_config.principal.clone(),
+            options.agenda_channels.clone(),
+        )?);
+        let agenda_actions: Arc<dyn excalibur_master::FastActions> = Arc::new(
+            crate::agenda_tools::AgendaFastActions::new(fast_actions, agenda_tools),
+        );
         let fast_actions: Arc<dyn excalibur_master::FastActions> = Arc::new(
             crate::master_skills::MasterSkillFastActions::new(
                 db.clone(),
-                fast_actions,
+                agenda_actions.clone(),
                 &skills,
                 master_config.principal.clone(),
                 redactor.clone(),
@@ -549,6 +563,7 @@ impl DaemonHost {
             .with_telemetry(telemetry.clone())
             .with_configuration(configuration)
             .with_task_actions(actions.clone())
+            .with_agenda(agenda_actions)
             .with_shutdown(shutdown.clone());
         let backend = match &memory {
             Some(memory) => backend.with_memory(excalibur_gateway::MemoryAccess {

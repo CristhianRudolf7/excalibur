@@ -1662,6 +1662,7 @@ pub fn fast_tool_name(name: &str) -> bool {
             | "config_read"
             | "config_update"
             | "schedule"
+            | "reminders"
     )
 }
 fn validate_scope(scope: &str) -> Result<()> {

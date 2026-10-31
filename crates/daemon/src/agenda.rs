@@ -1,7 +1,8 @@
 //! Generation-safe reminder admission. `Agenda` is the explicit host-tick API
 //! for one authenticated namespace; `AgendaRuntime` is the daemon-owned
 //! automatic task that records due fires and admits them through the same
-//! guarded host-notification path. No model tool or RPC is installed here.
+//! guarded host-notification path. The `reminders` master tool and the
+//! `agenda.reminders` RPC live in `agenda_tools` and call `Agenda`.
 use excalibur_orchestrator::{HostNotificationBinding, Orchestrator};
 use excalibur_scheduler::reminders::{self, Operation, Reminder, Reminders};
 use futures::future::BoxFuture;
@@ -17,6 +18,10 @@ pub enum Error {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
+/// Writer refusal of reminder text containing a secret literal.
+pub const SECRET_TEXT_REJECTED: &str = "secret literal in reminder text; use references";
+/// Writer refusal of reminder text the notice writer would never admit.
+pub const TEXT_REJECTED: &str = "reminder text rejected by the notice writer";
 /// A stable principal/scope/conversation namespace. Accepted source messages are
 /// delivery provenance per generation, never the namespace of each new request.
 #[derive(Clone)]
@@ -47,45 +52,113 @@ impl Agenda {
     }
     /// Host supplies an accepted message binding at open; model JSON has no such field.
     pub async fn apply(&self, key: String, operation: Operation) -> Result<Reminder, Error> {
-        // Reject text the notice writer would refuse forever (for example a
-        // secret literal) before it can become an undeliverable reminder.
-        // Rejection, not silent redaction, keeps the user's wording intact.
-        if let Operation::Create(definition) = &operation {
-            self.orchestrator
-                .validate_host_notice_text(&definition.text)?;
-        }
+        self.apply_at(key, operation, excalibur_store::unix_seconds())
+            .await
+    }
+    /// As `apply`, with the host clock used by `Operation::ChangeTimezone`.
+    pub async fn apply_at(
+        &self,
+        key: String,
+        operation: Operation,
+        now: i64,
+    ) -> Result<Reminder, Error> {
         let target = self
             .orchestrator
             .bind_host_notification(self.binding.clone())
             .await?;
+        let create = matches!(&operation, Operation::Create(_));
         // Preserve the creator's delivery source across snooze/completion generations.
-        let metadata = if matches!(&operation, Operation::Create(_)) {
+        let metadata = if create {
             Some(serde_json::to_value(&self.binding)?)
         } else {
             None
         };
+        let validate = self.validator(create);
         Ok(self
             .reminders
-            .apply_host_validated(
+            .apply_host_validated_at(
                 key,
                 operation,
                 metadata,
+                now,
                 move |c| target.validate(c),
-                |c, reminder, metadata| {
-                    if reminder.state == excalibur_scheduler::reminders::State::Active {
-                        let binding: HostNotificationBinding = serde_json::from_value(
-                            metadata.cloned().ok_or(excalibur_store::Error::Invalid(
-                                "reminder has no host delivery binding",
-                            ))?,
-                        )
-                        .map_err(|_| {
-                            excalibur_store::Error::Invalid("invalid reminder host metadata")
-                        })?;
-                        binding.validate_reminder(c, reminder.preferred_channel.as_deref())?;
-                    }
-                    Ok(())
-                },
+                validate,
             )
+            .await?)
+    }
+    /// Recompute every civil reminder of this namespace in `timezone` and
+    /// return the keyed report the user is informed with (21.1).
+    pub async fn change_timezone(
+        &self,
+        key: String,
+        timezone: String,
+        now: i64,
+    ) -> Result<reminders::TimezoneReport, Error> {
+        let target = self
+            .orchestrator
+            .bind_host_notification(self.binding.clone())
+            .await?;
+        Ok(self
+            .reminders
+            .change_timezone_all(
+                key,
+                timezone,
+                now,
+                move |c| target.validate(c),
+                self.validator(false),
+            )
+            .await?)
+    }
+    /// Writer-side validation, run after the keyed-replay check: an exact
+    /// retry returns its original snapshot even if the redactor learned a new
+    /// secret since (AR-10). A new create whose text the notice writer would
+    /// refuse forever (for example a secret literal) is rejected rather than
+    /// silently redacted, so the stored reminder keeps the user's wording.
+    fn validator(
+        &self,
+        create: bool,
+    ) -> impl Fn(
+        &excalibur_store::rusqlite::Connection,
+        &Reminder,
+        Option<&serde_json::Value>,
+    ) -> excalibur_store::Result<()>
+    + Clone
+    + Send
+    + 'static {
+        let orchestrator = self.orchestrator.clone();
+        move |c, reminder, metadata| {
+            if create {
+                orchestrator
+                    .validate_host_notice_text(&reminder.text)
+                    .map_err(|error| match error {
+                        excalibur_orchestrator::Error::Invalid(message)
+                            if message.starts_with("secret literal") =>
+                        {
+                            excalibur_store::Error::Invalid(SECRET_TEXT_REJECTED)
+                        }
+                        _ => excalibur_store::Error::Invalid(TEXT_REJECTED),
+                    })?;
+            }
+            if reminder.state == excalibur_scheduler::reminders::State::Active {
+                let binding: HostNotificationBinding = serde_json::from_value(
+                    metadata.cloned().ok_or(excalibur_store::Error::Invalid(
+                        "reminder has no host delivery binding",
+                    ))?,
+                )
+                .map_err(|_| excalibur_store::Error::Invalid("invalid reminder host metadata"))?;
+                binding.validate_reminder(c, reminder.preferred_channel.as_deref())?;
+            }
+            Ok(())
+        }
+    }
+    /// Live durable `next_fire_utc` of an active reminder generation.
+    pub async fn next_fire(&self, reminder: &Reminder) -> Result<Option<i64>, Error> {
+        if reminder.state != excalibur_scheduler::reminders::State::Active {
+            return Ok(None);
+        }
+        Ok(self
+            .reminders
+            .timer_next(&reminder.id, reminder.generation)
             .await?)
     }
     pub async fn list(

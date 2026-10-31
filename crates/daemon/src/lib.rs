@@ -31,6 +31,7 @@ pub use memory::{MemoryFastActions, MemoryHost, MemoryOptions};
 pub mod skills;
 
 pub mod agenda;
+pub mod agenda_tools;
 pub mod master_skills;
 
 pub mod watchdog;

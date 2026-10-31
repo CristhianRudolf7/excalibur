@@ -19,6 +19,7 @@ use std::{
 pub struct SharedBackend {
     master: Master,
     task_actions: Option<Arc<dyn excalibur_master::FastActions>>,
+    agenda: Option<Arc<dyn excalibur_master::FastActions>>,
     orchestrator: Orchestrator,
     project_roots: Vec<PathBuf>,
     project_registration_roots: Option<BTreeSet<PathBuf>>,
@@ -34,6 +35,7 @@ impl SharedBackend {
         Self {
             master,
             task_actions: None,
+            agenda: None,
             orchestrator,
             project_roots: Vec::new(),
             project_registration_roots: None,
@@ -103,6 +105,12 @@ impl SharedBackend {
     }
     pub fn with_task_actions(mut self, actions: Arc<dyn excalibur_master::FastActions>) -> Self {
         self.task_actions = Some(actions);
+        self
+    }
+    /// Host Agenda core behind `agenda.reminders`; it binds every call to an
+    /// accepted source message and never trusts client-named authority.
+    pub fn with_agenda(mut self, agenda: Arc<dyn excalibur_master::FastActions>) -> Self {
+        self.agenda = Some(agenda);
         self
     }
     pub fn with_security(mut self, security: excalibur_security::Security) -> Self {
@@ -496,6 +504,29 @@ impl SharedBackend {
                     )
                     .await
                     .map_err(|_| RpcError::invalid("task batch rejected"))
+            }
+            "agenda.reminders" => {
+                // The client acts for the user, but delivery authority still
+                // comes from an accepted message it sent in this conversation
+                // and scope; the shared core revalidates it in every writer.
+                let scope = text(&params, "scope")?;
+                self.validate_scope(scope).await?;
+                let agenda = self.agenda.as_ref().ok_or_else(RpcError::not_found)?;
+                let key = format!("client:{}", text(&params, "operation")?);
+                agenda
+                    .invoke_source_scoped(
+                        text(&params, "conversation")?,
+                        scope,
+                        text(&params, "source")?,
+                        "reminders",
+                        params
+                            .get("args")
+                            .cloned()
+                            .ok_or_else(|| RpcError::invalid("args required"))?,
+                        &key,
+                    )
+                    .await
+                    .map_err(RpcError::invalid)
             }
             "task.get" => {
                 let scope = text(&params, "scope")?;

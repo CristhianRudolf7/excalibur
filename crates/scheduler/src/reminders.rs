@@ -125,6 +125,14 @@ pub enum Operation {
         id: String,
         generation: i64,
     },
+    /// Re-express a civil (`LocalAt`/`Cron`) reminder in another IANA zone.
+    /// The same local wall time or cron expression is recomputed in the new
+    /// zone as a new generation; UTC timings are rejected.
+    ChangeTimezone {
+        id: String,
+        generation: i64,
+        timezone: String,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingReminder {
@@ -213,7 +221,35 @@ impl Reminders {
         + Send
         + 'static,
     ) -> Result<Reminder> {
-        if !bounded(&key, 256) {
+        self.apply_host_validated_at(
+            key,
+            operation,
+            metadata,
+            excalibur_store::unix_seconds(),
+            check,
+            validate,
+        )
+        .await
+    }
+    /// As `apply_host_validated`, with the host clock used by
+    /// `ChangeTimezone` (due-fire checks and the next cron occurrence). The
+    /// clock is not part of the keyed request, so a retry replays exactly.
+    pub async fn apply_host_validated_at(
+        &self,
+        key: String,
+        operation: Operation,
+        metadata: Option<serde_json::Value>,
+        now: i64,
+        check: impl FnOnce(&rusqlite::Connection) -> Result<()> + Send + 'static,
+        validate: impl FnOnce(
+            &rusqlite::Connection,
+            &Reminder,
+            Option<&serde_json::Value>,
+        ) -> Result<()>
+        + Send
+        + 'static,
+    ) -> Result<Reminder> {
+        if !bounded(&key, 256) || now < 0 {
             return Err(invalid());
         }
         let request = match &metadata {
@@ -229,7 +265,7 @@ impl Reminders {
             Operation::Snooze { timing, .. } => Some(timing.clone()),
             _ => None,
         };
-        let first = if let Some(timing) = timing {
+        let mut first = if let Some(timing) = timing {
             let at = self
                 .scheduler
                 .run_calendar(move || first_at(&timing))
@@ -241,12 +277,75 @@ impl Reminders {
         } else {
             None
         };
+        // A zone change is planned from the expected generation's record before
+        // the writer; the writer's generation CAS proves the plan is current.
+        // Plan failures that depend on stored state are raised only after the
+        // keyed-replay check, so an exact retry still returns its snapshot.
+        let mut rezone: Option<std::result::Result<Timing, &'static str>> = None;
+        if let Operation::ChangeTimezone {
+            id,
+            generation,
+            timezone,
+        } = &operation
+        {
+            if !bounded(id, 256) || !bounded(timezone, 256) {
+                return Err(invalid());
+            }
+            let zone = timezone.clone();
+            self.scheduler
+                .run_calendar(move || calendar::validate_timezone(&zone))
+                .await?;
+            let (scope, lookup) = (self.scheduler.scope.clone(), id.clone());
+            let record: Option<String> = self
+                .scheduler
+                .db
+                .read(ReadLane::Interactive, move |c| {
+                    Ok(c.query_row(
+                        "SELECT record FROM scheduler_reminders WHERE scope=?1 AND id=?2",
+                        rusqlite::params![scope, lookup],
+                        |r| r.get(0),
+                    )
+                    .optional()?)
+                })
+                .await?;
+            let current = record.map(|r| decode::<Reminder>(&r)).transpose()?;
+            if let Some(current) = current.filter(|r| r.generation == *generation) {
+                let planned = match current.timing {
+                    Timing::LocalAt { local, .. } => Ok(Timing::LocalAt {
+                        local,
+                        timezone: timezone.clone(),
+                    }),
+                    Timing::Cron {
+                        expression,
+                        not_before,
+                        ..
+                    } => Ok(Timing::Cron {
+                        expression,
+                        timezone: timezone.clone(),
+                        not_before: not_before.max(now.checked_add(1).ok_or_else(invalid)?),
+                    }),
+                    _ => Err("UTC reminders do not change with user time zone"),
+                };
+                if let Ok(timing) = &planned {
+                    let timing = timing.clone();
+                    let at = self
+                        .scheduler
+                        .run_calendar(move || first_at(&timing))
+                        .await?;
+                    if at < 0 {
+                        return Err(invalid());
+                    }
+                    first = Some(at);
+                }
+                rezone = Some(planned);
+            }
+        }
         let result = self.scheduler.db.write(Priority::Journal,move|c|{
             check(c)?;
             if let Some(previous)=replay(c,&scope,&key,&request)? {return Ok(previous);}
             let (id, expected)=match &operation {
                 Operation::Create(d)=>(d.id.clone(),None),
-                Operation::Snooze{id,generation,..}|Operation::Complete{id,generation}|Operation::Delete{id,generation}=>(id.clone(),Some(*generation)),
+                Operation::Snooze{id,generation,..}|Operation::Complete{id,generation}|Operation::Delete{id,generation}|Operation::ChangeTimezone{id,generation,..}=>(id.clone(),Some(*generation)),
             };
             if !bounded(&id,256) {return Err(invalid());}
             let current:Option<String>=c.query_row("SELECT record FROM scheduler_reminders WHERE scope=?1 AND id=?2",rusqlite::params![scope,id],|r|r.get(0)).optional()?;
@@ -258,6 +357,23 @@ impl Reminders {
                 (Some(expected),Some(record))=>{
                     let mut r:Reminder=decode(&record)?;
                     if r.generation!=expected || r.state!=State::Active {return Err(Error::Invalid("reminder generation conflict or inactive reminder"));}
+                    if matches!(operation,Operation::ChangeTimezone{..}) {
+                        match &rezone {
+                            None=>return Err(Error::Invalid("reminder generation conflict or inactive reminder")),
+                            Some(Err(message))=>return Err(Error::Invalid(message)),
+                            Some(Ok(_))=>{},
+                        }
+                        // Never drop a recorded or due fire: a zone change
+                        // cancels the old generation, so it waits for delivery.
+                        let next:Option<Option<i64>>=c.query_row("SELECT t.next_at FROM scheduler_timers t JOIN scheduler_reminder_timers m ON m.scope=t.scope AND m.timer_id=t.id WHERE m.scope=?1 AND m.reminder_id=?2 AND m.generation=?3",rusqlite::params![scope,id,expected],|r|r.get(0)).optional()?;
+                        match next.flatten() {
+                            None=>return Err(Error::Invalid("reminder has no future fire to recompute")),
+                            Some(at) if at<=now=>return Err(Error::Invalid("reminder has due or pending fires; retry after delivery")),
+                            Some(_)=>{},
+                        }
+                        let pending:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM scheduler_fires f JOIN scheduler_reminder_timers m ON m.scope=f.scope AND m.timer_id=f.timer_id WHERE f.scope=?1 AND m.reminder_id=?2 AND f.delivered=0 AND NOT EXISTS(SELECT 1 FROM scheduler_cancelled_fires x WHERE x.scope=f.scope AND x.fire_id=f.id))",rusqlite::params![scope,id],|r|r.get(0))?;
+                        if pending {return Err(Error::Invalid("reminder has due or pending fires; retry after delivery"));}
+                    }
                     r.generation=r.generation.checked_add(1).ok_or_else(invalid)?;
                     r
                 },
@@ -272,6 +388,9 @@ impl Reminders {
                 Operation::Snooze{timing,..}=>reminder.timing=timing,
                 Operation::Complete{..}=>reminder.state=State::Completed,
                 Operation::Delete{..}=>reminder.state=State::Deleted,
+                Operation::ChangeTimezone{..}=>{
+                    if let Some(Ok(timing))=rezone {reminder.timing=timing;}
+                },
                 Operation::Create(_)=>{},
             }
             let effective_metadata=match &metadata {
@@ -305,6 +424,139 @@ impl Reminders {
             signal_mutation(&self.scheduler.db);
         }
         result
+    }
+    /// Re-express every active civil reminder of this namespace in `timezone`
+    /// (21.1: local-time schedules are recomputed and the user is informed).
+    /// Each reminder changes through its own generation CAS with a key derived
+    /// from `key`, its id and generation; the batch report is a keyed receipt,
+    /// so an exact retry returns it unchanged. UTC timings are left alone, and a
+    /// reminder with a due or recorded-but-undelivered fire is skipped rather
+    /// than losing that fire. `check`/`validate` run in every writer.
+    pub async fn change_timezone_all<C, V>(
+        &self,
+        key: String,
+        timezone: String,
+        now: i64,
+        check: C,
+        validate: V,
+    ) -> Result<TimezoneReport>
+    where
+        C: Fn(&rusqlite::Connection) -> Result<()> + Clone + Send + 'static,
+        V: Fn(&rusqlite::Connection, &Reminder, Option<&serde_json::Value>) -> Result<()>
+            + Clone
+            + Send
+            + 'static,
+    {
+        if !bounded(&key, 256) || !bounded(&timezone, 256) || now < 0 {
+            return Err(invalid());
+        }
+        let request = encode(&("timezone-all-v1", &timezone))?;
+        let (scope, lookup, body, gate) = (
+            self.scheduler.scope.clone(),
+            key.clone(),
+            request.clone(),
+            check.clone(),
+        );
+        let previous: Option<TimezoneReport> = self
+            .scheduler
+            .db
+            .read(ReadLane::Interactive, move |c| {
+                gate(c)?;
+                replay(c, &scope, &lookup, &body)
+            })
+            .await?;
+        if let Some(previous) = previous {
+            return Ok(previous);
+        }
+        let zone = timezone.clone();
+        self.scheduler
+            .run_calendar(move || calendar::validate_timezone(&zone))
+            .await?;
+        let mut report = TimezoneReport {
+            timezone: timezone.clone(),
+            changed: Vec::new(),
+            skipped: Vec::new(),
+        };
+        let mut after = None;
+        loop {
+            let page = self.records_after(after.clone(), 256).await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.id.clone());
+            for reminder in page {
+                let old_timezone = match &reminder.timing {
+                    Timing::LocalAt { timezone, .. } | Timing::Cron { timezone, .. } => {
+                        timezone.clone()
+                    }
+                    _ => continue,
+                };
+                if reminder.state != State::Active || old_timezone == timezone {
+                    continue;
+                }
+                let sub = format!(
+                    "tz_{:x}",
+                    Sha256::digest(
+                        encode(&("timezone-v1", &key, &reminder.id, reminder.generation))?
+                            .as_bytes()
+                    )
+                );
+                let previous_next = self.timer_next(&reminder.id, reminder.generation).await?;
+                let outcome = self
+                    .apply_host_validated_at(
+                        sub,
+                        Operation::ChangeTimezone {
+                            id: reminder.id.clone(),
+                            generation: reminder.generation,
+                            timezone: timezone.clone(),
+                        },
+                        None,
+                        now,
+                        check.clone(),
+                        validate.clone(),
+                    )
+                    .await;
+                match outcome {
+                    Ok(changed) => report.changed.push(TimezoneMove {
+                        next: self.timer_next(&changed.id, changed.generation).await?,
+                        id: changed.id,
+                        generation: changed.generation,
+                        old_timezone,
+                        previous_next,
+                    }),
+                    Err(Error::Invalid(message)) => report.skipped.push(TimezoneSkip {
+                        id: reminder.id,
+                        reason: skip_reason(message).into(),
+                    }),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let (scope, body, response) = (self.scheduler.scope.clone(), request, encode(&report)?);
+        self.scheduler
+            .db
+            .write(Priority::Journal, move |c| {
+                check(c)?;
+                if let Some(previous) = replay(c, &scope, &key, &body)? {
+                    return Ok(previous);
+                }
+                c.execute("INSERT INTO scheduler_reminder_receipts(scope,operation_key,request,response) VALUES(?1,?2,?3,?4)", rusqlite::params![scope, key, body, response])?;
+                Ok(report)
+            })
+            .await
+    }
+    async fn records_after(&self, after: Option<String>, limit: u32) -> Result<Vec<Reminder>> {
+        let scope = self.scheduler.scope.clone();
+        self.scheduler.db.read(ReadLane::Interactive, move |c| {
+            let mut q = c.prepare("SELECT record FROM scheduler_reminders WHERE scope=?1 AND (?2 IS NULL OR id>?2) ORDER BY id LIMIT ?3")?;
+            let rows = q.query_map(rusqlite::params![scope, after, limit], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.iter().map(|s| decode(s)).collect()
+        }).await
+    }
+    /// Durable `next_fire_utc` of one reminder generation (None once spent).
+    pub async fn timer_next(&self, id: &str, generation: i64) -> Result<Option<i64>> {
+        let (scope, id) = (self.scheduler.scope.clone(), id.to_owned());
+        self.scheduler.db.read(ReadLane::Interactive, move |c| {
+            Ok(c.query_row("SELECT t.next_at FROM scheduler_timers t JOIN scheduler_reminder_timers m ON m.scope=t.scope AND m.timer_id=t.id WHERE m.scope=?1 AND m.reminder_id=?2 AND m.generation=?3", rusqlite::params![scope, id, generation], |r| r.get::<_, Option<i64>>(0)).optional()?.flatten())
+        }).await
     }
     /// Keyed, bounded snapshot with keyset pagination; includes tombstones.
     pub async fn list(
@@ -492,6 +744,36 @@ impl Reminders {
             let mut q = c.prepare("SELECT fire_id,reason,recorded_at FROM scheduler_fire_dead_letters WHERE scope=?1 ORDER BY recorded_at,fire_id LIMIT ?2")?;
             Ok(q.query_map(rusqlite::params![scope, limit], |r| Ok(DeadLetter { fire: r.get(0)?, reason: r.get(1)?, recorded_at: r.get(2)? }))?.collect::<std::result::Result<Vec<_>, _>>()?)
         }).await
+    }
+}
+/// Keyed report of a namespace-wide time-zone change, returned to the user.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimezoneReport {
+    pub timezone: String,
+    pub changed: Vec<TimezoneMove>,
+    pub skipped: Vec<TimezoneSkip>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimezoneMove {
+    pub id: String,
+    /// New generation carrying the re-expressed timing.
+    pub generation: i64,
+    pub old_timezone: String,
+    pub previous_next: Option<i64>,
+    pub next: Option<i64>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimezoneSkip {
+    pub id: String,
+    /// Fixed code: `due_or_pending`, `spent`, `conflict` or `rejected`.
+    pub reason: String,
+}
+fn skip_reason(message: &str) -> &'static str {
+    match message {
+        "reminder has due or pending fires; retry after delivery" => "due_or_pending",
+        "reminder has no future fire to recompute" => "spent",
+        "reminder generation conflict or inactive reminder" => "conflict",
+        _ => "rejected",
     }
 }
 /// Fixed reason codes; reminder text never appears in diagnostics.
