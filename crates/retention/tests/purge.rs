@@ -385,7 +385,7 @@ async fn rp2_json_and_identifier_texts_keep_every_payload_valid() {
     let dir = tempfile::tempdir().unwrap();
     let world = World::open(dir.path()).await;
     let structured = r#"{"alpha":1,"beta":2,"gamma":3}"#.to_string();
-    let unrelated = finished_run(&world, "unrelated", &[structured.clone()]).await;
+    let unrelated = finished_run(&world, "unrelated", std::slice::from_ref(&structured)).await;
     let linked = world
         .journal
         .create_run("linked", json!({"note": "start"}))
