@@ -63,10 +63,10 @@ async fn host(
         .spawn(&f.master.id, delegation("p", "general", 300))
         .await
         .unwrap();
-    let child = host
-        .spawn(&parent.id, delegation("c", "general", 60))
-        .await
-        .unwrap();
+    // The child must afford its own L0 core including the coordination catalog.
+    let mut child = delegation("c", "general", 60);
+    child.spec.budget.max_tokens = 10_000;
+    let child = host.spawn(&parent.id, child).await.unwrap();
     (host, adapter, model, parent, child)
 }
 #[tokio::test]
@@ -266,6 +266,8 @@ async fn mutable_worker_cannot_choose_nonblocking_but_readonly_optional_wait_can
         let p = host.spawn(&master.id, pd).await.unwrap();
         let mut cd = delegation("c", "general", 30);
         cd.token = token;
+        // The child must afford its own L0 core including the coordination catalog.
+        cd.spec.budget.max_tokens = 10_000;
         let c = host.spawn(&p.id, cd).await.unwrap();
         let run = c.run_id.as_ref().unwrap();
         assert_eq!(

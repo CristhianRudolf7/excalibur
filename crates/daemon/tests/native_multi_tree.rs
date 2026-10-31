@@ -497,7 +497,8 @@ fn delegation(
             context: ContextInput::new("Keep project scopes isolated.", id, "fixed fixture time"),
             budget: Budget {
                 max_steps: if parent.depth == 0 { 150 } else { 30 },
-                max_tokens: if parent.depth == 0 { 100000 } else { 1000 },
+                // Workers must afford their own native L0 core catalog.
+                max_tokens: if parent.depth == 0 { 100000 } else { 10000 },
                 max_wall_seconds: if parent.depth == 0 { 3600 } else { 120 },
                 max_tool_calls: if parent.depth == 0 { 500 } else { 30 },
                 ..Default::default()
