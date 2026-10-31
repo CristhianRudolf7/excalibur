@@ -1,0 +1,15 @@
+# Durable workflows
+
+[Español](workflows.es.md)
+
+`excalibur-workflow` is a scoped durable saga backend: versioned definitions, persistent per-node steps, injected-clock retry/backoff, an approval gate, crash resume with keyed effects, reverse-order compensation and dry-run simulation with a small textual flow. It is a partial H12 library; daemon/Agenda dispatch, parallel branches, bounded loops, subflows, agent/script nodes and event triggers remain pending, and no complete workflow product is claimed.
+
+## Definitions and instances
+
+`WorkflowDefinition` is an immutable, validated acyclic graph of typed nodes (`tool`, `condition`, `approval`, `wait`). Publishing is idempotent for identical content; different content under an existing version is rejected. Instances pin the `(id, version, hash)` they started with, so later publishes never change a running instance; migration to another published version is explicit and only allowed when the current node and every recorded step exist there with the same kind. Scopes come from authenticated host authority, never workflow content, and only the principal database is accepted. `describe` renders a one-line-per-node textual flow; `graph` exposes nodes and connections JSON for drawings.
+
+## Durable execution
+
+Every tool node writes its intent (with a per-instance-and-node idempotency key shared by all attempts and replays) before calling the host `Effector`, then records the result. Retries reuse the same key, so keyed hosts apply the effect once. A kill between intent and result replays the same key after reopening; idempotent and keyed effects simply re-execute under that key, while an interrupted non-idempotent effect blocks for host reconciliation (`reconcile` records whether the effect happened) instead of being repeated. Transient failures schedule bounded retries with deterministic jitter and an optional capped `Retry-After` hint, parked on the injected clock; exhausted retries, permanent failures and failed compensations pause for the user, input failures return to the agent without blind retry, and logical failures allow bounded corrections before replanning is required. Approval nodes wait durably for `decide_approval`; rejection moves the instance to compensation. Abort runs declared compensations in reverse start order under `<key>:compensate` keys and must stay idempotent, because started-but-unfinished steps are compensated too. Dry runs never receive an effector: outputs come from the scenario or the node's declared `dry_run` behaviour, and a tool declaring neither fails closed. Single-writer ownership comes from the store plus a per-instance async lock; revision conflicts surface as `Conflict`.
+
+Verification: `cargo test -p excalibur-workflow` covers the live chain with a durable wait, dry-run simulation, definition validation, reopen-after-completion, crash between intent and result with same-key replay, transient retries with keyed-once application, and the approval allow/reject paths with reverse compensation. Fixtures use a manual clock, an in-memory keyed effector double and temporary databases; no paid APIs are used.

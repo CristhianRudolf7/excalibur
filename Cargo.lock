@@ -1474,6 +1474,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "excalibur-workflow"
+version = "0.1.0"
+dependencies = [
+ "excalibur-store",
+ "excalibur-types",
+ "futures",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "excalibur-workspace"
 version = "0.1.0"
 dependencies = [
