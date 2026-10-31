@@ -34,6 +34,10 @@ struct Script {
     hang_prepares: Mutex<usize>,
     release: tokio::sync::Notify,
     prepares: AtomicUsize,
+    /// The next `prepare` blocks its worker thread synchronously (not at an
+    /// await point) until `unblock` is set, so an abort cannot take effect.
+    block_prepare_sync: AtomicBool,
+    unblock: AtomicBool,
     executions: AtomicUsize,
     execute_entered: AtomicBool,
 }
@@ -108,6 +112,11 @@ impl ToolRuntime for Tools {
                 hang
             };
             self.0.prepares.fetch_add(1, Ordering::SeqCst);
+            if self.0.block_prepare_sync.swap(false, Ordering::SeqCst) {
+                while !self.0.unblock.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
             if hang {
                 // Outside any control select: only an abort or an explicit
                 // test release can stop this driver.
@@ -561,7 +570,14 @@ async fn watchdog_schema_is_additive_and_tampering_fails_closed() {
         })
         .await
         .unwrap();
-    for column in ["action", "decision", "reason", "aborted", "notified"] {
+    for column in [
+        "action",
+        "decision",
+        "reason",
+        "aborted",
+        "notified",
+        "stalled_since",
+    ] {
         assert!(columns.iter().any(|c| c == column));
     }
     // Reopening applies nothing twice.
@@ -732,6 +748,85 @@ async fn an_intent_without_a_confirmed_interruption_is_closed_without_alert() {
     assert_ne!(
         f.host.engine().load(&run).await.unwrap().reason.as_deref(),
         Some(WATCHDOG_PAUSE_REASON)
+    );
+    f.host.shutdown().await.unwrap();
+    f.db.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_user_resume_after_give_up_is_not_failed_by_the_late_cancellation() {
+    let f = fixture(vec![Reply::Call("probe"), Reply::Done]).await;
+    f.script.block_prepare_sync.store(true, Ordering::SeqCst);
+    let (agent, run) = spawn(&f, "sync-stuck").await;
+    assert_eq!(f.host.tick().await.unwrap(), vec![agent.clone()]);
+    until(|| f.script.prepares.load(Ordering::SeqCst) >= 1).await;
+    let at = base(&f.db, &run).await;
+    assert_eq!(
+        f.host.watchdog_runs(at + 600).await.unwrap(),
+        vec![agent.clone()]
+    );
+    f.host.watchdog_runs(at + 605).await.unwrap();
+    assert!(f.host.watchdog_incidents(Some(&run)).await.unwrap()[0].aborted);
+    // The aborted task is stuck in synchronous code: give up after 60 s.
+    let incident = settle(&f.host, &run, at + 661).await;
+    assert_eq!(incident.decision.as_deref(), Some("paused"));
+    assert!(
+        incident
+            .reason
+            .unwrap()
+            .contains("did not stop after abort")
+    );
+    // The user resumes; this waits for the run boundary the old task holds.
+    let engine = f.host.engine().clone();
+    let target = run.clone();
+    let resume = tokio::spawn(async move { engine.resume(&target).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    f.script.unblock.store(true, Ordering::SeqCst);
+    resume.await.unwrap().unwrap();
+    for _ in 0..1000 {
+        if f.host.reap().await.unwrap() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The late cancellation of the aborted task does not fail the resumed run.
+    assert_eq!(
+        f.host.engine().load(&run).await.unwrap().status,
+        Status::Ready
+    );
+    for _ in 0..1000 {
+        f.host.tick().await.unwrap();
+        if f.host.engine().load(&run).await.unwrap().status == Status::Completed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        f.host.engine().load(&run).await.unwrap().status,
+        Status::Completed
+    );
+    f.host.shutdown().await.unwrap();
+    f.db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn downtime_is_measured_from_the_stall_reference_not_detection() {
+    // Detection is delayed by seven hours (for example a suspended host):
+    // the stall began long before the incident was observed.
+    let f = fixture(vec![Reply::Call("probe"), Reply::Done]).await;
+    *f.script.hang_prepares.lock().unwrap() = 1;
+    let (agent, run) = spawn(&f, "late-detection").await;
+    assert_eq!(f.host.tick().await.unwrap(), vec![agent.clone()]);
+    until(|| f.script.prepares.load(Ordering::SeqCst) >= 1).await;
+    let at = base(&f.db, &run).await + 7 * 3600;
+    assert_eq!(f.host.watchdog_runs(at).await.unwrap(), vec![agent.clone()]);
+    let incident = settle(&f.host, &run, at + 6).await;
+    assert_eq!(incident.decision.as_deref(), Some("paused"));
+    assert!(
+        incident
+            .reason
+            .unwrap()
+            .contains("interruption lasted six hours or more")
     );
     f.host.shutdown().await.unwrap();
     f.db.shutdown().await.unwrap();

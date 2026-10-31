@@ -23,12 +23,12 @@ The host may also interrupt a managed tool on a best-effort basis.
 
 ## Interruption, reconciliation and decision
 
-A live driver normally observes the durable control and stops by itself. A hung model call records its interruption and conservative accounting. If the exact driver task observed at detection is still alive 5 seconds later on the watchdog clock, it is aborted; a newer driver of the same agent is never aborted. The abort is recorded durably before cancelling, and the reaper ignores a cancelled driver only for a run with such an open aborted incident. Any other cancellation still fails the run. If it still has not stopped 60 seconds later (for example, it is stuck in synchronous code that cannot be cancelled), the incident is reported without an automatic resume.
+A live driver normally observes the durable control and stops by itself. A hung model call records its interruption and conservative accounting. If the exact driver task observed at detection is still alive 5 seconds later on the watchdog clock, it is aborted; a newer driver of the same agent is never aborted. The abort is recorded durably, and the exact aborted task identity is remembered before cancelling. The reaper ignores a cancellation only for that task, whatever was decided while it was stopping, so a run the user resumed after a give-up is not failed by the late cancellation. Any other cancellation still fails the run. If it still has not stopped 60 seconds later (for example, it is stuck in synchronous code that cannot be cancelled), the incident is reported without an automatic resume.
 
 Once the old driver is gone, the decision reuses the 17.3 startup assessment (`assess_resume`, shared with `recover_startup`). An automatic resume requires all of the following:
 
 - host and frozen run autonomy at least autonomous;
-- an interruption shorter than six hours. This is the time since detection and, when the incident predates the current daemon boot, also the boot downtime measured by startup recovery. The rule is shared with startup recovery through `assess_resume`;
+- an interruption shorter than six hours. It is measured from the stall reference timestamp stored with the incident (the last heartbeat, driver progress or registered tool deadline), not from detection, so a delayed detection cannot shorten it. When the incident predates the current daemon boot, the boot downtime measured by startup recovery also applies. The rule is shared with startup recovery through `assess_resume`;
 - sufficient remaining budget;
 - no unresolved non-pure intention;
 - no pending approval;
@@ -41,7 +41,7 @@ Once the old driver is gone, the decision reuses the 17.3 startup assessment (`a
 
 An eligible run is moved from `paused(watchdog_stalled)` to `ready` with the keyed CAS `watchdog-resume:<revision>`, and only then receives a `recovery_note` for its L5 context. The ordinary scheduler then admits it again, and the engine reconciles its pending pure tools as in 17.2. Any other case keeps the pause, with the blockers recorded as the reason.
 
-A blocked run keeps its block until the existing explicit `resolve_uncertain` reconciliation. The watchdog never executes or retries an effect. If a later user control or engine transition owns the run, the incident is recorded as `superseded`.
+A blocked run keeps its block until the existing explicit `resolve_uncertain` reconciliation. The watchdog never executes or retries an effect. If a later user control or engine transition owns the run, including a user resume that wins the race against the watchdog resume, or a pause by startup recovery after a resume committed before a long restart, the incident is recorded as `superseded` without a "resumed" note.
 
 ## Alerts and idempotency
 
@@ -57,7 +57,7 @@ Passes in one process are serialized. Passes from other processes or reopened da
 
 A failure while handling one run is reported and does not stop other runs, the rest of the tick or admission. A failed heartbeat renewal never fails the driver. A process that stops after the CAS resumes the incident from the confirmed journal key on the next pass. Startup recovery preserves `paused(watchdog_stalled)` as an existing control, and the watchdog settles it with the downtime rule above. An intent row whose CAS never applied is recorded as `not_applied` and produces no alert. Alerts require both the host row and the confirmed state-change key at revision `n + 1`.
 
-Schema: v1 (`run_watchdog.sql`, from the unverified checkpoint `d203232`) is kept unchanged. Additive v2 (`run_watchdog2.sql`) adds `action`, `decision`, `reason` and `aborted` once and is checksum-verified. The v1 cursor table is not used.
+Schema: v1 (`run_watchdog.sql`, from the unverified checkpoint `d203232`) is kept unchanged. Additive v2 (`run_watchdog2.sql`) adds `action`, `decision`, `reason` and `aborted` once; additive v3 (`run_watchdog3.sql`) adds `stalled_since`. Each version is applied once and checksum-verified. The v1 cursor table is not used.
 
 ## Verification
 
@@ -73,6 +73,9 @@ The suite drives real engine drivers with local mock models and tools, a real te
 - at most one automatic resume per run (a second stall stays paused);
 - a restart between the interruption and its settlement, with short downtime (resumed), downtime over six hours (paused) and supervised host autonomy (paused);
 - an intent row whose interruption was never confirmed (`not_applied`, no alert);
+- a driver stuck in synchronous code: abort, give-up decision, user resume and late cancellation, after which the run is still resumable and completes;
+- downtime measured from the stall reference when detection is delayed by seven hours;
+- a non-watchdog cancellation still failing its run, a newer driver that is never aborted, the alert fallback that withholds details failing the durable checks, and one failing incident not stopping the others;
 - cooperative interruption of a hung model call, with an urgent alert;
 - concurrent passes, and reopening the database without a duplicate interruption or alert;
 - abort of a driver hung outside any control point, followed by a single resume that completes from the recorded model response;

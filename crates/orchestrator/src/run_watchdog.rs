@@ -42,8 +42,6 @@ pub struct WatchdogIncident {
 pub(crate) async fn initialize(db: &Database) -> Result<()> {
     let sql = include_str!("run_watchdog.sql");
     let checksum = digest(sql.as_bytes());
-    let next = include_str!("run_watchdog2.sql");
-    let next_checksum = digest(next.as_bytes());
     db.write(Priority::Journal, move |c| {
         c.execute_batch(sql)?;
         let old: Option<String> = c
@@ -62,27 +60,33 @@ pub(crate) async fn initialize(db: &Database) -> Result<()> {
             "INSERT OR IGNORE INTO orchestration_run_watchdog_schema VALUES(1,?1)",
             [checksum],
         )?;
-        // Additive v2: columns are added exactly once in this transaction.
-        let old: Option<String> = c
-            .query_row(
-                "SELECT checksum FROM orchestration_run_watchdog_schema WHERE version=2",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        match old {
-            Some(old) if old != next_checksum => {
-                return Err(excalibur_store::Error::Configuration(
-                    "run watchdog decision schema checksum mismatch".into(),
-                ));
-            }
-            Some(_) => {}
-            None => {
-                c.execute_batch(next)?;
-                c.execute(
-                    "INSERT INTO orchestration_run_watchdog_schema VALUES(2,?1)",
-                    [next_checksum],
-                )?;
+        // Additive v2 and v3: each is applied exactly once in this transaction.
+        for (version, next) in [
+            (2, include_str!("run_watchdog2.sql")),
+            (3, include_str!("run_watchdog3.sql")),
+        ] {
+            let next_checksum = digest(next.as_bytes());
+            let old: Option<String> = c
+                .query_row(
+                    "SELECT checksum FROM orchestration_run_watchdog_schema WHERE version=?1",
+                    [version],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match old {
+                Some(old) if old != next_checksum => {
+                    return Err(excalibur_store::Error::Configuration(format!(
+                        "run watchdog schema v{version} checksum mismatch"
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    c.execute_batch(next)?;
+                    c.execute(
+                        "INSERT INTO orchestration_run_watchdog_schema VALUES(?1,?2)",
+                        rusqlite::params![version, next_checksum],
+                    )?;
+                }
             }
         }
         Ok(())
@@ -124,14 +128,6 @@ impl Orchestrator {
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?)
-        }).await?)
-    }
-    /// The reaper ignores a cancelled driver only when this watchdog aborted it
-    /// for a still-open incident; any other cancellation remains a failure.
-    pub(crate) async fn watchdog_aborted(&self, run: &str) -> Result<bool> {
-        let run = run.to_owned();
-        Ok(self.inner.db.read(ReadLane::Interactive, move |c| {
-            Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM orchestration_run_watchdog WHERE run_id=?1 AND aborted=1 AND decision IS NULL)", [run], |r| r.get(0))?)
         }).await?)
     }
     async fn live_driver(&self, agent: &str) -> bool {
@@ -212,7 +208,7 @@ impl Orchestrator {
             }
             // Host intent precedes the CAS; only this host row plus the
             // confirmed exact-key transition can produce a watchdog alert.
-            c.execute("INSERT OR IGNORE INTO orchestration_run_watchdog(run_id,sequence,agent_id,observed_at) VALUES(?1,?2,?3,?4)", rusqlite::params![r, sequence, a, at])?;
+            c.execute("INSERT OR IGNORE INTO orchestration_run_watchdog(run_id,sequence,agent_id,observed_at,stalled_since) VALUES(?1,?2,?3,?4,?5)", rusqlite::params![r, sequence, a, at, reference])?;
             Ok(true)
         }).await?;
         if !admitted {
@@ -241,7 +237,7 @@ impl Orchestrator {
     }
     async fn settle_watchdog_incidents(&self, at: i64) -> Result<()> {
         let rows = self.inner.db.read(ReadLane::Background, |c| {
-            let mut q = c.prepare("SELECT w.run_id,w.sequence,w.agent_id,w.observed_at,w.aborted,(SELECT j.idempotency_key FROM journal j WHERE j.run_id=w.run_id AND j.sequence=w.sequence+1 AND j.kind='state_change' AND j.state='confirmed' AND j.idempotency_key IN ('watchdog-stalled:'||w.sequence,'watchdog-blocked:'||w.sequence)),(SELECT COALESCE(MAX(sequence),0) FROM journal j WHERE j.run_id=w.run_id),EXISTS(SELECT 1 FROM journal j WHERE j.run_id=w.run_id AND j.kind='state_change' AND j.state='confirmed' AND j.idempotency_key='watchdog-resume:'||w.sequence) FROM orchestration_run_watchdog w WHERE w.decision IS NULL ORDER BY w.observed_at,w.run_id LIMIT ?1")?;
+            let mut q = c.prepare("SELECT w.run_id,w.sequence,w.agent_id,w.observed_at,w.aborted,w.stalled_since,(SELECT j.idempotency_key FROM journal j WHERE j.run_id=w.run_id AND j.sequence=w.sequence+1 AND j.kind='state_change' AND j.state='confirmed' AND j.idempotency_key IN ('watchdog-stalled:'||w.sequence,'watchdog-blocked:'||w.sequence)),(SELECT COALESCE(MAX(sequence),0) FROM journal j WHERE j.run_id=w.run_id),EXISTS(SELECT 1 FROM journal j WHERE j.run_id=w.run_id AND j.kind='state_change' AND j.state='confirmed' AND j.idempotency_key='watchdog-resume:'||w.sequence) FROM orchestration_run_watchdog w WHERE w.decision IS NULL ORDER BY w.observed_at,w.run_id LIMIT ?1")?;
             Ok(q.query_map([BATCH], |r| {
                 Ok(Incident {
                     run: r.get(0)?,
@@ -249,9 +245,10 @@ impl Orchestrator {
                     agent: r.get(2)?,
                     observed: r.get(3)?,
                     aborted: r.get(4)?,
-                    confirmed: r.get(5)?,
-                    actual: r.get(6)?,
-                    resumed: r.get(7)?,
+                    stalled_since: r.get(5)?,
+                    confirmed: r.get(6)?,
+                    actual: r.get(7)?,
+                    resumed: r.get(8)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?)
@@ -292,6 +289,17 @@ impl Orchestrator {
         } else {
             "paused"
         };
+        // The incident is still owned by the watchdog only while the run stays
+        // in the exact stop state that its CAS produced.
+        let owned = |state: &excalibur_engine::Snapshot| {
+            (action == "paused"
+                && state.status == Status::Paused
+                && state.reason.as_deref() == Some(WATCHDOG_PAUSE_REASON))
+                || (action == "blocked"
+                    && state.status == Status::Blocked
+                    && state.reason.as_deref() == Some(WATCHDOG_BLOCK_REASON))
+        };
+        let before = self.inner.engine.load(run).await?;
         // Wait for the exact observed driver: cooperative stop, then abort.
         let target = self
             .inner
@@ -304,9 +312,11 @@ impl Orchestrator {
             let handles = self.inner.running.lock().await;
             match handles.get(agent) {
                 Some(handle) if !handle.is_finished() && target != Some(handle.id()) => {
-                    // A driver this pass did not observe at detection is never
-                    // aborted. Without a recorded target it is only awaited.
-                    if target.is_some() {
+                    // A driver not observed at detection is never aborted. If
+                    // the watchdog no longer owns the run, a later control
+                    // started it and the incident is superseded; otherwise an
+                    // unidentified driver is only awaited.
+                    if target.is_some() || !owned(&before) || incident.resumed {
                         None
                     } else {
                         Some(at >= incident.observed.saturating_add(ABORT_GIVE_UP_SECONDS))
@@ -316,13 +326,19 @@ impl Orchestrator {
                     if !incident.aborted
                         && at >= incident.observed.saturating_add(ABORT_GRACE_SECONDS)
                     {
-                        // Persist the abort before cancelling so the reaper
-                        // can distinguish it from any other cancellation.
+                        // Persist the abort and remember the exact task before
+                        // cancelling, so the reaper ignores only this
+                        // cancellation, whatever is decided meanwhile.
                         let (r, s) = (run.clone(), sequence);
                         self.inner.db.write(Priority::Journal, move |c| {
                             c.execute("UPDATE orchestration_run_watchdog SET aborted=1 WHERE run_id=?1 AND sequence=?2", rusqlite::params![r, s])?;
                             Ok(())
                         }).await?;
+                        self.inner
+                            .watchdog_aborted_tasks
+                            .lock()
+                            .unwrap()
+                            .insert(handle.id());
                         handle.abort();
                     }
                     Some(at >= incident.observed.saturating_add(ABORT_GIVE_UP_SECONDS))
@@ -350,32 +366,34 @@ impl Orchestrator {
         self.inner.watchdog_targets.lock().unwrap().remove(agent);
         let state = self.inner.engine.load(run).await?;
         let (decision, reason) = if incident.resumed {
-            // The resume CAS committed earlier; the note follows it.
-            let reason = "eligible after watchdog reconciliation";
-            self.watchdog_note(run, sequence, "resumed", reason).await?;
-            ("resumed", reason.to_owned())
-        } else if action == "blocked" {
-            if state.status == Status::Blocked
-                && state.reason.as_deref() == Some(WATCHDOG_BLOCK_REASON)
-            {
-                self.watchdog_note(run, sequence, "blocked", WATCHDOG_BLOCK_REASON)
-                    .await?;
-                ("blocked", WATCHDOG_BLOCK_REASON.to_owned())
-            } else {
+            // The resume CAS committed earlier. If another control (for example
+            // startup recovery after a long restart) owns the run now, the
+            // incident is superseded and no "resumed" note is written.
+            if matches!(state.status, Status::Paused | Status::Blocked) || terminal(&state.status) {
                 ("superseded", superseded(&state))
+            } else {
+                let reason = "eligible after watchdog reconciliation";
+                self.watchdog_note(run, sequence, "resumed", reason).await?;
+                ("resumed", reason.to_owned())
             }
-        } else if state.status == Status::Paused
-            && state.reason.as_deref() == Some(WATCHDOG_PAUSE_REASON)
-        {
+        } else if !owned(&state) {
+            ("superseded", superseded(&state))
+        } else if action == "blocked" {
+            self.watchdog_note(run, sequence, "blocked", WATCHDOG_BLOCK_REASON)
+                .await?;
+            ("blocked", WATCHDOG_BLOCK_REASON.to_owned())
+        } else {
             let host = self
                 .inner
                 .host_autonomy
                 .lock()
                 .unwrap()
                 .unwrap_or(Autonomy::Supervised);
-            // 17.3 downtime: the interruption itself, plus the host downtime
-            // when the incident predates the current daemon boot.
-            let mut downtime = at.saturating_sub(incident.observed);
+            // 17.3 downtime: from the stall reference (last heartbeat, progress
+            // or registered tool deadline), plus the host downtime when the
+            // incident predates the current daemon boot.
+            let since = incident.stalled_since.unwrap_or(incident.observed);
+            let mut downtime = at.saturating_sub(since);
             if let Some((started, boot_downtime)) = self.recovery().current_boot().await?
                 && incident.observed < started
             {
@@ -406,8 +424,20 @@ impl Orchestrator {
                     .resume_watchdog_pause(run, sequence)
                     .await?
                 {
-                    // A concurrent control won; re-evaluate on the next pass.
-                    return Ok(());
+                    // A concurrent control won the race for the pause.
+                    let now_state = self.inner.engine.load(run).await?;
+                    if owned(&now_state) {
+                        return Ok(());
+                    }
+                    return self
+                        .record_watchdog_decision(
+                            run,
+                            sequence,
+                            Some(action),
+                            "superseded",
+                            &superseded(&now_state),
+                        )
+                        .await;
                 }
                 let reason = "eligible after watchdog reconciliation";
                 self.watchdog_note(run, sequence, "resumed", reason).await?;
@@ -417,8 +447,6 @@ impl Orchestrator {
                 self.watchdog_note(run, sequence, "paused", &reason).await?;
                 ("paused", reason)
             }
-        } else {
-            ("superseded", superseded(&state))
         };
         self.record_watchdog_decision(run, sequence, Some(action), decision, &reason)
             .await
@@ -543,6 +571,7 @@ struct Incident {
     agent: String,
     observed: i64,
     aborted: bool,
+    stalled_since: Option<i64>,
     confirmed: Option<String>,
     actual: u64,
     resumed: bool,
@@ -554,4 +583,235 @@ fn superseded(state: &excalibur_engine::Snapshot) -> String {
         "a later control or engine transition owns the run: {}",
         label(&state.status)
     )
+}
+
+#[cfg(test)]
+mod watchdog_unit_tests {
+    use super::*;
+    use crate::recovery_test_support::*;
+    use std::sync::Arc;
+
+    fn coordinated(name: &str) -> Delegation {
+        let mut task = delegation(name, "general", 2000);
+        task.profile = "coordinator".into();
+        task
+    }
+    type Driver = tokio::task::JoinHandle<excalibur_engine::Result<excalibur_engine::Snapshot>>;
+    fn hung_driver() -> Driver {
+        tokio::spawn(std::future::pending())
+    }
+    async fn running(f: &Fixture, name: &str) -> (String, String) {
+        let agent = f.host.spawn(&f.master.id, coordinated(name)).await.unwrap();
+        let run = agent.run_id.unwrap();
+        f.host
+            .engine()
+            .journal()
+            .set_state(&run, "running", None, &format!("fixture:{name}"))
+            .await
+            .unwrap();
+        (agent.id, run)
+    }
+    async fn finished(handle: &Driver) {
+        for _ in 0..500 {
+            if handle.is_finished() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("task did not finish");
+    }
+    async fn incident_row(
+        f: &Fixture,
+        run: &str,
+        agent: &str,
+        observed: i64,
+        decision: Option<&str>,
+        reason: &str,
+    ) {
+        let (run, agent, decision, reason) = (
+            run.to_owned(),
+            agent.to_owned(),
+            decision.map(str::to_owned),
+            reason.to_owned(),
+        );
+        f.db.write(Priority::Journal, move |c| {
+            c.execute("INSERT INTO orchestration_run_watchdog(run_id,sequence,agent_id,observed_at,action,decision,reason) VALUES(?1,1,?2,?3,'paused',?4,?5)", rusqlite::params![run, agent, observed, decision, reason])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_the_exact_watchdog_aborted_task_escapes_failure() {
+        let f = fixture().await;
+        let (plain, plain_run) = running(&f, "plain-cancel").await;
+        let (watched, watched_run) = running(&f, "watchdog-cancel").await;
+        let (a, b) = (hung_driver(), hung_driver());
+        f.host
+            .inner
+            .watchdog_aborted_tasks
+            .lock()
+            .unwrap()
+            .insert(b.id());
+        a.abort();
+        b.abort();
+        finished(&a).await;
+        finished(&b).await;
+        {
+            let mut handles = f.host.inner.running.lock().await;
+            handles.insert(plain, a);
+            handles.insert(watched, b);
+        }
+        assert_eq!(f.host.reap().await.unwrap(), 2);
+        assert_eq!(
+            f.host.engine().load(&plain_run).await.unwrap().status,
+            Status::Failed
+        );
+        assert_ne!(
+            f.host.engine().load(&watched_run).await.unwrap().status,
+            Status::Failed
+        );
+        assert!(
+            f.host
+                .inner
+                .watchdog_aborted_tasks
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        f.host.shutdown().await.unwrap();
+        f.db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_driver_not_observed_at_detection_is_never_aborted() {
+        let f = fixture().await;
+        let (agent, run) = running(&f, "replaced-driver").await;
+        let observed = hung_driver();
+        let observed_id = observed.id();
+        f.host
+            .inner
+            .running
+            .lock()
+            .await
+            .insert(agent.clone(), observed);
+        let at = now() + 10_000;
+        assert_eq!(f.host.watchdog_runs(at).await.unwrap(), vec![agent.clone()]);
+        assert_eq!(
+            f.host
+                .inner
+                .watchdog_targets
+                .lock()
+                .unwrap()
+                .get(&agent)
+                .copied(),
+            Some(observed_id)
+        );
+        // A different driver task now occupies the agent slot.
+        let newer = hung_driver();
+        let old = f
+            .host
+            .inner
+            .running
+            .lock()
+            .await
+            .insert(agent.clone(), newer)
+            .unwrap();
+        old.abort();
+        f.host
+            .watchdog_runs(at + ABORT_GIVE_UP_SECONDS + 1)
+            .await
+            .unwrap();
+        let incident = &f.host.watchdog_incidents(Some(&run)).await.unwrap()[0];
+        assert!(!incident.aborted);
+        let newer = f.host.inner.running.lock().await.remove(&agent).unwrap();
+        assert!(!newer.is_finished());
+        newer.abort();
+        f.host.shutdown().await.unwrap();
+        f.db.shutdown().await.unwrap();
+    }
+
+    struct Redacting;
+    impl RunAuthority for Redacting {
+        fn sanitize_durable(&self, value: &Value) -> std::result::Result<Value, String> {
+            Ok(serde_json::from_str(
+                &value
+                    .to_string()
+                    .replace("SYNTHETIC-SECRET-LITERAL", "[redacted]"),
+            )
+            .unwrap())
+        }
+        fn bind<'a>(
+            &'a self,
+            _: &'a Agent,
+        ) -> excalibur_types::runtime::BoxFuture<'a, std::result::Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn alert_withholds_details_that_fail_durable_checks() {
+        let f = fixture().await;
+        let agent = f
+            .host
+            .spawn(&f.master.id, coordinated("alert-fallback"))
+            .await
+            .unwrap();
+        let run = agent.run_id.clone().unwrap();
+        let host = f.host.clone().with_authority(Arc::new(Redacting));
+        incident_row(
+            &f,
+            &run,
+            &agent.id,
+            1,
+            Some("paused"),
+            "token SYNTHETIC-SECRET-LITERAL",
+        )
+        .await;
+        host.watchdog_runs(now()).await.unwrap();
+        let alerts = host
+            .notifications(&agent.origin_conversation)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.content.contains("run_watchdog"))
+            .collect::<Vec<_>>();
+        assert_eq!(alerts.len(), 1);
+        assert!(!alerts[0].content.contains("SYNTHETIC-SECRET-LITERAL"));
+        assert!(alerts[0].content.contains("details withheld"));
+        assert!(host.watchdog_incidents(Some(&run)).await.unwrap()[0].notified);
+        host.shutdown().await.unwrap();
+        f.db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failing_incident_does_not_stop_the_others() {
+        let f = fixture().await;
+        let agent = f
+            .host
+            .spawn(&f.master.id, coordinated("isolation"))
+            .await
+            .unwrap();
+        let run = agent.run_id.clone().unwrap();
+        // A run row with no durable journal cannot be loaded by the engine.
+        f.db.write(Priority::Journal, |c| {
+            c.execute(
+                "INSERT INTO runs(id,state) VALUES('broken-run','running')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        incident_row(&f, "broken-run", &agent.id, 0, None, "").await;
+        incident_row(&f, &run, &agent.id, 1, None, "").await;
+        f.host.watchdog_runs(now()).await.unwrap();
+        let broken = f.host.watchdog_incidents(Some("broken-run")).await.unwrap();
+        assert!(broken[0].decision.is_none());
+        let healthy = f.host.watchdog_incidents(Some(&run)).await.unwrap();
+        assert_eq!(healthy[0].decision.as_deref(), Some("not_applied"));
+        f.host.shutdown().await.unwrap();
+        f.db.shutdown().await.unwrap();
+    }
 }

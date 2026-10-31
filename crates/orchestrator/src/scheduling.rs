@@ -250,9 +250,18 @@ impl Orchestrator {
         for (id, handle) in finished {
             let a = self.agent(&id).await?;
             let run = a.run_id.as_ref().ok_or_else(|| invalid("run missing"))?;
+            let task = handle.id();
             let outcome = handle.await;
-            let watchdog_abort = matches!(&outcome, Err(e) if e.is_cancelled())
-                && self.watchdog_aborted(run).await?;
+            // Matched by exact task identity, independent of any decision the
+            // watchdog or a user control recorded while the task was stopping.
+            let aborted_by_watchdog = self
+                .inner
+                .watchdog_aborted_tasks
+                .lock()
+                .unwrap()
+                .remove(&task);
+            let watchdog_abort =
+                aborted_by_watchdog && matches!(&outcome, Err(e) if e.is_cancelled());
             match outcome {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {

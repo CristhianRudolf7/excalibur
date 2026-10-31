@@ -23,12 +23,12 @@ El host también puede interrumpir una herramienta gestionada, sin garantía de 
 
 ## Interrupción, reconciliación y decisión
 
-Normalmente, un conductor vivo observa el control durable y se detiene por sí mismo. Una llamada al modelo colgada registra su interrupción y una contabilidad conservadora. Si la tarea exacta del conductor observada en la detección sigue viva 5 segundos después según el reloj del vigilante, se aborta; nunca se aborta un conductor más reciente del mismo agente. El aborto se registra de forma durable antes de cancelar, y el recolector solo ignora un conductor cancelado en una ejecución con un incidente abierto de ese tipo. Cualquier otra cancelación sigue haciendo fallar la ejecución. Si 60 segundos después todavía no se ha detenido (por ejemplo, porque está atascada en código síncrono que no se puede cancelar), el incidente se informa sin reanudación automática.
+Normalmente, un conductor vivo observa el control durable y se detiene por sí mismo. Una llamada al modelo colgada registra su interrupción y una contabilidad conservadora. Si la tarea exacta del conductor observada en la detección sigue viva 5 segundos después según el reloj del vigilante, se aborta; nunca se aborta un conductor más reciente del mismo agente. El aborto se registra de forma durable y la identidad exacta de la tarea abortada se recuerda antes de cancelar. El recolector solo ignora la cancelación de esa tarea, se haya decidido lo que se haya decidido mientras se detenía, así que una ejecución que el usuario reanudó tras darse por vencido el vigilante no falla por la cancelación tardía. Cualquier otra cancelación sigue haciendo fallar la ejecución. Si 60 segundos después todavía no se ha detenido (por ejemplo, porque está atascada en código síncrono que no se puede cancelar), el incidente se informa sin reanudación automática.
 
 Cuando el conductor antiguo ha desaparecido, la decisión reutiliza la evaluación de arranque de 17.3 (`assess_resume`, compartida con `recover_startup`). Una reanudación automática requiere todo lo siguiente:
 
 - autonomía del host y autonomía congelada de la ejecución al menos autónomas;
-- una interrupción de menos de seis horas. Es el tiempo desde la detección y, si el incidente es anterior al arranque actual del daemon, también el tiempo de inactividad medido por la recuperación de arranque. La regla se comparte con la recuperación de arranque mediante `assess_resume`;
+- una interrupción de menos de seis horas. Se mide desde la marca de referencia del atasco guardada con el incidente (el último latido, el último avance del conductor o el plazo de la herramienta registrada), no desde la detección, así que una detección tardía no puede acortarla. Si el incidente es anterior al arranque actual del daemon, también se aplica el tiempo de inactividad medido por la recuperación de arranque. La regla se comparte con la recuperación de arranque mediante `assess_resume`;
 - presupuesto restante suficiente;
 - ninguna intención no pura sin resolver;
 - ninguna aprobación pendiente;
@@ -41,7 +41,7 @@ Cuando el conductor antiguo ha desaparecido, la decisión reutiliza la evaluaci�
 
 Una ejecución elegible pasa de `paused(watchdog_stalled)` a `ready` con el CAS con clave `watchdog-resume:<revisión>`, y solo entonces recibe una `recovery_note` para su contexto L5. Después, el planificador ordinario la vuelve a admitir y el motor reconcilia sus herramientas puras pendientes como indica 17.2. En cualquier otro caso se mantiene la pausa y los impedimentos quedan registrados como motivo.
 
-Una ejecución bloqueada mantiene el bloqueo hasta la reconciliación explícita existente mediante `resolve_uncertain`. El vigilante nunca ejecuta ni reintenta un efecto. Si un control posterior del usuario o una transición del motor se adueña de la ejecución, el incidente queda registrado como `superseded`.
+Una ejecución bloqueada mantiene el bloqueo hasta la reconciliación explícita existente mediante `resolve_uncertain`. El vigilante nunca ejecuta ni reintenta un efecto. Si un control posterior del usuario o una transición del motor se adueña de la ejecución, incluida una reanudación del usuario que gana la carrera a la del vigilante, o una pausa de la recuperación de arranque tras una reanudación confirmada antes de un reinicio largo, el incidente queda registrado como `superseded` sin nota de "reanudada".
 
 ## Alertas e idempotencia
 
@@ -57,7 +57,7 @@ Las pasadas de un mismo proceso se serializan. Las de otros procesos o de bases 
 
 Un fallo al tratar una ejecución se informa y no detiene las demás ejecuciones, el resto del tick ni la admisión. Un fallo al renovar el latido nunca hace fallar al conductor. Si un proceso se detiene después del CAS, el incidente continúa en la pasada siguiente a partir de la clave confirmada en el registro. La recuperación de arranque conserva `paused(watchdog_stalled)` como control existente, y el vigilante lo resuelve con la regla de inactividad anterior. Una fila de intención cuyo CAS nunca se aplicó queda como `not_applied` y no genera alerta. Las alertas exigen tanto la fila del host como la clave confirmada del cambio de estado en la revisión `n + 1`.
 
-Esquema: v1 (`run_watchdog.sql`, del punto de control no verificado `d203232`) se mantiene sin cambios. La v2 aditiva (`run_watchdog2.sql`) añade una sola vez `action`, `decision`, `reason` y `aborted`, y se verifica con checksum. La tabla de cursor de v1 no se usa.
+Esquema: v1 (`run_watchdog.sql`, del punto de control no verificado `d203232`) se mantiene sin cambios. La v2 aditiva (`run_watchdog2.sql`) añade una sola vez `action`, `decision`, `reason` y `aborted`; la v3 aditiva (`run_watchdog3.sql`) añade `stalled_since`. Cada versión se aplica una sola vez y se verifica con checksum. La tabla de cursor de v1 no se usa.
 
 ## Verificación
 
@@ -73,6 +73,9 @@ La suite ejecuta conductores reales del motor con modelos y herramientas simulad
 - como máximo una reanudación automática por ejecución (un segundo atasco queda pausado);
 - un reinicio entre la interrupción y su resolución, con inactividad corta (reanudada), inactividad de más de seis horas (pausada) y autonomía supervisada del host (pausada);
 - una fila de intención cuya interrupción nunca se confirmó (`not_applied`, sin alerta);
+- un conductor atascado en código síncrono: aborto, decisión de darse por vencido, reanudación del usuario y cancelación tardía, tras lo cual la ejecución sigue siendo reanudable y termina;
+- la inactividad medida desde la referencia del atasco cuando la detección se retrasa siete horas;
+- una cancelación ajena al vigilante que sigue haciendo fallar su ejecución, un conductor más reciente que nunca se aborta, la alternativa de la alerta que oculta los detalles que no superan las comprobaciones durables, y un incidente que falla sin detener a los demás;
 - la interrupción cooperativa de una llamada al modelo colgada, con alerta urgente;
 - pasadas concurrentes y la reapertura de la base de datos sin interrupciones ni alertas duplicadas;
 - el aborto de un conductor colgado fuera de cualquier punto de control, seguido de una única reanudación que termina a partir de la respuesta del modelo ya registrada;

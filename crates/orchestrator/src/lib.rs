@@ -125,6 +125,9 @@ struct Inner {
     watchdog: AsyncMutex<()>,
     /// Driver task observed at each watchdog detection; only it may be aborted.
     watchdog_targets: Mutex<BTreeMap<String, tokio::task::Id>>,
+    /// Exact driver tasks this process aborted; only their cancellation is
+    /// not a run failure.
+    watchdog_aborted_tasks: Mutex<std::collections::HashSet<tokio::task::Id>>,
 }
 fn digest(v: &[u8]) -> String {
     format!("{:x}", Sha256::digest(v))
@@ -240,6 +243,7 @@ impl Orchestrator {
                 host_autonomy: Mutex::new(None),
                 watchdog: AsyncMutex::new(()),
                 watchdog_targets: Mutex::new(BTreeMap::new()),
+                watchdog_aborted_tasks: Mutex::new(Default::default()),
             }),
         })
     }
