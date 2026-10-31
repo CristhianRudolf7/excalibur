@@ -384,7 +384,7 @@ fn symlinks_hard_links_and_devices_are_rejected() {
         code(g.examine(None, "application/zip", &zip(&[link]))),
         Code::Link
     );
-    for kind in [b'1', b'2', b'3', b'4', b'6'] {
+    for kind in *b"12346" {
         let entry = TarEntry {
             kind,
             link: "/etc/shadow".into(),
